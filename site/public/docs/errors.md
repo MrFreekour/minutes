@@ -199,6 +199,18 @@ Source: `crates/core/src/error.rs`
 
 Reference URL: https://useminutes.app/docs/errors#error-transcribeerror-transcriptionfailed
 
+<a id="error-transcribeerror-compresseddecoderunavailable"></a>
+
+## `TranscribeError::CompressedDecoderUnavailable`
+
+Exact message:
+
+> compressed audio decoder unavailable: {0}
+
+Source: `crates/core/src/error.rs`
+
+Reference URL: https://useminutes.app/docs/errors#error-transcribeerror-compresseddecoderunavailable
+
 <a id="error-transcribeerror-enginenotavailable"></a>
 
 ## `TranscribeError::EngineNotAvailable`
