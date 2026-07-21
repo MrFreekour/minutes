@@ -24,7 +24,7 @@ Fathom is the strongest free offer in cloud meeting notes — unlimited recordin
 - Model training — Fathom: subprocessors barred, internal de-identified training with opt-out; Minutes: no vendor exists
 - Compliance — Fathom: SOC 2 Type II, published blanket BAA (pricing lists HIPAA BAA under Enterprise); Minutes: no vendor in the loop
 - Open source — Fathom: no; Minutes: MIT
-- API/MCP — Fathom: public API + first-party MCP over its cloud; Minutes: MCP (31 tools) + CLI + SDK over local files
+- API/MCP — Fathom: public API + first-party MCP over its cloud; Minutes: MCP (33 tools) + CLI + SDK over local files
 - Pricing — Fathom: Free (unlimited recording), Premium $20, Team $19, Business $34/user/mo billed monthly ($16/$15/$25 annually), Enterprise custom; Minutes: free, open source
 
 ## Where Fathom wins

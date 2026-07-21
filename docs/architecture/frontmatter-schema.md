@@ -269,11 +269,15 @@ The current overlay table stores additive rows with these fields:
 | `reversible_to` | string? | Previous value, when known, so clients can explain or undo the overlay. |
 | `note` | string? | Optional provenance note. |
 | `created_at` | string | RFC3339 timestamp for the overlay write. |
+| `source_sha256` | string? | Exact source revision visible when the confirmation was written. Legacy unbound rows remain inspectable but cannot authorize graph facts. |
 
-`graph.db` remains a rebuildable projection. Rebuilding the graph reads the
-markdown corpus, then layers `overlays.db` on top. A third-party tool that only
-reads `~/meetings/` still gets the raw source material; a tool that wants
-user-confirmed state can also read `overlays.db`.
+The relationship graph is a process-private, disposable projection rather
+than a durable `graph.db`. Each graph operation reads stable, policy-authorized
+markdown snapshots, layers an attested correction snapshot from `overlays.db`
+and `vocabulary.toml`, materializes into temporary storage, and reauthorizes
+the complete input revision before returning results. A third-party tool that
+only reads `~/meetings/` still gets the raw source material; a tool that wants
+user-confirmed state can also read the correction stores.
 
 ---
 
@@ -354,18 +358,28 @@ Audio was not captured for this sensitive meeting.
 human-readable markdown file stays on disk untouched, but the meeting is
 excluded **by default** from the agent surfaces that read the corpus:
 
-- MCP tools (list, search, get-by-path, person profiles, open actions,
-  decisions) read through the Minutes SDK reader, which drops restricted
-  meetings unless an explicit override is set.
+- Core, SDK, and MCP meeting readers exclude restricted meetings by default.
+  Agent-facing indexed paths are re-read and strictly classified from live
+  bytes before a title, excerpt, body, action, or decision is returned. QMD
+  and SQLite rank candidates; their cached content is never authorization.
 - The knowledge graph rebuild skips restricted meetings, so their people,
   decisions, commitments, and topics never become agent-queryable facts.
 
-The override is explicit and logged: callers pass `includeRestricted: true`
-to the SDK reader functions, which emits a warning to stderr naming the count
-and surface. This keeps "designated sensitive" meaningful at the agent layer
-while leaving the operator's own files fully readable on disk. Agents never
-mutate the `sensitivity` field; it is set by Minutes when the meeting is
-designated.
+An SDK caller can pass `includeRestricted: true`, and human-invoked CLI reads
+can use `--include-restricted`; those surfaces log their override. Standalone
+MCP is stricter because its request arguments are model-controlled: both a
+trusted launch grant (`MINUTES_MCP_RESTRICTED_POLICY=logged-override`) and the
+per-call flag are required, and the server fails closed unless it can append a
+durable audit record. Native Recall has no override, no MCP server, and no
+tools. It accepts only exact, live, normal-sensitivity snapshots and clears
+policy-bound history after any byte or sensitivity change.
+
+Only `normal` and `restricted` are valid explicit values. Absence preserves
+legacy normal behavior. An unknown value, malformed frontmatter, unreadable
+file, or escaped path is policy-uncertain and is excluded even when an
+authorized restricted override exists. This keeps "designated sensitive"
+meaningful while leaving the operator's own markdown fully readable on disk.
+Agents never mutate the field; it is set by a human-initiated Minutes flow.
 
 The full per-surface contract — core search/actions/research, CLI
 `--include-restricted` with `sensitivity.override` event logging, knowledge

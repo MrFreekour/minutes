@@ -26,7 +26,7 @@ brew tap silverstein/tap && brew install minutes
 ```bash
 minutes record                # Start recording
 minutes stop                  # Stop and transcribe
-minutes search "pricing"      # Search across all meetings
+minutes search "pricing"      # Search normal meetings by default
 minutes actions               # Open action items
 ```
 

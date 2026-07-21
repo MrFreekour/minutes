@@ -44,7 +44,7 @@ const comparisonRows = [
   {
     label: "Agent / MCP surface",
     competitor: "None that we could find — built for humans typing with their voice",
-    minutes: "MCP server (31 tools), CLI, SDK, and a Claude Code plugin over your local files",
+    minutes: "MCP server (33 tools), CLI, SDK, and a Claude Code plugin over your local files",
   },
   {
     label: "Open source",
@@ -89,10 +89,10 @@ export default function SuperwhisperVsMinutesPage() {
       minutesWins={[
         "It's a memory layer, not just an input method: meetings and memos become diarized, searchable markdown with action items and decisions — a record you own, not text that vanishes into whatever app you pasted it into.",
         "It's open source (MIT) and free. You can read the capture, transcription, and storage code instead of trusting a privacy page.",
-        "Your agents can use it: Claude, Codex, and any MCP client query your conversation history through 31 MCP tools, a CLI, an SDK, and a Claude Code plugin.",
+        "Your agents can use it: Claude, Codex, and any MCP client query your conversation history through 33 MCP tools, a CLI, an SDK, and a Claude Code plugin.",
       ]}
       workflowSection={[
-        "The overlap is real: Minutes has a dictation mode too — speak, and the text lands in your clipboard and a daily note. But the two tools point in different directions from there. superwhisper optimizes the moment of typing: its modes reshape your words for the app you're in, and the output's job is to be pasted. Minutes optimizes what happens after the conversation: every meeting, memo, and dictation becomes a timestamped markdown file that search, the CLI, and MCP tools can reach.",
+        "The overlap is real: Minutes has a dictation mode too — speak, and the text lands in your clipboard and a daily note. But the two tools point in different directions from there. superwhisper optimizes the moment of typing: its modes reshape your words for the app you're in, and the output's job is to be pasted. Minutes optimizes what happens after the conversation: every meeting, memo, and dictation becomes a timestamped markdown file you own, while policy-authorized normal entries remain available to search, the CLI, and MCP tools.",
         "A useful test: a month from now, will you want to ask an assistant 'what did I say about this?' If no, you want a dictation tool. If yes, you want a memory layer — dictation included.",
       ]}
       chooseSection={[

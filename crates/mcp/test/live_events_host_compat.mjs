@@ -57,6 +57,7 @@ function loadCodexMinutesConfig() {
 }
 
 const HOSTS = [
+  ["candidate-stdio", () => ({ status: "ready", ...defaultServer })],
   ["claude-desktop-config", loadClaudeDesktopMinutesConfig],
   ["codex-cli-config", loadCodexMinutesConfig],
 ];
@@ -75,24 +76,14 @@ function appendCompatEvent(home, seq, body) {
     v: 1,
     seq,
     timestamp: new Date().toISOString(),
-    event_type: "NoteAdded",
-    meeting_path: "/tmp/mcp-host-compat.md",
+    event_type: "sensitive.marker",
+    session_id: "HOST_COMPAT_PRIVATE_SESSION",
     text: body,
   };
   const minutesDir = join(home, ".minutes");
   writeFileSync(join(minutesDir, "events.jsonl"), `${JSON.stringify(event)}\n`, { flag: "a" });
   writeFileSync(join(minutesDir, "events.seq"), `${seq}\n`);
   return event;
-}
-
-async function waitFor(predicate, label) {
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    const value = predicate();
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new Error(`timed out waiting for ${label}`);
 }
 
 async function runHostSmoke(host, serverConfig) {
@@ -128,32 +119,45 @@ async function runHostSmoke(host, serverConfig) {
 
   try {
     await client.connect(transport);
-    await client.subscribeResource({ uri: LIVE_URI });
-    const appended = appendCompatEvent(tempHome, 1, `compat smoke for ${host}`);
-    await waitFor(() => notifications.includes(LIVE_URI), `${host} resource update`);
+    let subscriptionRejected = false;
+    try {
+      await client.subscribeResource({ uri: LIVE_URI });
+    } catch {
+      subscriptionRejected = true;
+    }
+    if (!subscriptionRejected) {
+      throw new Error("restricted event subscriptions were unexpectedly enabled");
+    }
+    appendCompatEvent(tempHome, 1, `PRIVATE_HOST_COMPAT_CANARY_${host}`);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    if (notifications.length !== 0) {
+      throw new Error("a hidden event produced a resource notification");
+    }
 
     const read = await client.readResource({
       uri: `${LIVE_URI}?since_seq=0&limit=10`,
     });
     const text = read.contents?.[0]?.text ?? "";
     const payload = JSON.parse(text);
-    const seen = payload.events.some((event) => event.seq === appended.seq);
-    if (!seen) {
-      throw new Error(`read_resource did not include appended seq ${appended.seq}`);
-    }
-    if (payload.reconnect?.cursor < appended.seq) {
-      throw new Error(`reconnect cursor ${payload.reconnect?.cursor} is behind seq ${appended.seq}`);
+    if (
+      payload.latest_seq !== 0 ||
+      payload.reconnect?.cursor !== 0 ||
+      !Array.isArray(payload.events) ||
+      payload.events.length !== 0 ||
+      !String(payload.unavailable ?? "").includes("non-sensitive cursor") ||
+      text.includes("PRIVATE_HOST_COMPAT_CANARY") ||
+      text.includes("sensitive.marker")
+    ) {
+      throw new Error("hidden activity changed the constant unavailable resource");
     }
 
-    await client.unsubscribeResource({ uri: LIVE_URI });
     return {
       host,
       status: "passed",
       command: serverConfig.command,
       args: serverConfig.args,
-      subscribed_uri: LIVE_URI,
-      notification_uri: LIVE_URI,
-      appended_seq: appended.seq,
+      subscription: "rejected",
+      notifications: notifications.length,
       read_uri: `${LIVE_URI}?since_seq=0&limit=10`,
       reconnect_cursor: payload.reconnect.cursor,
     };
@@ -178,6 +182,19 @@ for (const [host, loader] of HOSTS) {
   const config = normalizeServerConfig(loader());
   if (config.status !== "ready") {
     results.push({ host, ...config });
+    continue;
+  }
+  const configuredEntry = config.args.find((arg) => arg.endsWith("index.js"));
+  if (
+    host !== "candidate-stdio" &&
+    (!configuredEntry ||
+      resolve(configuredEntry) !== resolve(defaultServer.args[0]))
+  ) {
+    results.push({
+      host,
+      status: "skipped",
+      reason: "configured server is outside this candidate checkout",
+    });
     continue;
   }
   results.push(await runHostSmoke(host, config));

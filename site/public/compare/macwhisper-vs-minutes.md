@@ -1,8 +1,8 @@
 # Minutes vs MacWhisper
 
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-18
 
-Both transcribe locally on your Mac, and both can run Whisper or Parakeet models. The difference is the shape of the job: MacWhisper is the best drag-and-drop file transcriber on macOS; Minutes is a conversation memory layer your AI agents can query.
+Both transcribe locally on your Mac. MacWhisper can offer Whisper and Parakeet there; Minutes currently uses bundled Whisper on macOS because Parakeet's pathname-only process cannot receive Minutes' sealed audio safely. The difference is the shape of the job: MacWhisper is the best drag-and-drop file transcriber on macOS; Minutes is a conversation memory layer your AI agents can query.
 
 ## Quick verdict
 
@@ -16,7 +16,7 @@ Both transcribe locally on your Mac, and both can run Whisper or Parakeet models
 - Optional cloud AI — MacWhisper: BYO API keys (or fully local via Ollama/LM Studio); Minutes: explicit opt-in only (Claude via MCP, local LLM, or BYO-key cloud — off by default)
 - Output — MacWhisper: per-file exports (txt/srt/vtt/md/pdf/docx); Minutes: markdown corpus with YAML frontmatter, action items, decisions
 - Speakers — MacWhisper: automatic speaker recognition (Pro); Minutes: diarization + confidence-aware attribution that learns names
-- Agent surface — MacWhisper: CLI + workflow automations, no MCP we could find; Minutes: MCP (31 tools), CLI, SDK, Claude Code plugin
+- Agent surface — MacWhisper: CLI + workflow automations, no MCP we could find; Minutes: MCP (33 tools), CLI, SDK, Claude Code plugin
 - Open source — MacWhisper: no; Minutes: MIT
 - Platforms — MacWhisper: macOS (14+ for the App Store build) and iOS; Minutes: macOS menu bar app + CLI (open source)
 - Pricing — MacWhisper: free tier, Pro €64 one-time direct; Minutes: free

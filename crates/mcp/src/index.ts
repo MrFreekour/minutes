@@ -11,20 +11,18 @@
  *   - search_meetings: Search meeting transcripts
  *   - get_meeting: Get full transcript of a specific meeting
  *   - process_audio: Process an audio file through the pipeline
- *   - add_note: Add a timestamped note to a recording or meeting
+ *   - add_note: Add a timestamped note to the active recording
  *   - activity_summary: Summarize meeting-adjacent desktop context for a session/path/window
  *   - search_context: Search app and captured window-title desktop context
  *   - get_moment: Show the local rewind around a linked artifact, session, or timestamp
  *   - get_screen_context: Retrieve bounded, session-linked screen images
  *   - consistency_report: Flag conflicting decisions and stale commitments
- *   - get_person_profile: Rich relationship profile for a person (graph index)
- *   - track_commitments: List open/stale commitments, filter by person
- *   - relationship_map: All contacts with scores and losing-touch alerts
+ *   - get_person_profile: Policy-authorized live profile for a person
+ *   - track_commitments: Live open/stale action and intent commitments
+ *   - relationship_map: Temporarily unavailable pending privacy-safe graph rebuild (#513)
  *   - research_topic: Cross-meeting topic research
- *   - qmd_collection_status: Check QMD collection registration
- *   - register_qmd_collection: Register Minutes output as QMD collection
  *   - list_voices: List enrolled voice profiles for speaker identification
- *   - confirm_speaker: Confirm/correct speaker attribution in a meeting
+ *   - confirm_speaker: Compatibility registration; directs humans to the app/CLI
  *   - get_meeting_insights: Query structured insights (decisions, commitments, etc.) with confidence filtering
  *   - start_copilot / stop_copilot: Control the independent real-time copilot engine
  *   - copilot_status / read_copilot_nudges: Observe copilot health and cursor-based nudges
@@ -55,26 +53,34 @@ import {
   EXTENSION_ID,
 } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod";
-import { execFile, spawn } from "child_process";
+import { execFile, spawn, spawnSync } from "child_process";
+import { createHash } from "crypto";
 import { promisify } from "util";
 import {
   closeSync,
+  constants,
   copyFileSync,
   existsSync,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   realpathSync,
+  statSync,
 } from "fs";
 import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from "path";
+import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
+import { parse as parseYaml } from "yaml";
 
 import * as reader from "minutes-sdk";
 import {
   canonicalizeRoot,
   expandHomeLikePath,
+  readTextFileInDirectory,
   validatePathInDirectories,
   validatePathInDirectory,
 } from "./paths.js";
@@ -90,6 +96,18 @@ import {
   type CaptureRelayCursor,
   type CaptureRelaySnapshot,
 } from "./captureRelay.js";
+import {
+  withStableCorpusLease,
+  type CorpusLeaseHooks,
+  type StableCorpusSnapshot,
+} from "./corpus-lease.js";
+import {
+  boundReadFingerprint,
+  captureBoundReadExpectation,
+  readTextFileFromBoundParent,
+  type BoundReadExpectation,
+  type BoundReadHooks,
+} from "./secure-read.js";
 
 crashTrace("imports-complete");
 
@@ -181,6 +199,25 @@ export type KnowledgeConfigStatus = {
   engine: string;
 };
 
+export const MCP_MEETING_RESULT_MAX = 50;
+export const MCP_ACTION_RESULT_MAX = 50;
+/** Maximum live meetings materialized for one exported policy projection. */
+export const MCP_POLICY_MEETING_RESULT_MAX = 5_000;
+/** Independent structured/text collection caps for derived MCP surfaces. */
+export const MCP_INTENT_RESULT_MAX = 50;
+export const MCP_PERSON_PROFILE_MEETING_MAX = 50;
+export const MCP_PERSON_PROFILE_OPEN_ACTION_MAX = 50;
+export const MCP_PERSON_PROFILE_TOPIC_MAX = 50;
+export const MCP_RELATIONSHIP_RESULT_MAX = 50;
+export const MCP_RELATIONSHIP_CANDIDATE_MAX = 5_000;
+export const MCP_PROCESSING_JOB_RESULT_MAX = 50;
+export const MCP_RESEARCH_MEETING_RESULT_MAX = 20;
+export const MCP_RESEARCH_DECISION_RESULT_MAX = 50;
+export const MCP_RESEARCH_TOPIC_RESULT_MAX = 50;
+const MCP_RESULT_FIELD_MAX_CHARS = 2_048;
+const MCP_TEXT_OUTPUT_MAX_CHARS = 256 * 1024;
+const MCP_QUERY_MAX_CHARS = 2_048;
+
 type MeetingLike = {
   path: string;
   frontmatter: {
@@ -194,21 +231,64 @@ type MeetingLike = {
 
 export function meetingListItem(meeting: MeetingLike) {
   return {
-    date: meeting.frontmatter.date,
-    title: meeting.frontmatter.title,
-    content_type: meeting.frontmatter.type,
-    path: meeting.path,
-    duration: meeting.frontmatter.duration,
+    date: boundedMcpField(meeting.frontmatter.date),
+    title: boundedMcpField(meeting.frontmatter.title),
+    content_type: boundedMcpField(meeting.frontmatter.type),
+    path: boundedMcpField(meeting.path),
+    duration: boundedMcpField(meeting.frontmatter.duration),
   };
 }
 
 export function meetingSearchItem(meeting: MeetingLike) {
   return {
-    date: meeting.frontmatter.date,
-    title: meeting.frontmatter.title,
-    content_type: meeting.frontmatter.type,
-    path: meeting.path,
+    date: boundedMcpField(meeting.frontmatter.date),
+    title: boundedMcpField(meeting.frontmatter.title),
+    content_type: boundedMcpField(meeting.frontmatter.type),
+    path: boundedMcpField(meeting.path),
   };
+}
+
+function boundedMcpField(value: string | undefined): string | undefined {
+  return value?.slice(0, MCP_RESULT_FIELD_MAX_CHARS);
+}
+
+function boundedMcpText(value: string): string {
+  return value.slice(0, MCP_TEXT_OUTPUT_MAX_CHARS);
+}
+
+function boundedMcpJsonArray(values: unknown[]): string {
+  const serialized: string[] = [];
+  let charLength = 2;
+  for (const value of values) {
+    const item = JSON.stringify(value);
+    const nextLength = charLength + item.length + (serialized.length > 0 ? 1 : 0);
+    if (nextLength > MCP_TEXT_OUTPUT_MAX_CHARS) break;
+    serialized.push(item);
+    charLength = nextLength;
+  }
+  return `[${serialized.join(",")}]`;
+}
+
+function normalizeMcpResultLimit(
+  limit: number,
+  max: number,
+  surface: string
+): number {
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > max
+  ) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `${surface} limit must be an integer between 1 and ${max}`
+    );
+  }
+  return limit;
+}
+
+export function normalizeMcpMeetingResultLimit(limit: number): number {
+  return normalizeMcpResultLimit(limit, MCP_MEETING_RESULT_MAX, "meeting result");
 }
 
 /**
@@ -296,12 +376,294 @@ export function meetingDetailPayload(input: {
   return payload;
 }
 
+/** Accept CLI speaker overlays only when the CLI proves they were selected
+ * for the exact Markdown bytes already authorized by this MCP process.
+ * Older CLIs omit the proof field and therefore degrade to the raw map. */
+export function verifiedCliSpeakerOverlay(
+  payload: any,
+  authorizedContent: string
+): { speaker_map: unknown[]; overlay_applied: true } | null {
+  if (
+    payload?.overlay_applied !== true ||
+    !Array.isArray(payload?.frontmatter?.speaker_map) ||
+    payload?.raw_markdown !== authorizedContent ||
+    payload?.overlay_source_sha256 !==
+      createHash("sha256").update(authorizedContent).digest("hex")
+  ) {
+    return null;
+  }
+  return {
+    speaker_map: payload.frontmatter.speaker_map,
+    overlay_applied: true,
+  };
+}
+
 function toolDocsUrl(name: string): string {
   return `${MCP_TOOLS_DOCS_BASE_URL}#tool-${name}`;
 }
 
 function withToolDocs(name: string, description: string): string {
   return `${description} Docs: ${toolDocsUrl(name)}`;
+}
+
+export type RestrictedContentPolicy = "logged-override" | "deny";
+const MAX_RESTRICTED_OVERRIDE_AUDIT_BYTES = 16 * 1024;
+
+export type RestrictedAuditWriter = (auditPath: string, line: string) => void;
+
+/**
+ * Native Recall is unattended: a model-selected tool argument is not human
+ * consent. Standalone MCP keeps the documented explicit/logged override, but
+ * an embedding surface can set this process policy to make every current and
+ * future tool reject `include_restricted: true` at the registration boundary.
+ */
+export function restrictedContentPolicyFromEnv(
+  value: string | undefined = process.env.MINUTES_MCP_RESTRICTED_POLICY,
+  _platform: NodeJS.Platform = process.platform
+): RestrictedContentPolicy {
+  const normalized = value?.trim().toLowerCase();
+  // The Rust CLI bridge retains an exact no-follow capability chain and an
+  // owner-only audit leaf on every supported platform, including a protected
+  // Windows DACL and non-delete-sharing handle.
+  if (normalized === "logged-override") {
+    return "logged-override";
+  }
+  // Absence, `deny`, and misspelled/future values all fail closed. Enabling
+  // the standalone override requires an operator-controlled launch setting.
+  return "deny";
+}
+
+export function enforceRestrictedContentPolicy(
+  input: unknown,
+  surface: string,
+  policy: RestrictedContentPolicy = restrictedContentPolicyFromEnv(),
+  auditPath: string = sensitivityOverrideAuditPath(),
+  auditWriter: RestrictedAuditWriter = appendDurableRestrictedOverrideAudit
+): void {
+  if (
+    input !== null &&
+    typeof input === "object" &&
+    (input as Record<string, unknown>).include_restricted === true
+  ) {
+    if (policy === "deny") {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Restricted meeting content is unavailable in this ${surface} session. ` +
+          "A human operator must launch the server with " +
+          "MINUTES_MCP_RESTRICTED_POLICY=logged-override to enable audited overrides."
+      );
+    }
+    try {
+      const auditScope = restrictedOverrideAuditScope(
+        input as Record<string, unknown>
+      );
+      auditWriter(
+        auditPath,
+        `${JSON.stringify({
+          v: 1,
+          event: "sensitivity.override",
+          recorded_at: new Date().toISOString(),
+          surface,
+          authorization: "operator-launch-policy+tool-argument",
+          scope_fields: auditScope.fields,
+          scope_sha256: auditScope.sha256,
+          pid: process.pid,
+        })}\n`
+      );
+      console.error(
+        `[Minutes] operator-authorized include_restricted request via ${surface}; audit recorded`
+      );
+    } catch {
+      throw new McpError(
+        ErrorCode.InternalError,
+        "Restricted override denied because its audit record could not be written safely."
+      );
+    }
+  }
+}
+
+function appendDurableRestrictedOverrideAudit(
+  _auditPath: string,
+  line: string
+): void {
+  const record = Buffer.from(line, "utf8");
+  if (
+    record.length === 0 ||
+    record.length > MAX_RESTRICTED_OVERRIDE_AUDIT_BYTES
+  ) {
+    throw new Error("override audit record exceeded its bounded size");
+  }
+  const child = spawnSync(MINUTES_BIN, ["policy-audit"], {
+    env: mcpCliChildEnv(),
+    input: record,
+    encoding: "buffer",
+    timeout: 5_000,
+    maxBuffer: MAX_RESTRICTED_OVERRIDE_AUDIT_BYTES,
+    windowsHide: true,
+  });
+  if (child.error || child.status !== 0 || child.signal !== null) {
+    throw new Error("override audit append failed");
+  }
+}
+
+function restrictedOverrideAuditScope(input: Record<string, unknown>): {
+  fields: string[];
+  sha256: string;
+} {
+  const scoped = Object.entries(input)
+    .filter(([key, value]) => key !== "include_restricted" && value !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return {
+    fields: scoped.map(([key]) => key),
+    // The audit correlates repeated/scoped authorization without copying a
+    // meeting path, person, or query into a durable diagnostics file.
+    sha256: createHash("sha256").update(JSON.stringify(scoped)).digest("hex"),
+  };
+}
+
+export function sensitivityOverrideAuditPath(): string {
+  const minutesHome = expandHomeLikePath(
+    process.env.MINUTES_HOME || join(homedir(), ".minutes")
+  );
+  return join(minutesHome, "audit", "sensitivity-overrides.jsonl");
+}
+
+// These operations return user-authored or user-derived content to the agent.
+// Readiness is deliberately checked for every invocation: the local registry
+// can change after MCP startup, so a successful startup probe is not durable
+// authorization for a later read.
+const CONTENT_BEARING_AGENT_TOOLS = new Set([
+  "list_processing_jobs",
+  "list_meetings",
+  "search_meetings",
+  "activity_summary",
+  "search_context",
+  "get_moment",
+  "get_screen_context",
+  "consistency_report",
+  "get_person_profile",
+  "research_topic",
+  "get_meeting",
+  "track_commitments",
+  "relationship_map",
+  "process_audio",
+  "list_voices",
+  "confirm_speaker",
+  "start_copilot",
+  "read_live_transcript",
+  "ingest_meeting",
+]);
+
+export function isContentBearingAgentTool(name: string): boolean {
+  return CONTENT_BEARING_AGENT_TOOLS.has(name);
+}
+
+export function contentBearingAgentToolNames(): string[] {
+  return [...CONTENT_BEARING_AGENT_TOOLS].sort();
+}
+
+export async function afterContentBearingToolReadiness<T>(
+  name: string,
+  operation: () => T | Promise<T>,
+  readiness: () => Promise<unknown> = () => requireAgentTrustReadiness()
+): Promise<T> {
+  if (isContentBearingAgentTool(name)) {
+    await readiness();
+  }
+  return operation();
+}
+
+/// Resource handlers do not pass through the tool registry above. Every
+/// resource that can expose user-authored or derived content must therefore
+/// use this per-read boundary explicitly; a successful MCP connection is not
+/// durable authorization after the QMD registry changes.
+const CONTENT_BEARING_AGENT_RESOURCES = new Set([
+  "recent_meetings",
+  "open_actions",
+  "live_events",
+  "live_events_since_seq",
+  "live_copilot",
+  "meeting",
+  "recent-ideas",
+]);
+
+export function contentBearingAgentResourceNames(): string[] {
+  return [...CONTENT_BEARING_AGENT_RESOURCES].sort();
+}
+
+export async function afterContentResourceReadiness<T>(
+  name: string,
+  operation: () => T | Promise<T>,
+  readiness: () => Promise<unknown> = () => requireAgentTrustReadiness()
+): Promise<T> {
+  if (CONTENT_BEARING_AGENT_RESOURCES.has(name)) {
+    await readiness();
+  }
+  return operation();
+}
+
+export async function terminalControlBeforeContentReadiness<T>(
+  control: () => T | Promise<T>,
+  readiness: () => Promise<unknown> = () => requireAgentTrustReadiness()
+): Promise<{ result: T; mayRevealContent: boolean }> {
+  const result = await control();
+  try {
+    await readiness();
+    return { result, mayRevealContent: true };
+  } catch {
+    // The local terminal control has already completed. Readiness failure may
+    // withhold derived content, but must never leave capture running.
+    return { result, mayRevealContent: false };
+  }
+}
+
+export function runAgentToolPolicies<T>(
+  name: string,
+  input: unknown,
+  operation: () => T | Promise<T>,
+  readiness: () => Promise<unknown> = () => requireAgentTrustReadiness(),
+  policy: RestrictedContentPolicy = restrictedContentPolicyFromEnv(),
+  auditWriter: RestrictedAuditWriter = appendDurableRestrictedOverrideAudit
+): T | Promise<T> {
+  // Authorization and its durable audit record must precede readiness. The
+  // readiness bridge can retire QMD state, so it is not a read-only preflight
+  // and must never run for a denied or not-yet-audited request.
+  enforceRestrictedContentPolicy(
+    input,
+    name,
+    policy,
+    sensitivityOverrideAuditPath(),
+    auditWriter
+  );
+  if (isContentBearingAgentTool(name)) {
+    return afterContentBearingToolReadiness(name, operation, readiness);
+  }
+  return operation();
+}
+
+function withAgentToolPolicies(
+  name: string,
+  handler: (...args: any[]) => any
+): (...args: any[]) => any {
+  return (...args: any[]) =>
+    runAgentToolPolicies(name, args[0], () => handler(...args));
+}
+
+export function registerToolWithRestrictedPolicy(
+  serverArg: McpServer,
+  name: string,
+  description: string,
+  inputSchema: Record<string, unknown>,
+  annotations: Record<string, unknown>,
+  handler: (...args: any[]) => any
+) {
+  return serverArg.tool(
+    name,
+    withToolDocs(name, description),
+    inputSchema as any,
+    annotations as any,
+    withAgentToolPolicies(name, handler) as any
+  );
 }
 
 function registerTool(
@@ -311,16 +673,17 @@ function registerTool(
   annotations: Record<string, unknown>,
   handler: (...args: any[]) => any
 ) {
-  return server.tool(
+  return registerToolWithRestrictedPolicy(
+    server,
     name,
-    withToolDocs(name, description),
-    inputSchema as any,
-    annotations as any,
-    handler as any
+    description,
+    inputSchema,
+    annotations,
+    handler
   );
 }
 
-function registerDocsAppTool(
+export function registerDocsAppToolWithRestrictedPolicy(
   serverArg: McpServer,
   name: string,
   config: Record<string, unknown>,
@@ -336,171 +699,1055 @@ function registerDocsAppTool(
       ...config,
       description: withToolDocs(name, description),
     } as any,
-    handler as any
+    withAgentToolPolicies(name, handler) as any
+  );
+}
+
+function registerDocsAppTool(
+  serverArg: McpServer,
+  name: string,
+  config: Record<string, unknown>,
+  handler: (...args: any[]) => any
+) {
+  return registerDocsAppToolWithRestrictedPolicy(
+    serverArg,
+    name,
+    config,
+    handler
   );
 }
 
 const execFileAsync = promisify(execFile);
 
-// ── Sensitivity enforcement shims (consent layer Wave 2) ────
-// The published minutes-sdk typings can lag the in-repo reader: the
-// `sensitivity` frontmatter field, the ReadOptions `includeRestricted`
-// parameter, and the restricted `getMeeting` stub ship with sdk >= 0.20.
-// These wrappers keep the server compiling against older typings while
-// passing the option through. With an older sdk at runtime the extra
-// argument is ignored (no exclusion in the pure-TS fallback yet) and the
-// CLI path still enforces the exclusion + records the override event.
+// ── Sensitivity enforcement (consent layer Wave 2) ──────────
 
-type SensitivityReadOptions = { includeRestricted?: boolean };
-
-/** `frontmatter.sensitivity`, tolerant of older sdk typings. */
+/** `frontmatter.sensitivity` from the sensitivity-capable SDK. */
 function meetingSensitivity(meeting: unknown): string | undefined {
   return (meeting as any)?.frontmatter?.sensitivity;
 }
 
-/** True for the minimal restricted stub returned by sdk >= 0.20 getMeeting. */
-function isRestrictedStubMeeting(meeting: unknown): boolean {
-  return Boolean((meeting as any)?.restricted_stub);
+/**
+ * Parse a live meeting under the stricter agent policy. The SDK version
+ * bundled by an already-published MCP package may not yet know a future or
+ * mistyped sensitivity value, so the MCP boundary independently rejects any
+ * explicit value other than `normal` or `restricted`.
+ */
+export function parsePolicyVerifiedMeeting(
+  content: string,
+  filePath: string
+): NonNullable<ReturnType<typeof reader.parseFrontmatter>> | null {
+  const { yaml } = reader.splitFrontmatter(content);
+  if (!yaml) return null;
+
+  try {
+    const parsed = parseYaml(yaml);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (typeof parsed.title !== "string" || parsed.title.trim() === "") return null;
+    if (
+      typeof parsed.type !== "string" ||
+      !["meeting", "memo", "dictation"].includes(parsed.type)
+    ) {
+      return null;
+    }
+    const parsedDate =
+      parsed.date instanceof Date ? parsed.date : new Date(String(parsed.date ?? ""));
+    if (Number.isNaN(parsedDate.getTime())) return null;
+    if (
+      Object.prototype.hasOwnProperty.call(parsed, "sensitivity") &&
+      parsed.sensitivity !== "normal" &&
+      parsed.sensitivity !== "restricted"
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  return reader.parseFrontmatter(content, filePath);
 }
 
-const listMeetingsWithOpts = reader.listMeetings as unknown as (
+type PolicyVerifiedMeeting = NonNullable<
+  ReturnType<typeof reader.parseFrontmatter>
+>;
+
+type PolicyVerifiedMeetingSnapshot = {
+  path: string;
+  content: string;
+  meeting: PolicyVerifiedMeeting;
+};
+
+function comparePolicyMeetingsNewestFirst(
+  left: PolicyVerifiedMeetingSnapshot,
+  right: PolicyVerifiedMeetingSnapshot
+): number {
+  const leftDate = Date.parse(left.meeting.frontmatter.date);
+  const rightDate = Date.parse(right.meeting.frontmatter.date);
+  // parsePolicyVerifiedMeeting already rejects invalid dates. Keep the fallback
+  // deterministic if a future SDK parser ever widens that contract.
+  const byDate = (Number.isFinite(rightDate) ? rightDate : Number.NEGATIVE_INFINITY) -
+    (Number.isFinite(leftDate) ? leftDate : Number.NEGATIVE_INFINITY);
+  if (byDate) return byDate;
+  if (left.path === right.path) return 0;
+  return left.path < right.path ? -1 : 1;
+}
+
+function newestPolicySnapshots(
+  snapshots: PolicyVerifiedMeetingSnapshot[]
+): PolicyVerifiedMeetingSnapshot[] {
+  return [...snapshots].sort(comparePolicyMeetingsNewestFirst);
+}
+
+const MAX_POLICY_SCAN_FILES = 100_000;
+const INACTIVE_CORPUS_DIRS = new Set([
+  "archive",
+  "processed",
+  "failed",
+  "failed-captures",
+]);
+
+export function isActiveCorpusMeetingPath(filePath: string, root: string): boolean {
+  const canonicalRoot = canonicalizeRoot(root);
+  const canonicalFile = canonicalizeRoot(filePath);
+  const relativePath = relative(canonicalRoot, canonicalFile);
+  if (
+    relativePath === "" ||
+    isAbsolute(relativePath) ||
+    relativePath.split(/[\\/]+/).some((component) => component === "..")
+  ) {
+    return false;
+  }
+  return !relativePath
+    .split(/[\\/]+/)
+    .some(
+      (component) =>
+        component.startsWith(".") || INACTIVE_CORPUS_DIRS.has(component.toLowerCase())
+    );
+}
+
+export function isPathWithinCanonicalRoot(filePath: string, root: string): boolean {
+  const canonicalRoot = canonicalizeRoot(root);
+  const canonicalFile = canonicalizeRoot(filePath);
+  const relativePath = relative(canonicalRoot, canonicalFile);
+  return (
+    relativePath === "" ||
+    (!isAbsolute(relativePath) &&
+      !relativePath.split(/[\\/]+/).some((component) => component === ".."))
+  );
+}
+
+/**
+ * Re-read SDK candidates from their canonical live paths and apply the MCP's
+ * strict classifier. This deliberately does not trust the installed SDK's
+ * parsed object: an older published artifact can map an unknown sensitivity
+ * value to `undefined` while retaining the body.
+ */
+function policySnapshotIsWorse(
+  left: PolicyVerifiedMeetingSnapshot,
+  right: PolicyVerifiedMeetingSnapshot
+): boolean {
+  return comparePolicyMeetingsNewestFirst(left, right) > 0;
+}
+
+function pushNewestPolicySnapshot(
+  heap: PolicyVerifiedMeetingSnapshot[],
+  snapshot: PolicyVerifiedMeetingSnapshot,
+  limit: number
+): void {
+  if (heap.length < limit) {
+    heap.push(snapshot);
+    let child = heap.length - 1;
+    while (child > 0) {
+      const parent = Math.floor((child - 1) / 2);
+      if (!policySnapshotIsWorse(heap[child], heap[parent])) break;
+      [heap[parent], heap[child]] = [heap[child], heap[parent]];
+      child = parent;
+    }
+    return;
+  }
+
+  // The root is the oldest/path-last retained meeting. A candidate that is
+  // not newer cannot improve the bounded newest-first corpus window.
+  if (comparePolicyMeetingsNewestFirst(snapshot, heap[0]) >= 0) return;
+  heap[0] = snapshot;
+  let parent = 0;
+  for (;;) {
+    const left = parent * 2 + 1;
+    if (left >= heap.length) break;
+    const right = left + 1;
+    let worse = left;
+    if (right < heap.length && policySnapshotIsWorse(heap[right], heap[left])) {
+      worse = right;
+    }
+    if (!policySnapshotIsWorse(heap[worse], heap[parent])) break;
+    [heap[parent], heap[worse]] = [heap[worse], heap[parent]];
+    parent = worse;
+  }
+}
+
+export function collectPolicyVerifiedMeetingSnapshots(
+  snapshot: StableCorpusSnapshot,
+  includeRestricted: boolean,
+  matches: (meeting: PolicyVerifiedMeeting) => boolean = () => true
+): PolicyVerifiedMeetingSnapshot[] {
+  const snapshots: PolicyVerifiedMeetingSnapshot[] = [];
+
+  let scanned = 0;
+  for (const file of snapshot.files) {
+    if (scanned >= MAX_POLICY_SCAN_FILES) break;
+    scanned += 1;
+    if (!isActiveCorpusMeetingPath(file.path, snapshot.canonicalRoot)) continue;
+    const meeting = parsePolicyVerifiedMeeting(file.content, file.path);
+    if (!meeting) continue;
+    if (!includeRestricted && meetingSensitivity(meeting) === "restricted") {
+      continue;
+    }
+    if (!matches(meeting)) continue;
+    pushNewestPolicySnapshot(
+      snapshots,
+      { path: file.path, content: file.content, meeting },
+      MCP_POLICY_MEETING_RESULT_MAX
+    );
+  }
+
+  return snapshots;
+}
+
+async function policyMatchingSnapshotOperation<T>(
   dir: string,
-  limit?: number,
-  opts?: SensitivityReadOptions
-) => ReturnType<typeof reader.listMeetings>;
+  includeRestricted: boolean,
+  matches: (meeting: PolicyVerifiedMeeting) => boolean,
+  operation: (snapshots: PolicyVerifiedMeetingSnapshot[]) => T | Promise<T>,
+  hooks: CorpusLeaseHooks = {}
+): Promise<T> {
+  return withStableCorpusLease(
+    dir,
+    (snapshot) =>
+      operation(
+        collectPolicyVerifiedMeetingSnapshots(snapshot, includeRestricted, matches)
+      ),
+    hooks
+  );
+}
 
-const searchMeetingsWithOpts = reader.searchMeetings as unknown as (
+async function policySnapshotsStillAuthorized(
   dir: string,
-  query: string,
-  limit?: number,
-  opts?: SensitivityReadOptions
-) => ReturnType<typeof reader.searchMeetings>;
-
-const findOpenActionsWithOpts = reader.findOpenActions as unknown as (
-  dir: string,
-  assignee?: string,
-  opts?: SensitivityReadOptions
-) => ReturnType<typeof reader.findOpenActions>;
-
-const getPersonProfileWithOpts = reader.getPersonProfile as unknown as (
-  dir: string,
-  name: string,
-  opts?: SensitivityReadOptions
-) => ReturnType<typeof reader.getPersonProfile>;
-
-const getMeetingWithOpts = reader.getMeeting as unknown as (
-  filePath: string,
-  opts?: SensitivityReadOptions
-) => ReturnType<typeof reader.getMeeting>;
-
-// ── QMD semantic search (optional — falls back to CLI) ──────
-
-let qmdAvailable: boolean | null = null;
-
-async function runQmd(
-  args: string[],
-  timeoutMs: number = 15000
-): Promise<{ stdout: string; stderr: string } | null> {
+  includeRestricted: boolean,
+  snapshots: PolicyVerifiedMeetingSnapshot[]
+): Promise<boolean> {
   try {
-    const { stdout, stderr } = await execFileAsync("qmd", args, {
-      timeout: timeoutMs,
-      env: { ...process.env },
+    return await withStableCorpusLease(dir, (corpus) => {
+      const live = new Map(corpus.files.map((file) => [file.path, file.content]));
+      return snapshots.every((snapshot) => {
+        const content = live.get(snapshot.path);
+        if (content !== snapshot.content) return false;
+        const meeting = parsePolicyVerifiedMeeting(content, snapshot.path);
+        return !!meeting &&
+          (includeRestricted || meetingSensitivity(meeting) !== "restricted");
+      });
     });
-    return { stdout: stdout.trim(), stderr: stderr.trim() };
+  } catch {
+    return false;
+  }
+}
+
+async function policySnapshotOperation<T>(
+  dir: string,
+  includeRestricted: boolean,
+  operation: (snapshots: PolicyVerifiedMeetingSnapshot[]) => T | Promise<T>,
+  hooks: CorpusLeaseHooks = {}
+): Promise<T> {
+  return withStableCorpusLease(
+    dir,
+    (snapshot) =>
+      operation(collectPolicyVerifiedMeetingSnapshots(snapshot, includeRestricted)),
+    hooks
+  );
+}
+
+/**
+ * Rust's `std::fs::canonicalize` preserves Windows' extended-length namespace
+ * (`\\?\C:\...` / `\\?\UNC\server\share\...`), while Node's
+ * `realpathSync` returns the equivalent DOS/UNC spelling. Strip only those two
+ * well-formed namespace prefixes. Case, separators, dot components, trailing
+ * separators, and every other namespace remain exact.
+ */
+export function normalizeCanonicalPathWire(path: string): string {
+  const extendedUnc = /^\\\\\?\\UNC\\([^\\]+)\\([^\\]+)(.*)$/i.exec(path);
+  if (extendedUnc) {
+    return `\\\\${extendedUnc[1]}\\${extendedUnc[2]}${extendedUnc[3]}`;
+  }
+  if (/^\\\\\?\\[A-Za-z]:\\/.test(path)) {
+    return path.slice(4);
+  }
+  return path;
+}
+
+export function canonicalPathWireEquals(left: string, right: string): boolean {
+  return normalizeCanonicalPathWire(left) === normalizeCanonicalPathWire(right);
+}
+
+function contextSourceAuthorizationSessionId(
+  value: unknown,
+  source: PolicyVerifiedMeetingSnapshot
+): string {
+  if (!value || typeof value !== "object") {
+    throw new Error("Desktop context did not return a source authorization receipt.");
+  }
+  const receipt = (value as any).source_authorization;
+  if (
+    !receipt ||
+    typeof receipt !== "object" ||
+    Object.keys(receipt).sort().join("\0") !==
+      ["path", "session_id", "sha256"].sort().join("\0") ||
+    typeof receipt.session_id !== "string" ||
+    receipt.session_id.trim() === "" ||
+    typeof receipt.path !== "string" ||
+    typeof receipt.sha256 !== "string"
+  ) {
+    throw new Error("Desktop context returned an invalid source authorization receipt.");
+  }
+  const expectedSha256 = createHash("sha256")
+    .update(source.content)
+    .digest("hex");
+  if (
+    !canonicalPathWireEquals(receipt.path, source.path) ||
+    receipt.sha256 !== expectedSha256
+  ) {
+    throw new Error("Desktop context source authorization no longer matches the live meeting.");
+  }
+  return receipt.session_id;
+}
+
+export async function withPolicyBoundContextPath<TValue, TResult>(
+  requestedPath: string,
+  meetingsDir: string,
+  operation: (
+    canonicalPath: string,
+    timeoutMs: number,
+    signal: AbortSignal
+  ) => Promise<TValue>,
+  consume: (
+    value: TValue,
+    sessionId: string,
+    source: PolicyVerifiedMeetingSnapshot,
+    signal: AbortSignal
+  ) => TResult | Promise<TResult>,
+  leaseHooks: CorpusLeaseHooks = {}
+): Promise<TResult> {
+  const canonicalPath = canonicalizeRoot(requestedPath);
+  return withStableCorpusLease(
+    meetingsDir,
+    async (snapshot, _attempt, signal) => {
+      const file = snapshot.files.find((candidate) => candidate.path === canonicalPath);
+      if (!file || !isActiveCorpusMeetingPath(file.path, snapshot.canonicalRoot)) {
+        throw new Error("Desktop context source is outside the active meeting corpus.");
+      }
+      const meeting = parsePolicyVerifiedMeeting(file.content, file.path);
+      if (!meeting || meetingSensitivity(meeting) === "restricted") {
+        throw new Error("Desktop context source is unavailable under the active policy.");
+      }
+      const source = { path: file.path, content: file.content, meeting };
+      const value = await operation(file.path, 10_000, signal);
+      const sessionId = contextSourceAuthorizationSessionId(value, source);
+      return consume(value, sessionId, source, signal);
+    },
+    leaseHooks
+  );
+}
+
+function assertContextSession(value: unknown, sessionId: string): void {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !(value as any).session ||
+    (value as any).session.id !== sessionId
+  ) {
+    throw new Error("Desktop context session does not match its authorized source.");
+  }
+}
+
+function assertContextItemsSession(
+  items: unknown,
+  sessionId: string,
+  label: string
+): void {
+  if (
+    !Array.isArray(items) ||
+    items.some(
+      (item) =>
+        !item ||
+        typeof item !== "object" ||
+        (item as any).session_id !== sessionId
+    )
+  ) {
+    throw new Error(`${label} escaped its authorized context session.`);
+  }
+}
+
+export function assistantSafeContextLinks(items: unknown, sourcePath: string): unknown[] {
+  if (!Array.isArray(items)) {
+    throw new Error("Desktop context links were unavailable.");
+  }
+  return items.filter((item) => {
+    const kind = (item as any)?.kind;
+    const target = (item as any)?.target;
+    if (
+      kind === "markdown-artifact" &&
+      typeof target === "string" &&
+      canonicalPathWireEquals(target, sourcePath)
+    ) {
+      return true;
+    }
+    return false;
+  });
+}
+
+function withoutContextSourceAuthorization<T extends Record<string, unknown>>(
+  value: T
+): Omit<T, "source_authorization"> {
+  const { source_authorization: _receipt, ...publicValue } = value;
+  return publicValue;
+}
+
+async function policyVerifiedMeetingSnapshots(
+  dir: string,
+  includeRestricted: boolean
+): Promise<PolicyVerifiedMeetingSnapshot[]> {
+  return policySnapshotOperation(dir, includeRestricted, (snapshots) => snapshots);
+}
+
+export async function policyVerifiedExactMeetingSnapshot(
+  filePath: string,
+  dir: string,
+  includeRestricted: boolean
+): Promise<PolicyVerifiedMeetingSnapshot | null> {
+  try {
+    if (!isActiveCorpusMeetingPath(filePath, dir)) return null;
+    const { path, content } = await readTextFileInDirectory(filePath, dir, [".md"]);
+    if (!isActiveCorpusMeetingPath(path, dir)) return null;
+    const meeting = parsePolicyVerifiedMeeting(content, path);
+    if (!meeting) return null;
+    if (!includeRestricted && meetingSensitivity(meeting) === "restricted") return null;
+    return { path, content, meeting };
   } catch {
     return null;
   }
 }
 
-async function isQmdAvailable(): Promise<boolean> {
-  if (qmdAvailable !== null) return qmdAvailable;
-  const result = await runQmd(["collection", "show", "minutes"]);
-  qmdAvailable = result !== null && !result.stderr.includes("not found") && !result.stderr.includes("No collection");
-  if (qmdAvailable) {
-    console.error("[Minutes] QMD available — semantic search enabled for minutes collection");
-  }
-  return qmdAvailable;
-}
-
-async function enrichWithFrontmatter(
-  qmdResults: any[],
-  includeRestricted: boolean
-): Promise<any[]> {
-  const enriched = await Promise.all(
-    qmdResults.map(async (r: any) => {
-      const filePath = r.source_path || r.path;
-      try {
-        const meeting = await getMeetingWithOpts(filePath, {
-          includeRestricted,
-        });
-        // Sensitivity enforcement: without the override, drop restricted (or
-        // unreadable) hits entirely so a semantic index match cannot leak a
-        // restricted meeting into search results. Older sdks return null for
-        // restricted meetings; sdk >= 0.20 returns a stub — both are dropped.
-        if (
-          !includeRestricted &&
-          (!meeting ||
-            isRestrictedStubMeeting(meeting) ||
-            meetingSensitivity(meeting) === "restricted")
-        ) {
-          return null;
-        }
-        return {
-          date: meeting?.frontmatter.date || "",
-          title: meeting?.frontmatter.title || "",
-          content_type: meeting?.frontmatter.type || "meeting",
-          path: filePath,
-          snippet: r.snippet || "",
-        };
-      } catch {
-        return {
-          date: "",
-          title: "",
-          content_type: "meeting",
-          path: filePath,
-          snippet: r.snippet || "",
-        };
-      }
-    })
+export async function policyListMeetings(
+  dir: string,
+  limit: number,
+  includeRestricted: boolean,
+  beforeFinalAuthorization: () => void | Promise<void> = () => {},
+  leaseHooks: CorpusLeaseHooks = {}
+): Promise<PolicyVerifiedMeeting[]> {
+  const boundedLimit = normalizeMcpResultLimit(
+    limit,
+    MCP_POLICY_MEETING_RESULT_MAX,
+    "policy meeting"
   );
-  return enriched.filter((r): r is any => r !== null);
+  return policySnapshotOperation(
+    dir,
+    includeRestricted,
+    (snapshots) =>
+      newestPolicySnapshots(snapshots)
+        .slice(0, boundedLimit)
+        .map((snapshot) => snapshot.meeting),
+    {
+      ...leaseHooks,
+      beforeFinalManifest: async (context) => {
+        await beforeFinalAuthorization();
+        await leaseHooks.beforeFinalManifest?.(context);
+      },
+    }
+  );
 }
 
-async function searchViaQmd(
+export async function policySearchMeetings(
+  dir: string,
   query: string,
   limit: number,
-  contentType?: string,
-  includeRestricted: boolean = false
-): Promise<any[] | null> {
-  if (!(await isQmdAvailable())) return null;
-
-  const args = ["search", query, "-c", "minutes", "-n", String(limit), "--json"];
-  const result = await runQmd(args);
-  if (!result) return null;
-
-  try {
-    const parsed = JSON.parse(result.stdout);
-    const results = Array.isArray(parsed) ? parsed : parsed.results || [];
-    if (results.length === 0) return null;
-
-    const enriched = await enrichWithFrontmatter(results, includeRestricted);
-
-    // Apply content type filter if specified
-    if (contentType) {
-      const filtered = enriched.filter((r: any) => r.content_type === contentType);
-      return filtered.length > 0 ? filtered : null;
+  includeRestricted: boolean,
+  beforeFinalAuthorization: () => void | Promise<void> = () => {},
+  leaseHooks: CorpusLeaseHooks = {}
+): Promise<PolicyVerifiedMeeting[]> {
+  const boundedLimit = normalizeMcpResultLimit(
+    limit,
+    MCP_POLICY_MEETING_RESULT_MAX,
+    "policy search"
+  );
+  if (!query) return [];
+  const needle = query.toLowerCase();
+  return policyMatchingSnapshotOperation(
+    dir,
+    includeRestricted,
+    (meeting) =>
+      meeting.frontmatter.title.toLowerCase().includes(needle) ||
+      meeting.body.toLowerCase().includes(needle),
+    (snapshots) => {
+      const results: PolicyVerifiedMeeting[] = [];
+      for (const snapshot of newestPolicySnapshots(snapshots)) {
+        results.push(snapshot.meeting);
+        if (results.length >= boundedLimit) break;
+      }
+      return results;
+    },
+    {
+      ...leaseHooks,
+      beforeFinalManifest: async (context) => {
+        await beforeFinalAuthorization();
+        await leaseHooks.beforeFinalManifest?.(context);
+      },
     }
-
-    return enriched;
-  } catch {
-    return null;
-  }
+  );
 }
 
-async function triggerQmdIndex(): Promise<void> {
-  if (!(await isQmdAvailable())) return;
-  // Fire-and-forget — don't block the response
-  execFileAsync("qmd", ["update", "-c", "minutes"]).catch(() => {});
+export type PolicyIntentResult = {
+  date: string;
+  title: string;
+  content_type: string;
+  path: string;
+  kind: string;
+  what: string;
+  who?: string;
+  by_date?: string;
+  status: string;
+};
+
+function meetingMatchesSince(meeting: PolicyVerifiedMeeting, since?: string): boolean {
+  if (!since) return true;
+  const boundary = Date.parse(since);
+  const meetingDate = Date.parse(meeting.frontmatter.date);
+  return Number.isFinite(boundary) && Number.isFinite(meetingDate) && meetingDate >= boundary;
+}
+
+function meetingMatchesPerson(meeting: PolicyVerifiedMeeting, person?: string): boolean {
+  if (!person) return true;
+  const needle = person.trim().toLowerCase();
+  if (!needle) return true;
+  const people = [
+    ...meeting.frontmatter.attendees,
+    ...meeting.frontmatter.people,
+    ...(meeting.frontmatter.attendees_raw || "").split(/[,;\n]/),
+  ];
+  return people.some((entry) => entry.trim().toLowerCase().includes(needle));
+}
+
+export function policyIntentResults(
+  meetings: PolicyVerifiedMeeting[],
+  query: string,
+  intentKind?: string,
+  owner?: string,
+  limit: number = MCP_INTENT_RESULT_MAX,
+  statuses?: ReadonlySet<string>
+): PolicyIntentResult[] {
+  const boundedLimit = normalizeMcpResultLimit(
+    limit,
+    MCP_INTENT_RESULT_MAX,
+    "intent result"
+  );
+  const needle = query.trim().toLowerCase();
+  const ownerNeedle = owner?.trim().toLowerCase();
+  const results: PolicyIntentResult[] = [];
+
+  const push = (
+    meeting: PolicyVerifiedMeeting,
+    kind: string,
+    what: string,
+    status: string,
+    who?: string,
+    byDate?: string
+  ): boolean => {
+    if (intentKind && kind !== intentKind) return false;
+    if (statuses && !statuses.has(status)) return false;
+    if (needle && ![what, who || "", meeting.frontmatter.title].some((value) => value.toLowerCase().includes(needle))) return false;
+    if (ownerNeedle && !(who || "").toLowerCase().includes(ownerNeedle)) return false;
+    results.push(boundedPolicyIntentResult({
+      date: meeting.frontmatter.date,
+      title: meeting.frontmatter.title,
+      content_type: meeting.frontmatter.type,
+      path: meeting.path,
+      kind,
+      what,
+      who,
+      by_date: byDate,
+      status,
+    }));
+    return results.length >= boundedLimit;
+  };
+
+  for (const meeting of meetings) {
+    for (const item of meeting.frontmatter.action_items) {
+      if (push(meeting, "action-item", item.task, item.status, item.assignee, item.due)) {
+        return results;
+      }
+    }
+    for (const decision of meeting.frontmatter.decisions) {
+      if (push(meeting, "decision", decision.text, "decided")) return results;
+    }
+    for (const intent of meeting.frontmatter.intents) {
+      if (push(meeting, intent.kind, intent.what, intent.status, intent.who, intent.by_date)) {
+        return results;
+      }
+    }
+  }
+  return results;
+}
+
+function boundedPolicyIntentResult(result: PolicyIntentResult): PolicyIntentResult {
+  return {
+    date: boundedMcpField(result.date) ?? "",
+    title: boundedMcpField(result.title) ?? "",
+    content_type: boundedMcpField(result.content_type) ?? "",
+    path: boundedMcpField(result.path) ?? "",
+    kind: boundedMcpField(result.kind) ?? "",
+    what: boundedMcpField(result.what) ?? "",
+    who: boundedMcpField(result.who),
+    by_date: boundedMcpField(result.by_date),
+    status: boundedMcpField(result.status) ?? "",
+  };
+}
+
+export type PolicyToolSearchFilter = {
+  query: string;
+  contentType?: "meeting" | "memo";
+  since?: string;
+  intentKind?: string;
+  owner?: string;
+  intentsOnly?: boolean;
+};
+
+function meetingMatchesToolSearch(
+  meeting: PolicyVerifiedMeeting,
+  filter: PolicyToolSearchFilter
+): boolean {
+  if (
+    (filter.contentType && meeting.frontmatter.type !== filter.contentType) ||
+    !meetingMatchesSince(meeting, filter.since)
+  ) {
+    return false;
+  }
+  const intentMode = filter.intentsOnly || !!filter.intentKind || !!filter.owner;
+  if (intentMode) {
+    return policyIntentResults(
+      [meeting],
+      filter.query,
+      filter.intentKind,
+      filter.owner,
+      1
+    ).length > 0;
+  }
+  const needle = filter.query.trim().toLowerCase();
+  return needle.length > 0 &&
+    (meeting.frontmatter.title.toLowerCase().includes(needle) ||
+      meeting.body.toLowerCase().includes(needle));
+}
+
+export function collectPolicyToolSearchSnapshots(
+  snapshot: StableCorpusSnapshot,
+  includeRestricted: boolean,
+  filter: PolicyToolSearchFilter
+): PolicyVerifiedMeetingSnapshot[] {
+  return newestPolicySnapshots(
+    collectPolicyVerifiedMeetingSnapshots(
+      snapshot,
+      includeRestricted,
+      (meeting) => meetingMatchesToolSearch(meeting, filter)
+    )
+  );
+}
+
+async function policyToolSearchMeetings(
+  dir: string,
+  includeRestricted: boolean,
+  filter: PolicyToolSearchFilter
+): Promise<PolicyVerifiedMeeting[]> {
+  return withStableCorpusLease(dir, (snapshot) =>
+    collectPolicyToolSearchSnapshots(snapshot, includeRestricted, filter)
+      .map((entry) => entry.meeting)
+  );
+}
+
+export function openActionsFromMeetings(
+  meetings: PolicyVerifiedMeeting[],
+  limit: number = MCP_ACTION_RESULT_MAX
+) {
+  const boundedLimit = normalizeMcpResultLimit(
+    limit,
+    MCP_ACTION_RESULT_MAX,
+    "open action"
+  );
+  const actions: Array<{
+    path: string;
+    item: PolicyVerifiedMeeting["frontmatter"]["action_items"][number];
+  }> = [];
+  for (const meeting of meetings) {
+    for (const item of meeting.frontmatter.action_items) {
+      if (item.status !== "open") continue;
+      actions.push({ path: meeting.path, item });
+      if (actions.length >= boundedLimit) return actions;
+    }
+  }
+  return actions;
+}
+
+function boundedActionItem(
+  item: PolicyVerifiedMeeting["frontmatter"]["action_items"][number]
+) {
+  return {
+    task: boundedMcpField(item.task) ?? "",
+    assignee: boundedMcpField(item.assignee) ?? "",
+    due: boundedMcpField(item.due),
+    status: boundedMcpField(item.status) ?? "open",
+  };
+}
+
+export type McpPersonProfileLimits = {
+  meetingLimit?: number;
+  openActionLimit?: number;
+  topicLimit?: number;
+};
+
+export function personProfileFromMeetings(
+  meetings: PolicyVerifiedMeeting[],
+  name: string,
+  limits: McpPersonProfileLimits = {}
+): {
+  name: string;
+  meetings: Array<{ title: string; date: string; path: string }>;
+  openActions: Array<PolicyVerifiedMeeting["frontmatter"]["action_items"][number]>;
+  topics: string[];
+} {
+  const meetingLimit = normalizeMcpResultLimit(
+    limits.meetingLimit ?? MCP_PERSON_PROFILE_MEETING_MAX,
+    MCP_PERSON_PROFILE_MEETING_MAX,
+    "person profile meeting"
+  );
+  const openActionLimit = normalizeMcpResultLimit(
+    limits.openActionLimit ?? MCP_PERSON_PROFILE_OPEN_ACTION_MAX,
+    MCP_PERSON_PROFILE_OPEN_ACTION_MAX,
+    "person profile open-action"
+  );
+  const topicLimit = normalizeMcpResultLimit(
+    limits.topicLimit ?? MCP_PERSON_PROFILE_TOPIC_MAX,
+    MCP_PERSON_PROFILE_TOPIC_MAX,
+    "person profile topic"
+  );
+  const needle = name.toLowerCase();
+  const profileMeetings: Array<{ title: string; date: string; path: string }> = [];
+  const topics = new Set<string>();
+  const openActions: Array<
+    PolicyVerifiedMeeting["frontmatter"]["action_items"][number]
+  > = [];
+  for (const meeting of meetings) {
+    let matched =
+      meeting.frontmatter.attendees.some((entry) =>
+        entry.toLowerCase().includes(needle)
+      ) ||
+      meeting.frontmatter.people.some((entry) =>
+        entry.toLowerCase().includes(needle)
+      ) ||
+      meeting.body.toLowerCase().includes(needle);
+    if (!matched) {
+      for (const entry of (meeting.frontmatter.attendees_raw || "").matchAll(/[^,;\n]+/g)) {
+        if (entry[0].trim().toLowerCase().includes(needle)) {
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched) continue;
+
+    if (profileMeetings.length < meetingLimit) {
+      profileMeetings.push({
+        title: boundedMcpField(meeting.frontmatter.title) ?? "",
+        date: boundedMcpField(meeting.frontmatter.date) ?? "",
+        path: boundedMcpField(meeting.path) ?? "",
+      });
+    }
+    if (topics.size < topicLimit) {
+      for (const rawTag of meeting.frontmatter.tags) {
+        const tag = boundedMcpField(rawTag) ?? "";
+        if (!tag || topics.has(tag)) continue;
+        topics.add(tag);
+        if (topics.size >= topicLimit) break;
+      }
+    }
+    if (openActions.length < openActionLimit) {
+      for (const item of meeting.frontmatter.action_items) {
+        if (
+          item.status !== "open" ||
+          !item.assignee.toLowerCase().includes(needle)
+        ) {
+          continue;
+        }
+        openActions.push(boundedActionItem(item));
+        if (openActions.length >= openActionLimit) break;
+      }
+    }
+    if (
+      profileMeetings.length >= meetingLimit &&
+      openActions.length >= openActionLimit &&
+      topics.size >= topicLimit
+    ) {
+      break;
+    }
+  }
+  return {
+    name: boundedMcpField(name) ?? "",
+    meetings: profileMeetings,
+    openActions,
+    topics: [...topics],
+  };
+}
+
+export type McpResearchTopicProjection = {
+  decisions: string[];
+  openIntents: PolicyIntentResult[];
+  topics: Array<{ topic: string; count: number }>;
+  meetings: Array<{ date: string; title: string }>;
+  text: string;
+};
+
+/** Build a field- and collection-bounded research response from matched meetings. */
+export function researchTopicProjection(
+  sourceMeetings: PolicyVerifiedMeeting[],
+  query: string
+): McpResearchTopicProjection {
+  const meetings = sourceMeetings.slice(0, MCP_RESEARCH_MEETING_RESULT_MAX);
+  const decisions: string[] = [];
+  for (const meeting of meetings) {
+    for (const decision of meeting.frontmatter.decisions) {
+      const line = `- ${boundedMcpField(meeting.frontmatter.date) ?? ""} — ${boundedMcpField(decision.text) ?? ""} (${boundedMcpField(meeting.frontmatter.title) ?? ""})`;
+      decisions.push(boundedMcpField(line) ?? "");
+      if (decisions.length >= MCP_RESEARCH_DECISION_RESULT_MAX) break;
+    }
+    if (decisions.length >= MCP_RESEARCH_DECISION_RESULT_MAX) break;
+  }
+
+  const openIntents = policyIntentResults(
+    meetings,
+    "",
+    undefined,
+    undefined,
+    MCP_INTENT_RESULT_MAX,
+    new Set(["open"])
+  );
+  const topicCounts = new Map<string, number>();
+  for (const meeting of meetings) {
+    for (const rawTag of meeting.frontmatter.tags) {
+      const topic = boundedMcpField(rawTag) ?? "";
+      if (!topic) continue;
+      const current = topicCounts.get(topic);
+      if (current !== undefined) {
+        topicCounts.set(topic, current + 1);
+      } else if (topicCounts.size < MCP_RESEARCH_TOPIC_RESULT_MAX) {
+        topicCounts.set(topic, 1);
+      }
+    }
+  }
+  const topics = Array.from(topicCounts, ([topic, count]) => ({ topic, count }));
+  const meetingResults = meetings.map((meeting) => ({
+    date: boundedMcpField(meeting.frontmatter.date) ?? "",
+    title: boundedMcpField(meeting.frontmatter.title) ?? "",
+  }));
+  const sections: string[] = [];
+  if (topics.length > 0) {
+    sections.push(
+      "Related topics:\n" +
+        topics.map(({ topic, count }) => `- ${topic} (${count})`).join("\n")
+    );
+  }
+  if (decisions.length > 0) {
+    sections.push(`Recent decisions:\n${decisions.join("\n")}`);
+  }
+  if (openIntents.length > 0) {
+    sections.push(
+      "Open follow-ups:\n" +
+        openIntents
+          .map(
+            (intent) =>
+              `- ${intent.kind}: ${intent.what}${intent.who ? ` (@${intent.who})` : ""}${intent.by_date ? ` by ${intent.by_date}` : ""}`
+          )
+          .join("\n")
+    );
+  }
+  if (meetingResults.length > 0) {
+    sections.push(
+      "Matching meetings:\n" +
+        meetingResults
+          .map((meeting) => `- ${meeting.date} — ${meeting.title}`)
+          .join("\n")
+    );
+  }
+  const boundedQuery = boundedMcpField(query) ?? "";
+  const text = sections.length > 0
+    ? `Cross-meeting research for ${boundedQuery}:\n\n${sections.join("\n\n")}`
+    : `No cross-meeting results found for ${boundedQuery}.`;
+  return {
+    decisions,
+    openIntents,
+    topics,
+    meetings: meetingResults,
+    text: boundedMcpText(text),
+  };
+}
+
+export type LiveRelationship = {
+  name: string;
+  meeting_count: number;
+  days_since: number;
+  losing_touch: boolean;
+  open_commitments: number;
+  score: number;
+};
+
+export function relationshipMapFromMeetings(
+  meetings: PolicyVerifiedMeeting[],
+  limit: number = MCP_RELATIONSHIP_RESULT_MAX,
+  candidateLimit: number = MCP_RELATIONSHIP_CANDIDATE_MAX
+): LiveRelationship[] {
+  const boundedLimit = normalizeMcpResultLimit(
+    limit,
+    MCP_RELATIONSHIP_RESULT_MAX,
+    "relationship"
+  );
+  const boundedCandidateLimit = normalizeMcpResultLimit(
+    candidateLimit,
+    MCP_RELATIONSHIP_CANDIDATE_MAX,
+    "relationship candidate"
+  );
+  const people = new Map<
+    string,
+    { name: string; meetingCount: number; latest: number; open: number }
+  >();
+  for (const meeting of meetings) {
+    const names = new Map<string, string>();
+    const addName = (rawName: string) => {
+      const name = (boundedMcpField(rawName.trim()) ?? "").trim();
+      const key = name.toLowerCase();
+      if (!key || names.has(key)) return;
+      if (names.size >= boundedCandidateLimit && !people.has(key)) return;
+      names.set(key, name);
+    };
+    for (const name of meeting.frontmatter.attendees) addName(name);
+    for (const name of meeting.frontmatter.people) addName(name);
+    for (const match of (meeting.frontmatter.attendees_raw || "").matchAll(/[^,;\n]+/g)) {
+      addName(match[0]);
+    }
+    const timestamp = Date.parse(meeting.frontmatter.date);
+    for (const [key, name] of names) {
+      let record = people.get(key);
+      if (!record) {
+        if (people.size >= boundedCandidateLimit) continue;
+        record = {
+          name,
+          meetingCount: 0,
+          latest: 0,
+          open: 0,
+        };
+        people.set(key, record);
+      }
+      record.meetingCount += 1;
+      if (Number.isFinite(timestamp)) {
+        record.latest = Math.max(record.latest, timestamp);
+      }
+      for (const item of meeting.frontmatter.action_items) {
+        if (
+          item.status === "open" &&
+          item.assignee.trim().toLowerCase().includes(key)
+        ) {
+          record.open += 1;
+        }
+      }
+    }
+  }
+  const now = Date.now();
+  const results: LiveRelationship[] = [];
+  for (const person of people.values()) {
+    const daysSince = person.latest > 0
+      ? Math.max(0, (now - person.latest) / 86_400_000)
+      : 0;
+    results.push({
+      name: person.name,
+      meeting_count: person.meetingCount,
+      days_since: daysSince,
+      losing_touch: person.meetingCount > 0 && daysSince >= 60,
+      open_commitments: person.open,
+      score: person.meetingCount / (1 + daysSince / 30),
+    });
+  }
+  return results
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.name.localeCompare(right.name)
+    )
+    .slice(0, boundedLimit);
+}
+
+// ── Live-snapshot enrichment for policy-filtered search indexes ─────
+
+export async function enrichWithFrontmatter(
+  qmdResults: any[],
+  includeRestricted: boolean,
+  meetingsDir?: string,
+  query?: string,
+  limit: number = MCP_MEETING_RESULT_MAX
+): Promise<any[]> {
+  const boundedLimit = normalizeMcpMeetingResultLimit(limit);
+  const verifiedMeetingsDir = meetingsDir ?? (await getEffectiveMeetingsDir());
+  return withStableCorpusLease(verifiedMeetingsDir, (snapshot) => {
+    const liveFiles = new Map(snapshot.files.map((file) => [file.path, file.content]));
+    const enriched: any[] = [];
+    for (const r of qmdResults) {
+      try {
+        const candidatePath = r.source_path || r.path;
+        if (!isActiveCorpusMeetingPath(candidatePath, verifiedMeetingsDir)) continue;
+        const filePath = canonicalizeRoot(candidatePath);
+        const content = liveFiles.get(filePath);
+        if (content === undefined) continue;
+        if (!isActiveCorpusMeetingPath(filePath, verifiedMeetingsDir)) continue;
+        const meeting = parsePolicyVerifiedMeeting(content, filePath);
+        // Verification failure is never overridable: an operator can grant
+        // access to a known restricted file, not to an unreadable or
+        // policy-uncertain index record.
+        if (!meeting) continue;
+        if (!includeRestricted && meetingSensitivity(meeting) === "restricted") {
+          continue;
+        }
+        enriched.push({
+          date: boundedMcpField(meeting.frontmatter.date) ?? "",
+          title: boundedMcpField(meeting.frontmatter.title) ?? "",
+          content_type: boundedMcpField(meeting.frontmatter.type) ?? "meeting",
+          path: boundedMcpField(filePath) ?? "",
+          // QMD is only a ranking/path hint. Its cached snippet may predate a
+          // sensitivity change, so derive display text from the verified live
+          // snapshot instead of returning index content.
+          snippet: liveMeetingSnippet(meeting.body, query),
+        });
+        if (enriched.length >= boundedLimit) break;
+      } catch {
+        // QMD is an index, not an authorization source. A hit whose live file
+        // cannot be canonicalized, read, or parsed must disappear completely;
+        // returning its stale path/snippet would leak the very content the
+        // frontmatter verification is meant to protect.
+        continue;
+      }
+    }
+    return enriched;
+  });
+}
+
+export function liveMeetingSnippet(body: string, query?: string): string {
+  const normalized = body.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const maxChars = 320;
+  const needle = query?.trim().toLowerCase();
+  if (!needle) return normalized.slice(0, maxChars);
+  const match = normalized.toLowerCase().indexOf(needle);
+  if (match < 0) return normalized.slice(0, maxChars);
+  const start = Math.max(0, match - 120);
+  return normalized.slice(start, start + maxChars);
 }
 
 // ESM-compatible __dirname
@@ -745,7 +1992,7 @@ async function tryAutoInstall(): Promise<boolean> {
 
 async function checkCliVersion(): Promise<void> {
   try {
-    const { stdout } = await execFileAsync(MINUTES_BIN, ["--version"], { timeout: 5000, env: augmentedEnv() });
+    const { stdout } = await execFileAsync(MINUTES_BIN, ["--version"], { timeout: 5000, env: mcpCliChildEnv() });
     // Output is like "minutes 0.8.0" or just "0.8.0".
     const match = stdout.trim().match(/(\d+\.\d+\.\d+)/);
     if (!match) return;
@@ -782,7 +2029,7 @@ async function ensureWhisperModel(): Promise<void> {
   try {
     // health --json returns an array of { label, state, detail, optional } items.
     // The "Speech model" item has state "ready" when downloaded.
-    const { stdout } = await execFileAsync(MINUTES_BIN, ["health", "--json"], { timeout: 10000, env: augmentedEnv() });
+    const { stdout } = await execFileAsync(MINUTES_BIN, ["health", "--json"], { timeout: 10000, env: mcpCliChildEnv() });
     const items = JSON.parse(stdout);
     const modelItem = Array.isArray(items) && items.find((i: any) => i.label === "Speech model");
     if (modelItem && modelItem.state === "ready") {
@@ -796,7 +2043,7 @@ async function ensureWhisperModel(): Promise<void> {
   // Model not found — download tiny model in background
   console.error("[Minutes] Whisper model not found — downloading tiny model (~75MB)...");
   try {
-    await execFileAsync(MINUTES_BIN, ["setup", "--model", "tiny"], { timeout: 300000, env: augmentedEnv() });
+    await execFileAsync(MINUTES_BIN, ["setup", "--model", "tiny"], { timeout: 300000, env: mcpCliChildEnv() });
     console.error("[Minutes] ✓ Whisper tiny model downloaded — recording is ready");
   } catch (e: any) {
     console.error(
@@ -807,8 +2054,9 @@ async function ensureWhisperModel(): Promise<void> {
 }
 
 // ── CLI availability detection ──────────────────────────────
-// When installed via `npx minutes-mcp`, the Rust CLI may not be present.
-// In that case, read-only tools use the pure-TS reader module.
+// When installed via `npx minutes-mcp`, the Rust CLI may not be present yet.
+// The CLI is the trust-boundary bridge, so startup must install/probe it before
+// accepting any MCP request rather than advertising a CLI-less reader mode.
 
 let cliAvailable: boolean | null = null;
 let cliCheckedAt = 0;
@@ -821,7 +2069,7 @@ async function isCliAvailable(): Promise<boolean> {
   if (cliAvailable === false && Date.now() - cliCheckedAt < CLI_CACHE_TTL_MS) return false;
 
   try {
-    await execFileAsync(MINUTES_BIN, ["--version"], { timeout: 5000, env: augmentedEnv() });
+    await execFileAsync(MINUTES_BIN, ["--version"], { timeout: 5000, env: mcpCliChildEnv() });
     cliAvailable = true;
     cliCheckedAt = Date.now();
     console.error("[Minutes] CLI found — full mode (all tools enabled)");
@@ -834,7 +2082,7 @@ async function isCliAvailable(): Promise<boolean> {
       const installed = await tryAutoInstall();
       if (installed) {
         try {
-          await execFileAsync(MINUTES_BIN, ["--version"], { timeout: 5000, env: augmentedEnv() });
+          await execFileAsync(MINUTES_BIN, ["--version"], { timeout: 5000, env: mcpCliChildEnv() });
           cliAvailable = true;
           cliCheckedAt = Date.now();
           console.error("[Minutes] CLI now available after auto-install — full mode");
@@ -849,7 +2097,7 @@ async function isCliAvailable(): Promise<boolean> {
     cliAvailable = false;
     cliCheckedAt = Date.now();
     console.error(
-      "[Minutes] CLI not available — read-only mode (search and browse only)"
+      "[Minutes] CLI not available — the agent trust boundary cannot be established"
     );
   }
   return cliAvailable;
@@ -1003,14 +2251,25 @@ const EXTRA_PATH_DIRS = [
   "/usr/local/bin",
 ];
 
-function augmentedEnv(extra?: Record<string, string>): Record<string, string | undefined> {
+export function mcpCliChildEnv(
+  extra?: Record<string, string>
+): Record<string, string | undefined> {
   const currentPath = process.env.PATH || "";
   const augmentedPath = [...EXTRA_PATH_DIRS, currentPath].join(delimiter);
-  return { ...process.env, PATH: augmentedPath, ...extra };
+  return {
+    ...process.env,
+    PATH: augmentedPath,
+    ...extra,
+    // A child CLI is still an assistant surface. This assignment is
+    // deliberately last so neither the ambient environment nor a call-site
+    // override can restore the human CLI's restricted-content access.
+    MINUTES_CLI_RESTRICTED_POLICY: "deny",
+  };
 }
 
 export const LIVE_EVENTS_RESOURCE_URI = "minutes://events/live";
 export const LIVE_EVENTS_URI_TEMPLATE = "minutes://events/live{?since_seq,limit}";
+export const LIVE_EVENTS_SUBSCRIPTIONS_ENABLED = false;
 const LIVE_EVENTS_DEFAULT_RECENT_LIMIT = 20;
 const LIVE_EVENTS_DEFAULT_CURSOR_LIMIT = 100;
 const LIVE_EVENTS_POLL_INTERVAL_MS = Math.max(
@@ -1027,19 +2286,25 @@ const COPILOT_READ_MAX_LIMIT = 200;
 
 type JsonObject = Record<string, unknown>;
 
+export type CopilotStatusState =
+  | "Off"
+  | "Arming"
+  | "Listening"
+  | "Thinking"
+  | "Nudge"
+  | "Paused"
+  | "Degraded";
+
 export type CopilotStatusPayload = {
+  schema_version: 1;
   available: boolean;
   active: boolean;
-  state: string;
+  state: CopilotStatusState;
   pid: number | null;
-  goal: string | null;
-  surface: string | null;
-  provider: string | null;
-  model: string | null;
+  surface: "stdout" | "tui" | null;
   evidence_cursor: number;
-  capture_attachment: string | null;
-  last_error: string | null;
-  raw: string;
+  input_mode: "realtime" | "final_only";
+  setup_needed: boolean;
   error?: string;
 };
 
@@ -1189,67 +2454,85 @@ export function buildLiveEventsResourcePayload(
 
 function inactiveCopilotStatus(error?: string): CopilotStatusPayload {
   return {
+    schema_version: 1,
     available: error === undefined,
     active: false,
     state: "Off",
     pid: null,
-    goal: null,
     surface: null,
-    provider: null,
-    model: null,
     evidence_cursor: 0,
-    capture_attachment: null,
-    last_error: null,
-    raw: "Copilot: Off",
+    input_mode: "final_only",
+    setup_needed: false,
     ...(error ? { error } : {}),
   };
 }
 
-/** Parse the stable human-readable `minutes copilot status` surface. */
-export function parseCopilotStatusOutput(raw: string): CopilotStatusPayload {
-  const lines = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const state = lines[0]?.match(/^Copilot:\s*(.+)$/)?.[1]?.trim() || "Off";
-  const fields = new Map<string, string>();
-  const attachmentLines: string[] = [];
+const COPILOT_STATUS_STATES = new Set<CopilotStatusState>([
+  "Off",
+  "Arming",
+  "Listening",
+  "Thinking",
+  "Nudge",
+  "Paused",
+  "Degraded",
+]);
+const COPILOT_STATUS_JSON_KEYS = [
+  "active",
+  "evidence_cursor",
+  "input_mode",
+  "pid",
+  "schema_version",
+  "setup_needed",
+  "state",
+  "surface",
+].sort();
 
-  for (const line of lines.slice(1)) {
-    const match = line.match(/^([^:]+):\s*(.*)$/);
-    if (match) {
-      fields.set(match[1], match[2]);
-    } else {
-      attachmentLines.push(line);
-    }
+/** Parse the exact, content-free `minutes copilot status --json` contract. */
+export function parseCopilotStatusOutput(raw: string): CopilotStatusPayload {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("Copilot status response was invalid.");
+  }
+  if (!isJsonObject(parsed)) {
+    throw new Error("Copilot status response was invalid.");
+  }
+  const keys = Object.keys(parsed).sort();
+  const state = parsed.state;
+  const pid = parsed.pid;
+  const surface = parsed.surface;
+  const inputMode = parsed.input_mode;
+  if (
+    keys.join("\0") !== COPILOT_STATUS_JSON_KEYS.join("\0") ||
+    parsed.schema_version !== 1 ||
+    typeof parsed.active !== "boolean" ||
+    typeof state !== "string" ||
+    !COPILOT_STATUS_STATES.has(state as CopilotStatusState) ||
+    !(pid === null || (typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0)) ||
+    !(surface === null || surface === "stdout" || surface === "tui") ||
+    typeof parsed.evidence_cursor !== "number" ||
+    !Number.isSafeInteger(parsed.evidence_cursor) ||
+    parsed.evidence_cursor < 0 ||
+    (inputMode !== "realtime" && inputMode !== "final_only") ||
+    typeof parsed.setup_needed !== "boolean" ||
+    (!parsed.active && (state !== "Off" || pid !== null || surface !== null)) ||
+    (parsed.active && (state === "Off" || pid === null || surface === null)) ||
+    (parsed.setup_needed && parsed.active)
+  ) {
+    throw new Error("Copilot status response was invalid.");
   }
 
-  const pidRaw = fields.get("PID");
-  const cursorRaw = fields.get("Evidence cursor");
-  const providerRaw = fields.get("Provider") || "";
-  const providerSeparator = providerRaw.indexOf(" / ");
-  const pid = pidRaw && /^\d+$/.test(pidRaw) ? Number.parseInt(pidRaw, 10) : null;
-  const evidenceCursor = cursorRaw && /^\d+$/.test(cursorRaw)
-    ? Number.parseInt(cursorRaw, 10)
-    : 0;
-
   return {
+    schema_version: 1,
     available: true,
-    active: state.toLowerCase() !== "off",
-    state,
-    pid: pid !== null && Number.isSafeInteger(pid) ? pid : null,
-    goal: fields.get("Goal") || null,
-    surface: fields.get("Surface") || null,
-    provider: providerSeparator >= 0
-      ? providerRaw.slice(0, providerSeparator).trim() || null
-      : providerRaw || null,
-    model: providerSeparator >= 0
-      ? providerRaw.slice(providerSeparator + 3).trim() || null
-      : null,
-    evidence_cursor: Number.isSafeInteger(evidenceCursor) ? evidenceCursor : 0,
-    capture_attachment: attachmentLines.join("\n") || null,
-    last_error: fields.get("Degraded") || fields.get("Last error") || null,
-    raw: raw.trim() || "Copilot: Off",
+    active: parsed.active,
+    state: state as CopilotStatusState,
+    pid: pid as number | null,
+    surface: surface as "stdout" | "tui" | null,
+    evidence_cursor: parsed.evidence_cursor,
+    input_mode: inputMode,
+    setup_needed: parsed.setup_needed,
   };
 }
 
@@ -1484,12 +2767,14 @@ export function selectCopilotNudges(
 
 async function runMinutes(
   args: string[],
-  timeoutMs: number = 30000
+  timeoutMs: number = 30000,
+  signal?: AbortSignal
 ): Promise<{ stdout: string; stderr: string }> {
   try {
     const { stdout, stderr } = await execFileAsync(MINUTES_BIN, args, {
       timeout: timeoutMs,
-      env: augmentedEnv({ RUST_LOG: "info" }),
+      signal,
+      env: mcpCliChildEnv({ RUST_LOG: "info" }),
     });
     return { stdout: stdout.trim(), stderr: stderr.trim() };
   } catch (error: any) {
@@ -1500,6 +2785,352 @@ async function runMinutes(
     const stdout = error.stdout?.trim() || "";
     throw new Error(stderr || stdout || error.message);
   }
+}
+
+type MinutesRunner = (
+  args: string[],
+  timeoutMs?: number
+) => Promise<{ stdout: string; stderr: string }>;
+
+export type KnowledgeStatusSnapshot = {
+  enabled: boolean;
+  configured: boolean;
+  adapter: string | null;
+  engine: string | null;
+  people_count: number;
+  log_entries: number;
+};
+
+/**
+ * Single fail-closed bridge for MCP knowledge status. Rust strict-loads the
+ * authoritative config, reconciles and counts under one policy lock, and
+ * refreshes or disables configured QMD before returning this path-free result.
+ * JavaScript must not reopen config or the knowledge tree afterward.
+ */
+export async function readKnowledgeStatusSnapshot(
+  runner: MinutesRunner = runMinutes
+): Promise<KnowledgeStatusSnapshot> {
+  const { stdout } = await runner(["knowledge-status", "--json"]);
+  let result: any;
+  try {
+    result = JSON.parse(stdout);
+  } catch {
+    throw new Error("Persistent meeting derivatives could not be safely read.");
+  }
+  if (
+    !result ||
+    typeof result.enabled !== "boolean" ||
+    typeof result.configured !== "boolean" ||
+    !(typeof result.adapter === "string" || result.adapter === null) ||
+    !(typeof result.engine === "string" || result.engine === null) ||
+    !Number.isSafeInteger(result.people_count) ||
+    result.people_count < 0 ||
+    !Number.isSafeInteger(result.log_entries) ||
+    result.log_entries < 0
+  ) {
+    throw new Error("Persistent meeting derivatives could not be safely read.");
+  }
+  return result as KnowledgeStatusSnapshot;
+}
+
+export type AgentTrustReadiness = {
+  schema: 1;
+  ready: boolean;
+  qmd_retirement: "ready-clean" | "blocked";
+  remediation?: string;
+};
+
+export async function readAgentTrustReadiness(
+  runner: MinutesRunner = runMinutes
+): Promise<AgentTrustReadiness> {
+  let stdout: string;
+  try {
+    ({ stdout } = await runner(["agent-readiness", "--json"]));
+  } catch {
+    throw new Error("Minutes agent readiness could not be verified safely.");
+  }
+  let result: any;
+  try {
+    result = JSON.parse(stdout);
+  } catch {
+    throw new Error("Minutes agent readiness could not be verified safely.");
+  }
+  if (
+    !result ||
+    result.schema !== 1 ||
+    typeof result.ready !== "boolean" ||
+    !["ready-clean", "blocked"].includes(
+      result.qmd_retirement
+    ) ||
+    (result.ready && result.qmd_retirement === "blocked") ||
+    (!result.ready && result.qmd_retirement !== "blocked") ||
+    (result.ready && result.remediation !== undefined) ||
+    (!result.ready &&
+      (typeof result.remediation !== "string" ||
+        result.remediation.trim().length === 0))
+  ) {
+    throw new Error("Minutes agent readiness could not be verified safely.");
+  }
+  return result as AgentTrustReadiness;
+}
+
+export async function requireAgentTrustReadiness(
+  runner: MinutesRunner = runMinutes
+): Promise<AgentTrustReadiness> {
+  const readiness = await readAgentTrustReadiness(runner);
+  if (!readiness.ready) {
+    throw new Error(
+      readiness.remediation ||
+        "Run `minutes qmd cleanup`, repair or reinstall qmd if requested, then restart Minutes."
+    );
+  }
+  return readiness;
+}
+
+export async function afterAgentTrustReadiness<T>(
+  operation: () => Promise<T>,
+  runner: MinutesRunner = runMinutes
+): Promise<T> {
+  await requireAgentTrustReadiness(runner);
+  return operation();
+}
+
+export async function afterRequiredCli<T>(
+  operation: () => Promise<T>,
+  cliProbe: () => Promise<boolean> = isCliAvailable
+): Promise<T> {
+  let available = false;
+  try {
+    available = await cliProbe();
+  } catch {
+    // Installation/probe diagnostics stay local; the MCP failure is path-free.
+  }
+  if (!available) {
+    throw new Error(
+      "Minutes CLI is required to establish the agent trust boundary."
+    );
+  }
+  return operation();
+}
+
+const OPERATIONAL_JOB_STATES = {
+  queued: { state: "queued", stage: "Queued for processing" },
+  transcribing: { state: "transcribing", stage: "Transcribing" },
+  transcriptonly: { state: "transcript-ready", stage: "Transcript ready" },
+  diarizing: { state: "diarizing", stage: "Separating speakers" },
+  summarizing: { state: "summarizing", stage: "Generating summary" },
+  saving: { state: "saving", stage: "Saving" },
+  needsreview: { state: "needs-review", stage: "Needs review" },
+  complete: { state: "complete", stage: "Complete" },
+  failed: { state: "failed", stage: "Failed" },
+} as const;
+
+type PrivacySafeJobState =
+  | (typeof OPERATIONAL_JOB_STATES)[keyof typeof OPERATIONAL_JOB_STATES]["state"]
+  | "unknown";
+
+export type PrivacySafeProcessingJob = {
+  id: string;
+  state: PrivacySafeJobState;
+  stage: string;
+};
+
+export type PrivacySafeRecordingStatus = {
+  schema_version: 1;
+  status_available: boolean;
+  recording: boolean;
+  processing: boolean;
+  recording_mode: "meeting" | "quick-thought" | "dictation" | "live-transcript" | null;
+  processing_stage: string | null;
+  processing_job_count: number;
+};
+
+function normalizedOperationalToken(value: unknown): string {
+  return typeof value === "string"
+    ? value.toLowerCase().replace(/[^a-z0-9]+/g, "")
+    : "";
+}
+
+function operationalJobState(value: unknown): {
+  state: PrivacySafeJobState;
+  stage: string;
+} {
+  const normalized = normalizedOperationalToken(value);
+  const aliases: Record<string, keyof typeof OPERATIONAL_JOB_STATES> = {
+    queued: "queued",
+    transcribing: "transcribing",
+    transcriptonly: "transcriptonly",
+    transcriptready: "transcriptonly",
+    diarizing: "diarizing",
+    summarizing: "summarizing",
+    saving: "saving",
+    needsreview: "needsreview",
+    complete: "complete",
+    completed: "complete",
+    failed: "failed",
+  };
+  const key = aliases[normalized];
+  return key
+    ? OPERATIONAL_JOB_STATES[key]
+    : { state: "unknown", stage: "Status unavailable" };
+}
+
+function privacySafeJobId(value: unknown, index: number): string {
+  return typeof value === "string" && /^job-\d{17}-\d+-\d+$/.test(value)
+    ? value
+    : `job-${index + 1}`;
+}
+
+/**
+ * Project the CLI's intentionally rich local job record into the complete MCP
+ * job schema. The projection is closed: source titles, paths, notes, context,
+ * consent, calendar fields, templates, raw stages, and errors can never enter
+ * either MCP text or structuredContent.
+ */
+export function privacySafeProcessingJobs(value: unknown): PrivacySafeProcessingJob[] {
+  if (!Array.isArray(value)) {
+    throw new Error("Processing jobs could not be safely read.");
+  }
+  const jobs: PrivacySafeProcessingJob[] = [];
+  for (const [index, rawJob] of value.entries()) {
+    const job = rawJob !== null && typeof rawJob === "object" ? rawJob as any : {};
+    const operational = operationalJobState(job.state);
+    jobs.push({
+      id: privacySafeJobId(job.id, index),
+      state: operational.state,
+      stage: operational.stage,
+    });
+    if (jobs.length >= MCP_PROCESSING_JOB_RESULT_MAX) break;
+  }
+  return jobs;
+}
+
+export function buildPrivacySafeProcessingJobsResult(value: unknown) {
+  const jobs = privacySafeProcessingJobs(value);
+  if (jobs.length === 0) {
+    return {
+      content: [{ type: "text" as const, text: "No processing jobs right now." }],
+      structuredContent: { jobs },
+    };
+  }
+  const lines = jobs.map((job) => `- ${job.id}: ${job.state} — ${job.stage}`);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `Processing jobs:\n\n${lines.join("\n")}`,
+      },
+    ],
+    structuredContent: { jobs },
+  };
+}
+
+function privacySafeRecordingMode(
+  value: unknown
+): PrivacySafeRecordingStatus["recording_mode"] {
+  switch (normalizedOperationalToken(value)) {
+    case "meeting":
+      return "meeting";
+    case "quickthought":
+      return "quick-thought";
+    case "dictation":
+      return "dictation";
+    case "livetranscript":
+      return "live-transcript";
+    default:
+      return null;
+  }
+}
+
+function privacySafeProcessingStage(value: unknown): string | null {
+  const stages: Record<string, string> = {
+    queuedforprocessing: "Queued for processing",
+    transcribing: "Transcribing",
+    transcribingaudio: "Transcribing",
+    transcribingmeeting: "Transcribing",
+    transcriptready: "Transcript ready",
+    transcriptreadyenrichingartifact: "Transcript ready",
+    separatingspeakers: "Separating speakers",
+    generatingsummary: "Generating summary",
+    saving: "Saving",
+    savingartifact: "Saving",
+    needsreview: "Needs review",
+    needsreviewrawcapturepreserved: "Needs review",
+    processingfailed: "Failed",
+  };
+  return stages[normalizedOperationalToken(value)] ?? null;
+}
+
+/** Build the entire path-free MCP status schema from untrusted CLI JSON. */
+export function privacySafeRecordingStatus(value: unknown): PrivacySafeRecordingStatus {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    typeof (value as any).recording !== "boolean" ||
+    typeof (value as any).processing !== "boolean"
+  ) {
+    return {
+      schema_version: 1,
+      status_available: false,
+      recording: false,
+      processing: false,
+      recording_mode: null,
+      processing_stage: null,
+      processing_job_count: 0,
+    };
+  }
+
+  const raw = value as any;
+  return {
+    schema_version: 1,
+    status_available: true,
+    recording: raw.recording,
+    processing: raw.processing,
+    recording_mode: privacySafeRecordingMode(raw.recording_mode),
+    processing_stage: raw.processing
+      ? privacySafeProcessingStage(raw.processing_stage)
+      : null,
+    processing_job_count:
+      raw.processing &&
+      Number.isSafeInteger(raw.processing_job_count) &&
+      raw.processing_job_count >= 0
+        ? raw.processing_job_count
+        : 0,
+  };
+}
+
+export function buildPrivacySafeStatusText(value: unknown): string {
+  const status = privacySafeRecordingStatus(value);
+  if (!status.status_available) {
+    return "Recording status is unavailable.";
+  }
+  const modeLabel = status.recording_mode === "quick-thought" ? "Quick thought" : "Recording";
+  const processingLabel =
+    status.recording_mode === "quick-thought" ? "Quick thought processing" : "Processing";
+  if (status.recording) {
+    return `${modeLabel} in progress.`;
+  }
+  if (!status.processing) {
+    return "No recording in progress.";
+  }
+  const stage = status.processing_stage ? `: ${status.processing_stage}` : ".";
+  const queue =
+    status.processing_job_count > 1
+      ? ` (${status.processing_job_count} jobs queued)`
+      : "";
+  return `${processingLabel}${stage}${queue}`;
+}
+
+export function buildPrivacySafeStatusResource(value: unknown) {
+  return {
+    contents: [
+      {
+        uri: "minutes://status",
+        mimeType: "application/json",
+        text: JSON.stringify(privacySafeRecordingStatus(value)),
+      },
+    ],
+  };
 }
 
 function parseJsonOutput(stdout: string): any {
@@ -1519,17 +3150,19 @@ function copilotObserverPaths(minutesHome: string = join(homedir(), ".minutes"))
   };
 }
 
-async function readCopilotStatusFromCli(): Promise<CopilotStatusPayload> {
-  if (!(await isCliAvailable())) {
+export async function readCopilotStatusFromCli(
+  runner: MinutesRunner = runMinutes,
+  cliAvailable: () => Promise<boolean> = isCliAvailable
+): Promise<CopilotStatusPayload> {
+  if (!(await cliAvailable())) {
     return inactiveCopilotStatus("Minutes CLI is not installed; copilot control requires the local CLI.");
   }
 
   try {
-    const { stdout } = await runMinutes(["copilot", "status"], 5000);
+    const { stdout } = await runner(["copilot", "status", "--json"], 5000);
     return parseCopilotStatusOutput(stdout);
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    return inactiveCopilotStatus(`Unable to read copilot status: ${message}`);
+  } catch {
+    return inactiveCopilotStatus("Unable to read copilot status safely.");
   }
 }
 
@@ -1560,7 +3193,7 @@ function observerMatchesStatus(
 ): boolean {
   if (!status.active) return false;
   if (status.pid !== null && session.pid !== status.pid) return false;
-  return session.goal === status.goal && session.surface === status.surface;
+  return session.surface === status.surface;
 }
 
 async function readCopilotNudgeObservation(
@@ -1635,8 +3268,24 @@ async function readCopilotNudgeObservation(
 
 async function getLiveCopilotSnapshot(): Promise<LiveCopilotResourcePayload> {
   const status = await readCopilotStatusFromCli();
-  const observation = await readCopilotNudgeObservation(status);
-  return buildLiveCopilotResourcePayload(status, observation);
+  return afterActiveCopilotReadiness(status, async () => {
+    const observation = await readCopilotNudgeObservation(status);
+    return buildLiveCopilotResourcePayload(status, observation);
+  });
+}
+
+/// An inactive copilot status is operational metadata and contains no meeting
+/// content. Once active, its observation stream can include derived nudges, so
+/// the QMD-retirement boundary must pass before the stream is read at all.
+export async function afterActiveCopilotReadiness<T>(
+  status: Pick<CopilotStatusPayload, "active">,
+  operation: () => T | Promise<T>,
+  readiness: () => Promise<unknown> = () => requireAgentTrustReadiness()
+): Promise<T> {
+  if (status.active) {
+    await readiness();
+  }
+  return operation();
 }
 
 async function readLiveCopilotResource(uri: URL): Promise<{
@@ -1664,7 +3313,7 @@ async function liveCopilotFingerprint(): Promise<string> {
     available: payload.available,
     active: payload.active,
     state: payload.state,
-    status: payload.status.raw,
+    status: payload.status,
     attached: payload.nudge_stream.attached,
     cursor: payload.nudge_stream.cursor,
     latest: payload.latest_nudge?.raw ?? null,
@@ -1692,7 +3341,7 @@ async function spawnCopilotCli(
       {
         detached: true,
         stdio: ["ignore", stdoutFd, stderrFd],
-        env: augmentedEnv({ RUST_LOG: "info" }),
+        env: mcpCliChildEnv({ RUST_LOG: "info" }),
       }
     );
   } finally {
@@ -1760,6 +3409,35 @@ async function waitForCopilotStatus(
   return status;
 }
 
+export type CopilotStopAfterControl =
+  | { mayRevealContent: false }
+  | { mayRevealContent: true; status: CopilotStatusPayload };
+
+/**
+ * Issue the idempotent terminal control before status observation. The strict
+ * status schema is path-free operational metadata: an inactive result is safe
+ * to return without QMD readiness. If the engine remains active, readiness is
+ * required before that active session can be surfaced.
+ */
+export async function stopCopilotBeforeStatusRead(
+  control: () => Promise<unknown> = () => runMinutes(["copilot", "stop"], 5000),
+  readStatus: () => Promise<CopilotStatusPayload> = () =>
+    waitForCopilotStatus((candidate) => !candidate.active, 3000),
+  readiness: () => Promise<unknown> = () => requireAgentTrustReadiness()
+): Promise<CopilotStopAfterControl> {
+  await control();
+  const status = await readStatus();
+  if (!status.active) {
+    return { mayRevealContent: true, status };
+  }
+  try {
+    await readiness();
+  } catch {
+    return { mayRevealContent: false };
+  }
+  return { mayRevealContent: true, status };
+}
+
 async function readEventsFromCli(args: string[]): Promise<unknown[]> {
   if (!(await isCliAvailable())) {
     return [];
@@ -1807,7 +3485,7 @@ async function latestEventSeqFromCli(): Promise<number> {
   return maxEventSeq(events);
 }
 
-async function readLiveEventsResource(uri: URL): Promise<{
+export async function readLiveEventsResource(uri: URL): Promise<{
   contents: Array<{ uri: string; mimeType: string; text: string }>;
 }> {
   const options = parseLiveEventsResourceUri(uri.href);
@@ -1815,35 +3493,16 @@ async function readLiveEventsResource(uri: URL): Promise<{
     throw new McpError(ErrorCode.InvalidParams, `Unsupported live events resource: ${uri.href}`);
   }
 
-  if (!(await isCliAvailable())) {
-    const unavailable = {
-      v: 1,
-      resource: LIVE_EVENTS_RESOURCE_URI,
-      mode: options.sinceSeq === null ? "recent" : "since_seq",
-      since_seq: options.sinceSeq,
-      limit: options.limit,
-      latest_seq: options.sinceSeq ?? 0,
-      events: [],
-      reconnect: {
-        cursor: options.sinceSeq ?? 0,
-        read_uri: `${LIVE_EVENTS_RESOURCE_URI}?since_seq=${options.sinceSeq ?? 0}`,
-      },
-      unavailable: "Minutes CLI is not installed; live event reads require the local CLI.",
-    };
-    return {
-      contents: [{
-        uri: uri.href,
-        mimeType: "application/json",
-        text: JSON.stringify(unavailable, null, 2),
-      }],
-    };
-  }
-
-  const events = options.sinceSeq === null
-    ? await readRecentEventsFromCli(options.limit)
-    : await readEventsSinceSeqFromCli(options.sinceSeq, options.limit);
-  const latestSeq = options.sinceSeq === null ? maxEventSeq(events) : await latestEventSeqFromCli();
-  const payload = buildLiveEventsResourcePayload(options, events, latestSeq);
+  // Raw event cursors advance for restricted markers and overrides even when
+  // their bodies are removed. A constant unavailable surface is therefore the
+  // only honest default until event records carry independently verifiable
+  // source policy provenance and a non-sensitive cursor namespace.
+  const stableCursor = options.sinceSeq ?? 0;
+  const payload = {
+    ...buildLiveEventsResourcePayload(options, [], stableCursor),
+    unavailable:
+      "Live event reads and subscriptions are withheld from MCP until records carry live-verifiable source policy provenance and a non-sensitive cursor.",
+  };
 
   return {
     contents: [{
@@ -1861,6 +3520,7 @@ export type LiveEventsSubscriptionOptions = {
   latestEventSeq?: () => Promise<number>;
   readEventsSinceSeq?: (sinceSeq: number, limit: number) => Promise<unknown[]>;
   copilotFingerprint?: () => Promise<string>;
+  resourceReadiness?: () => Promise<unknown>;
   sendResourceUpdated?: (uri: string) => Promise<void>;
   onError?: (error: unknown) => void;
 };
@@ -1876,12 +3536,14 @@ export function registerLiveEventsSubscriptionHandlers(
 ): LiveEventsSubscriptionController {
   const eventSubscriptions = new Set<string>();
   const copilotSubscriptions = new Set<string>();
-  const enableLiveEvents = options.enableLiveEvents ?? true;
+  const enableLiveEvents =
+    options.enableLiveEvents ?? LIVE_EVENTS_SUBSCRIPTIONS_ENABLED;
   const enableCopilot = options.enableCopilot ?? false;
   const pollIntervalMs = options.pollIntervalMs ?? LIVE_EVENTS_POLL_INTERVAL_MS;
   const loadLatestSeq = options.latestEventSeq ?? latestEventSeqFromCli;
   const loadEventsSinceSeq = options.readEventsSinceSeq ?? readEventsSinceSeqFromCli;
   const loadCopilotFingerprint = options.copilotFingerprint ?? liveCopilotFingerprint;
+  const resourceReadiness = options.resourceReadiness ?? requireAgentTrustReadiness;
   const sendResourceUpdated = options.sendResourceUpdated ??
     ((uri: string) => mcpServer.server.sendResourceUpdated({ uri }));
   const onError = options.onError ?? ((error: unknown) => {
@@ -1893,34 +3555,57 @@ export function registerLiveEventsSubscriptionHandlers(
   let copilotFingerprint: string | null = null;
   let pollTimer: NodeJS.Timeout | null = null;
   let pollInFlight = false;
+  let lifecycleEpoch = 0;
+  let controllerStopped = false;
+
+  function epochIsCurrent(epoch: number): boolean {
+    return !controllerStopped && lifecycleEpoch === epoch;
+  }
 
   mcpServer.server.registerCapabilities({
     resources: { subscribe: true },
   });
 
-  async function initializeSubscribedResources(): Promise<void> {
+  async function initializeSubscribedResources(epoch: number): Promise<void> {
     if (eventSubscriptions.size > 0 && !eventCursorInitialized) {
       try {
-        cursor = await loadLatestSeq();
+        const initialCursor = await afterContentResourceReadiness(
+          "live_events",
+          loadLatestSeq,
+          resourceReadiness
+        );
+        await resourceReadiness();
+        if (!epochIsCurrent(epoch) || eventSubscriptions.size === 0) return;
+        cursor = initialCursor;
+        eventCursorInitialized = true;
       } catch (error) {
         onError(error);
-        cursor = 0;
       }
-      eventCursorInitialized = true;
     }
     if (copilotSubscriptions.size > 0 && copilotFingerprint === null) {
       try {
-        copilotFingerprint = await loadCopilotFingerprint();
+        const initialFingerprint = await afterContentResourceReadiness(
+          "live_copilot",
+          loadCopilotFingerprint,
+          resourceReadiness
+        );
+        await resourceReadiness();
+        if (!epochIsCurrent(epoch) || copilotSubscriptions.size === 0) return;
+        copilotFingerprint = initialFingerprint;
       } catch (error) {
         onError(error);
-        copilotFingerprint = "";
       }
     }
   }
 
   async function ensurePollerStarted(): Promise<void> {
-    await initializeSubscribedResources();
-    if (pollTimer) return;
+    const epoch = lifecycleEpoch;
+    await initializeSubscribedResources(epoch);
+    if (
+      !epochIsCurrent(epoch) ||
+      (eventSubscriptions.size === 0 && copilotSubscriptions.size === 0) ||
+      pollTimer
+    ) return;
     pollTimer = setInterval(() => {
       void pollOnce();
     }, pollIntervalMs);
@@ -1928,22 +3613,39 @@ export function registerLiveEventsSubscriptionHandlers(
   }
 
   function stopPollerIfIdle(): void {
-    if (eventSubscriptions.size > 0 || copilotSubscriptions.size > 0 || !pollTimer) return;
-    clearInterval(pollTimer);
+    if (eventSubscriptions.size > 0 || copilotSubscriptions.size > 0) return;
+    if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
-    pollInFlight = false;
     eventCursorInitialized = false;
     copilotFingerprint = null;
   }
 
-  async function notifySubscriptions(subscriptions: Set<string>): Promise<void> {
-    await Promise.all([...subscriptions].map(async (uri) => {
+  async function notifySubscriptions(
+    subscriptions: Set<string>,
+    resourceName: "live_events" | "live_copilot",
+    epoch: number
+  ): Promise<boolean> {
+    const subscribedUris = [...subscriptions];
+    if (subscribedUris.length === 0 || !epochIsCurrent(epoch)) return false;
+    const results = await Promise.all(subscribedUris.map(async (uri) => {
       try {
-        await sendResourceUpdated(uri);
+        await afterContentResourceReadiness(
+          resourceName,
+          async () => {
+            if (!epochIsCurrent(epoch) || !subscriptions.has(uri)) {
+              throw new Error("live resource subscription changed during notification");
+            }
+            await sendResourceUpdated(uri);
+          },
+          resourceReadiness
+        );
+        return epochIsCurrent(epoch) && subscriptions.has(uri);
       } catch (error) {
         onError(error);
+        return false;
       }
     }));
+    return epochIsCurrent(epoch) && results.every(Boolean);
   }
 
   async function pollOnce(): Promise<void> {
@@ -1953,27 +3655,49 @@ export function registerLiveEventsSubscriptionHandlers(
     ) {
       return;
     }
+    const epoch = lifecycleEpoch;
     pollInFlight = true;
     try {
-      if (eventSubscriptions.size > 0) {
+      await initializeSubscribedResources(epoch);
+      if (!epochIsCurrent(epoch)) return;
+
+      if (eventSubscriptions.size > 0 && eventCursorInitialized) {
         try {
-          const events = await loadEventsSinceSeq(cursor, LIVE_EVENTS_DEFAULT_CURSOR_LIMIT);
-          const nextCursor = maxEventSeq(events, cursor);
-          if (nextCursor > cursor) {
-            cursor = nextCursor;
-            await notifySubscriptions(eventSubscriptions);
+          const readCursor = cursor;
+          const events = await afterContentResourceReadiness(
+            "live_events",
+            () => loadEventsSinceSeq(readCursor, LIVE_EVENTS_DEFAULT_CURSOR_LIMIT),
+            resourceReadiness
+          );
+          await resourceReadiness();
+          if (!epochIsCurrent(epoch) || eventSubscriptions.size === 0) return;
+          const nextCursor = maxEventSeq(events, readCursor);
+          if (nextCursor > readCursor) {
+            // Authorization may be revoked while the source read is pending.
+            // Do not advance the durable subscription baseline unless every
+            // notification passed a fresh post-read readiness boundary.
+            if (await notifySubscriptions(eventSubscriptions, "live_events", epoch)) {
+              cursor = nextCursor;
+            }
           }
         } catch (error) {
           onError(error);
         }
       }
 
-      if (copilotSubscriptions.size > 0) {
+      if (copilotSubscriptions.size > 0 && copilotFingerprint !== null) {
         try {
-          const nextFingerprint = await loadCopilotFingerprint();
+          const nextFingerprint = await afterContentResourceReadiness(
+            "live_copilot",
+            loadCopilotFingerprint,
+            resourceReadiness
+          );
+          await resourceReadiness();
+          if (!epochIsCurrent(epoch) || copilotSubscriptions.size === 0) return;
           if (copilotFingerprint !== null && nextFingerprint !== copilotFingerprint) {
-            copilotFingerprint = nextFingerprint;
-            await notifySubscriptions(copilotSubscriptions);
+            if (await notifySubscriptions(copilotSubscriptions, "live_copilot", epoch)) {
+              copilotFingerprint = nextFingerprint;
+            }
           } else {
             copilotFingerprint = nextFingerprint;
           }
@@ -2014,11 +3738,17 @@ export function registerLiveEventsSubscriptionHandlers(
   }
 
   mcpServer.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    if (controllerStopped) {
+      throw new McpError(ErrorCode.InvalidRequest, "Live resource subscriptions are stopped");
+    }
     const subscription = normalizeSubscriptionUri(request.params.uri);
     const subscriptions = subscription.kind === "events"
       ? eventSubscriptions
       : copilotSubscriptions;
-    subscriptions.add(subscription.uri);
+    if (!subscriptions.has(subscription.uri)) {
+      subscriptions.add(subscription.uri);
+      lifecycleEpoch += 1;
+    }
     await ensurePollerStarted();
     return {};
   });
@@ -2028,13 +3758,23 @@ export function registerLiveEventsSubscriptionHandlers(
     const subscriptions = subscription.kind === "events"
       ? eventSubscriptions
       : copilotSubscriptions;
-    subscriptions.delete(subscription.uri);
+    if (subscriptions.delete(subscription.uri)) {
+      lifecycleEpoch += 1;
+      if (subscription.kind === "events" && eventSubscriptions.size === 0) {
+        eventCursorInitialized = false;
+      }
+      if (subscription.kind === "copilot" && copilotSubscriptions.size === 0) {
+        copilotFingerprint = null;
+      }
+    }
     stopPollerIfIdle();
     return {};
   });
 
   return {
     stop: () => {
+      controllerStopped = true;
+      lifecycleEpoch += 1;
       eventSubscriptions.clear();
       copilotSubscriptions.clear();
       stopPollerIfIdle();
@@ -2060,38 +3800,79 @@ crashTrace("post-mcp-server-construct");
 } as any);
 
 // Configurable directories — override via env vars in Claude Desktop extension settings
-const MEETINGS_DIR = canonicalizeRoot(
-  expandHomeLikePath(process.env.MEETINGS_DIR || join(homedir(), "meetings"))
-);
 const MINUTES_HOME = canonicalizeRoot(
   expandHomeLikePath(process.env.MINUTES_HOME || join(homedir(), ".minutes"))
 );
-let effectiveMeetingsDirPromise: Promise<string> | null = null;
 
-async function getEffectiveMeetingsDir(): Promise<string> {
-  if (effectiveMeetingsDirPromise) {
-    return effectiveMeetingsDirPromise;
+const MEETINGS_ROOT_ERROR = "The live meeting root could not be safely resolved.";
+
+function parseMeetingsRootSnapshotValue(stdout: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(MEETINGS_ROOT_ERROR);
   }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Object.keys(parsed).sort().join("\0") !== ["output_dir", "schema_version"].sort().join("\0") ||
+    (parsed as any).schema_version !== 1 ||
+    typeof (parsed as any).output_dir !== "string" ||
+    (parsed as any).output_dir.trim() === "" ||
+    (parsed as any).output_dir.includes("\0")
+  ) {
+    throw new Error(MEETINGS_ROOT_ERROR);
+  }
+  return (parsed as any).output_dir;
+}
 
-  effectiveMeetingsDirPromise = (async () => {
-    if (!(await isCliAvailable())) {
-      return MEETINGS_DIR;
-    }
+export function parseMeetingsRootSnapshot(stdout: string): string {
+  return canonicalizeRoot(parseMeetingsRootSnapshotValue(stdout));
+}
 
-    try {
-      const { stdout } = await runMinutes(["paths", "--json"]);
-      const parsed = parseJsonOutput(stdout);
-      if (parsed && typeof parsed.output_dir === "string" && parsed.output_dir.length > 0) {
-        return canonicalizeRoot(parsed.output_dir);
-      }
-    } catch {
-      // Fall back to the MCP-configured default when the CLI cannot report paths.
-    }
+/** Resolve the live corpus for each operation; never retain a stale root. */
+export async function getEffectiveMeetingsDir(
+  runner: MinutesRunner = runMinutes,
+  cliAvailability: () => Promise<boolean> = isCliAvailable,
+  envOverride: string | undefined = process.env.MEETINGS_DIR
+): Promise<string> {
+  if (envOverride?.trim()) {
+    return canonicalizeRoot(expandHomeLikePath(envOverride.trim()));
+  }
+  if (!(await cliAvailability())) {
+    return canonicalizeRoot(join(homedir(), "meetings"));
+  }
+  try {
+    const { stdout } = await runner(["meetings-root", "--json"]);
+    return parseMeetingsRootSnapshot(stdout);
+  } catch {
+    throw new Error(MEETINGS_ROOT_ERROR);
+  }
+}
 
-    return MEETINGS_DIR;
-  })();
-
-  return effectiveMeetingsDirPromise;
+/**
+ * Resolve only the lexical live-root value for the isolated process_audio
+ * helper. Canonicalization and every filesystem syscall belong in that
+ * bounded helper process, not in the long-lived MCP event loop.
+ */
+async function getEffectiveMeetingsDirForIsolatedAudio(
+  runner: MinutesRunner = runMinutes,
+  cliAvailability: () => Promise<boolean> = isCliAvailable,
+  envOverride: string | undefined = process.env.MEETINGS_DIR
+): Promise<string> {
+  if (envOverride?.trim()) {
+    return resolve(expandHomeLikePath(envOverride.trim()));
+  }
+  if (!(await cliAvailability())) {
+    return join(homedir(), "meetings");
+  }
+  try {
+    const { stdout } = await runner(["meetings-root", "--json"]);
+    return resolve(expandHomeLikePath(parseMeetingsRootSnapshotValue(stdout)));
+  } catch {
+    throw new Error(MEETINGS_ROOT_ERROR);
+  }
 }
 
 // ── UI Resource: MCP App dashboard ──────────────────────────
@@ -2279,7 +4060,7 @@ registerTool(
 
     const child = spawn(MINUTES_BIN, args, {
       stdio: "ignore",
-      env: { ...process.env, RUST_LOG: "info" },
+      env: mcpCliChildEnv({ RUST_LOG: "info" }),
     });
     child.unref();
 
@@ -2314,6 +4095,53 @@ registerTool(
 
 // ── Tool: stop_recording ────────────────────────────────────
 
+export function verifiedStopRecordingSummary(snapshot: {
+  path: string;
+  meeting: {
+    body?: string;
+    frontmatter: {
+      title?: unknown;
+      duration?: unknown;
+      people?: unknown;
+      action_items?: unknown;
+      decisions?: unknown;
+    };
+  };
+}): string {
+  const fm = snapshot.meeting.frontmatter;
+  const title = typeof fm.title === "string" && fm.title.trim() ? fm.title : "Recording";
+  const words = (snapshot.meeting.body ?? "").trim().split(/\s+/).filter(Boolean).length;
+  let summary = `## ${title}\n\n**Saved:** ${snapshot.path}\n`;
+  if (words > 0) summary += `**Words:** ${words}\n`;
+  if (typeof fm.duration === "string" && fm.duration) {
+    summary += `**Duration:** ${fm.duration}\n`;
+  }
+  if (Array.isArray(fm.people) && fm.people.length) {
+    summary += `**People:** ${fm.people.map(String).join(", ")}\n`;
+  }
+
+  const actions = Array.isArray(fm.action_items)
+    ? fm.action_items.filter((item: any) => item?.status === "open")
+    : [];
+  if (actions.length > 0) {
+    summary += "\n### Action Items\n";
+    for (const item of actions) {
+      summary += `- [ ] ${String(item.task ?? "")}`;
+      if (item.assignee) summary += ` (${String(item.assignee)})`;
+      if (item.due) summary += ` — due ${String(item.due)}`;
+      summary += "\n";
+    }
+  }
+
+  if (Array.isArray(fm.decisions) && fm.decisions.length) {
+    summary += "\n### Decisions\n";
+    for (const decision of fm.decisions) {
+      summary += `- ${String(decision?.text ?? "")}\n`;
+    }
+  }
+  return summary;
+}
+
 registerTool(
   "stop_recording",
   "Stop the current recording and process it (transcribe, diarize, summarize).",
@@ -2324,67 +4152,66 @@ registerTool(
       return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
     }
     try {
-      const { stdout, stderr } = await runMinutes(["stop"], 180000);
+      const stopped = await terminalControlBeforeContentReadiness(() =>
+        runMinutes(["stop"], 180000)
+      );
+      if (!stopped.mayRevealContent) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Recording stopped. The result is withheld until the agent trust boundary is ready.",
+          }],
+        };
+      }
+      const { stdout } = stopped.result;
       const result = parseJsonOutput(stdout);
 
       if (result.status === "queued") {
-        const title = result.title ? ` for ${result.title}` : "";
-        const jobLine = result.job_id ? ` Job: ${result.job_id}.` : "";
         return {
           content: [
             {
               type: "text" as const,
-              text: `Recording stopped. Processing queued${title}.${jobLine}`,
+              text: "Recording stopped. Processing queued.",
             },
           ],
         };
       }
 
       if (!result.file) {
-        return { content: [{ type: "text" as const, text: stderr || "Recording stopped." }] };
+        return { content: [{ type: "text" as const, text: "Recording stopped." }] };
       }
-
-      // Trigger QMD re-index so new meeting is immediately searchable
-      triggerQmdIndex();
-
-      // Build a rich summary by reading the meeting frontmatter
-      let summary = `## ${result.title ?? "Recording"}\n\n`;
-      summary += `**Saved:** ${result.file}\n`;
-      if (result.words != null) summary += `**Words:** ${result.words}\n`;
 
       try {
-        const meeting = await reader.getMeeting(result.file);
-        if (meeting) {
-          const fm = meeting.frontmatter;
-          if (fm.duration) summary += `**Duration:** ${fm.duration}\n`;
-          if (fm.people?.length) summary += `**People:** ${fm.people.join(", ")}\n`;
-
-          const actions = fm.action_items?.filter((a: any) => a.status === "open") || [];
-          if (actions.length > 0) {
-            summary += `\n### Action Items\n`;
-            for (const item of actions) {
-              summary += `- [ ] ${item.task}`;
-              if (item.assignee) summary += ` (${item.assignee})`;
-              if (item.due) summary += ` — due ${item.due}`;
-              summary += `\n`;
-            }
-          }
-
-          if (fm.decisions?.length) {
-            summary += `\n### Decisions\n`;
-            for (const d of fm.decisions) {
-              summary += `- ${d.text}\n`;
-            }
-          }
+        const meetingsRoot = await getEffectiveMeetingsDir();
+        const snapshot = await policyVerifiedExactMeetingSnapshot(
+          result.file,
+          meetingsRoot,
+          false
+        );
+        if (!snapshot) {
+          return {
+            content: [{ type: "text" as const, text: "Recording stopped. Processing finished, but the saved meeting is unavailable under the current privacy policy." }],
+          };
         }
-      } catch {
-        // Frontmatter read is best-effort — basic info is already in the summary
-      }
 
-      return { content: [{ type: "text" as const, text: summary }] };
-    } catch (error: any) {
+        const summary = verifiedStopRecordingSummary(snapshot);
+        if (!(await policySnapshotsStillAuthorized(meetingsRoot, false, [snapshot]))) {
+          return {
+            content: [{ type: "text" as const, text: "Recording stopped. Processing finished, but the saved meeting is unavailable under the current privacy policy." }],
+          };
+        }
+
+        // CLI fields are never surfaced; the response is derived only from
+        // the exact live snapshot that survived final authorization.
+        return { content: [{ type: "text" as const, text: summary }] };
+      } catch {
+        return {
+          content: [{ type: "text" as const, text: "Recording stopped. Processing finished, but the saved meeting is unavailable under the current privacy policy." }],
+        };
+      }
+    } catch {
       return {
-        content: [{ type: "text" as const, text: `Stop failed: ${error.message}` }],
+        content: [{ type: "text" as const, text: "Stop failed. Check Minutes logs locally." }],
       };
     }
   }
@@ -2401,17 +4228,24 @@ registerTool(
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: `No recording in progress (read-only mode).\n\n${CLI_INSTALL_MSG}` }] };
     }
-    const { stdout } = await runMinutes(["status"]);
-    const status = parseJsonOutput(stdout);
-    const modeLabel = status.recording_mode === "quick-thought" ? "Quick thought" : "Recording";
-    const processingLabel =
-      status.recording_mode === "quick-thought" ? "Quick thought processing" : "Processing";
-    const text = status.recording
-      ? `${modeLabel} in progress (PID: ${status.pid})`
-      : status.processing
-        ? `${processingLabel}${status.processing_title ? ` for ${status.processing_title}` : ""}${status.processing_stage ? `: ${status.processing_stage}` : "."}${status.processing_job_count > 1 ? ` (${status.processing_job_count} jobs queued)` : ""}`
-        : "No recording in progress.";
-    return { content: [{ type: "text" as const, text }] };
+    try {
+      const { stdout } = await runMinutes(["status"]);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: buildPrivacySafeStatusText(JSON.parse(stdout)),
+          },
+        ],
+      };
+    } catch {
+      return {
+        content: [
+          { type: "text" as const, text: "Recording status is unavailable." },
+        ],
+        isError: true,
+      };
+    }
   }
 );
 
@@ -2419,7 +4253,14 @@ registerTool(
   "list_processing_jobs",
   "List background processing jobs for recent recordings, including queued, transcript-ready, needs-review, failed, and completed work.",
   {
-    limit: z.number().optional().default(10).describe("Maximum number of jobs"),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(MCP_PROCESSING_JOB_RESULT_MAX)
+      .optional()
+      .default(10)
+      .describe(`Maximum number of jobs (1-${MCP_PROCESSING_JOB_RESULT_MAX})`),
     include_completed: z.boolean().optional().default(true).describe("Include completed and failed jobs"),
   },
   { title: "Processing Jobs", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -2433,28 +4274,15 @@ registerTool(
 
     try {
       const { stdout } = await runMinutes(args);
-      const jobs = parseJsonOutput(stdout);
-      if (!Array.isArray(jobs) || jobs.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: "No processing jobs right now." }],
-          structuredContent: { jobs: [] },
-        };
-      }
-
-      const lines = jobs.map((job: any) => {
-        const title = job.title || "Queued recording";
-        const state = job.state || "queued";
-        const stage = job.stage ? ` — ${job.stage}` : "";
-        return `- ${job.id}: ${state} — ${title}${stage}`;
-      });
-
+      return buildPrivacySafeProcessingJobsResult(JSON.parse(stdout));
+    } catch {
       return {
-        content: [{ type: "text" as const, text: `Processing jobs:\n\n${lines.join("\n")}` }],
-        structuredContent: { jobs },
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Failed to list processing jobs: ${error.message}` }],
+        content: [
+          {
+            type: "text" as const,
+            text: "Processing jobs could not be safely read.",
+          },
+        ],
         isError: true,
       };
     }
@@ -2467,30 +4295,46 @@ registerDocsAppTool(
   server,
   "list_meetings",
   {
-    description: "List recent meetings and voice memos. Meetings designated `sensitivity: restricted` are excluded unless include_restricted is set; the override is logged.",
+    description: "List recent meetings and voice memos. Restricted meetings are excluded. An override requires both an operator launch grant and include_restricted=true, and is durably audited.",
     inputSchema: {
-      limit: z.number().optional().default(10).describe("Maximum results"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MCP_MEETING_RESULT_MAX)
+        .optional()
+        .default(10)
+        .describe(`Maximum results (1-${MCP_MEETING_RESULT_MAX})`),
       type: z.enum(["meeting", "memo"]).optional().describe("Filter by type"),
       include_restricted: z
         .boolean()
         .optional()
         .default(false)
-        .describe("Include meetings designated `sensitivity: restricted` (excluded by default; the override is logged)"),
+        .describe("Include restricted meetings only when a human launched the server with MINUTES_MCP_RESTRICTED_POLICY=logged-override; every request is durably audited"),
     },
     annotations: { title: "List Meetings", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ limit, type: contentType, include_restricted }) => {
-    // Pure-TS fallback when CLI is not available
-    if (!(await isCliAvailable())) {
-      const opts = { includeRestricted: include_restricted };
-      const meetings = await listMeetingsWithOpts(MEETINGS_DIR, limit, opts);
-      const filtered = contentType
-        ? meetings.filter((m) => m.frontmatter.type === contentType)
-        : meetings;
-      const openActions = await findOpenActionsWithOpts(MEETINGS_DIR, undefined, opts);
+    const boundedLimit = normalizeMcpMeetingResultLimit(limit);
+    // Agent-facing meeting content always comes from strict live snapshots.
+    // The CLI/search indexes remain operator surfaces, never authorization
+    // sources for MCP responses.
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const meetings = await policyListMeetings(
+      meetingsDir,
+      MCP_POLICY_MEETING_RESULT_MAX,
+      include_restricted
+    );
+      const limited: PolicyVerifiedMeeting[] = [];
+      for (const meeting of meetings) {
+        if (contentType && meeting.frontmatter.type !== contentType) continue;
+        limited.push(meeting);
+        if (limited.length >= boundedLimit) break;
+      }
+      const openActions = openActionsFromMeetings(meetings, MCP_ACTION_RESULT_MAX);
 
-      if (filtered.length === 0) {
+      if (limited.length === 0) {
         return {
           content: [{ type: "text" as const, text: "No meetings or memos found." }],
           structuredContent: { meetings: [], actions: [], view: "dashboard" },
@@ -2498,55 +4342,14 @@ registerDocsAppTool(
         };
       }
 
-      const text = filtered
-        .map((m) => `${m.frontmatter.date} — ${m.frontmatter.title} [${m.frontmatter.type}]\n  ${m.path}`)
+      const meetingsJson = limited.map(meetingListItem);
+      const text = meetingsJson
+        .map((m) => `${m.date} — ${m.title} [${m.content_type}]\n  ${m.path}`)
         .join("\n\n");
 
-      const meetingsJson = filtered.map(meetingListItem);
-
-      return {
-        content: [{ type: "text" as const, text }],
-        structuredContent: { meetings: meetingsJson, actions: openActions.map((a) => a.item), view: "dashboard" },
-        _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "dashboard" },
-      };
-    }
-
-    const args = ["list", "--limit", String(limit)];
-    if (contentType) args.push("-t", contentType);
-    // The CLI records the sensitivity.override event when this flag is set.
-    if (include_restricted) args.push("--include-restricted");
-
-    const actionArgs = ["search", "", "--intents-only", "--intent-kind", "action-item", "--limit", "20"];
-    if (include_restricted) actionArgs.push("--include-restricted");
-
-    // Fetch meetings and action items in parallel
-    const [meetingsResult, actionsResult] = await Promise.all([
-      runMinutes(args),
-      runMinutes(actionArgs).catch(() => ({ stdout: "[]", stderr: "" })),
-    ]);
-
-    const meetings = parseJsonOutput(meetingsResult.stdout);
-    let actions: any[] = [];
-    const parsedActions = parseJsonOutput(actionsResult.stdout);
-    if (Array.isArray(parsedActions)) actions = parsedActions;
-
-    if (Array.isArray(meetings) && meetings.length === 0) {
-      return {
-        content: [{ type: "text" as const, text: "No meetings or memos found." }],
-        structuredContent: { meetings: [], actions, view: "dashboard" },
-        _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "dashboard" },
-      };
-    }
-
-    const text = Array.isArray(meetings)
-      ? meetings
-          .map((m: any) => `${m.date} — ${m.title} [${m.content_type}]\n  ${m.path}`)
-          .join("\n\n")
-      : (meetingsResult.stderr || meetingsResult.stdout);
-
     return {
-      content: [{ type: "text" as const, text }],
-      structuredContent: { meetings: Array.isArray(meetings) ? meetings : [], actions, view: "dashboard" },
+      content: [{ type: "text" as const, text: boundedMcpText(text) }],
+      structuredContent: { meetings: meetingsJson, actions: openActions.map((a) => boundedActionItem(a.item)), view: "dashboard" },
       _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "dashboard" },
     };
   }
@@ -2558,12 +4361,19 @@ registerDocsAppTool(
   server,
   "search_meetings",
   {
-    description: "Search meeting transcripts and voice memos. Meetings designated `sensitivity: restricted` are excluded unless include_restricted is set; the override is logged.",
+    description: "Search meeting transcripts and voice memos. Restricted meetings are excluded. An override requires both an operator launch grant and include_restricted=true, and is durably audited.",
     inputSchema: {
-      query: z.string().describe("Text to search for"),
+      query: z.string().max(MCP_QUERY_MAX_CHARS).describe("Text to search for"),
       type: z.enum(["meeting", "memo"]).optional().describe("Filter by type"),
       since: z.string().optional().describe("Only results after this date (ISO)"),
-      limit: z.number().optional().default(10).describe("Maximum results"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MCP_MEETING_RESULT_MAX)
+        .optional()
+        .default(10)
+        .describe(`Maximum results (1-${MCP_MEETING_RESULT_MAX})`),
       intent_kind: z
         .enum(["action-item", "decision", "open-question", "commitment"])
         .optional()
@@ -2578,113 +4388,82 @@ registerDocsAppTool(
         .boolean()
         .optional()
         .default(false)
-        .describe("Include meetings designated `sensitivity: restricted` (excluded by default; the override is logged)"),
+        .describe("Include restricted meetings only when a human launched the server with MINUTES_MCP_RESTRICTED_POLICY=logged-override; every request is durably audited"),
     },
     annotations: { title: "Search Meetings", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ query, type: contentType, since, limit, intent_kind, owner, intents_only, include_restricted }) => {
-    // Pure-TS fallback when CLI is not available
-    if (!(await isCliAvailable())) {
-      const droppedFilters = [since && "since", intent_kind && "intent_kind", owner && "owner", intents_only && "intents_only"].filter(Boolean);
-      const filterWarning = droppedFilters.length > 0
-        ? `\n\n(Note: ${droppedFilters.join(", ")} filters require the CLI. Install: brew install minutes)`
-        : "";
+    const boundedLimit = normalizeMcpMeetingResultLimit(limit);
+    // Search indexes and CLI output provide no authorization guarantee. Scan
+    // strict live snapshots here and derive every returned field from those
+    // bytes. This also makes metadata/intent filters fail closed instead of
+    // routing around the policy boundary.
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const intentMode = intents_only || !!intent_kind || !!owner;
+    const meetings = await policyToolSearchMeetings(
+      meetingsDir,
+      include_restricted,
+      {
+        query,
+        contentType,
+        since,
+        intentKind: intent_kind,
+        owner,
+        intentsOnly: intents_only,
+      }
+    );
 
-      const results = await searchMeetingsWithOpts(MEETINGS_DIR, query, limit, {
-        includeRestricted: include_restricted,
-      });
-      const filtered = contentType
-        ? results.filter((m) => m.frontmatter.type === contentType)
-        : results;
+      let results: Array<PolicyIntentResult | ReturnType<typeof meetingSearchItem> & { snippet: string }>;
+      if (intentMode) {
+        results = policyIntentResults(
+          meetings,
+          query,
+          intent_kind,
+          owner,
+          boundedLimit
+        );
+      } else {
+        const matches: Array<ReturnType<typeof meetingSearchItem> & { snippet: string }> = [];
+        for (const meeting of meetings) {
+            matches.push({
+              ...meetingSearchItem(meeting),
+              snippet: liveMeetingSnippet(meeting.body, query),
+            });
+            if (matches.length >= boundedLimit) break;
+        }
+        results = matches;
+      }
 
-      if (filtered.length === 0) {
+      if (results.length === 0) {
         return {
-          content: [{ type: "text" as const, text: `No results for "${query}".${filterWarning}` }],
+          content: [{ type: "text" as const, text: boundedMcpText(`No results for "${query}".`) }],
           structuredContent: { results: [], view: "search" },
           _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "search" },
         };
       }
 
-      const text = filtered
-        .map((m) => `${m.frontmatter.date} — ${m.frontmatter.title} [${m.frontmatter.type}]\n  ${m.path}`)
-        .join("\n\n") + filterWarning;
-
-      return {
-        content: [{ type: "text" as const, text }],
-        structuredContent: {
-          results: filtered.map(meetingSearchItem),
-          view: "search",
-        },
-        _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "search" },
-      };
-    }
-
-    // Intent/metadata queries always use CLI (QMD doesn't index YAML frontmatter fields).
-    // include_restricted also routes through the CLI so the override is
-    // recorded on the event bus, not just applied.
-    const useCliOnly = intents_only || intent_kind || owner || since || include_restricted;
-
-    // Try QMD semantic search for text queries
-    let results: any[] | null = null;
-    let usedQmd = false;
-
-    if (!useCliOnly) {
-      results = await searchViaQmd(query, limit, contentType, include_restricted);
-      if (results) usedQmd = true;
-    }
-
-    // Fall back to CLI regex search
-    if (!results) {
-      const args = ["search", query, "--limit", String(limit)];
-      if (contentType) args.push("-t", contentType);
-      if (since) args.push("--since", since);
-      if (intent_kind) args.push("--intent-kind", intent_kind);
-      if (owner) args.push("--owner", owner);
-      if (intents_only) args.push("--intents-only");
-      // The CLI records the sensitivity.override event when this flag is set.
-      if (include_restricted) args.push("--include-restricted");
-
-      const { stdout, stderr } = await runMinutes(args);
-      const parsed = parseJsonOutput(stdout);
-      results = Array.isArray(parsed) ? parsed : [];
-    }
-
-    if (results.length === 0) {
-      return {
-        content: [{ type: "text" as const, text: `No results found for "${query}".` }],
-        structuredContent: { meetings: [], actions: [], view: "dashboard" },
-        _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "dashboard" },
-      };
-    }
-
-    const text = intents_only
-      ? results
-          .map(
-            (r: any) =>
-              `${r.date} — ${r.title} [${r.content_type}]\n  ${r.kind}: ${r.what}${r.who ? ` (@${r.who})` : ""}${r.by_date ? ` by ${r.by_date}` : ""}\n  ${r.path}`
-          )
-          .join("\n\n")
-      : results
-          .map(
-            (r: any) =>
-              `${r.date} — ${r.title} [${r.content_type}]\n  ${r.snippet}\n  ${r.path}`
-          )
-          .join("\n\n");
-
-    // Map search results to meeting-like objects for the dashboard view
-    const meetings = results.map((r: any) => ({
-          date: r.date,
-          title: r.title,
-          content_type: r.content_type,
-          path: r.path,
-          snippet: r.snippet || (intents_only ? `${r.kind}: ${r.what}` : undefined),
-        }));
+      const text = intentMode
+        ? results
+            .map(
+              (result: any) =>
+                `${result.date} — ${result.title} [${result.content_type}]\n  ${result.kind}: ${result.what}${result.who ? ` (@${result.who})` : ""}${result.by_date ? ` by ${result.by_date}` : ""}\n  ${result.path}`
+            )
+            .join("\n\n")
+        : results
+            .map(
+              (result: any) =>
+                `${result.date} — ${result.title} [${result.content_type}]\n  ${result.snippet}\n  ${result.path}`
+            )
+            .join("\n\n");
 
     return {
-      content: [{ type: "text" as const, text }],
-      structuredContent: { meetings, actions: [], view: "dashboard" },
-      _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "dashboard" },
+      content: [{ type: "text" as const, text: boundedMcpText(text) }],
+      structuredContent: {
+        results,
+        view: "search",
+      },
+      _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "search" },
     };
   }
 );
@@ -2700,32 +4479,46 @@ registerDocsAppTool(
   server,
   "activity_summary",
   {
-    description: "Summarize meeting-adjacent desktop context for a linked artifact, context session, or explicit time window.",
+    description: "Summarize meeting-adjacent desktop context bound to one exact normal meeting source.",
     inputSchema: {
-      session_id: z.string().optional().describe("Explicit desktop-context session id"),
-      path: z.string().optional().describe("Linked artifact path, such as a meeting markdown file or live transcript JSONL"),
-      start: z.string().optional().describe("Window start (RFC3339); use with end when no session/path is provided"),
-      end: z.string().optional().describe("Window end (RFC3339); use with start when no session/path is provided"),
+      path: z.string().describe("Exact normal meeting Markdown path linked to the context session"),
     },
     annotations: { title: "Activity Summary", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
-  async ({ session_id, path, start, end }) => {
+  async ({ path }) => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: `Desktop-context summaries require the full CLI.\n\n${CLI_INSTALL_MSG}` }] };
     }
 
-    const args = ["context", "activity-summary", "--json"];
-    if (session_id) args.push("--session", session_id);
-    if (path) args.push("--path", path);
-    if (start) args.push("--start", start);
-    if (end) args.push("--end", end);
-
-    const { stdout, stderr } = await runMinutes(args);
-    const parsed = parseJsonOutput(stdout);
-    if (!parsed || typeof parsed !== "object") {
-      return { content: [{ type: "text" as const, text: stderr || stdout }] };
-    }
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const parsed = await withPolicyBoundContextPath(
+      path,
+      meetingsDir,
+      async (canonicalPath, timeoutMs, signal) => {
+        const { stdout } = await runMinutes([
+          "context",
+          "activity-summary",
+          "--json",
+          "--path",
+          canonicalPath,
+        ], timeoutMs, signal);
+        const value = parseJsonOutput(stdout);
+        if (!value || typeof value !== "object") {
+          throw new Error("Desktop context summary could not be safely read.");
+        }
+        return value as Record<string, unknown>;
+      },
+      (value, sessionId, source) => {
+        assertContextSession(value, sessionId);
+        assertContextItemsSession((value as any).events, sessionId, "Desktop context events");
+        assertContextItemsSession((value as any).links, sessionId, "Desktop context links");
+        return withoutContextSourceAuthorization({
+          ...value,
+          links: assistantSafeContextLinks((value as any).links, source.path),
+        });
+      }
+    );
 
     const apps = Array.isArray((parsed as any).top_apps) ? (parsed as any).top_apps : [];
     const windows = Array.isArray((parsed as any).top_windows) ? (parsed as any).top_windows : [];
@@ -2753,24 +4546,46 @@ registerDocsAppTool(
   server,
   "search_context",
   {
-    description: "Search desktop-context events across app focus and captured window titles, including opted-in browser titles.",
+    description: "Search desktop-context events bound to one exact normal meeting source.",
     inputSchema: {
+      path: z.string().describe("Exact normal meeting Markdown path linked to the context session"),
       query: z.string().describe("Text query for app names, bundle ids, or captured window titles"),
       limit: z.number().optional().default(20).describe("Maximum results"),
     },
     annotations: { title: "Search Context", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
-  async ({ query, limit }) => {
+  async ({ path, query, limit }) => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: `Desktop-context search requires the full CLI.\n\n${CLI_INSTALL_MSG}` }] };
     }
 
-    const { stdout, stderr } = await runMinutes(["context", "search", query, "--limit", String(limit), "--json"]);
-    const parsed = parseJsonOutput(stdout);
-    if (!parsed || typeof parsed !== "object") {
-      return { content: [{ type: "text" as const, text: stderr || stdout }] };
-    }
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const parsed = await withPolicyBoundContextPath(
+      path,
+      meetingsDir,
+      async (canonicalPath, timeoutMs, signal) => {
+        const { stdout } = await runMinutes([
+          "context",
+          "search",
+          query,
+          "--path",
+          canonicalPath,
+          "--limit",
+          String(limit),
+          "--json",
+        ], timeoutMs, signal);
+        const value = parseJsonOutput(stdout);
+        if (!value || typeof value !== "object") {
+          throw new Error("Desktop context search could not be safely read.");
+        }
+        return value as Record<string, unknown>;
+      },
+      (value, sessionId) => {
+        assertContextItemsSession((value as any).results, sessionId, "Desktop context search results");
+        return withoutContextSourceAuthorization(value);
+      }
+    );
 
     const results = Array.isArray((parsed as any).results) ? (parsed as any).results : [];
     const text = results.length === 0
@@ -2798,10 +4613,9 @@ registerDocsAppTool(
   server,
   "get_moment",
   {
-    description: "Show the local rewind around a linked artifact, context session, or explicit timestamp.",
+    description: "Show the local rewind bound to one exact normal meeting source.",
     inputSchema: {
-      session_id: z.string().optional().describe("Explicit desktop-context session id"),
-      path: z.string().optional().describe("Linked artifact path, such as a meeting markdown file or live transcript JSONL"),
+      path: z.string().describe("Exact normal meeting Markdown path linked to the context session"),
       at: z.string().optional().describe("Explicit anchor timestamp (RFC3339)"),
       before_minutes: z.number().optional().default(10).describe("Minutes before the anchor"),
       after_minutes: z.number().optional().default(10).describe("Minutes after the anchor"),
@@ -2809,21 +4623,45 @@ registerDocsAppTool(
     annotations: { title: "Get Moment", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
-  async ({ session_id, path, at, before_minutes, after_minutes }) => {
+  async ({ path, at, before_minutes, after_minutes }) => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: `Desktop-context rewind requires the full CLI.\n\n${CLI_INSTALL_MSG}` }] };
     }
 
-    const args = ["context", "get-moment", "--json", "--before-minutes", String(before_minutes), "--after-minutes", String(after_minutes)];
-    if (session_id) args.push("--session", session_id);
-    if (path) args.push("--path", path);
-    if (at) args.push("--at", at);
-
-    const { stdout, stderr } = await runMinutes(args);
-    const parsed = parseJsonOutput(stdout);
-    if (!parsed || typeof parsed !== "object") {
-      return { content: [{ type: "text" as const, text: stderr || stdout }] };
-    }
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const parsed = await withPolicyBoundContextPath(
+      path,
+      meetingsDir,
+      async (canonicalPath, timeoutMs, signal) => {
+        const args = [
+          "context",
+          "get-moment",
+          "--json",
+          "--path",
+          canonicalPath,
+          "--before-minutes",
+          String(before_minutes),
+          "--after-minutes",
+          String(after_minutes),
+        ];
+        if (at) args.push("--at", at);
+        const { stdout } = await runMinutes(args, timeoutMs, signal);
+        const value = parseJsonOutput(stdout);
+        if (!value || typeof value !== "object") {
+          throw new Error("Desktop context moment could not be safely read.");
+        }
+        return value as Record<string, unknown>;
+      },
+      (value, sessionId, source) => {
+        assertContextSession(value, sessionId);
+        assertContextItemsSession((value as any).events, sessionId, "Desktop context events");
+        assertContextItemsSession((value as any).links, sessionId, "Desktop context links");
+        return withoutContextSourceAuthorization({
+          ...value,
+          links: assistantSafeContextLinks((value as any).links, source.path),
+        });
+      }
+    );
 
     const events = Array.isArray((parsed as any).events) ? (parsed as any).events : [];
     const text = [
@@ -2849,43 +4687,136 @@ registerDocsAppTool(
 // ScreenshotRef events and that this process independently canonicalizes under
 // ~/.minutes/screens. This is intentionally not a generic local-file tool.
 
+const MAX_SCREEN_CONTEXT_IMAGE_BYTES = 10 * 1024 * 1024;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+export async function readVerifiedScreenImage(
+  imagePath: string,
+  expectedByteSize: number,
+  expectedSha256: string,
+  screenRoot = join(homedir(), ".minutes", "screens"),
+  hooks: BoundReadHooks = {}
+): Promise<Buffer> {
+  if (
+    !Number.isSafeInteger(expectedByteSize) ||
+    expectedByteSize <= 0 ||
+    expectedByteSize > MAX_SCREEN_CONTEXT_IMAGE_BYTES
+  ) {
+    throw new Error("Screen-context image has an invalid capture-time byte bound");
+  }
+  if (!/^[0-9a-f]{64}$/.test(expectedSha256)) {
+    throw new Error("Screen-context image has an invalid capture-time digest");
+  }
+  const resolved = validatePathInDirectory(imagePath, screenRoot, [".png"]);
+  const bytes = await readTextFileFromBoundParent(resolved, {
+    ...hooks,
+    maxBytes: MAX_SCREEN_CONTEXT_IMAGE_BYTES,
+  });
+  if (bytes.length > MAX_SCREEN_CONTEXT_IMAGE_BYTES) {
+    throw new Error("Screen-context image exceeds the 10 MiB delivery limit");
+  }
+  if (bytes.length < PNG_SIGNATURE.length || !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+    throw new Error("Screen-context image is not a verified PNG");
+  }
+  if (bytes.length !== expectedByteSize) {
+    throw new Error("Screen-context image no longer matches its capture-time byte bound");
+  }
+  const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+  if (actualSha256 !== expectedSha256) {
+    throw new Error("Screen-context image no longer matches its capture-time digest");
+  }
+  return bytes;
+}
+
 if (hasFeature(CLI_CAPABILITIES, "screen_context"))
 registerDocsAppTool(
   server,
   "get_screen_context",
   {
-    description: "Retrieve up to three verified PNG screenshots linked to a Minutes context session, optionally nearest a timestamp.",
+    description: "Retrieve up to three verified PNG screenshots bound to one exact normal meeting source, optionally nearest a timestamp.",
     inputSchema: {
-      session_id: z.string().optional().describe("Explicit Minutes context session id"),
-      path: z.string().optional().describe("Linked meeting, audio, or live-transcript artifact path"),
+      path: z.string().describe("Exact normal meeting Markdown path linked to the context session"),
       at: z.string().optional().describe("Nearest-image anchor timestamp (RFC3339)"),
       limit: z.number().int().min(1).max(3).optional().default(1).describe("Maximum verified images (1-3)"),
     },
     annotations: { title: "Get Screen Context", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
-  async ({ session_id, path, at, limit }) => {
+  async ({ path, at, limit }) => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: `Screen-context retrieval requires the full CLI.\n\n${CLI_INSTALL_MSG}` }] };
     }
 
-    const args = ["context", "screen", "--json", "--limit", String(limit)];
-    if (session_id) args.push("--session", session_id);
-    if (path) args.push("--path", path);
-    if (at) args.push("--at", at);
-
-    const { stdout, stderr } = await runMinutes(args);
-    const parsed = parseJsonOutput(stdout);
-    if (!parsed || typeof parsed !== "object") {
-      return { content: [{ type: "text" as const, text: stderr || stdout }] };
-    }
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const screenRoot = join(homedir(), ".minutes", "screens");
+    const { parsed, verifiedImages } = await withPolicyBoundContextPath(
+      path,
+      meetingsDir,
+      async (canonicalPath, timeoutMs, signal) => {
+        const args = [
+          "context",
+          "screen",
+          "--json",
+          "--limit",
+          String(limit),
+          "--path",
+          canonicalPath,
+        ];
+        if (at) args.push("--at", at);
+        const { stdout } = await runMinutes(args, timeoutMs, signal);
+        const value = parseJsonOutput(stdout);
+        if (!value || typeof value !== "object") {
+          throw new Error("Screen context could not be safely read.");
+        }
+        return value as Record<string, unknown>;
+      },
+      async (value, sessionId, _source, signal) => {
+        assertContextSession(value, sessionId);
+        const status = (value as any).status || {};
+        if (
+          status.context_session_id !== undefined &&
+          status.context_session_id !== sessionId
+        ) {
+          throw new Error("Screen context status escaped its authorized session.");
+        }
+        const images = Array.isArray((value as any).images)
+          ? (value as any).images.slice(0, 3)
+          : [];
+        const verifiedImages: Buffer[] = [];
+        for (const image of images) {
+          if (signal.aborted) {
+            throw new Error("Screen-context authorization deadline elapsed");
+          }
+          if (
+            !image ||
+            typeof image.path !== "string" ||
+            typeof image.byte_size !== "number" ||
+            typeof image.sha256 !== "string"
+          ) {
+            throw new Error("Screen-context image is missing its capture-time attestation");
+          }
+          verifiedImages.push(
+            await readVerifiedScreenImage(
+              image.path,
+              image.byte_size,
+              image.sha256,
+              screenRoot,
+              { signal, timeoutMs: 10_000 }
+            )
+          );
+        }
+        return {
+          parsed: withoutContextSourceAuthorization(value),
+          verifiedImages,
+        };
+      }
+    );
 
     const status = (parsed as any).status || {};
-    const images = Array.isArray((parsed as any).images) ? (parsed as any).images.slice(0, 3) : [];
     const reason = typeof (parsed as any).reason === "string" ? (parsed as any).reason : "";
     const text = [
       `Screen context state: ${status.state || "unknown"}`,
-      `Verified images delivered: ${images.length}`,
+      `Verified images delivered: ${verifiedImages.length}`,
       reason,
       "An image must be inspected before making any visual claim; app/window metadata alone is not sight.",
     ].filter(Boolean).join("\n");
@@ -2894,17 +4825,10 @@ registerDocsAppTool(
       | { type: "text"; text: string }
       | { type: "image"; data: string; mimeType: string }
     > = [{ type: "text", text }];
-    const screenRoot = join(homedir(), ".minutes", "screens");
-    for (const image of images) {
-      if (!image || typeof image.path !== "string") continue;
-      const resolved = validatePathInDirectory(image.path, screenRoot, [".png"]);
-      const metadata = await stat(resolved);
-      if (metadata.size > 10 * 1024 * 1024) {
-        throw new Error("Screen-context image exceeds the 10 MiB delivery limit");
-      }
+    for (const bytes of verifiedImages) {
       content.push({
         type: "image",
-        data: (await readFile(resolved)).toString("base64"),
+        data: bytes.toString("base64"),
         mimeType: "image/png",
       });
     }
@@ -3002,102 +4926,37 @@ registerDocsAppTool(
   server,
   "get_person_profile",
   {
-    description: "Get a rich relationship profile for a person: meetings, commitments, topics, relationship score, and trend. Uses the conversation graph index for instant results. Meetings designated `sensitivity: restricted` never enter the graph; include_restricted only affects the file-reader fallback and is logged.",
+    description: "Get a relationship profile derived from live, policy-authorized meeting snapshots within the supported corpus bounds. Restricted meetings are excluded unless an operator launch grant plus include_restricted=true is durably audited.",
     inputSchema: {
-      name: z.string().describe("Person / attendee name to profile"),
+      name: z.string().max(MCP_QUERY_MAX_CHARS).describe("Person / attendee name to profile"),
       include_restricted: z
         .boolean()
         .optional()
         .default(false)
-        .describe("Include meetings designated `sensitivity: restricted` in the file-reader fallback (graph-backed results always exclude them; the override is logged)"),
+        .describe("Include restricted meetings only when a human launched the server with MINUTES_MCP_RESTRICTED_POLICY=logged-override; every request is durably audited"),
     },
     annotations: { title: "Person Profile", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ name, include_restricted }) => {
-    // Try graph index first (via CLI `minutes people --json`)
-    if (await isCliAvailable()) {
-      const { stdout } = await runMinutes(["people", "--json"]);
-      const people = parseJsonOutput(stdout);
-
-      if (Array.isArray(people)) {
-        const nameLower = name.toLowerCase();
-        const match = people.find((p: any) =>
-          p.name?.toLowerCase().includes(nameLower) ||
-          p.slug?.toLowerCase().includes(nameLower)
-        );
-
-        if (match) {
-          const daysSince = Math.round(match.days_since || 0);
-          const last = daysSince < 1 ? "today" : daysSince < 2 ? "yesterday" : `${daysSince}d ago`;
-          const sections = [];
-
-          sections.push(`Relationship score: ${(match.score || 0).toFixed(1)} | ${match.meeting_count} meetings | last: ${last}`);
-
-          if (match.losing_touch) {
-            sections.push("⚠ LOSING TOUCH — meeting frequency has declined");
-          }
-
-          if (match.top_topics?.length > 0) {
-            sections.push("Top topics: " + match.top_topics.join(", "));
-          }
-
-          if (match.open_commitments > 0) {
-            sections.push(`Open commitments: ${match.open_commitments}`);
-          }
-
-          return {
-            content: [{ type: "text" as const, text: `Profile for ${match.name}:\n\n${sections.join("\n")}` }],
-            structuredContent: { ...match, view: "person" },
-            _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "person" },
-          };
-        }
-      }
-
-      // Fall back to legacy CLI person command for richer meeting-level data
-      const { stdout: legacyOut, stderr } = await runMinutes(["person", name]);
-      const profile = parseJsonOutput(legacyOut);
-
-      if (profile && typeof profile === "object") {
-        const topics = Array.isArray(profile.top_topics) ? profile.top_topics : [];
-        const openIntents = Array.isArray(profile.open_intents) ? profile.open_intents : [];
-        const recentMeetings = Array.isArray(profile.recent_meetings) ? profile.recent_meetings : [];
-
-        if (topics.length === 0 && openIntents.length === 0 && recentMeetings.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: `No profile data found for ${name}.` }],
-            structuredContent: { name, top_topics: [], open_intents: [], recent_meetings: [], view: "person" },
-            _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "person" },
-          };
-        }
-
-        const sections = [];
-        if (topics.length > 0) sections.push("Top topics:\n" + topics.map((t: any) => `- ${t.topic} (${t.count})`).join("\n"));
-        if (openIntents.length > 0) sections.push("Open commitments:\n" + openIntents.map((i: any) => `- ${i.kind}: ${i.what}${i.by_date ? ` by ${i.by_date}` : ""}`).join("\n"));
-        if (recentMeetings.length > 0) sections.push("Recent meetings:\n" + recentMeetings.map((m: any) => `- ${m.date} — ${m.title}`).join("\n"));
-
-        return {
-          content: [{ type: "text" as const, text: `Profile for ${profile.name}:\n\n${sections.join("\n\n")}` }],
-          structuredContent: { ...profile, view: "person" },
-          _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "person" },
-        };
-      }
-
-      return { content: [{ type: "text" as const, text: stderr || legacyOut || `No data found for ${name}.` }] };
-    }
-
-    // Pure-TS fallback when CLI is not available
-    const profile = await getPersonProfileWithOpts(MEETINGS_DIR, name, {
-      includeRestricted: include_restricted,
-    });
+    // Profile every field from strict live snapshots. Cached graph and legacy
+    // CLI profile output remain operator conveniences, not authorization
+    // sources for an agent-facing response.
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const meetings = await policyListMeetings(
+        meetingsDir,
+        MCP_POLICY_MEETING_RESULT_MAX,
+        include_restricted
+    );
+    const profile = personProfileFromMeetings(meetings, name);
     const sections = [];
     if (profile.topics.length > 0) sections.push("Topics: " + profile.topics.join(", "));
     if (profile.meetings.length > 0) sections.push("Meetings:\n" + profile.meetings.map((m) => `- ${m.date} — ${m.title}`).join("\n"));
     if (profile.openActions.length > 0) sections.push("Open actions:\n" + profile.openActions.map((a) => `- ${a.task} (${a.status})`).join("\n"));
-    const text = sections.length > 0 ? sections.join("\n\n") : `No profile data found for ${name}.`;
+    const text = sections.length > 0 ? sections.join("\n\n") : `No profile data found for ${profile.name}.`;
     return {
-      content: [{ type: "text" as const, text }],
-      structuredContent: { name, top_topics: profile.topics.map((t) => ({ topic: t, count: 1 })), open_intents: profile.openActions, recent_meetings: profile.meetings, view: "person" },
+      content: [{ type: "text" as const, text: boundedMcpText(text) }],
+      structuredContent: { name: profile.name, top_topics: profile.topics.map((t) => ({ topic: t, count: 1 })), open_intents: profile.openActions, recent_meetings: profile.meetings, view: "person" },
       _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "person" },
     };
   }
@@ -3107,9 +4966,9 @@ registerDocsAppTool(
 
 registerTool(
   "research_topic",
-  "Research a topic across meetings, decisions, and open follow-ups. Meetings designated `sensitivity: restricted` are excluded unless include_restricted is set; the override is logged.",
+  "Research a topic across policy-authorized meetings within the supported corpus bounds. Restricted meetings are excluded. An override requires an operator launch grant plus include_restricted=true and is durably audited.",
   {
-    query: z.string().describe("Topic or question to investigate across meetings"),
+    query: z.string().max(MCP_QUERY_MAX_CHARS).describe("Topic or question to investigate across meetings"),
     type: z.enum(["meeting", "memo"]).optional().describe("Filter by type"),
     since: z.string().optional().describe("Only results after this date (ISO)"),
     attendee: z.string().optional().describe("Filter by attendee / person"),
@@ -3117,157 +4976,106 @@ registerTool(
       .boolean()
       .optional()
       .default(false)
-      .describe("Include meetings designated `sensitivity: restricted` (excluded by default; the override is logged)"),
+      .describe("Include restricted meetings only when a human launched the server with MINUTES_MCP_RESTRICTED_POLICY=logged-override; every request is durably audited"),
   },
   { title: "Research Topic", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async ({ query, type: contentType, since, attendee, include_restricted }) => {
-    if (!(await isCliAvailable())) {
-      // Fallback: basic search when CLI is not available
-      const results = await searchMeetingsWithOpts(MEETINGS_DIR, query, 20, {
-        includeRestricted: include_restricted,
-      });
-      const filtered = contentType ? results.filter((m) => m.frontmatter.type === contentType) : results;
-      const text = filtered.length > 0
-        ? filtered.map((m) => `${m.frontmatter.date} — ${m.frontmatter.title}\n  ${m.path}`).join("\n\n")
-        : `No results for "${query}". (Note: advanced research features require the CLI.)`;
-      return { content: [{ type: "text" as const, text }] };
-    }
-
-    const args = ["research", query];
-    if (contentType) args.push("-t", contentType);
-    if (since) args.push("--since", since);
-    if (attendee) args.push("--attendee", attendee);
-    // The CLI records the sensitivity.override event when this flag is set.
-    if (include_restricted) args.push("--include-restricted");
-
-    const { stdout, stderr } = await runMinutes(args);
-    const report = parseJsonOutput(stdout);
-
-    if (!report || typeof report !== "object") {
-      return { content: [{ type: "text" as const, text: stderr || stdout }] };
-    }
-
-    const decisions = Array.isArray(report.related_decisions) ? report.related_decisions : [];
-    const openIntents = Array.isArray(report.related_open_intents)
-      ? report.related_open_intents
-      : [];
-    const recentMeetings = Array.isArray(report.recent_meetings)
-      ? report.recent_meetings
-      : [];
-    const topics = Array.isArray(report.related_topics) ? report.related_topics : [];
-
-    if (decisions.length === 0 && openIntents.length === 0 && recentMeetings.length === 0) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `No cross-meeting results found for ${query}.`,
-          },
-        ],
-      };
-    }
-
-    const sections = [];
-    if (topics.length > 0) {
-      sections.push(
-        "Related topics:\n" +
-          topics.map((topic: any) => `- ${topic.topic} (${topic.count})`).join("\n")
+    const needle = query.trim().toLowerCase();
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const sourceMeetings = await policyListMeetings(
+        meetingsDir,
+        MCP_POLICY_MEETING_RESULT_MAX,
+        include_restricted
       );
+    const meetings: PolicyVerifiedMeeting[] = [];
+    if (needle.length > 0) {
+      for (const meeting of sourceMeetings) {
+        if (
+          (contentType && meeting.frontmatter.type !== contentType) ||
+          !meetingMatchesSince(meeting, since) ||
+          !meetingMatchesPerson(meeting, attendee) ||
+          (!meeting.frontmatter.title.toLowerCase().includes(needle) &&
+            !meeting.body.toLowerCase().includes(needle))
+        ) {
+          continue;
+        }
+        meetings.push(meeting);
+        if (meetings.length >= MCP_RESEARCH_MEETING_RESULT_MAX) break;
+      }
     }
-    if (decisions.length > 0) {
-      sections.push(
-        "Recent decisions:\n" +
-          decisions
-            .map((decision: any) => `- ${decision.date} — ${decision.what} (${decision.title})`)
-            .join("\n")
-      );
-    }
-    if (openIntents.length > 0) {
-      sections.push(
-        "Open follow-ups:\n" +
-          openIntents
-            .map(
-              (intent: any) =>
-                `- ${intent.kind}: ${intent.what}${intent.who ? ` (@${intent.who})` : ""}${intent.by_date ? ` by ${intent.by_date}` : ""}`
-            )
-            .join("\n")
-      );
-    }
-    if (recentMeetings.length > 0) {
-      sections.push(
-        "Matching meetings:\n" +
-          recentMeetings
-            .map((meeting: any) => `- ${meeting.date} — ${meeting.title}`)
-            .join("\n")
-      );
-    }
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Cross-meeting research for ${query}:\n\n${sections.join("\n\n")}`,
-        },
-      ],
-    };
+    const projection = researchTopicProjection(meetings, query);
+    return { content: [{ type: "text" as const, text: projection.text }] };
   }
 );
 
 // ── Tool: get_meeting ───────────────────────────────────────
 
+export function restrictedMeetingStubResult(meeting: PolicyVerifiedMeeting) {
+  const stubText = [
+    `${meeting.frontmatter.title}`,
+    `date: ${meeting.frontmatter.date}`,
+    "sensitivity: restricted",
+    "",
+    "Content excluded by default: this meeting is designated `sensitivity: restricted`.",
+    "A human operator must launch the MCP server with MINUTES_MCP_RESTRICTED_POLICY=logged-override, then pass include_restricted: true. The request is durably audited.",
+  ].join("\n");
+  return {
+    content: [{ type: "text" as const, text: stubText }],
+    structuredContent: {
+      title: meeting.frontmatter.title,
+      date: meeting.frontmatter.date,
+      type: meeting.frontmatter.type,
+      sensitivity: "restricted",
+      restricted_stub: true,
+      view: "detail",
+    },
+    _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "detail" },
+  };
+}
+
 registerDocsAppTool(
   server,
   "get_meeting",
   {
-    description: "Get the full transcript and details of a specific meeting or memo. Speaker attributions reflect sidecar overlay confirmations. A meeting designated `sensitivity: restricted` returns a minimal stub unless include_restricted is set; the override is logged.",
+    description: "Get a full meeting transcript with speaker overlays. A restricted meeting returns a stub. Full access requires an operator launch grant plus include_restricted=true and is durably audited.",
     inputSchema: {
       path: z.string().describe("Path to the meeting markdown file"),
       include_restricted: z
         .boolean()
         .optional()
         .default(false)
-        .describe("Return the full content of a meeting designated `sensitivity: restricted` (a stub is returned by default; the override is logged)"),
+        .describe("Return restricted content only when a human launched the server with MINUTES_MCP_RESTRICTED_POLICY=logged-override; every request is durably audited"),
     },
     annotations: { title: "View Meeting", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ path: filePath, include_restricted }) => {
     try {
-      const resolved = validatePathInDirectory(filePath, await getEffectiveMeetingsDir(), [".md"]);
-      const rawContent = await readFile(resolved, "utf-8");
+      const meetingsDir = await getEffectiveMeetingsDir();
+      const { path: resolved, content: rawContent } = await readTextFileInDirectory(
+        filePath,
+        meetingsDir,
+        [".md"]
+      );
+      if (!isActiveCorpusMeetingPath(resolved, meetingsDir)) {
+        throw new Error("Meeting is outside the active corpus.");
+      }
 
       // Sensitivity enforcement (consent layer Wave 2): a restricted meeting
       // fetched by exact path returns a minimal stub — title, date, and the
       // designation — never the transcript, unless the caller overrides.
-      const sensitivityParsed = reader.parseFrontmatter(rawContent, resolved);
+      const sensitivityParsed = parsePolicyVerifiedMeeting(rawContent, resolved);
+      if (!sensitivityParsed) {
+        throw new Error(
+          "Meeting frontmatter is missing, malformed, or has an unsupported sensitivity value."
+        );
+      }
       if (sensitivityParsed && meetingSensitivity(sensitivityParsed) === "restricted") {
         if (!include_restricted) {
-          const stubText = [
-            `${sensitivityParsed.frontmatter.title}`,
-            `date: ${sensitivityParsed.frontmatter.date}`,
-            "sensitivity: restricted",
-            "",
-            "Content excluded by default: this meeting is designated `sensitivity: restricted`.",
-            "Pass include_restricted: true for an explicit, logged override.",
-          ].join("\n");
-          return {
-            content: [{ type: "text" as const, text: stubText }],
-            structuredContent: {
-              path: resolved,
-              title: sensitivityParsed.frontmatter.title,
-              date: sensitivityParsed.frontmatter.date,
-              sensitivity: "restricted",
-              restricted_stub: true,
-              view: "detail",
-            },
-            _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "detail", path: resolved },
-          };
+          return restrictedMeetingStubResult(sensitivityParsed);
         }
-        // The MCP server has no direct event-bus writer; the override is
-        // recorded in the server log and flagged in the response instead.
-        console.error(
-          `[Minutes] include_restricted override: returning restricted meeting ${resolved} via get_meeting`
-        );
+        // The central registration wrapper already appended the durable audit
+        // record before this handler ran. Do not duplicate the path on stderr.
       }
 
       // Ask the CLI for an overlay-applied structured view. Raw markdown on
@@ -3280,10 +5088,12 @@ registerDocsAppTool(
       // markdown still rides along in content[0].text, but structured-content
       // consumers and MCP-App hosts that surface structuredContent over the text
       // block must not be left with an envelope only (issue #255).
-      const rawParsed = reader.parseFrontmatter(rawContent, resolved);
+      const rawParsed = sensitivityParsed;
       let structured = meetingDetailPayload({
         path: resolved,
+        speaker_map: (rawParsed?.frontmatter as any)?.speaker_map ?? [],
         recording_health: (rawParsed?.frontmatter as any)?.recording_health,
+        overlay_applied: false,
         title: (rawParsed?.frontmatter as any)?.title,
         summary: extractMarkdownSection(rawParsed?.body, "Summary"),
         action_items: (rawParsed?.frontmatter as any)?.action_items ?? [],
@@ -3292,31 +5102,18 @@ registerDocsAppTool(
         body: rawParsed?.body ?? rawContent,
       });
 
-      if (await isCliAvailable()) {
+      const restrictedSource =
+        meetingSensitivity(sensitivityParsed) === "restricted";
+      if (!restrictedSource && await isCliAvailable()) {
         try {
           const { stdout } = await runMinutes(["get", resolved, "--json"], 10000);
           const parsed = parseJsonOutput(stdout);
-          if (parsed && typeof parsed === "object" && !parsed.raw) {
-            const speakerMap = parsed.frontmatter?.speaker_map;
-            const body = typeof parsed.body === "string" ? parsed.body : rawParsed?.body;
-            structured = meetingDetailPayload({
-              path: resolved,
-              speaker_map: Array.isArray(speakerMap) ? speakerMap : [],
-              recording_health: parsed.frontmatter?.recording_health,
-              overlay_applied: Boolean(parsed.overlay_applied),
-              title: parsed.frontmatter?.title,
-              summary: extractMarkdownSection(body, "Summary"),
-              action_items: Array.isArray(parsed.frontmatter?.action_items)
-                ? parsed.frontmatter.action_items
-                : [],
-              decisions: Array.isArray(parsed.frontmatter?.decisions)
-                ? parsed.frontmatter.decisions
-                : [],
-              intents: Array.isArray(parsed.frontmatter?.intents)
-                ? parsed.frontmatter.intents
-                : [],
-              body: body ?? rawContent,
-            });
+          const verifiedOverlay = verifiedCliSpeakerOverlay(parsed, rawContent);
+          if (verifiedOverlay) {
+            structured = {
+              ...structured,
+              ...verifiedOverlay,
+            };
           }
         } catch {
           // Non-fatal: fall through to raw content with no speaker_map enrichment.
@@ -3328,8 +5125,21 @@ registerDocsAppTool(
         structuredOut = {
           ...structured,
           sensitivity: "restricted",
-          sensitivity_override: { applied: true, logged: "server-log" },
+          sensitivity_override: { applied: true, logged: "durable-jsonl" },
         };
+      }
+
+      // The CLI overlay read above is a second path-based operation. Recheck
+      // the exact live bytes before returning so a concurrent sensitivity
+      // change cannot swap restricted content into this already-authorized
+      // response. On any change the caller retries from a fresh snapshot.
+      const { content: finalContent } = await readTextFileInDirectory(
+        resolved,
+        meetingsDir,
+        [".md"]
+      );
+      if (!isActiveCorpusMeetingPath(resolved, meetingsDir) || finalContent !== rawContent) {
+        throw new Error("Meeting changed while its sensitivity was being verified; retry.");
       }
 
       return {
@@ -3337,9 +5147,10 @@ registerDocsAppTool(
         structuredContent: structuredOut,
         _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "detail", path: resolved },
       };
-    } catch (error: any) {
+    } catch {
       return {
-        content: [{ type: "text" as const, text: `Could not read: ${error.message}` }],
+        content: [{ type: "text" as const, text: "Meeting could not be safely read." }],
+        isError: true,
       };
     }
   }
@@ -3347,204 +5158,1096 @@ registerDocsAppTool(
 
 // ── Tool: process_audio ─────────────────────────────────────
 
+export function validateMcpProcessAudioInput(
+  filePath: string,
+  allowedDirs: string[],
+  meetingsDir: string,
+  audioExts: string[]
+): string {
+  const resolved = validatePathInDirectories(filePath, allowedDirs, audioExts);
+  if (isPathWithinCanonicalRoot(resolved, meetingsDir)) {
+    throw new Error(
+      "Retained meeting audio cannot be reprocessed through an agent surface."
+    );
+  }
+  return resolved;
+}
+
+type MeetingsRootAttestation = {
+  canonicalPath: string;
+  identity: string;
+};
+
+export type EffectiveMeetingsRootResolver = () => Promise<string>;
+
+export type AudioDigest = {
+  byteLength: number;
+};
+
+export type AuthorizedMcpProcessAudioInput = {
+  /** Retained read-only source capability. Child stdio maps this exact fd to 3. */
+  fd: number;
+  digest: AudioDigest;
+  format: string;
+  /** Sanitized title; the operation never receives a caller-controlled path. */
+  safeTitle: string;
+};
+
+export type McpProcessAudioAuthorizationHooks = {
+  /** Test/diagnostic byte ceiling; production is always capped at 2 GiB. */
+  maxBytes?: number;
+  /** Test/diagnostic aggregate retained-input ceiling. */
+  maxAggregateBytes?: number;
+  /** Test/diagnostic hash/authorization deadline. */
+  timeoutMs?: number;
+  /** Test-only monotonic clock override. */
+  nowMs?: () => number;
+  /** Test-only race injection after the source fd has been retained. */
+  afterValidation?: () => void | Promise<void>;
+  /** Test-only observation used to prove fd closure on every branch. */
+  onRetainedFd?: (fd: number) => void;
+  /** Test-only race injection after the exact fd length has been declared. */
+  afterHash?: (digest: AudioDigest) => void | Promise<void>;
+  /** Test-only race injection before the final path/config attestation. */
+  beforeFinalAttestation?: () => void | Promise<void>;
+  /** Test-only simulation of a helper that never publishes `close`. */
+  ignoreHelperCloseForTest?: boolean;
+};
+
+type ProcessAudioBudget = {
+  maxBytes: number;
+  maxAggregateBytes: number;
+  deadlineMs: number;
+  nowMs: () => number;
+};
+
+export const MCP_PROCESS_AUDIO_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+export const MCP_PROCESS_AUDIO_AUTHORIZATION_TIMEOUT_MS = 120_000;
+export const MCP_PROCESS_AUDIO_MAX_ACTIVE_JOBS = 2;
+export const MCP_PROCESS_AUDIO_MAX_AGGREGATE_BYTES =
+  4 * 1024 * 1024 * 1024;
+export const MCP_PROCESS_AUDIO_CLI_TIMEOUT_MS = 300_000;
+export const MCP_PROCESS_AUDIO_MAX_STDOUT_BYTES = 1024 * 1024;
+export const MCP_PROCESS_AUDIO_MAX_STDERR_BYTES = 1024 * 1024;
+const MCP_AUDIO_BUDGET_ERROR =
+  "Access denied: process_audio resource budget exceeded";
+
+let activeProcessAudioJobs = 0;
+let reservedProcessAudioBytes = 0;
+let processAudioIsolationPoisoned = false;
+
+/**
+ * Bind the live meetings root to both its canonical location and directory
+ * identity. A missing first-run root is bound to its nearest existing
+ * canonical ancestor plus the exact missing suffix.
+ */
+function attestMeetingsRoot(root: string): MeetingsRootAttestation {
+  let cursor = resolve(expandHomeLikePath(root));
+  const missing: string[] = [];
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) throw new Error(MEETINGS_ROOT_ERROR);
+    missing.unshift(basename(cursor));
+    cursor = parent;
+  }
+
+  const canonicalAncestor = realpathSync(cursor);
+  const ancestor = statSync(canonicalAncestor, { bigint: true });
+  if (!ancestor.isDirectory()) throw new Error(MEETINGS_ROOT_ERROR);
+  return {
+    canonicalPath:
+      missing.length === 0
+        ? canonicalAncestor
+        : join(canonicalAncestor, ...missing),
+    identity:
+      (missing.length === 0 ? "present:" : "absent:") +
+      String(ancestor.dev) +
+      ":" +
+      String(ancestor.ino) +
+      ":" +
+      missing.join("/"),
+  };
+}
+
+function sameMeetingsRoot(
+  initial: MeetingsRootAttestation,
+  final: MeetingsRootAttestation
+): boolean {
+  return (
+    initial.canonicalPath === final.canonicalPath &&
+    initial.identity === final.identity
+  );
+}
+
+function expectationsMatch(
+  left: BoundReadExpectation,
+  right: BoundReadExpectation
+): boolean {
+  return (
+    left.parentIdentity === right.parentIdentity &&
+    left.leafFingerprint === right.leafFingerprint
+  );
+}
+
+function requirePathExpectation(
+  path: string,
+  expected: BoundReadExpectation
+): void {
+  if (!expectationsMatch(captureBoundReadExpectation(path), expected)) {
+    throw new Error("Access denied: authorized audio identity changed");
+  }
+}
+
+function openBoundSingleLinkAudio(
+  path: string,
+  expected: BoundReadExpectation
+): number {
+  requirePathExpectation(path, expected);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = fstatSync(fd, { bigint: true });
+    if (
+      !info.isFile() ||
+      info.nlink !== 1n ||
+      boundReadFingerprint(info) !== expected.leafFingerprint
+    ) {
+      throw new Error(
+        "Access denied: audio is not the expected unique regular file"
+      );
+    }
+    requirePathExpectation(path, expected);
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function createProcessAudioBudget(
+  hooks: McpProcessAudioAuthorizationHooks
+): ProcessAudioBudget {
+  const maxBytes = hooks.maxBytes ?? MCP_PROCESS_AUDIO_MAX_BYTES;
+  const maxAggregateBytes =
+    hooks.maxAggregateBytes ?? MCP_PROCESS_AUDIO_MAX_AGGREGATE_BYTES;
+  const timeoutMs =
+    hooks.timeoutMs ?? MCP_PROCESS_AUDIO_AUTHORIZATION_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    !Number.isSafeInteger(maxAggregateBytes) ||
+    maxAggregateBytes < 1 ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1
+  ) {
+    throw new Error(MCP_AUDIO_BUDGET_ERROR);
+  }
+  const nowMs = hooks.nowMs ?? (() => performance.now());
+  const startedMs = nowMs();
+  const deadlineMs = startedMs + timeoutMs;
+  if (!Number.isFinite(startedMs) || !Number.isFinite(deadlineMs)) {
+    throw new Error(MCP_AUDIO_BUDGET_ERROR);
+  }
+  return {
+    maxBytes: Math.min(maxBytes, MCP_PROCESS_AUDIO_MAX_BYTES),
+    maxAggregateBytes: Math.min(
+      maxAggregateBytes,
+      MCP_PROCESS_AUDIO_MAX_AGGREGATE_BYTES
+    ),
+    deadlineMs,
+    nowMs,
+  };
+}
+
+function requireProcessAudioBudget(
+  budget: ProcessAudioBudget,
+  byteLength?: bigint | number
+): void {
+  const now = budget.nowMs();
+  const size =
+    byteLength === undefined
+      ? undefined
+      : typeof byteLength === "bigint"
+        ? byteLength
+        : BigInt(byteLength);
+  if (
+    !Number.isFinite(now) ||
+    now >= budget.deadlineMs ||
+    (size !== undefined && size > BigInt(budget.maxBytes))
+  ) {
+    throw new Error(MCP_AUDIO_BUDGET_ERROR);
+  }
+}
+
+function reserveProcessAudioBytes(
+  byteLength: number,
+  maxAggregateBytes: number
+): () => void {
+  if (reservedProcessAudioBytes > maxAggregateBytes - byteLength) {
+    throw new Error(MCP_AUDIO_BUDGET_ERROR);
+  }
+  reservedProcessAudioBytes += byteLength;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    reservedProcessAudioBytes = Math.max(
+      0,
+      reservedProcessAudioBytes - byteLength
+    );
+  };
+}
+
+function acquireProcessAudioJob(): () => void {
+  if (activeProcessAudioJobs >= MCP_PROCESS_AUDIO_MAX_ACTIVE_JOBS) {
+    throw new Error(MCP_AUDIO_BUDGET_ERROR);
+  }
+  activeProcessAudioJobs += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeProcessAudioJobs = Math.max(0, activeProcessAudioJobs - 1);
+  };
+}
+
+function sanitizeAudioTitle(value: string): string {
+  return (
+    value
+      .replace(/[\u0000-\u001f\u007f]/g, " ")
+      .replace(/[\\/]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 200) || "Untitled Recording"
+  );
+}
+
+function authorizedAudioTitle(
+  canonicalSourcePath: string,
+  callerPath: string,
+  requestedTitle?: string
+): string {
+  const fallback = sanitizeAudioTitle(
+    basename(canonicalSourcePath, extname(canonicalSourcePath))
+  );
+  if (requestedTitle === undefined) return fallback;
+  if (
+    requestedTitle.includes(canonicalSourcePath) ||
+    requestedTitle.includes(callerPath) ||
+    requestedTitle.includes("/") ||
+    requestedTitle.includes("\\")
+  ) {
+    return fallback;
+  }
+  const candidate = sanitizeAudioTitle(requestedTitle);
+  // Titles remain useful, but a path-shaped title must never smuggle the
+  // caller's source capability into argv or a child diagnostic.
+  if (
+    candidate.includes(canonicalSourcePath) ||
+    candidate.includes(callerPath)
+  ) {
+    return fallback;
+  }
+  return candidate;
+}
+
+function authorizedAudioFormat(path: string): string {
+  const format = extname(path).slice(1).toLowerCase();
+  if (format !== "wav") {
+    throw new Error(
+      "Access denied: exact-byte agent audio currently supports bounded WAV input only"
+    );
+  }
+  return format;
+}
+
+/**
+ * Retain one exact input revision without creating any named copy,
+ * request directory, durable registry, or cleanup pathname. The operation
+ * receives only an fd capability and path-free metadata.
+ */
+export async function withAuthorizedMcpProcessAudioInput<T>(
+  filePath: string,
+  allowedDirs: string[],
+  audioExts: string[],
+  resolveEffectiveMeetingsRoot: EffectiveMeetingsRootResolver,
+  requestedTitle: string | undefined,
+  operation: (input: AuthorizedMcpProcessAudioInput) => Promise<T>,
+  hooks: McpProcessAudioAuthorizationHooks = {}
+): Promise<T> {
+  if (process.platform !== "linux" && process.platform !== "darwin") {
+    throw new Error("Access denied: private audio processing is unavailable");
+  }
+  const budget = createProcessAudioBudget(hooks);
+  const initialRoot = attestMeetingsRoot(await resolveEffectiveMeetingsRoot());
+  const canonicalSourcePath = validateMcpProcessAudioInput(
+    filePath,
+    allowedDirs,
+    initialRoot.canonicalPath,
+    audioExts
+  );
+  const expectation = captureBoundReadExpectation(canonicalSourcePath);
+  const fd = openBoundSingleLinkAudio(canonicalSourcePath, expectation);
+  let releaseBytes: (() => void) | undefined;
+  try {
+    hooks.onRetainedFd?.(fd);
+    const initial = fstatSync(fd, { bigint: true });
+    requireProcessAudioBudget(budget, initial.size);
+    // Reserve the full per-input ceiling. A retained inode can grow until the
+    // final proof rejects it; pessimistic admission keeps aggregate memory and
+    // IO work bounded throughout that race.
+    releaseBytes = reserveProcessAudioBytes(
+      budget.maxBytes,
+      budget.maxAggregateBytes
+    );
+    await hooks.afterValidation?.();
+    // Do not read source bytes in the MCP event-loop process. The exact fd and
+    // declared length cross the inherited-descriptor boundary; the outer-time-
+    // bounded CLI performs the SHA-256 copy and before/after inode attestation.
+    const digest: AudioDigest = { byteLength: Number(initial.size) };
+    requirePathExpectation(canonicalSourcePath, expectation);
+    await hooks.afterHash?.(digest);
+    await hooks.beforeFinalAttestation?.();
+
+    // Re-resolve live config and re-authorize the source path immediately
+    // before spawning. The child independently rechecks fd metadata, copies
+    // the exact bytes, and computes the digest within the outer deadline.
+    const finalRoot = attestMeetingsRoot(await resolveEffectiveMeetingsRoot());
+    requireProcessAudioBudget(budget);
+    if (!sameMeetingsRoot(initialRoot, finalRoot)) {
+      throw new Error(
+        "Access denied: the live meeting root changed during authorization"
+      );
+    }
+    const finalSourcePath = validateMcpProcessAudioInput(
+      canonicalSourcePath,
+      allowedDirs,
+      finalRoot.canonicalPath,
+      audioExts
+    );
+    if (finalSourcePath !== canonicalSourcePath) {
+      throw new Error("Access denied: the authorized audio path changed");
+    }
+    requirePathExpectation(canonicalSourcePath, expectation);
+    const finalInfo = fstatSync(fd, { bigint: true });
+    if (
+      !finalInfo.isFile() ||
+      finalInfo.nlink !== 1n ||
+      finalInfo.size !== BigInt(digest.byteLength) ||
+      boundReadFingerprint(finalInfo) !== expectation.leafFingerprint
+    ) {
+      throw new Error("Access denied: authorized audio changed before dispatch");
+    }
+
+    const result = await operation({
+      fd,
+      digest,
+      format: authorizedAudioFormat(canonicalSourcePath),
+      safeTitle: authorizedAudioTitle(
+        canonicalSourcePath,
+        filePath,
+        requestedTitle
+      ),
+    });
+    let serialized = "";
+    try {
+      serialized = JSON.stringify(result) ?? "";
+    } catch {
+      throw new Error("Access denied: process_audio result was not serializable");
+    }
+    if (
+      serialized.includes(canonicalSourcePath) ||
+      serialized.includes(filePath)
+    ) {
+      throw new Error("Access denied: process_audio result exposed its source");
+    }
+    return result;
+  } finally {
+    releaseBytes?.();
+    closeSync(fd);
+  }
+}
+
+export function buildMcpProcessAudioArgs(
+  input: AuthorizedMcpProcessAudioInput,
+  contentType: "meeting" | "memo",
+  language?: string
+): string[] {
+  validateAuthorizedProcessAudioInput(input);
+  if (
+    (contentType !== "meeting" && contentType !== "memo") ||
+    (language !== undefined && !/^[A-Za-z0-9_-]{1,32}$/.test(language))
+  ) {
+    throw new Error("Access denied: process_audio arguments are invalid");
+  }
+  const syntheticPath = "authorized-input." + input.format;
+  const args = [
+    "process",
+    syntheticPath,
+    "-t",
+    contentType,
+    "--title",
+    input.safeTitle,
+  ];
+  if (language) args.push("--language", language);
+  args.push(
+    "--authorized-input-fd",
+    "3",
+    "--authorized-input-bytes",
+    String(input.digest.byteLength),
+    "--authorized-input-format",
+    input.format
+  );
+  return args;
+}
+
+function validateAuthorizedProcessAudioInput(
+  input: AuthorizedMcpProcessAudioInput
+): void {
+  if (
+    !Number.isSafeInteger(input.fd) ||
+    input.fd < 0 ||
+    !Number.isSafeInteger(input.digest.byteLength) ||
+    input.digest.byteLength < 0 ||
+    input.digest.byteLength > MCP_PROCESS_AUDIO_MAX_BYTES ||
+    input.format !== "wav" ||
+    input.safeTitle.length < 1 ||
+    input.safeTitle.length > 200 ||
+    sanitizeAudioTitle(input.safeTitle) !== input.safeTitle ||
+    input.safeTitle.includes("/") ||
+    input.safeTitle.includes("\\")
+  ) {
+    throw new Error("Access denied: authorized audio capability is invalid");
+  }
+  try {
+    const info = fstatSync(input.fd, { bigint: true });
+    if (
+      !info.isFile() ||
+      info.nlink !== 1n ||
+      info.size !== BigInt(input.digest.byteLength)
+    ) {
+      throw new Error("invalid");
+    }
+  } catch {
+    throw new Error("Access denied: authorized audio capability is invalid");
+  }
+}
+
+export type McpProcessAudioCliOptions = {
+  /** Test-only binary override. Production always uses the resolved Minutes CLI. */
+  binary?: string;
+  /** Overrides may only lower production limits. */
+  timeoutMs?: number;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+  extraEnv?: Record<string, string>;
+};
+
+function boundedProcessAudioLimit(
+  requested: number | undefined,
+  productionLimit: number
+): number {
+  const value = requested ?? productionLimit;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(MCP_AUDIO_BUDGET_ERROR);
+  }
+  return Math.min(value, productionLimit);
+}
+
+function killProcessAudioGroup(child: ReturnType<typeof spawn>): void {
+  const pid = child.pid;
+  if (
+    process.platform !== "win32" &&
+    Number.isSafeInteger(pid) &&
+    (pid ?? 0) > 0
+  ) {
+    try {
+      process.kill(-(pid as number), "SIGKILL");
+      return;
+    } catch {
+      // A start race may precede process-group creation; fall back to the
+      // direct child handle without ever targeting an unvalidated PID.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // It may already have exited. The close/error handler settles the promise.
+  }
+}
+
+/**
+ * Spawn the CLI with exactly one inherited source capability at fd 3.
+ * Child output is bounded and never reflected into thrown errors.
+ */
+export async function runMcpProcessAudioCli(
+  input: AuthorizedMcpProcessAudioInput,
+  contentType: "meeting" | "memo",
+  language?: string,
+  options: McpProcessAudioCliOptions = {}
+): Promise<{ stdout: string; stderr: string }> {
+  if (process.platform !== "linux" && process.platform !== "darwin") {
+    throw new Error("process_audio inherited descriptors are unavailable");
+  }
+  const timeoutMs = boundedProcessAudioLimit(
+    options.timeoutMs,
+    MCP_PROCESS_AUDIO_CLI_TIMEOUT_MS
+  );
+  const maxStdoutBytes = boundedProcessAudioLimit(
+    options.maxStdoutBytes,
+    MCP_PROCESS_AUDIO_MAX_STDOUT_BYTES
+  );
+  const maxStderrBytes = boundedProcessAudioLimit(
+    options.maxStderrBytes,
+    MCP_PROCESS_AUDIO_MAX_STDERR_BYTES
+  );
+  validateAuthorizedProcessAudioInput(input);
+  const args = buildMcpProcessAudioArgs(input, contentType, language);
+  const safeExtraEnv = { ...(options.extraEnv ?? {}) };
+  delete safeExtraEnv.MINUTES_MCP_OUTER_PROCESS_GROUP;
+
+  return new Promise((resolveRun, rejectRun) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(options.binary ?? MINUTES_BIN, args, {
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe", input.fd],
+        env: mcpCliChildEnv({
+          RUST_LOG: "info",
+          ...safeExtraEnv,
+        }),
+      });
+    } catch {
+      rejectRun(new Error("process_audio CLI could not be started safely"));
+      return;
+    }
+
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let failure: string | undefined;
+    let settled = false;
+    const timer = setTimeout(() => {
+      failure = "process_audio CLI exceeded its time budget";
+      killProcessAudioGroup(child);
+    }, timeoutMs);
+
+    const requestFailure = (message: string): void => {
+      if (failure === undefined) failure = message;
+      killProcessAudioGroup(child);
+    };
+    child.stdout?.on("data", (value: Buffer | string) => {
+      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      stdoutBytes += bytes.byteLength;
+      if (stdoutBytes > maxStdoutBytes) {
+        requestFailure("process_audio CLI stdout exceeded its byte budget");
+        return;
+      }
+      stdoutChunks.push(bytes);
+    });
+    child.stderr?.on("data", (value: Buffer | string) => {
+      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      stderrBytes += bytes.byteLength;
+      if (stderrBytes > maxStderrBytes) {
+        requestFailure("process_audio CLI stderr exceeded its byte budget");
+        return;
+      }
+      stderrChunks.push(bytes);
+    });
+
+    child.once("error", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      killProcessAudioGroup(child);
+      rejectRun(new Error("process_audio CLI could not be started safely"));
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Retire descendants even after a successful leader exit. A decoder may
+      // have forked after closing its pipes; the outer group remains killable
+      // after its original leader has exited.
+      killProcessAudioGroup(child);
+      if (failure !== undefined) {
+        rejectRun(new Error(failure));
+        return;
+      }
+      if (code !== 0) {
+        rejectRun(new Error("process_audio CLI failed safely"));
+        return;
+      }
+      resolveRun({
+        stdout: Buffer.concat(stdoutChunks).toString("utf8").trim(),
+        stderr: Buffer.concat(stderrChunks).toString("utf8").trim(),
+      });
+    });
+  });
+}
+
+function processAudioHelperInvocation(): { binary: string; args: string[] } {
+  const currentModule = fileURLToPath(import.meta.url);
+  const sourceMode = extname(currentModule) === ".ts";
+  const helper = fileURLToPath(
+    new URL(
+      sourceMode ? "./process-audio-helper.ts" : "./process-audio-helper.js",
+      import.meta.url
+    )
+  );
+  return sourceMode
+    ? { binary: process.execPath, args: ["--import", "tsx", helper] }
+    : { binary: process.execPath, args: [helper] };
+}
+
+function writeBoundedProcessAudioHelperRequest(
+  child: ReturnType<typeof spawn>,
+  value: unknown
+): void {
+  const serialized = JSON.stringify(value);
+  if (Buffer.byteLength(serialized) > 64 * 1024 || !child.stdin) {
+    throw new Error(MCP_AUDIO_BUDGET_ERROR);
+  }
+  child.stdin.write(serialized + "\n");
+}
+
+/**
+ * Run the complete process_audio authorization and CLI tree in one detached,
+ * bounded helper process. No caller-controlled filesystem operation occurs in
+ * the long-lived MCP event loop. The helper is the process-group leader; the
+ * CLI and all of its decoders remain in that same group, so one kill(-pgid)
+ * contains a stalled FUSE lookup, retained source fd, CLI, and descendants.
+ */
+export async function runIsolatedMcpProcessAudio(
+  filePath: string,
+  allowedDirs: string[],
+  audioExts: string[],
+  resolveEffectiveMeetingsRoot: EffectiveMeetingsRootResolver,
+  requestedTitle: string | undefined,
+  contentType: "meeting" | "memo",
+  language?: string,
+  options: McpProcessAudioCliOptions = {},
+  hooks: McpProcessAudioAuthorizationHooks = {}
+): Promise<{ stdout: string; stderr: string }> {
+  if (process.platform !== "linux" && process.platform !== "darwin") {
+    throw new Error("Access denied: private audio processing is unavailable");
+  }
+  if (processAudioIsolationPoisoned) {
+    throw new Error(
+      "Access denied: private audio processing requires an MCP restart"
+    );
+  }
+  const budget = createProcessAudioBudget(hooks);
+  const timeoutMs = boundedProcessAudioLimit(
+    options.timeoutMs,
+    MCP_PROCESS_AUDIO_CLI_TIMEOUT_MS
+  );
+  const maxStdoutBytes = boundedProcessAudioLimit(
+    options.maxStdoutBytes,
+    MCP_PROCESS_AUDIO_MAX_STDOUT_BYTES
+  );
+  const maxStderrBytes = boundedProcessAudioLimit(
+    options.maxStderrBytes,
+    MCP_PROCESS_AUDIO_MAX_STDERR_BYTES
+  );
+  const releaseBytes = reserveProcessAudioBytes(
+    budget.maxBytes,
+    budget.maxAggregateBytes
+  );
+  try {
+    const initialMeetingsRoot = await resolveEffectiveMeetingsRoot();
+    requireProcessAudioBudget(budget);
+    const helper = processAudioHelperInvocation();
+    const safeExtraEnv = { ...(options.extraEnv ?? {}) };
+    delete safeExtraEnv.MINUTES_MCP_OUTER_PROCESS_GROUP;
+
+    return await new Promise((resolveRun, rejectRun) => {
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(helper.binary, helper.args, {
+          detached: true,
+          stdio: ["pipe", "pipe", "pipe", "pipe"],
+          env: mcpCliChildEnv(),
+        });
+      } catch {
+        rejectRun(new Error("process_audio helper could not be started safely"));
+        return;
+      }
+
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let controlBytes = 0;
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      const controlChunks: Buffer[] = [];
+      let failure: string | undefined;
+      let settled = false;
+      let authorized = false;
+      let rootUpdateStarted = false;
+      let timer: NodeJS.Timeout;
+
+      const requestFailure = (message: string): void => {
+        if (settled) return;
+        if (failure === undefined) failure = message;
+        // A helper killed while blocked in an uninterruptible kernel
+        // filesystem operation may remain pending until that kernel request
+        // returns. Permanently refusing another helper bounds this MCP process
+        // to one doomed out-of-process authorization and zero retained parent
+        // descriptors until the host restarts it.
+        processAudioIsolationPoisoned = true;
+        settled = true;
+        clearTimeout(timer);
+        killProcessAudioGroup(child);
+        // Do not wait for `close`: a helper wedged in an uninterruptible
+        // filesystem syscall may never emit it.  The doomed process remains
+        // contained in its poisoned process group while the MCP request and
+        // aggregate-byte reservation are released immediately.
+        rejectRun(new Error(failure));
+      };
+      child.stdin?.on("error", () => {
+        requestFailure("process_audio helper request channel failed safely");
+      });
+      const resetTimer = (durationMs: number, message: string): void => {
+        clearTimeout(timer);
+        timer = setTimeout(() => requestFailure(message), durationMs);
+      };
+      timer = setTimeout(
+        () => requestFailure("process_audio authorization exceeded its time budget"),
+        Math.max(1, Math.min(hooks.timeoutMs ?? MCP_PROCESS_AUDIO_AUTHORIZATION_TIMEOUT_MS, MCP_PROCESS_AUDIO_AUTHORIZATION_TIMEOUT_MS))
+      );
+
+      child.stdout?.on("data", (value: Buffer | string) => {
+        const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stdoutBytes += bytes.byteLength;
+        if (stdoutBytes > maxStdoutBytes) {
+          requestFailure("process_audio CLI stdout exceeded its byte budget");
+          return;
+        }
+        stdoutChunks.push(bytes);
+      });
+      child.stderr?.on("data", (value: Buffer | string) => {
+        const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stderrBytes += bytes.byteLength;
+        if (stderrBytes > maxStderrBytes) {
+          requestFailure("process_audio CLI stderr exceeded its byte budget");
+          return;
+        }
+        stderrChunks.push(bytes);
+      });
+
+      const control = child.stdio[3];
+      if (!control || typeof (control as NodeJS.ReadableStream).on !== "function") {
+        requestFailure("process_audio helper control channel was unavailable");
+      } else {
+        (control as NodeJS.ReadableStream).on(
+          "data",
+          (value: Buffer | string) => {
+            if (authorized || rootUpdateStarted) {
+              requestFailure("process_audio helper protocol was invalid");
+              return;
+            }
+            const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+            controlBytes += bytes.byteLength;
+            if (controlBytes > 8 * 1024) {
+              requestFailure("process_audio helper protocol exceeded its budget");
+              return;
+            }
+            controlChunks.push(bytes);
+            const serialized = Buffer.concat(controlChunks).toString("utf8");
+            const newline = serialized.indexOf("\n");
+            if (newline < 0) return;
+            if (serialized.slice(newline + 1).length > 0) {
+              requestFailure("process_audio helper protocol was invalid");
+              return;
+            }
+            let message: unknown;
+            try {
+              message = JSON.parse(serialized.slice(0, newline));
+            } catch {
+              requestFailure("process_audio helper protocol was invalid");
+              return;
+            }
+            if (
+              !message ||
+              typeof message !== "object" ||
+              Array.isArray(message) ||
+              Object.keys(message).sort().join("\0") !==
+                ["byteLength", "status"].sort().join("\0") ||
+              (message as any).status !== "authorized" ||
+              !Number.isSafeInteger((message as any).byteLength) ||
+              (message as any).byteLength < 0 ||
+              (message as any).byteLength > budget.maxBytes
+            ) {
+              requestFailure("process_audio helper protocol was invalid");
+              return;
+            }
+            authorized = true;
+            rootUpdateStarted = true;
+            void (async () => {
+              await hooks.afterValidation?.();
+              const digest = { byteLength: (message as any).byteLength };
+              await hooks.afterHash?.(digest);
+              await hooks.beforeFinalAttestation?.();
+              const finalMeetingsRoot = await resolveEffectiveMeetingsRoot();
+              requireProcessAudioBudget(budget);
+              writeBoundedProcessAudioHelperRequest(child, {
+                finalMeetingsRoot,
+              });
+              child.stdin?.end();
+              resetTimer(timeoutMs, "process_audio CLI exceeded its time budget");
+            })().catch(() => {
+              requestFailure("process_audio final authorization failed safely");
+            });
+          }
+        );
+      }
+
+      child.once("error", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        killProcessAudioGroup(child);
+        rejectRun(new Error("process_audio helper could not be started safely"));
+      });
+      child.once("close", (code) => {
+        if (hooks.ignoreHelperCloseForTest) return;
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        killProcessAudioGroup(child);
+        if (failure !== undefined) {
+          rejectRun(new Error(failure));
+          return;
+        }
+        if (code !== 0 || !authorized) {
+          rejectRun(new Error("process_audio authorization or CLI failed safely"));
+          return;
+        }
+        const result = {
+          stdout: Buffer.concat(stdoutChunks).toString("utf8").trim(),
+          stderr: Buffer.concat(stderrChunks).toString("utf8").trim(),
+        };
+        const serialized = JSON.stringify(result);
+        if (serialized.includes(filePath)) {
+          rejectRun(new Error("Access denied: process_audio result exposed its source"));
+          return;
+        }
+        resolveRun(result);
+      });
+
+      try {
+        writeBoundedProcessAudioHelperRequest(child, {
+          schemaVersion: 1,
+          filePath,
+          allowedDirs,
+          audioExts,
+          initialMeetingsRoot,
+          requestedTitle,
+          contentType,
+          language,
+          cliBinary: options.binary ?? MINUTES_BIN,
+          maxBytes: budget.maxBytes,
+          extraEnv: safeExtraEnv,
+        });
+      } catch {
+        requestFailure("process_audio helper request was invalid");
+      }
+    });
+  } finally {
+    releaseBytes();
+  }
+}
+export const MCP_PROCESS_AUDIO_WINDOWS_UNAVAILABLE_MESSAGE =
+  "process_audio is unavailable on Windows because its agent-facing inherited-descriptor boundary is not supported there. No audio was read or passed to the CLI; use the Minutes desktop app or CLI directly.";
+export const MCP_PROCESS_AUDIO_UNSUPPORTED_UNIX_MESSAGE =
+  "process_audio is unavailable on this platform because its private-audio capability is supported only on macOS and Linux. No audio was read or passed to the CLI.";
+
+export function mcpProcessAudioPlatformPolicy(
+  platform: NodeJS.Platform
+): { available: true } | { available: false; error: string } {
+  if (platform === "win32") {
+    return {
+      available: false,
+      error: MCP_PROCESS_AUDIO_WINDOWS_UNAVAILABLE_MESSAGE,
+    };
+  }
+  if (platform !== "darwin" && platform !== "linux") {
+    return {
+      available: false,
+      error: MCP_PROCESS_AUDIO_UNSUPPORTED_UNIX_MESSAGE,
+    };
+  }
+  return { available: true };
+}
+
+export type McpProcessAudioToolInput = {
+  file_path: string;
+  type: "meeting" | "memo";
+  title?: string;
+  language?: string;
+};
+
+export type McpProcessAudioToolDependencies = {
+  isCliAvailable: () => Promise<boolean>;
+  execute: (input: McpProcessAudioToolInput) => Promise<{ stdout: string }>;
+};
+
+type McpProcessAudioSuccess = {
+  status: "done";
+  file: string;
+  title: string;
+  words: number;
+};
+
+function parseMcpProcessAudioSuccess(stdout: string): McpProcessAudioSuccess | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = value as Record<string, unknown>;
+  if (
+    result.status !== "done" ||
+    typeof result.file !== "string" ||
+    result.file.trim() === "" ||
+    typeof result.title !== "string" ||
+    result.title.trim() === "" ||
+    !Number.isSafeInteger(result.words) ||
+    (result.words as number) < 0
+  ) {
+    return null;
+  }
+  return {
+    status: "done",
+    file: result.file.trim(),
+    title: result.title.trim(),
+    words: result.words as number,
+  };
+}
+
+function mcpProcessAudioError(error: string, message: string) {
+  return {
+    content: [{ type: "text" as const, text: message }],
+    structuredContent: { available: false, error },
+    isError: true,
+  };
+}
+
+export async function handleMcpProcessAudioRequest(
+  input: McpProcessAudioToolInput,
+  dependencies: McpProcessAudioToolDependencies,
+  platform: NodeJS.Platform = process.platform
+) {
+  // This gate is intentionally first: on unsupported platforms no caller path or ambient
+  // filesystem/CLI dependency is inspected before the path-free denial.
+  const platformPolicy = mcpProcessAudioPlatformPolicy(platform);
+  if (!platformPolicy.available) {
+    return mcpProcessAudioError(
+      platform === "win32"
+        ? "windows-agent-audio-fd-unavailable"
+        : "private-audio-capability-unavailable",
+      platformPolicy.error
+    );
+  }
+
+  try {
+    const releaseJob = acquireProcessAudioJob();
+    try {
+      if (!(await dependencies.isCliAvailable())) {
+        return mcpProcessAudioError(
+          "cli-unavailable",
+          "process_audio is unavailable because the Minutes CLI is not ready. No audio was read or passed to the CLI."
+        );
+      }
+      const { stdout } = await dependencies.execute(input);
+      const result = parseMcpProcessAudioSuccess(stdout);
+      if (!result) {
+        return mcpProcessAudioError(
+          "invalid-cli-response",
+          "process_audio failed because the Minutes CLI returned an invalid completion response. No result was accepted."
+        );
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Processed: ${result.file}\nTitle: ${result.title}\nWords: ${result.words}`,
+          },
+        ],
+        structuredContent: { available: true, ...result },
+      };
+    } finally {
+      releaseJob();
+    }
+  } catch (error) {
+    return mcpProcessAudioError(
+      "processing-failed",
+      "process_audio failed safely during authorization or execution. No CLI error details or input paths were returned."
+    );
+  }
+}
+
 registerTool(
   "process_audio",
-  "Process an audio file through the transcription pipeline.",
+  "On macOS and Linux, process a bounded WAV file from the Minutes inbox or Downloads through the transcription pipeline. Compressed/private containers and Windows fail closed without reading audio. Retained meeting-library audio is unavailable to agent surfaces.",
   {
-    file_path: z.string().describe("Path to audio file (.wav, .m4a, .mp3)"),
+    file_path: z.string().describe("Path to an inbox/Downloads WAV file (.wav)"),
     type: z.enum(["meeting", "memo"]).optional().default("memo").describe("Content type"),
     title: z.string().optional().describe("Optional title"),
     language: z.string().optional().describe("Transcription language code (e.g. 'en', 'ur', 'es', 'zh'). Overrides config.toml setting."),
   },
   { title: "Process Audio", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async ({ file_path, type: contentType, title, language }) => {
-    if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
-    }
-    const allowedDirs = [
-      join(MINUTES_HOME, "inbox"),
-      await getEffectiveMeetingsDir(),
-      join(homedir(), "Downloads"),
-    ];
-    const audioExts = [".wav", ".m4a", ".mp3", ".ogg", ".webm"];
-
-    try {
-      const resolved = validatePathInDirectories(file_path, allowedDirs, audioExts);
-      const args = ["process", resolved, "-t", contentType];
-      if (title) args.push("--title", title);
-      if (language) args.push("--language", language);
-      const { stdout } = await runMinutes(args, 300000);
-      const result = parseJsonOutput(stdout);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: result.file
-              ? `Processed: ${result.file}\nTitle: ${result.title}\nWords: ${result.words}`
-              : stdout,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Failed: ${error.message}` }],
-      };
-    }
+    const allowedDirs = [join(MINUTES_HOME, "inbox"), join(homedir(), "Downloads")];
+    const audioExts = [".wav"];
+    return handleMcpProcessAudioRequest(
+      { file_path, type: contentType, title, language },
+      {
+        isCliAvailable,
+        execute: (input) =>
+          runIsolatedMcpProcessAudio(
+            input.file_path,
+            allowedDirs,
+            audioExts,
+            () => getEffectiveMeetingsDirForIsolatedAudio(),
+            input.title,
+            input.type,
+            input.language
+          ),
+      }
+    );
   }
 );
 
 // ── Tool: add_note ───────────────────────────────────────────
 
+export const MCP_ADD_NOTE_INPUT_SCHEMA = Object.freeze({
+  text: z.string().describe("The note text (plain text, no markdown needed)"),
+});
+
 registerTool(
   "add_note",
-  "Add a note to the current recording. Notes are timestamped and included in the meeting summary. If no recording is active, annotate an existing meeting file with --meeting.",
-  {
-    text: z.string().describe("The note text (plain text, no markdown needed)"),
-    meeting_path: z
-      .string()
-      .optional()
-      .describe("Path to an existing meeting file to annotate (for post-meeting notes)"),
-  },
+  "Add a note to the current active recording. Notes are timestamped and included in that recording's meeting summary. Existing meeting files cannot be mutated from this assistant tool.",
+  MCP_ADD_NOTE_INPUT_SCHEMA,
   { title: "Add Note", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  async ({ text, meeting_path }) => {
+  async ({ text }) => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
     }
     try {
       const args = ["note", text];
-      if (meeting_path) {
-        const resolved = validatePathInDirectory(
-          meeting_path,
-          await getEffectiveMeetingsDir(),
-          [".md"]
-        );
-        args.push("--meeting", resolved);
-      }
-
       const { stdout, stderr } = await runMinutes(args);
       return {
         content: [{ type: "text" as const, text: stderr || stdout || "Note added." }],
       };
-    } catch (error: any) {
+    } catch {
       return {
-        content: [{ type: "text" as const, text: `Note failed: ${error.message}` }],
+        content: [{ type: "text" as const, text: "Note could not be safely added." }],
+        isError: true,
       };
     }
-  }
-);
-
-// ── Tool: qmd_collection_status ─────────────────────────────
-
-registerTool(
-  "qmd_collection_status",
-  "Check whether the Minutes output directory is already registered as a QMD collection.",
-  {
-    collection: z
-      .string()
-      .optional()
-      .default("minutes")
-      .describe("QMD collection name to check"),
-  },
-  { title: "QMD Status", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  async ({ collection }) => {
-    const { stdout, stderr } = await runMinutes([
-      "qmd",
-      "status",
-      "--collection",
-      collection,
-    ]);
-    const report = parseJsonOutput(stdout);
-
-    if (!report || typeof report !== "object") {
-      return { content: [{ type: "text" as const, text: stderr || stdout }] };
-    }
-
-    if (!report.qmd_available) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `QMD is not installed or not on PATH. Install qmd, then run register_qmd_collection for "${collection}".`,
-          },
-        ],
-      };
-    }
-
-    if (report.registered) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `QMD collection "${collection}" already indexes ${report.output_dir}.`,
-          },
-        ],
-      };
-    }
-
-    const aliases = Array.isArray(report.matching_collections)
-      ? report.matching_collections.map((candidate: any) => candidate.name)
-      : [];
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text:
-            aliases.length > 0
-              ? `${report.output_dir} is already indexed in QMD under: ${aliases.join(", ")}.`
-              : `${report.output_dir} is not indexed in QMD yet.`,
-        },
-      ],
-    };
-  }
-);
-
-// ── Tool: register_qmd_collection ───────────────────────────
-
-registerTool(
-  "register_qmd_collection",
-  "Register the Minutes output directory as a QMD collection.",
-  {
-    collection: z
-      .string()
-      .optional()
-      .default("minutes")
-      .describe("QMD collection name to register"),
-  },
-  { title: "Register QMD", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  async ({ collection }) => {
-    const { stdout, stderr } = await runMinutes([
-      "qmd",
-      "register",
-      "--collection",
-      collection,
-    ]);
-    const report = parseJsonOutput(stdout);
-
-    if (!report || typeof report !== "object") {
-      return { content: [{ type: "text" as const, text: stderr || stdout }] };
-    }
-
-    if (!report.registered) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: stderr || stdout || `Failed to register QMD collection "${collection}".`,
-          },
-        ],
-      };
-    }
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Registered ${report.output_dir} as QMD collection "${collection}".`,
-        },
-      ],
-    };
   }
 );
 
@@ -3554,60 +6257,65 @@ registerDocsAppTool(
   server,
   "track_commitments",
   {
-    description: "List open and stale commitments (action items, intents, decisions) across all meetings. Optionally filter by person. Answers: 'What did I promise Sarah?' or 'What's overdue?' Meetings designated `sensitivity: restricted` never enter the underlying graph.",
+    description: "List open and stale action items and explicit intent commitments from live meeting frontmatter. Optionally filter by person. Answers: 'What did I promise Sarah?' or 'What's overdue?' Meetings designated `sensitivity: restricted` never enter this live-source view.",
     inputSchema: {
-      person: z.string().optional().describe("Filter by person name or slug (optional — omit for all commitments)"),
+      person: z.string().max(MCP_QUERY_MAX_CHARS).optional().describe("Filter by person name or slug (optional — omit for all commitments)"),
     },
     annotations: { title: "Track Commitments", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ person }) => {
-    if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: "Minutes CLI not available. Install with: cargo install minutes-cli" }] };
-    }
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const meetings = await policyListMeetings(
+      meetingsDir,
+      MCP_POLICY_MEETING_RESULT_MAX,
+      false
+    );
+    const commitments = policyIntentResults(
+      meetings,
+      "",
+      undefined,
+      person,
+      MCP_INTENT_RESULT_MAX,
+      new Set(["open", "stale"])
+    );
+    const boundedPerson = boundedMcpField(person) || null;
 
-    // Use dedicated commitments command for full text detail
-    const args = ["commitments", "--json"];
-    if (person) args.push("--person", person);
-
-    const { stdout } = await runMinutes(args);
-    const commitments = parseJsonOutput(stdout);
-
-    if (!Array.isArray(commitments) || commitments.length === 0) {
-      const scope = person ? ` for ${person}` : "";
+    if (commitments.length === 0) {
+      const scope = boundedPerson ? ` for ${boundedPerson}` : "";
       return {
-        content: [{ type: "text" as const, text: `No open commitments found${scope}.` }],
-        structuredContent: { commitments: [], person: person || null, view: "commitments" },
+        content: [{ type: "text" as const, text: boundedMcpText(`No open commitments found${scope}.`) }],
+        structuredContent: { commitments: [], person: boundedPerson, view: "commitments" },
         _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "commitments" },
       };
     }
 
     // Group by status
-    const stale = commitments.filter((c: any) => c.status === "stale");
-    const open = commitments.filter((c: any) => c.status === "open");
+    const stale = commitments.filter((commitment) => commitment.status === "stale");
+    const open = commitments.filter((commitment) => commitment.status === "open");
 
     const lines: string[] = [];
     if (stale.length > 0) {
       lines.push(`STALE (${stale.length} overdue):`);
       for (const c of stale) {
-        const who = c.person_name || "unassigned";
-        lines.push(`  ⚠ ${c.text} (${who}; due: ${c.due_date || "no date"}; from: ${c.meeting_title})`);
+        const who = c.who || "unassigned";
+        lines.push(`  ⚠ ${c.what} (${who}; due: ${c.by_date || "no date"}; from: ${c.title})`);
       }
     }
     if (open.length > 0) {
       if (stale.length > 0) lines.push("");
       lines.push(`OPEN (${open.length}):`);
       for (const c of open) {
-        const who = c.person_name || "unassigned";
-        lines.push(`  · ${c.text} (${who}; from: ${c.meeting_title})`);
+        const who = c.who || "unassigned";
+        lines.push(`  · ${c.what} (${who}; from: ${c.title})`);
       }
     }
 
-    const text = `Commitments${person ? ` for ${person}` : ""}:\n\n${lines.join("\n")}`;
+    const text = `Commitments${boundedPerson ? ` for ${boundedPerson}` : ""}:\n\n${lines.join("\n")}`;
 
     return {
-      content: [{ type: "text" as const, text }],
-      structuredContent: { commitments, person: person || null, stale_count: stale.length, open_count: open.length, view: "commitments" },
+      content: [{ type: "text" as const, text: boundedMcpText(text) }],
+      structuredContent: { commitments, person: boundedPerson, stale_count: stale.length, open_count: open.length, view: "commitments" },
       _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "commitments" },
     };
   }
@@ -3619,60 +6327,24 @@ registerDocsAppTool(
   server,
   "relationship_map",
   {
-    description: "Show all contacts with relationship scores, meeting frequency, and 'losing touch' alerts. Overview of your entire conversation network. Meetings designated `sensitivity: restricted` never enter the underlying graph.",
+    description: "Temporarily unavailable while the bounded privacy-safe relationship graph is rebuilt; see roadmap issue #513.",
     inputSchema: {
-      limit: z.number().optional().describe("Max people to return (default: 15)"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MCP_RELATIONSHIP_RESULT_MAX)
+        .optional()
+        .default(15)
+        .describe(`Max people to return (1-${MCP_RELATIONSHIP_RESULT_MAX})`),
     },
     annotations: { title: "Relationship Map", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
-  async ({ limit }) => {
-    if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: "Minutes CLI not available. Install with: cargo install minutes-cli" }] };
-    }
-
-    const maxPeople = limit || 15;
-    const { stdout } = await runMinutes(["people", "--json", "--limit", String(maxPeople)]);
-    const people = parseJsonOutput(stdout);
-
-    if (!Array.isArray(people) || people.length === 0) {
-      return {
-        content: [{ type: "text" as const, text: "No relationship data found. Run: minutes people --rebuild" }],
-        structuredContent: { people: [], view: "relationship_map" },
-        _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "relationship_map" },
-      };
-    }
-
-    // Format human-readable output
-    const lines: string[] = [];
-    const losingTouch: string[] = [];
-
-    for (const p of people) {
-      const daysSince = Math.round(p.days_since || 0);
-      const last = daysSince < 1 ? "today" : daysSince < 2 ? "yesterday" : `${daysSince}d ago`;
-      const status = p.losing_touch
-        ? "⚠ losing touch"
-        : p.open_commitments > 0
-          ? `${p.open_commitments} open commitment${p.open_commitments !== 1 ? "s" : ""}`
-          : "✓ all clear";
-
-      lines.push(`${p.name} — ${p.meeting_count} meetings, last: ${last}, ${status} (score: ${(p.score || 0).toFixed(1)})`);
-
-      if (p.losing_touch) {
-        losingTouch.push(`${p.name} — ${p.meeting_count} meetings total, last seen ${daysSince}d ago`);
-      }
-    }
-
-    let text = `Relationship Map (${people.length} contacts):\n\n${lines.join("\n")}`;
-    if (losingTouch.length > 0) {
-      text += `\n\nLosing Touch:\n${losingTouch.join("\n")}`;
-    }
-
-    return {
-      content: [{ type: "text" as const, text }],
-      structuredContent: { people, view: "relationship_map" },
-      _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "relationship_map" },
-    };
+  async () => {
+    throw new Error(
+      "Cross-meeting relationship graph is temporarily unavailable while its privacy-safe bounded rebuild is completed; see roadmap issue #513"
+    );
   }
 );
 
@@ -3682,15 +6354,12 @@ server.resource(
   "recent_meetings",
   "minutes://meetings/recent",
   { description: "List of recent meetings and memos" },
-  async () => {
-    if (!(await isCliAvailable())) {
-      const meetings = await reader.listMeetings(MEETINGS_DIR, 20);
-      const json = JSON.stringify(meetings.map(meetingListItem));
-      return { contents: [{ uri: "minutes://meetings/recent", mimeType: "application/json", text: json }] };
-    }
-    const { stdout } = await runMinutes(["list", "--limit", "20"]);
-    return { contents: [{ uri: "minutes://meetings/recent", mimeType: "application/json", text: stdout }] };
-  }
+  async () => afterContentResourceReadiness("recent_meetings", async () => {
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const meetings = await policyListMeetings(meetingsDir, 20, false);
+    const json = boundedMcpJsonArray(meetings.map(meetingListItem));
+    return { contents: [{ uri: "minutes://meetings/recent", mimeType: "application/json", text: json }] };
+  })
 );
 
 server.resource(
@@ -3699,10 +6368,14 @@ server.resource(
   { description: "Current recording status" },
   async () => {
     if (!(await isCliAvailable())) {
-      return { contents: [{ uri: "minutes://status", mimeType: "application/json", text: JSON.stringify({ recording: false, processing: false, note: "Read-only mode (CLI not installed)" }) }] };
+      return buildPrivacySafeStatusResource({ recording: false, processing: false });
     }
-    const { stdout } = await runMinutes(["status"]);
-    return { contents: [{ uri: "minutes://status", mimeType: "application/json", text: stdout }] };
+    try {
+      const { stdout } = await runMinutes(["status"]);
+      return buildPrivacySafeStatusResource(JSON.parse(stdout));
+    } catch {
+      return buildPrivacySafeStatusResource(null);
+    }
   }
 );
 
@@ -3710,39 +6383,48 @@ server.resource(
   "open_actions",
   "minutes://actions/open",
   { description: "All open action items across meetings" },
-  async () => {
-    if (!(await isCliAvailable())) {
-      const actions = await reader.findOpenActions(MEETINGS_DIR);
-      return { contents: [{ uri: "minutes://actions/open", mimeType: "application/json", text: JSON.stringify(actions) }] };
-    }
-    const { stdout } = await runMinutes(["search", "", "--intents-only", "--intent-kind", "action-item"]);
-    return { contents: [{ uri: "minutes://actions/open", mimeType: "application/json", text: stdout }] };
-  }
+  async () => afterContentResourceReadiness("open_actions", async () => {
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const meetings = await policyListMeetings(
+      meetingsDir,
+      MCP_POLICY_MEETING_RESULT_MAX,
+      false
+    );
+    const actions = openActionsFromMeetings(meetings);
+    const boundedActions = actions.map(({ path, item }) => ({
+      path: boundedMcpField(path) ?? "",
+      item: boundedActionItem(item),
+    }));
+    return { contents: [{ uri: "minutes://actions/open", mimeType: "application/json", text: boundedMcpJsonArray(boundedActions) }] };
+  })
 );
 
 server.resource(
   "recent_events",
   "minutes://events/recent",
-  { description: "Recent pipeline events (recordings, processing, notes)" },
+  { description: "Recent pipeline events with meeting-derived content withheld until source policy provenance is available" },
   async () => {
-    if (!(await isCliAvailable())) {
-      return { contents: [{ uri: "minutes://events/recent", mimeType: "application/json", text: "[]" }] };
-    }
-    const { stdout } = await runMinutes(["events", "--limit", "20"]);
-    return { contents: [{ uri: "minutes://events/recent", mimeType: "application/json", text: stdout }] };
+    const payload = {
+      events: [],
+      unavailable:
+        "Event records are withheld from MCP until each content-bearing record carries live-verifiable meeting policy provenance.",
+    };
+    return { contents: [{ uri: "minutes://events/recent", mimeType: "application/json", text: JSON.stringify(payload) }] };
   }
 );
 
 server.resource(
   "agent_annotations",
   "minutes://events/agent-annotations",
-  { description: "Recent append-only agent.annotation events, separate from human meeting markdown" },
+  { description: "Agent annotations are withheld until their source policy provenance can be revalidated" },
   async () => {
-    if (!(await isCliAvailable())) {
-      return { contents: [{ uri: "minutes://events/agent-annotations", mimeType: "application/json", text: "[]" }] };
-    }
-    const { stdout } = await runMinutes(["events", "--event-type", "agent.annotation", "--limit", "50"]);
-    return { contents: [{ uri: "minutes://events/agent-annotations", mimeType: "application/json", text: stdout }] };
+    return {
+      contents: [{
+        uri: "minutes://events/agent-annotations",
+        mimeType: "application/json",
+        text: JSON.stringify({ annotations: [], unavailable: "Source policy provenance is required before annotations can be exposed to agents." }),
+      }],
+    };
   }
 );
 
@@ -3752,7 +6434,7 @@ if (LIVE_EVENTS_SUPPORTED) {
     LIVE_EVENTS_RESOURCE_URI,
     {
       description:
-        "Subscribable live event stream. Subscribe to receive notifications/resources/updated, then read this resource or minutes://events/live?since_seq=N to resume from a durable event cursor.",
+        "Live events are currently withheld because raw cursors can reveal restricted activity; reads return a constant unavailable response.",
     },
     async (uri) => readLiveEventsResource(uri)
   );
@@ -3762,7 +6444,7 @@ if (LIVE_EVENTS_SUPPORTED) {
     new ResourceTemplate(LIVE_EVENTS_URI_TEMPLATE, { list: undefined }),
     {
       description:
-        "Read live event stream entries after a stable event sequence cursor. Example: minutes://events/live?since_seq=4826&limit=100",
+        "Live event cursor reads are currently withheld because raw cursors can reveal restricted activity; reads return a constant unavailable response.",
     },
     async (uri) => readLiveEventsResource(uri)
   );
@@ -3784,9 +6466,12 @@ if (COPILOT_SUPPORTED) {
   crashTrace("live-copilot-resource-disabled", { reason: "missing copilot_realtime CLI capability" });
 }
 
-if (LIVE_EVENTS_SUPPORTED || COPILOT_SUPPORTED) {
+if (COPILOT_SUPPORTED) {
   registerLiveEventsSubscriptionHandlers(server, {
-    enableLiveEvents: LIVE_EVENTS_SUPPORTED,
+    // Reads remain registered as an honest constant-unavailable resource, but
+    // subscriptions must not poll raw sequence numbers or notify on hidden
+    // restricted events.
+    enableLiveEvents: LIVE_EVENTS_SUBSCRIPTIONS_ENABLED,
     enableCopilot: COPILOT_SUPPORTED,
   });
 }
@@ -3795,27 +6480,27 @@ server.resource(
   "meeting",
   new ResourceTemplate("minutes://meetings/{slug}", { list: undefined }),
   { description: "Get a specific meeting by its filename slug" },
-  async (uri, variables) => {
+  async (uri, variables) => afterContentResourceReadiness("meeting", async () => {
     const slug = String(variables.slug);
-    if (!(await isCliAvailable())) {
-      // Without CLI resolve, find by filename match
-      const meetings = await reader.listMeetings(MEETINGS_DIR, 1000);
-      const match = meetings.find((m) => m.path.includes(slug));
-      if (match) {
-        const content = await readFile(match.path, "utf-8");
-        return { contents: [{ uri: uri.href, mimeType: "text/markdown", text: content }] };
-      }
-      return { contents: [{ uri: uri.href, mimeType: "text/plain", text: `Meeting not found: ${slug}` }] };
-    }
-    const { stdout } = await runMinutes(["resolve", slug]);
-    const parsed = parseJsonOutput(stdout);
-    if (parsed.path) {
-      const validated = validatePathInDirectory(parsed.path, await getEffectiveMeetingsDir(), [".md"]);
-      const content = await readFile(validated, "utf-8");
-      return { contents: [{ uri: uri.href, mimeType: "text/markdown", text: content }] };
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const snapshots = await policyVerifiedMeetingSnapshots(
+      meetingsDir,
+      false
+    );
+    const match = snapshots.find(
+      (snapshot) => basename(snapshot.path, ".md") === slug
+    );
+    if (match) {
+      return {
+        contents: [{
+          uri: uri.href,
+          mimeType: "text/markdown",
+          text: match.content,
+        }],
+      };
     }
     return { contents: [{ uri: uri.href, mimeType: "text/plain", text: `Meeting not found: ${slug}` }] };
-  }
+  })
 );
 
 // ── Resource: recent_ideas (voice memos from last N days) ──
@@ -3824,8 +6509,13 @@ server.resource(
   "recent-ideas",
   "minutes://ideas/recent",
   { description: "Recent voice memos and ideas captured from any device (last 14 days)" },
-  async (uri) => {
-    const meetings = await reader.listMeetings(await getEffectiveMeetingsDir(), 200);
+  async (uri) => afterContentResourceReadiness("recent-ideas", async () => {
+    const meetingsDir = await getEffectiveMeetingsDir();
+    const meetings = await policyListMeetings(
+      meetingsDir,
+      200,
+      false
+    );
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 14);
 
@@ -3865,7 +6555,7 @@ server.resource(
         text: `Recent voice memos (${memos.length} in last 14 days):\n\n${lines}`,
       }],
     };
-  }
+  })
 );
 
 // ── Tool: start_dictation ──────────────────────────────────
@@ -3975,7 +6665,7 @@ registerTool(
     if (language) dictArgs.push("--language", language);
     const child = spawn(MINUTES_BIN, dictArgs, {
       stdio: "ignore",
-      env: { ...process.env, RUST_LOG: "info" },
+      env: mcpCliChildEnv({ RUST_LOG: "info" }),
     });
     child.unref();
 
@@ -4001,19 +6691,29 @@ registerTool(
   {},
   { title: "Stop Dictation", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async () => {
-    // Send stop signal by killing the dictation process via PID file
-    const minutesDir = join(homedir(), ".minutes");
-    const pidPath = join(minutesDir, "dictation.pid");
-    if (existsSync(pidPath)) {
-      try {
-        const pidContent = await readFile(pidPath, "utf-8");
-        const pid = parseInt(pidContent.trim(), 10);
-        if (Number.isFinite(pid) && pid > 0) {
-          process.kill(pid, "SIGTERM");
+    const stopped = await terminalControlBeforeContentReadiness(async () => {
+      // Send stop signal by killing the dictation process via PID file.
+      const minutesDir = join(homedir(), ".minutes");
+      const pidPath = join(minutesDir, "dictation.pid");
+      if (existsSync(pidPath)) {
+        try {
+          const pidContent = await readFile(pidPath, "utf-8");
+          const pid = parseInt(pidContent.trim(), 10);
+          if (Number.isFinite(pid) && pid > 0) {
+            process.kill(pid, "SIGTERM");
+          }
+        } catch {
+          // Process already dead or PID file invalid.
         }
-      } catch {
-        // Process already dead or PID file invalid
       }
+    });
+    if (!stopped.mayRevealContent) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: "Dictation stop requested. Any derived result is withheld until the agent trust boundary is ready.",
+        }],
+      };
     }
 
     return {
@@ -4063,38 +6763,20 @@ registerTool(
 
 registerTool(
   "confirm_speaker",
-  "Confirm or correct a speaker attribution in a meeting. Stores the correction in Minutes' sidecar overlay store so the original markdown capture stays immutable. Optionally saves the speaker's voice profile for future meetings.",
+  "Compatibility registration for speaker confirmation. Agent-controlled mutation is intentionally unavailable; confirm in the Minutes app or a human CLI session so identity changes cannot race policy authorization.",
   {
     meeting: z.string().describe("Path to the meeting markdown file"),
     speaker_label: z.string().describe("Speaker label to confirm (e.g., SPEAKER_1)"),
     name: z.string().describe("Real name to assign to this speaker"),
-    save_voice: z.boolean().optional().default(false).describe("Save this speaker's voice profile for future automatic identification"),
   },
   { title: "Confirm Speaker", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  async ({ meeting, speaker_label, name, save_voice }) => {
-    if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: "Minutes CLI not available." }] };
-    }
-
-    const args = ["confirm", "--meeting", meeting, "--speaker", speaker_label, "--name", name];
-    if (save_voice) args.push("--save-voice");
-
-    try {
-      const { stdout, stderr } = await runMinutes(args);
-      const output = (stderr || stdout || "").trim();
-
-      return {
-        content: [{ type: "text" as const, text: output || `Confirmed: ${speaker_label} = ${name}` }],
-        structuredContent: { meeting, speaker_label, name, save_voice, confirmed: true },
-      };
-    } catch (error: any) {
-      const msg = error?.stderr || error?.message || String(error);
-      return {
-        content: [{ type: "text" as const, text: `Failed to confirm speaker: ${msg}` }],
-        isError: true,
-      };
-    }
-  }
+  async () => ({
+    content: [{
+      type: "text" as const,
+      text: "Speaker confirmation is unavailable in agent sessions. Use the Minutes app or run minutes confirm directly in a human terminal.",
+    }],
+    isError: true,
+  })
 );
 
 // ── Tool: add_agent_annotation ─────────────────────────────
@@ -4176,88 +6858,62 @@ registerTool(
 
 // ── Tool: get_agent_annotations ────────────────────────────
 
-registerTool(
-  "get_agent_annotations",
-  "Read append-only agent.annotation events separately from human-authored meeting markdown/frontmatter.",
-  {
-    limit: z.number().optional().default(50).describe("Maximum number of annotations"),
-    agent_id: z.string().optional().describe("Filter by agent id"),
-    meeting_id: z.string().optional().describe("Filter by target meeting id"),
-    meeting_path: z.string().optional().describe("Filter by target meeting path"),
-  },
-  { title: "Get Agent Annotations", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  async ({ limit, agent_id, meeting_id, meeting_path }) => {
-    if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }], isError: true };
-    }
+export const MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION =
+  "Compatibility name only: unavailable in MCP until every agent annotation carries canonical source policy provenance that can be revalidated live.";
+export const MCP_MEETING_INSIGHTS_UNAVAILABLE_DESCRIPTION =
+  "Compatibility name only: unavailable in MCP until every derived insight carries canonical source policy provenance that can be revalidated live.";
 
-    const annotations = (await readAgentAnnotationsFromCli(limit)).filter((event: any) => {
-      if (agent_id && event?.agent?.id !== agent_id) return false;
-      if (meeting_id && event?.target?.meeting_id !== meeting_id) return false;
-      if (meeting_path && event?.target?.meeting_path !== meeting_path) return false;
-      return true;
-    });
+function unavailableDerivedRecordResult(message: string) {
+  return {
+    content: [{ type: "text" as const, text: message }],
+    structuredContent: {
+      available: false,
+      error: {
+        code: "source-policy-provenance-required",
+        message,
+      },
+    },
+    isError: true,
+  };
+}
 
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(annotations, null, 2) }],
-      structuredContent: { annotations },
-    };
-  }
-);
+export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
+  registerToolWithRestrictedPolicy(
+    serverArg,
+    "get_agent_annotations",
+    MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION,
+    {
+      limit: z.number().optional().default(50).describe("Compatibility argument; the tool is unavailable"),
+      agent_id: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+      meeting_id: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+      meeting_path: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+    },
+    { title: "Get Agent Annotations (Unavailable)", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async () => unavailableDerivedRecordResult(
+      "Agent annotations are unavailable to MCP until every record carries canonical source policy provenance that can be revalidated live."
+    )
+  );
 
-// ── Tool: get_meeting_insights ─────────────────────────────
+  registerToolWithRestrictedPolicy(
+    serverArg,
+    "get_meeting_insights",
+    MCP_MEETING_INSIGHTS_UNAVAILABLE_DESCRIPTION,
+    {
+      kind: z.enum(MEETING_INSIGHT_KINDS).optional().describe("Compatibility argument; the tool is unavailable"),
+      confidence: z.enum(["tentative", "inferred", "strong", "explicit"]).optional().describe("Compatibility argument; the tool is unavailable"),
+      participant: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+      since: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+      limit: z.number().optional().default(50).describe("Compatibility argument; the tool is unavailable"),
+      actionable_only: z.boolean().optional().default(false).describe("Compatibility argument; the tool is unavailable"),
+    },
+    { title: "Get Meeting Insights (Unavailable)", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async () => unavailableDerivedRecordResult(
+      "Meeting insights are unavailable to MCP until every derived record carries canonical source policy provenance that can be revalidated live."
+    )
+  );
+}
 
-registerTool(
-  "get_meeting_insights",
-  "Query structured insights extracted from meetings — decisions, commitments, and questions with confidence levels. Use this to find what was decided, who committed to what, and what's still open across all meetings. External systems can subscribe to these events for workflow automation.",
-  {
-    kind: z.enum(MEETING_INSIGHT_KINDS).optional().describe("Filter by insight type"),
-    confidence: z.enum(["tentative", "inferred", "strong", "explicit"]).optional().describe("Minimum confidence level"),
-    participant: z.string().optional().describe("Filter by participant name (partial match)"),
-    since: z.string().optional().describe("Only insights since this date (YYYY-MM-DD)"),
-    limit: z.number().optional().default(50).describe("Maximum number of results"),
-    actionable_only: z.boolean().optional().default(false).describe("Only return actionable insights (Strong or Explicit confidence)"),
-  },
-  { title: "Get Meeting Insights", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  async ({ kind, confidence, participant, since, limit, actionable_only }) => {
-    if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
-    }
-
-    const args = ["insights", "--limit", String(limit ?? 50)];
-    if (kind) { args.push("--kind", kind); }
-    if (actionable_only) {
-      args.push("--actionable");
-    } else if (confidence) {
-      args.push("--confidence", confidence);
-    }
-    if (participant) { args.push("--participant", participant); }
-    if (since) { args.push("--since", since); }
-
-    try {
-      const { stdout } = await runMinutes(args);
-      const insights = parseJsonOutput(stdout);
-      const count = Array.isArray(insights) ? insights.length : 0;
-
-      if (count === 0) {
-        return {
-          content: [{ type: "text" as const, text: "No meeting insights found matching the filter criteria. Insights are extracted when meetings are processed with summarization enabled." }],
-        };
-      }
-
-      return {
-        content: [{ type: "text" as const, text: `Found ${count} insight(s):\n\n${JSON.stringify(insights, null, 2)}` }],
-        structuredContent: { count, insights },
-      };
-    } catch (error: any) {
-      const msg = error?.stderr || error?.message || String(error);
-      return {
-        content: [{ type: "text" as const, text: `Failed to query insights: ${msg}` }],
-        isError: true,
-      };
-    }
-  }
-);
+registerUnavailableCompatibilityTools(server);
 
 // ── Tools: real-time copilot control + observation ──────────
 
@@ -4300,7 +6956,7 @@ if (COPILOT_SUPPORTED) {
         return {
           content: [{
             type: "text" as const,
-            text: `Copilot is already active (${before.state})${before.goal ? ` for goal: ${before.goal}` : ""}. Use copilot_status or stop_copilot before starting a different session.`,
+            text: `Copilot is already active (${before.state}). Use copilot_status or stop_copilot before starting a different session.`,
           }],
           structuredContent: snapshot,
         };
@@ -4382,21 +7038,17 @@ if (COPILOT_SUPPORTED) {
         return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
       }
 
-      const before = await readCopilotStatusFromCli();
-      if (!before.active) {
-        const snapshot = buildLiveCopilotResourcePayload(
-          before,
-          await readCopilotNudgeObservation(before)
-        );
-        return {
-          content: [{ type: "text" as const, text: "Copilot is not active; nothing was stopped." }],
-          structuredContent: snapshot,
-        };
-      }
-
       try {
-        const { stdout, stderr } = await runMinutes(["copilot", "stop"], 5000);
-        const status = await waitForCopilotStatus((candidate) => !candidate.active, 3000);
+        const stopped = await stopCopilotBeforeStatusRead();
+        if (!stopped.mayRevealContent) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: "Copilot stop requested. Status is withheld until the agent trust boundary is ready.",
+            }],
+          };
+        }
+        const status = stopped.status;
         if (!status.active) {
           await rm(copilotObserverPaths().session, { force: true }).catch(() => {});
         }
@@ -4408,16 +7060,16 @@ if (COPILOT_SUPPORTED) {
           content: [{
             type: "text" as const,
             text: status.active
-              ? (stderr || stdout || "Copilot stop requested; the engine is still shutting down. Capture continues unchanged.")
+              ? "Copilot stop requested; the engine is still shutting down. Capture continues unchanged."
               : "Copilot stopped. Recording and live transcription were not changed.",
           }],
           structuredContent: snapshot,
         };
-      } catch (error: unknown) {
+      } catch {
         return {
           content: [{
             type: "text" as const,
-            text: `Failed to request copilot stop: ${error instanceof Error ? error.message : String(error)}`,
+            text: "Failed to request copilot stop safely.",
           }],
           isError: true,
         };
@@ -4427,7 +7079,7 @@ if (COPILOT_SUPPORTED) {
 
   registerTool(
     "copilot_status",
-    "Read the current copilot session and provider health from `minutes copilot status`. This is observation only and returns a clear Off/not-active payload when no engine is running.",
+    "Read the current operational copilot state from the strict `minutes copilot status --json` contract. This is observation only and returns a clear Off/not-active payload when no engine is running.",
     {},
     { title: "Copilot Status", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async () => {
@@ -4446,7 +7098,7 @@ if (COPILOT_SUPPORTED) {
         content: [{
           type: "text" as const,
           text: snapshot.active
-            ? `Copilot is ${snapshot.state}${snapshot.status.goal ? ` for goal: ${snapshot.status.goal}` : ""}. ${snapshot.nudge_stream.note}`
+            ? `Copilot is ${snapshot.state}. ${snapshot.nudge_stream.note}`
             : "Copilot is not active (Off).",
         }],
         structuredContent: snapshot,
@@ -4501,6 +7153,7 @@ if (COPILOT_SUPPORTED) {
         };
       }
 
+      await requireAgentTrustReadiness();
       const observation = await readCopilotNudgeObservation(status);
       if (!observation.attached) {
         return {
@@ -4610,7 +7263,7 @@ registerTool(
     if (language) liveArgs.push("--language", language);
     const child = spawn(MINUTES_BIN, liveArgs, {
       stdio: "ignore",
-      env: { ...process.env, RUST_LOG: "info" },
+      env: mcpCliChildEnv({ RUST_LOG: "info" }),
     });
     child.unref();
 
@@ -4706,8 +7359,8 @@ registerTool(
   "ingest_meeting",
   "Extract facts from a meeting and update the knowledge base (person profiles, log, index). Requires [knowledge] to be configured in config.toml. Uses structured frontmatter data only by default (zero hallucination risk). Set engine to 'agent' for richer LLM-based extraction.",
   {
-    path: z.string().optional().describe("Path to a specific meeting .md file. Omit to process all meetings."),
-    all: z.boolean().optional().default(false).describe("Process all meetings in the output directory"),
+    path: z.string().optional().describe("Path to a specific policy-authorized normal meeting .md file. Omit to process all normal meetings."),
+    all: z.boolean().optional().default(false).describe("Process all policy-authorized normal meetings in the output directory"),
     dry_run: z.boolean().optional().default(false).describe("Show what would be extracted without writing anything"),
   },
   { title: "Ingest Meeting", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -4716,30 +7369,32 @@ registerTool(
       return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
     }
 
-    const args = ["ingest"];
-    if (path) {
-      // Validate path is within the meetings directory to prevent path traversal
-      const resolved = validatePathInDirectory(path, await getEffectiveMeetingsDir(), [".md"]);
-      args.push(resolved);
-    }
-    if (all) args.push("--all");
-    if (dry_run) args.push("--dry-run");
-
-    if (!path && !all) {
-      return {
-        content: [{ type: "text" as const, text: "Provide a meeting path or use all=true to process all meetings." }],
-        isError: true,
-      };
-    }
-
     try {
+      const args = ["ingest"];
+      if (path) {
+        const meetingsDir = await getEffectiveMeetingsDir();
+        const resolved = validatePathInDirectory(path, meetingsDir, [".md"]);
+        if (!isActiveCorpusMeetingPath(resolved, meetingsDir)) {
+          throw new Error("Meeting is outside the active corpus.");
+        }
+        args.push(resolved);
+      }
+      if (all) args.push("--all");
+      if (dry_run) args.push("--dry-run");
+      if (!path && !all) {
+        throw new Error("No meeting selection was provided.");
+      }
       const { stdout, stderr } = await runMinutes(args);
       const output = stderr || stdout;
       return { content: [{ type: "text" as const, text: output }] };
-    } catch (error: any) {
-      const msg = error?.stderr || error?.message || String(error);
+    } catch {
       return {
-        content: [{ type: "text" as const, text: `Knowledge ingestion failed: ${msg}` }],
+        content: [
+          {
+            type: "text" as const,
+            text: "Knowledge ingestion could not be safely completed.",
+          },
+        ],
         isError: true,
       };
     }
@@ -4750,141 +7405,33 @@ registerTool(
 
 registerTool(
   "knowledge_status",
-  "Show the current state of the knowledge base — whether it's configured, which adapter is in use, and how many person profiles and log entries exist.",
+  "Reconcile persistent meeting derivatives and show the privacy-safe knowledge-base status. This cleanup/status tool cannot create or register an external index.",
   {},
-  { title: "Knowledge Status", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  { title: "Knowledge Status", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async () => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
     }
 
     try {
-      const { stdout } = await runMinutes(["paths", "--json"]);
-      const paths = parseJsonOutput(stdout);
-      const configPath = paths?.config || "unknown";
-
-      // Read config to check knowledge settings
-      const { readFile: readFileAsync } = await import("fs/promises");
-      let configContent = "";
-      try {
-        configContent = await readFileAsync(configPath, "utf-8");
-      } catch {
-        // Try default location
-        try {
-          configContent = await readFileAsync(join(homedir(), ".config", "minutes", "config.toml"), "utf-8");
-        } catch {
-          return { content: [{ type: "text" as const, text: "Knowledge base: not configured.\n\nAdd [knowledge] section to ~/.config/minutes/config.toml with enabled = true and a path." }] };
-        }
-      }
-
-      const knowledge = parseKnowledgeConfig(configContent);
-      if (!knowledge || !knowledge.enabled) {
+      const status = await readKnowledgeStatusSnapshot();
+      if (!status.configured || !status.enabled) {
         return { content: [{ type: "text" as const, text: "Knowledge base: not configured or disabled.\n\nAdd [knowledge] section to ~/.config/minutes/config.toml with enabled = true and a path." }] };
       }
 
-      const rawKbPath = knowledge.path || "unknown";
-      const kbPath = rawKbPath.startsWith("~") ? join(homedir(), rawKbPath.slice(1)) : rawKbPath;
-      const { adapter, engine } = knowledge;
-
-      // Count people and log entries
-      const { readdir, stat: statAsync } = await import("fs/promises");
-      let peopleCount = 0;
-      let logEntries = 0;
-
-      try {
-        const peopleDir = adapter === "para" ? join(kbPath, "areas", "people") : join(kbPath, "people");
-        const entries = await readdir(peopleDir, { withFileTypes: true });
-        peopleCount = entries.filter(e => e.isDirectory() || e.name.endsWith(".md")).length;
-      } catch { /* dir may not exist yet */ }
-
-      try {
-        const logPath = adapter === "para" ? join(kbPath, "memory", "log.md") : join(kbPath, "log.md");
-        const logContent = await readFileAsync(logPath, "utf-8");
-        logEntries = (logContent.match(/^## \[/gm) || []).length;
-      } catch { /* log may not exist yet */ }
-
       const lines = [
         `Knowledge base: **enabled**`,
-        `Path: ${kbPath}`,
-        `Adapter: ${adapter}`,
-        `Extraction engine: ${engine}`,
-        `People profiles: ${peopleCount}`,
-        `Log entries: ${logEntries}`,
+        `Adapter: ${status.adapter}`,
+        `Extraction engine: ${status.engine}`,
+        `People profiles: ${status.people_count}`,
+        `Log entries: ${status.log_entries}`,
       ];
 
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (error: any) {
-      const msg = error?.stderr || error?.message || String(error);
       return {
-        content: [{ type: "text" as const, text: `Failed to check knowledge status: ${msg}` }],
+        content: [{ type: "text" as const, text: "Persistent meeting derivatives could not be safely read." }],
         isError: true,
-      };
-    }
-  }
-);
-
-// ── Dashboard ───────────────────────────────────────────────
-
-registerTool(
-  "open_dashboard",
-  "Open the Meeting Intelligence Dashboard in the browser. Shows a visual overview of your conversation memory: metrics, meeting timeline, decisions, recurring topics, action items, and voice memos. Runs a local HTTP server — data never leaves your machine.",
-  {},
-  { title: "Open Dashboard", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  async () => {
-    if (!(await isCliAvailable())) {
-      return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
-    }
-
-    // Check if dashboard is already running via PID file
-    const pidPath = join(homedir(), ".minutes", "dashboard.pid");
-    try {
-      const pidStr = await readFile(pidPath, "utf-8");
-      const pid = parseInt(pidStr.trim(), 10);
-      if (pid > 0) {
-        // Check if process is alive
-        try {
-          process.kill(pid, 0);
-          return {
-            content: [{
-              type: "text" as const,
-              text: `Dashboard already running (PID ${pid}). Open http://localhost:3141 in your browser.`,
-            }],
-          };
-        } catch {
-          // Process not alive, stale PID — proceed to launch
-        }
-      }
-    } catch {
-      // No PID file — proceed to launch
-    }
-
-    // Spawn dashboard as detached subprocess
-    const { spawn } = await import("child_process");
-    const child = spawn(MINUTES_BIN, ["dashboard"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.unref();
-
-    // Give it a moment to start
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    // Count meetings for the response
-    try {
-      const { stdout } = await runMinutes(["list", "--format", "json", "--limit", "999"]);
-      const lines = stdout.trim().split("\n").filter(Boolean);
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Dashboard opened at http://localhost:3141 (${lines.length} meetings loaded).`,
-        }],
-      };
-    } catch {
-      return {
-        content: [{
-          type: "text" as const,
-          text: "Dashboard opened at http://localhost:3141.",
-        }],
       };
     }
   }
@@ -4894,10 +7441,13 @@ registerTool(
 
 async function main() {
   crashTrace("main-start");
-  const transport = new StdioServerTransport();
-  crashTrace("transport-created");
-  await server.connect(transport);
-  crashTrace("transport-connected");
+  await afterRequiredCli(async () => {
+    crashTrace("required-cli-ready");
+    const transport = new StdioServerTransport();
+    crashTrace("transport-created");
+    await server.connect(transport);
+    crashTrace("transport-connected");
+  });
   console.error("Minutes MCP server running on stdio");
 }
 

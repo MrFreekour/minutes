@@ -18,7 +18,7 @@
 //!   a same-person signal. Reuses the exact edit-distance matcher from
 //!   `name_correction`.
 
-use crate::name_correction::{levenshtein, normalize_name};
+use crate::name_correction::normalize_name;
 
 /// Why two names were linked. Kept for tests/scoring; the graph display collapses
 /// clusters and does not surface the per-edge reason.
@@ -33,6 +33,41 @@ pub(crate) enum MatchReason {
 /// Minimum compact length for a separator-variant match, so short initials
 /// (`d-p`, `c-s`) don't collapse to one entity.
 const MIN_COMPACT_LEN: usize = 3;
+const MAX_MATCH_NAME_BYTES: usize = 4 * 1024;
+
+fn bounded_ascii_levenshtein(a: &[u8], b: &[u8], limit: usize) -> bool {
+    if a.len().abs_diff(b.len()) > limit {
+        return false;
+    }
+    let unreachable = limit + 1;
+    let mut previous = vec![unreachable; b.len() + 1];
+    let mut current = vec![unreachable; b.len() + 1];
+    for (index, value) in previous.iter_mut().enumerate().take(limit + 1) {
+        *value = index;
+    }
+    for (i, &left) in a.iter().enumerate() {
+        current.fill(unreachable);
+        let row = i + 1;
+        if row <= limit {
+            current[0] = row;
+        }
+        let start = row.saturating_sub(limit).max(1);
+        let end = b.len().min(row.saturating_add(limit));
+        let mut row_min = current[0];
+        for column in start..=end {
+            let substitution = previous[column - 1] + usize::from(left != b[column - 1]);
+            current[column] = (previous[column] + 1)
+                .min(current[column - 1] + 1)
+                .min(substitution);
+            row_min = row_min.min(current[column]);
+        }
+        if row_min > limit {
+            return false;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()] <= limit
+}
 
 /// Compact key: normalized (lowercase + accent-folded) with every non-alphanumeric
 /// character removed, so pure separator/case variants share a key
@@ -66,6 +101,9 @@ fn is_single_token(name: &str) -> bool {
 /// stays confidently negative for dissimilar names (different first letter,
 /// different phonetics, out of edit budget).
 pub(crate) fn names_plausibly_same_person(a: &str, b: &str) -> Option<MatchReason> {
+    if a.len() > MAX_MATCH_NAME_BYTES || b.len() > MAX_MATCH_NAME_BYTES {
+        return None;
+    }
     let ca = compact_key(a);
     let cb = compact_key(b);
     if ca.is_empty() || cb.is_empty() {
@@ -101,7 +139,7 @@ pub(crate) fn names_plausibly_same_person(a: &str, b: &str) -> Option<MatchReaso
         return None;
     }
     let budget = distance_budget(na.chars().count().min(nb.chars().count()));
-    if levenshtein(&na, &nb) <= budget {
+    if bounded_ascii_levenshtein(na.as_bytes(), nb.as_bytes(), budget) {
         Some(MatchReason::PhoneticEdit)
     } else {
         None
@@ -119,12 +157,24 @@ pub(crate) fn names_plausibly_same_person(a: &str, b: &str) -> Option<MatchReaso
 /// component is decomposed into its direct-edge pairs (2-member clusters), so
 /// every real pairwise link is still surfaced without the spurious transitive
 /// pair. Output is deterministic: members sorted, clusters ordered lexically.
+#[cfg(test)]
 pub(crate) fn cluster_indices(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    cluster_indices_with_check(n, edges, || true).unwrap_or_default()
+}
+
+pub(crate) fn cluster_indices_with_check(
+    n: usize,
+    edges: &[(usize, usize)],
+    mut check: impl FnMut() -> bool,
+) -> Option<Vec<Vec<usize>>> {
     use std::collections::{BTreeMap, BTreeSet};
 
     // Normalize edges to (min, max) and dedup.
     let mut edge_set: BTreeSet<(usize, usize)> = BTreeSet::new();
     for &(a, b) in edges {
+        if !check() {
+            return None;
+        }
         if a >= n || b >= n || a == b {
             continue;
         }
@@ -146,6 +196,9 @@ pub(crate) fn cluster_indices(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usi
         root
     }
     for &(a, b) in &edge_set {
+        if !check() {
+            return None;
+        }
         let ra = find(&mut parent, a);
         let rb = find(&mut parent, b);
         if ra != rb {
@@ -159,6 +212,9 @@ pub(crate) fn cluster_indices(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usi
 
     let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for i in 0..n {
+        if !check() {
+            return None;
+        }
         let root = find(&mut parent, i);
         components.entry(root).or_default().push(i);
     }
@@ -166,14 +222,25 @@ pub(crate) fn cluster_indices(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usi
     let is_edge = |a: usize, b: usize| edge_set.contains(&(a.min(b), a.max(b)));
     let mut clusters: Vec<Vec<usize>> = Vec::new();
     for members in components.into_values() {
+        if !check() {
+            return None;
+        }
         if members.len() < 2 {
             continue;
         }
         // Clique? every pair within the component must be a direct edge.
-        let is_clique = members
-            .iter()
-            .enumerate()
-            .all(|(i, &a)| members[i + 1..].iter().all(|&b| is_edge(a, b)));
+        let mut is_clique = true;
+        'clique: for (i, &a) in members.iter().enumerate() {
+            for &b in &members[i + 1..] {
+                if !check() {
+                    return None;
+                }
+                if !is_edge(a, b) {
+                    is_clique = false;
+                    break 'clique;
+                }
+            }
+        }
         if is_clique {
             clusters.push(members); // already ascending (built from 0..n)
         } else {
@@ -181,6 +248,9 @@ pub(crate) fn cluster_indices(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usi
             // (jon/jana) never share a cluster.
             for i in 0..members.len() {
                 for j in (i + 1)..members.len() {
+                    if !check() {
+                        return None;
+                    }
                     if is_edge(members[i], members[j]) {
                         clusters.push(vec![members[i], members[j]]);
                     }
@@ -189,7 +259,7 @@ pub(crate) fn cluster_indices(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usi
         }
     }
     clusters.sort();
-    clusters
+    Some(clusters)
 }
 
 /// Convenience: cluster a flat list of names using [`names_plausibly_same_person`]
@@ -242,6 +312,41 @@ mod tests {
         // r/l and r/w drift, same first letter, within budget.
         assert!(names_plausibly_same_person("junrei", "junlei").is_some());
         assert!(names_plausibly_same_person("junrei", "junwei").is_some());
+    }
+
+    #[test]
+    fn oversized_names_are_rejected_before_normalization_or_edit_distance() {
+        let oversized = format!("a{}", "x".repeat(MAX_MATCH_NAME_BYTES));
+        assert_eq!(names_plausibly_same_person(&oversized, &oversized), None);
+        assert!(!bounded_ascii_levenshtein(b"aaaaaaaa", b"azzzzzzz", 2));
+    }
+
+    #[test]
+    fn bounded_edit_distance_matches_reference_inside_the_supported_thresholds() {
+        let values = [
+            "", "a", "b", "aa", "ab", "ba", "bb", "aaa", "aab", "abb", "bbb",
+        ];
+        for left in values {
+            for right in values {
+                for limit in 0..=2 {
+                    assert_eq!(
+                        bounded_ascii_levenshtein(left.as_bytes(), right.as_bytes(), limit),
+                        crate::name_correction::levenshtein(left, right) <= limit,
+                        "left={left:?} right={right:?} limit={limit}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_clustering_honors_the_operation_deadline_hook() {
+        let mut checks = 0usize;
+        let result = cluster_indices_with_check(3, &[(0, 1), (1, 2)], || {
+            checks += 1;
+            checks < 2
+        });
+        assert!(result.is_none());
     }
 
     #[test]

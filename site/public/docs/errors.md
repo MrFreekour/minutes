@@ -2,12 +2,12 @@
 
 > Generated file. Do not edit by hand.
 > Source: crates/core thiserror definitions
-> Last generated: 2026-07-25
+> Last generated: 2026-07-23
 
 This is the generated public catalog of stable Minutes core errors. It intentionally favors actionable, user-facing errors over generic wrapper variants.
 
-- Visible actionable errors: 67
-- Hidden low-signal wrappers: 17
+- Visible actionable errors: 60
+- Hidden low-signal wrappers: 14
 
 # CaptureError
 
@@ -387,92 +387,6 @@ Source: `crates/core/src/error.rs`
 
 Reference URL: https://useminutes.app/docs/errors#error-markdownerror-renamerefused
 
-<a id="error-markdownerror-concurrentmodification"></a>
-
-## `MarkdownError::ConcurrentModification`
-
-Exact message:
-
-> file changed on disk between staging and swap; rewrite aborted
-
-Source: `crates/core/src/error.rs`
-
-Reference URL: https://useminutes.app/docs/errors#error-markdownerror-concurrentmodification
-
-<a id="error-markdownerror-ambiguoussection"></a>
-
-## `MarkdownError::AmbiguousSection`
-
-Exact message:
-
-> ambiguous document: found {count} '## {name}' sections; refusing to operate on an ambiguous file
-
-Source: `crates/core/src/error.rs`
-
-Reference URL: https://useminutes.app/docs/errors#error-markdownerror-ambiguoussection
-
-# ResummarizeError
-
-<a id="error-resummarizeerror-unsupported"></a>
-
-## `ResummarizeError::Unsupported`
-
-Exact message:
-
-> unsupported artifact: {0}
-
-Source: `crates/core/src/error.rs`
-
-Reference URL: https://useminutes.app/docs/errors#error-resummarizeerror-unsupported
-
-<a id="error-resummarizeerror-frontmatter"></a>
-
-## `ResummarizeError::Frontmatter`
-
-Exact message:
-
-> frontmatter does not parse: {0}
-
-Source: `crates/core/src/error.rs`
-
-Reference URL: https://useminutes.app/docs/errors#error-resummarizeerror-frontmatter
-
-<a id="error-resummarizeerror-templateunavailable"></a>
-
-## `ResummarizeError::TemplateUnavailable`
-
-Exact message:
-
-> template '{slug}' is unavailable: {reason} (pass --template to override explicitly)
-
-Source: `crates/core/src/error.rs`
-
-Reference URL: https://useminutes.app/docs/errors#error-resummarizeerror-templateunavailable
-
-<a id="error-resummarizeerror-summarizefailed"></a>
-
-## `ResummarizeError::SummarizeFailed`
-
-Exact message:
-
-> summarization produced nothing (engine '{engine}'): {reason}; file left untouched
-
-Source: `crates/core/src/error.rs`
-
-Reference URL: https://useminutes.app/docs/errors#error-resummarizeerror-summarizefailed
-
-<a id="error-resummarizeerror-concurrentedit"></a>
-
-## `ResummarizeError::ConcurrentEdit`
-
-Exact message:
-
-> file changed while summarizing — save your editor and re-run
-
-Source: `crates/core/src/error.rs`
-
-Reference URL: https://useminutes.app/docs/errors#error-resummarizeerror-concurrentedit
-
 # VaultError
 
 <a id="error-vaulterror-notconfigured"></a>
@@ -839,17 +753,17 @@ Reference URL: https://useminutes.app/docs/errors#error-templateerror-invalidver
 
 # GraphError
 
-<a id="error-grapherror-dirnotfound"></a>
+<a id="error-grapherror-temporarilyunavailable"></a>
 
-## `GraphError::DirNotFound`
+## `GraphError::TemporarilyUnavailable`
 
 Exact message:
 
-> meetings directory does not exist: {0}
+> cross-meeting graph is temporarily unavailable while its privacy-safe bounded rebuild is completed; see roadmap issue #513
 
 Source: `crates/core/src/graph.rs`
 
-Reference URL: https://useminutes.app/docs/errors#error-grapherror-dirnotfound
+Reference URL: https://useminutes.app/docs/errors#error-grapherror-temporarilyunavailable
 
 # VoiceError
 

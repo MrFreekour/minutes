@@ -34,7 +34,7 @@ const comparisonRows = [
   {
     label: "Agent surface",
     competitor: "Desktop app first",
-    minutes: "Files, 31 MCP tools, CLI, SDK, live transcript reads, Claude Code plugin",
+    minutes: "Files, 33 MCP tools, CLI, SDK, live transcript reads, Claude Code plugin",
   },
   {
     label: "Consent provenance",
@@ -49,7 +49,7 @@ const comparisonRows = [
   {
     label: "Cross-meeting memory",
     competitor: "Notes organized per meeting",
-    minutes: "People, decisions, and commitments tracked across the whole corpus",
+    minutes: "People, decisions, and commitments from policy-authorized live sources",
   },
 ] as const;
 

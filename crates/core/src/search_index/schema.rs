@@ -16,17 +16,26 @@
 //! the external-content path requires triggers or explicit rebuild commands;
 //! storing body twice (~25MB at current corpus) is the cheaper trade.
 
-use rusqlite::{params, Connection, TransactionBehavior};
+#[cfg(test)]
+use rusqlite::params;
+use rusqlite::{Connection, TransactionBehavior};
+#[cfg(test)]
 use std::path::Path;
 
 use super::SearchIndexError;
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// Version 2 is a privacy-boundary migration. Version 1 could persist
+/// restricted or malformed meeting bodies in both the B-tree and FTS tables.
+/// There is no trustworthy in-place classifier for those existing rows, so an
+/// upgrade deliberately drops the index and lets the next sync repopulate it
+/// from policy-verified source files.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Open or create the index database. Sets WAL + busy_timeout pragmas, runs
 /// schema validation, and rebuilds in place if anything is corrupted or
 /// missing. Sidecar `.db-wal`/`.db-shm` permissions are tightened after the
 /// first write (which forces them to exist).
+#[cfg(test)]
 pub fn open_db(db_path: &Path) -> Result<Connection, SearchIndexError> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -38,6 +47,9 @@ pub fn open_db(db_path: &Path) -> Result<Connection, SearchIndexError> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000_i32)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Meeting bodies are privacy-sensitive. Overwrite deleted cells instead
+    // of leaving their payloads recoverable from SQLite freelist pages.
+    conn.pragma_update(None, "secure_delete", "ON")?;
     Ok(conn)
 }
 
@@ -45,6 +57,23 @@ pub fn open_db(db_path: &Path) -> Result<Connection, SearchIndexError> {
 /// use `IF NOT EXISTS`. After commit, sets `user_version` and forces a write
 /// so the WAL/SHM sidecar files exist for permission-tightening.
 pub fn ensure_schema(conn: &mut Connection) -> Result<(), SearchIndexError> {
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    let has_existing_index: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'meetings')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    // Never bless a pre-policy index merely by updating user_version. Its raw
+    // bodies may include content that the current classifier would reject.
+    if user_version != SCHEMA_VERSION && (user_version != 0 || has_existing_index) {
+        return rebuild(conn);
+    }
+
     let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     txn.execute_batch(SCHEMA_SQL)?;
     txn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -62,6 +91,7 @@ pub fn ensure_schema(conn: &mut Connection) -> Result<(), SearchIndexError> {
 ///
 /// Checks: PRAGMA user_version, PRAGMA quick_check, FTS5 integrity-check,
 /// presence of every required table.
+#[cfg(test)]
 pub fn is_healthy(conn: &Connection) -> Result<bool, SearchIndexError> {
     let user_version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -123,12 +153,21 @@ pub fn rebuild(conn: &mut Connection) -> Result<(), SearchIndexError> {
     txn.execute_batch(SCHEMA_SQL)?;
     txn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     txn.commit()?;
+    // Dropping logical rows is insufficient for a privacy-boundary migration:
+    // old FTS payloads can otherwise remain in freelist pages or WAL frames.
+    // VACUUM rewrites the main database and the checkpoints truncate both the
+    // pre- and post-VACUUM WAL.
+    conn.execute_batch(
+        "PRAGMA wal_checkpoint(TRUNCATE);
+         VACUUM;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )?;
     Ok(())
 }
 
 /// Set 0600 on the main DB file plus its WAL/SHM sidecars (Unix only).
 /// Safe to call multiple times; missing sidecars are skipped silently.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub fn tighten_permissions(db_path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     for suffix in ["", "-wal", "-shm"] {
@@ -145,13 +184,14 @@ pub fn tighten_permissions(db_path: &Path) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 pub fn tighten_permissions(_db_path: &Path) {
     // No-op on non-Unix; ACLs are out of scope.
 }
 
 /// Fetch the stored `output_dir_path` (if any). Used to detect output_dir
 /// changes that require a full rebuild.
+#[cfg(test)]
 pub fn read_output_dir(conn: &Connection) -> Result<Option<String>, SearchIndexError> {
     let row: Result<String, _> = conn.query_row(
         "SELECT value FROM sync_state WHERE key = 'output_dir_path'",
@@ -165,6 +205,7 @@ pub fn read_output_dir(conn: &Connection) -> Result<Option<String>, SearchIndexE
     }
 }
 
+#[cfg(test)]
 pub fn write_output_dir(conn: &Connection, output_dir: &str) -> Result<(), SearchIndexError> {
     conn.execute(
         "INSERT INTO sync_state (key, value) VALUES ('output_dir_path', ?)
@@ -174,6 +215,7 @@ pub fn write_output_dir(conn: &Connection, output_dir: &str) -> Result<(), Searc
     Ok(())
 }
 
+#[cfg(test)]
 const REQUIRED_TABLES: &[&str] = &[
     "meetings",
     "meeting_attendees",
@@ -286,6 +328,58 @@ mod tests {
         conn.execute("DROP TABLE meeting_attendees", []).unwrap();
         rebuild(&mut conn).unwrap();
         assert!(is_healthy(&conn).unwrap());
+    }
+
+    #[test]
+    fn privacy_schema_upgrade_purges_pre_policy_raw_rows() {
+        let (dir, mut conn) = fresh_db();
+        conn.execute(
+            "INSERT INTO meetings
+                (path, title, date, content_type, attendees_json, recorded_by,
+                 mtime_ns, size_bytes, body_hash, indexed_at)
+             VALUES ('/legacy/restricted.md', 'Legacy secret', '2026-01-01',
+                     'meeting', '[]', '', 1, 1, 'hash', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meetings_fts (rowid, title, body)
+             VALUES (last_insert_rowid(), 'Legacy secret', 'PRIVACYMIGRATIONCANARY')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1_i64).unwrap();
+
+        ensure_schema(&mut conn).unwrap();
+
+        let meetings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM meetings", [], |r| r.get(0))
+            .unwrap();
+        let fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meetings_fts WHERE meetings_fts MATCH 'PRIVACYMIGRATIONCANARY'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(meetings, 0);
+        assert_eq!(fts, 0);
+        assert!(is_healthy(&conn).unwrap());
+
+        drop(conn);
+        for suffix in ["", "-wal"] {
+            let path = dir.path().join(format!("search.db{suffix}"));
+            if path.exists() {
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    !bytes
+                        .windows(b"PRIVACYMIGRATIONCANARY".len())
+                        .any(|window| window == b"PRIVACYMIGRATIONCANARY"),
+                    "legacy canary remained in {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]

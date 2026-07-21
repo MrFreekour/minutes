@@ -68,7 +68,7 @@ If no conflicts and no stale commitments, say: "No decision conflicts or stale c
 
 ## Gotchas
 
-- **The consistency check uses graph.db** — if it seems stale, suggest `minutes people --rebuild` to refresh the index
+- **The consistency check reads live Markdown** — it uses stable source snapshots, not a durable graph cache. If a result looks wrong, inspect and correct the referenced meeting source; do not suggest deleting or rebuilding `graph.db` (it does not exist)
 - **Stale != forgotten** — some action items are intentionally deferred. Don't alarm the user; present the data and let them decide
 - **Decision conflicts are topic-based** — two meetings discussing "pricing" with different conclusions will flag, even if the later decision intentionally superseded the earlier one. Context matters.
 

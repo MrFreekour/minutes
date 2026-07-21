@@ -922,13 +922,10 @@ pub struct ChatInvocation {
 /// Non-claude agents get the same `lean = true` argument conventions as the
 /// summarization path (see `prepare_agent_invocation`). claude gets its own
 /// arg-building path — [`prepare_claude_chat_invocation`] — which is
-/// deliberately *not* the shared `lean = true` claude branch: that branch is
-/// load-bearing for `run_speaker_mapping_via_agent` (#382, zero MCP/tools so
-/// a tiny classification call can't hang on tool-permission init) and must
-/// stay untouched. The chat panel instead gets a conservative read-only
-/// `--allowedTools` scope onto the Minutes MCP server, so it can ground
-/// answers in real search/graph data — see [`prepare_claude_chat_invocation`]
-/// for the full rationale and the tool allow-list.
+/// deliberately *not* the shared `lean = true` claude branch because chat has
+/// different streaming arguments. It now shares that branch's security
+/// posture—strictly empty MCP and tools—so only the desktop's verified inline
+/// context can reach the model.
 ///
 /// When `stream_json` is set and the agent is claude, the `--output-format
 /// text` produced by the branch above is upgraded to `--output-format
@@ -970,78 +967,44 @@ pub fn build_chat_invocation(
     })
 }
 
-/// Minutes MCP server tools considered safe to pre-approve for the
-/// unattended Recall chat process: every tool the server itself annotates
-/// `readOnlyHint: true` in `crates/mcp/src/index.ts` (search, meeting/person
-/// lookups, insights, commitments, status checks, live-transcript reads),
-/// *except* `open_dashboard`. `open_dashboard` is read-only with respect to
-/// Minutes' own data, but it starts a local HTTP server and opens the user's
-/// default browser — a side effect that should never fire from an unattended
-/// headless process. Nothing that writes data (notes, annotations, speaker
-/// confirmations), controls recording/dictation, or touches config is in
-/// this list; those all require a human in the loop.
-///
-/// `activity_summary`, `search_context`, and `get_moment` are included
-/// because the server marks them read-only, but they surface desktop-context
-/// data (other apps' window/tab titles) rather than pure meeting content —
-/// worth a second look if that trust boundary feels too broad for chat.
-const CHAT_ALLOWED_MCP_TOOLS: &[&str] = &[
-    "get_status",
-    "list_processing_jobs",
-    "list_meetings",
-    "search_meetings",
-    "activity_summary",
-    "search_context",
-    "get_moment",
-    "get_screen_context",
-    "consistency_report",
-    "get_person_profile",
-    "research_topic",
-    "get_meeting",
-    "qmd_collection_status",
-    "track_commitments",
-    "relationship_map",
-    "list_voices",
-    "get_agent_annotations",
-    "get_meeting_insights",
-    "read_live_transcript",
-    "knowledge_status",
-];
+/// Native Recall receives meeting context only through the desktop's
+/// fail-closed constructor. Even nominal status tools can expose job titles or
+/// local paths, and `npx` may resolve a cached MCP package older than the
+/// desktop binary. Use an empty strict config and an empty tool set so the
+/// native security contract is independent of every external MCP runtime.
+const CHAT_MCP_CONFIG: &str = "{\"mcpServers\":{}}";
 
-/// Self-contained MCP config declaring only the Minutes MCP server (same
-/// `npx minutes-mcp` invocation documented in README.md's "Any MCP client"
-/// section). Passed alongside `--strict-mcp-config` so this process ignores
-/// whatever else the user has registered in their own claude config —
-/// the chat panel gets exactly this one server, nothing more.
-const CHAT_MCP_CONFIG: &str =
-    "{\"mcpServers\":{\"minutes\":{\"command\":\"npx\",\"args\":[\"minutes-mcp\"]}}}";
+const CHAT_SYSTEM_PROMPT: &str = "You are answering one message inside the Minutes app's Recall chat panel. This is a fresh, non-interactive, single-shot session with no tools, MCP servers, shell, file access, plugins, hooks, skills, or persistent session. The user message already contains all policy-verified meeting context and recent conversation turns available to you. Ground the answer only in that inline context. If it is insufficient, say so briefly and suggest selecting the relevant meeting. Never request or suggest an include_restricted override. Native Recall receives no screen image. Screen-state metadata is not sight; never claim to see or describe screen pixels.";
 
-/// claude-specific chat invocation (see [`build_chat_invocation`] for why
-/// this is separate from the shared `lean = true` branch in
-/// `prepare_agent_invocation`). Registers only the Minutes MCP server via an
-/// inline `--mcp-config` + `--strict-mcp-config`, and pre-approves a
-/// read-only tool allow-list via `--allowedTools` (confirmed flag name/syntax
-/// against `claude --help` on this machine: `--allowedTools, --allowed-tools
-/// <tools...>`, MCP tools addressed as `mcp__<server>__<tool>`). In `-p`
-/// (print/non-interactive) mode, a tool call outside the allow-list is
-/// rejected outright rather than blocking on an approval prompt, which is
-/// what makes this safe to run unattended.
+/// Claude-specific chat invocation (see [`build_chat_invocation`] for why
+/// streaming stays separate from the shared lean branch). The strict empty
+/// MCP config blocks user-global servers, and `--tools ""` blocks built-ins.
 fn prepare_claude_chat_invocation(agent_cmd: &str, prompt: &str) -> AgentInvocation {
-    let allowed_tools = CHAT_ALLOWED_MCP_TOOLS
-        .iter()
-        .map(|name| format!("mcp__minutes__{}", name))
-        .collect::<Vec<_>>()
-        .join(",");
-
     AgentInvocation {
         cmd: agent_cmd.to_string(),
         args: vec![
             "-p".into(),
+            // `--bare` is the only installed Claude mode that skips managed
+            // settings-file hooks as well as user/project plugins and memory.
+            // It deliberately refuses OAuth/keychain auth; Recall would
+            // rather fail locally than expose a meeting prompt to an
+            // enterprise UserPromptSubmit hook. API-key/explicit provider
+            // credentials remain supported by Claude itself.
+            "--bare".into(),
+            "--setting-sources".into(),
+            "".into(),
+            "--no-session-persistence".into(),
+            "--disable-slash-commands".into(),
+            "--no-chrome".into(),
+            "--prompt-suggestions".into(),
+            "false".into(),
             "--strict-mcp-config".into(),
             "--mcp-config".into(),
             CHAT_MCP_CONFIG.into(),
-            "--allowedTools".into(),
-            allowed_tools,
+            "--tools".into(),
+            "".into(),
+            "--system-prompt".into(),
+            CHAT_SYSTEM_PROMPT.into(),
             "--output-format".into(),
             "text".into(),
             "-".into(),
@@ -2705,13 +2668,28 @@ pub fn map_speakers(
     config: &Config,
     log_file: Option<&str>,
 ) -> Vec<crate::diarize::SpeakerAttribution> {
+    map_speakers_with_pre_egress(transcript, attendees, config, log_file, || Ok(()))
+        .unwrap_or_default()
+}
+
+/// Map speakers while requiring a caller-supplied source authorization check
+/// immediately before the prompt crosses an HTTP or agent-process boundary.
+/// Authorization failures are distinct from provider failures: callers must
+/// propagate them rather than recording an empty-but-successful mapping.
+pub fn map_speakers_with_pre_egress(
+    transcript: &str,
+    attendees: &[String],
+    config: &Config,
+    log_file: Option<&str>,
+    pre_egress: impl FnOnce() -> Result<(), String>,
+) -> Result<Vec<crate::diarize::SpeakerAttribution>, String> {
     if attendees.is_empty() || !transcript.contains("SPEAKER_") {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let speakers = extract_speaker_labels(transcript);
     if speakers.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     tracing::info!(
@@ -2737,13 +2715,14 @@ pub fn map_speakers(
     let step_started = Instant::now();
     let model = speaker_mapping_model_hint(config);
 
+    pre_egress()?;
     let response = if config.summarization.engine != "none" {
         run_speaker_mapping_prompt(&prompt, config)
     } else {
         run_speaker_mapping_via_agent(&prompt, config)
     };
 
-    match response {
+    Ok(match response {
         Ok(text) => {
             let mappings = parse_speaker_mapping(&text, &speakers, attendees);
             if let Some(file) = log_file {
@@ -2799,7 +2778,7 @@ pub fn map_speakers(
             tracing::warn!(error = %e, "Level 1: speaker mapping failed");
             Vec::new()
         }
-    }
+    })
 }
 
 /// Extract unique SPEAKER_X labels from a transcript. Public for pipeline use.
@@ -3555,6 +3534,26 @@ PARTICIPANTS:
     }
 
     #[test]
+    fn speaker_mapping_pre_egress_denial_stops_before_provider_dispatch() {
+        let mut config = Config::default();
+        config.summarization.engine = "none".into();
+        let checked = std::cell::Cell::new(false);
+        let result = map_speakers_with_pre_egress(
+            "[SPEAKER_1 0:00] hello Alex",
+            &["Alex".into()],
+            &config,
+            None,
+            || {
+                checked.set(true);
+                Err("source authorization changed".into())
+            },
+        );
+
+        assert!(checked.get());
+        assert_eq!(result.unwrap_err(), "source authorization changed");
+    }
+
+    #[test]
     fn prepare_agent_invocation_for_codex_skips_git_repo_check() {
         // Regression: summaries run in a non-repo job dir; without the bypass
         // Codex refuses to start and the summary degrades.
@@ -3591,36 +3590,41 @@ PARTICIPANTS:
     }
 
     #[test]
-    fn build_chat_invocation_claude_streams_json_and_scopes_readonly_tools() {
-        // Recall chat: claude must be strictly scoped to the Minutes MCP
-        // server with a read-only --allowedTools list (not the #382 zero-MCP
-        // lean branch, which stays reserved for speaker mapping) AND stream
-        // incrementally. `--no-interactive` (which does not exist on the
-        // claude CLI and broke every chat message) must never appear.
+    fn build_chat_invocation_claude_streams_json_without_mcp_or_tools() {
+        // Recall context crosses one fail-closed constructor. Claude must not
+        // inherit an external/cached MCP server or any tool while streaming.
         let inv = build_chat_invocation("claude", "hola", true).unwrap();
         assert_eq!(inv.cmd, "claude");
-        // Scoped to exactly the Minutes MCP server, no other configured servers.
+        // Strictly empty MCP configuration, regardless of user-global config.
         assert!(inv.args.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(inv.args.iter().any(|a| a == "{\"mcpServers\":{}}"));
         assert!(inv
             .args
-            .iter()
-            .any(|a| a.contains("\"minutes\"") && a.contains("npx") && a.contains("minutes-mcp")));
-        // Read-only allow-list present, addressed as mcp__minutes__<tool>, and
-        // does not include mutating tools or open_dashboard (browser side effect).
-        let allowed_tools = inv
+            .windows(2)
+            .any(|w| w[0] == "--tools" && w[1].is_empty()));
+        assert!(!inv.args.iter().any(|a| a == "--allowedTools"));
+        assert!(!inv.args.iter().any(|a| a.contains("minutes-mcp")));
+        assert!(inv.args.iter().any(|a| a == "--bare"));
+        assert!(!inv.args.iter().any(|a| a == "--safe-mode"));
+        assert!(inv.args.iter().any(|a| a == "--no-session-persistence"));
+        assert!(inv.args.iter().any(|a| a == "--disable-slash-commands"));
+        assert!(inv.args.iter().any(|a| a == "--no-chrome"));
+        assert!(inv
             .args
             .windows(2)
-            .find(|w| w[0] == "--allowedTools")
-            .map(|w| w[1].as_str())
-            .expect("--allowedTools must be present");
-        assert!(allowed_tools.contains("mcp__minutes__search_meetings"));
-        assert!(allowed_tools.contains("mcp__minutes__get_meeting"));
-        assert!(allowed_tools.contains("mcp__minutes__get_screen_context"));
-        assert!(!allowed_tools.contains("start_recording"));
-        assert!(!allowed_tools.contains("add_note"));
-        assert!(!allowed_tools.contains("open_dashboard"));
-        // The old hard `--tools ""` lockout is gone.
-        assert!(!inv.args.iter().any(|a| a == "--tools"));
+            .any(|w| w[0] == "--setting-sources" && w[1].is_empty()));
+        assert!(inv
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--prompt-suggestions" && w[1] == "false"));
+        assert!(inv.args.windows(2).any(|w| {
+            w[0] == "--system-prompt" && w[1].contains("policy-verified meeting context")
+        }));
+        assert!(inv.args.windows(2).any(|w| {
+            w[0] == "--system-prompt"
+                && w[1].contains("Native Recall receives no screen image")
+                && w[1].contains("never claim to see or describe screen pixels")
+        }));
         // Streaming upgrade applied, `text` replaced, `--verbose` present.
         assert!(inv
             .args

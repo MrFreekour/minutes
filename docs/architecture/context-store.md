@@ -27,7 +27,8 @@ meeting and memo corpus. Only the adjacent desktop-context index is lost.
 
 The schema is intentionally narrow:
 
-- raw desktop events do **not** go into `graph.db`
+- raw desktop events do **not** go into conversation-graph projections or
+  durable correction stores
 - markdown does **not** move into SQLite
 - event rows link to sessions directly instead of requiring a second join table
 
@@ -69,8 +70,11 @@ lands.
 
 - `context.db` uses WAL mode and 0600 file permissions like the other local
   sidecar stores
-- deleting `context.db` does not damage meeting markdown or `graph.db`
-- `graph.db` remains the rebuildable conversation graph
+- deleting `context.db` does not damage meeting markdown, `overlays.db`, or
+  `vocabulary.toml`
+- conversation graphs are process-private projections rematerialized from
+  authorized markdown plus attested correction snapshots; there is no durable
+  `graph.db`
 - `context.db` is not treated as a cross-device sync layer in this slice
 
 This keeps Minutes file-native where it matters while still giving the desktop

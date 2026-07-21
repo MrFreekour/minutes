@@ -44,7 +44,7 @@ const comparisonRows = [
   {
     label: "Agent / MCP surface",
     competitor: "CLI control and workflow automations; no MCP server we could find",
-    minutes: "MCP server (31 tools), CLI, SDK, Claude Code plugin over your local files",
+    minutes: "MCP server (33 tools), CLI, SDK, Claude Code plugin over your local files",
   },
   {
     label: "Open source",
@@ -84,8 +84,8 @@ export default function MacwhisperVsMinutesPage() {
       competitorName="MacWhisper"
       competitorLabel="MacWhisper"
       markdownHref="/compare/macwhisper-vs-minutes.md"
-      lastReviewed="2026-07-11"
-      heroSummary="MacWhisper and Minutes are on the same side of the line that matters most: transcription runs locally on your Mac, and both can run Whisper or Parakeet models. The difference is the shape of the job. MacWhisper is the best drag-and-drop file transcriber on macOS — files in, transcripts and subtitles out. Minutes is a conversation memory layer — meetings and memos in, a growing structured archive out, one your AI agents can query. Respect where it's due; this is a comparison between two local-first tools, and many people legitimately want the other one."
+      lastReviewed="2026-07-18"
+      heroSummary="MacWhisper and Minutes are on the same side of the line that matters most: transcription runs locally on your Mac. MacWhisper can offer Whisper and Parakeet there; Minutes currently uses its bundled Whisper backend on macOS because Parakeet's pathname-only process cannot receive Minutes' sealed audio safely. The larger difference is the shape of the job. MacWhisper is the best drag-and-drop file transcriber on macOS — files in, transcripts and subtitles out. Minutes is a conversation memory layer — meetings and memos in, a growing structured archive out, one your AI agents can query. Respect where it's due; this is a comparison between two local-first tools, and many people legitimately want the other one."
       quickVerdictCompetitor="your job is transcribing files — interviews, podcasts, videos, YouTube links — and you want the most polished Mac GUI for it, with subtitle export and a one-time price."
       quickVerdictMinutes="your job is remembering conversations — recording meetings and memos into a private, diarized, searchable archive that Claude and other agents can use — and you want it open source and free."
       comparisonRows={comparisonRows as any}
@@ -96,7 +96,7 @@ export default function MacwhisperVsMinutesPage() {
       ]}
       minutesWins={[
         "It builds an archive, not just outputs: every meeting, memo, and dictation becomes structured markdown — attendees, action items, decisions in YAML — organized and greppable over months, not a folder of one-off exports.",
-        "It's agent-native: 31 MCP tools, a CLI, an SDK, and a Claude Code plugin let your assistant search meetings, track commitments, and build person profiles from your local files. MacWhisper automates workflows; it doesn't give agents a memory.",
+        "It's agent-native: 33 MCP tools, a CLI, an SDK, and a Claude Code plugin let your assistant search meetings, track commitments, and build person profiles from your local files. MacWhisper automates workflows; it doesn't give agents a memory.",
         "It's open source (MIT) and free — the entire pipeline is auditable Rust, which matters if 'local' is a compliance requirement rather than a preference.",
       ]}
       workflowSection={[
@@ -113,7 +113,7 @@ export default function MacwhisperVsMinutesPage() {
         "It's also not the fit if you want an iOS-first experience or a polished GUI for one-off transcription jobs; MacWhisper is simply better at those today.",
       ]}
       evaluatedSection={[
-        "This is a fit-based comparison between two local-first tools, reviewed on 2026-07-11 against MacWhisper's official site and App Store listing, linked below. MacWhisper's local-by-default transcription, Whisper/Parakeet engine support, Pro feature list, and €64 one-time direct pricing (with a separate App Store channel selling subscriptions and a one-time lifetime unlock) are drawn from its own pages.",
+        "This is a fit-based comparison between two local-first tools, reviewed on 2026-07-18 against MacWhisper's official site and App Store listing, linked below. MacWhisper's local-by-default transcription, Whisper/Parakeet engine support, Pro feature list, and €64 one-time direct pricing (with a separate App Store channel selling subscriptions and a one-time lifetime unlock) are drawn from its own pages.",
         "The Minutes side is grounded in its public docs and open-source repository. Both tools' privacy claims are architecture-level and, in Minutes' case, verifiable in source.",
       ]}
       sources={sources as any}

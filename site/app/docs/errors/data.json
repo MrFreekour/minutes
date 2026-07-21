@@ -1,7 +1,7 @@
 {
-  "generatedAt": "2026-07-25",
-  "visibleCount": 67,
-  "hiddenCount": 17,
+  "generatedAt": "2026-07-23",
+  "visibleCount": 60,
+  "hiddenCount": 14,
   "groups": [
     {
       "enumName": "CaptureError",
@@ -332,7 +332,7 @@
     },
     {
       "enumName": "MarkdownError",
-      "count": 5,
+      "count": 3,
       "entries": [
         {
           "id": "markdownerror-outputdirerror",
@@ -366,89 +366,6 @@
           "hidden": false,
           "anchorId": "error-markdownerror-renamerefused",
           "docsUrl": "https://useminutes.app/docs/errors#error-markdownerror-renamerefused"
-        },
-        {
-          "id": "markdownerror-concurrentmodification",
-          "enumName": "MarkdownError",
-          "variant": "ConcurrentModification",
-          "cfg": null,
-          "message": "file changed on disk between staging and swap; rewrite aborted",
-          "sourceFile": "crates/core/src/error.rs",
-          "hidden": false,
-          "anchorId": "error-markdownerror-concurrentmodification",
-          "docsUrl": "https://useminutes.app/docs/errors#error-markdownerror-concurrentmodification"
-        },
-        {
-          "id": "markdownerror-ambiguoussection",
-          "enumName": "MarkdownError",
-          "variant": "AmbiguousSection",
-          "cfg": null,
-          "message": "ambiguous document: found {count} '## {name}' sections; refusing to operate on an ambiguous file",
-          "sourceFile": "crates/core/src/error.rs",
-          "hidden": false,
-          "anchorId": "error-markdownerror-ambiguoussection",
-          "docsUrl": "https://useminutes.app/docs/errors#error-markdownerror-ambiguoussection"
-        }
-      ]
-    },
-    {
-      "enumName": "ResummarizeError",
-      "count": 5,
-      "entries": [
-        {
-          "id": "resummarizeerror-unsupported",
-          "enumName": "ResummarizeError",
-          "variant": "Unsupported",
-          "cfg": null,
-          "message": "unsupported artifact: {0}",
-          "sourceFile": "crates/core/src/error.rs",
-          "hidden": false,
-          "anchorId": "error-resummarizeerror-unsupported",
-          "docsUrl": "https://useminutes.app/docs/errors#error-resummarizeerror-unsupported"
-        },
-        {
-          "id": "resummarizeerror-frontmatter",
-          "enumName": "ResummarizeError",
-          "variant": "Frontmatter",
-          "cfg": null,
-          "message": "frontmatter does not parse: {0}",
-          "sourceFile": "crates/core/src/error.rs",
-          "hidden": false,
-          "anchorId": "error-resummarizeerror-frontmatter",
-          "docsUrl": "https://useminutes.app/docs/errors#error-resummarizeerror-frontmatter"
-        },
-        {
-          "id": "resummarizeerror-templateunavailable",
-          "enumName": "ResummarizeError",
-          "variant": "TemplateUnavailable",
-          "cfg": null,
-          "message": "template '{slug}' is unavailable: {reason} (pass --template to override explicitly)",
-          "sourceFile": "crates/core/src/error.rs",
-          "hidden": false,
-          "anchorId": "error-resummarizeerror-templateunavailable",
-          "docsUrl": "https://useminutes.app/docs/errors#error-resummarizeerror-templateunavailable"
-        },
-        {
-          "id": "resummarizeerror-summarizefailed",
-          "enumName": "ResummarizeError",
-          "variant": "SummarizeFailed",
-          "cfg": null,
-          "message": "summarization produced nothing (engine '{engine}'): {reason}; file left untouched",
-          "sourceFile": "crates/core/src/error.rs",
-          "hidden": false,
-          "anchorId": "error-resummarizeerror-summarizefailed",
-          "docsUrl": "https://useminutes.app/docs/errors#error-resummarizeerror-summarizefailed"
-        },
-        {
-          "id": "resummarizeerror-concurrentedit",
-          "enumName": "ResummarizeError",
-          "variant": "ConcurrentEdit",
-          "cfg": null,
-          "message": "file changed while summarizing — save your editor and re-run",
-          "sourceFile": "crates/core/src/error.rs",
-          "hidden": false,
-          "anchorId": "error-resummarizeerror-concurrentedit",
-          "docsUrl": "https://useminutes.app/docs/errors#error-resummarizeerror-concurrentedit"
         }
       ]
     },
@@ -806,15 +723,15 @@
       "count": 1,
       "entries": [
         {
-          "id": "grapherror-dirnotfound",
+          "id": "grapherror-temporarilyunavailable",
           "enumName": "GraphError",
-          "variant": "DirNotFound",
+          "variant": "TemporarilyUnavailable",
           "cfg": null,
-          "message": "meetings directory does not exist: {0}",
+          "message": "cross-meeting graph is temporarily unavailable while its privacy-safe bounded rebuild is completed; see roadmap issue #513",
           "sourceFile": "crates/core/src/graph.rs",
           "hidden": false,
-          "anchorId": "error-grapherror-dirnotfound",
-          "docsUrl": "https://useminutes.app/docs/errors#error-grapherror-dirnotfound"
+          "anchorId": "error-grapherror-temporarilyunavailable",
+          "docsUrl": "https://useminutes.app/docs/errors#error-grapherror-temporarilyunavailable"
         }
       ]
     },
@@ -868,11 +785,6 @@
       "sourceFile": "crates/core/src/error.rs"
     },
     {
-      "enumName": "ResummarizeError",
-      "variant": "Io",
-      "sourceFile": "crates/core/src/error.rs"
-    },
-    {
       "enumName": "VaultError",
       "variant": "Io",
       "sourceFile": "crates/core/src/error.rs"
@@ -896,16 +808,6 @@
       "enumName": "MinutesError",
       "variant": "Io",
       "sourceFile": "crates/core/src/error.rs"
-    },
-    {
-      "enumName": "GraphError",
-      "variant": "Sqlite",
-      "sourceFile": "crates/core/src/graph.rs"
-    },
-    {
-      "enumName": "GraphError",
-      "variant": "Io",
-      "sourceFile": "crates/core/src/graph.rs"
     },
     {
       "enumName": "VoiceError",

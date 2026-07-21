@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-10T02:36:28.325Z",
+  "generated_at": "2026-07-21T09:27:30.416Z",
   "source": {
     "plugin_json": ".claude/plugins/minutes/plugin.json",
     "packs_dir": ".claude/plugins/minutes/packs"
@@ -271,7 +271,7 @@
     {
       "skill_name": "minutes-graph",
       "title": "graph",
-      "description": "Cross-meeting entity graph — query who/what/when across all your meetings as structured data, with co-occurrence and cross-entity queries that text search can't answer. Use whenever the user says \"show me everyone who mentioned X\", \"every time we talked about Y\", \"who knows about Z\", \"graph\", \"across all meetings\", \"entity search\", \"first time we talked about\", \"trend for X over time\", \"who's been mentioned alongside\", or wants to query meetings as an index rather than full-text search. Builds a JSON entity index on first run (one-time slow), then answers queries instantly. Surface this skill for relationship intelligence, due diligence, or any \"across all my history\" question that text search alone can't answer.",
+      "description": "Policy-safe relationship intelligence across normal meeting history. Use for top contacts, relationship summaries, commitments, losing-touch signals, person profiles, topic research, or questions about people across meetings. Always use Minutes' native CLI projections; never build or read a durable graph cache.",
       "category": "intelligence",
       "surface_support": [
         "claude-code-plugin"
@@ -284,6 +284,71 @@
         "relationship-intel"
       ],
       "source_path": "skills/minutes-graph/SKILL.md"
+    },
+    {
+      "skill_name": "minutes-video-review",
+      "title": "video review",
+      "description": "Analyze a product walkthrough, bug report video, Loom, or ScreenPal using Minutes transcription plus visual review. Use when the user wants a recorded demo or bug clip turned into a durable brief with transcript, key frames, issues, and next steps.",
+      "category": "other",
+      "surface_support": [
+        "claude-code-plugin"
+      ],
+      "installable_via": "claude-code-plugin",
+      "pack_ids": [],
+      "role_fit": [],
+      "source_path": "skills/minutes-video-review/SKILL.md"
+    },
+    {
+      "skill_name": "minutes-copilot",
+      "title": "copilot",
+      "description": "Start and control Minutes Coach, the separate real-time copilot HUD, with an explicit meeting goal. Use only for explicit Coach or HUD lifecycle requests such as \"start Minutes Coach\", \"open the Coach HUD\", \"pause Minutes Coach\", \"resume Minutes Coach\", \"Minutes Coach status\", or \"stop Minutes Coach\". Do not use for requests that explicitly ask the current terminal agent to watch or strategize; those belong to minutes-live-sidekick. An ambiguous request such as \"coach me live\" requires one short surface clarification and must not automatically start Coach.",
+      "category": "other",
+      "surface_support": [
+        "claude-code-plugin"
+      ],
+      "installable_via": "claude-code-plugin",
+      "pack_ids": [],
+      "role_fit": [],
+      "source_path": "skills/minutes-copilot/SKILL.md"
+    },
+    {
+      "skill_name": "minutes-live-sidekick",
+      "title": "live sidekick",
+      "description": "Act as the user's live meeting sidekick inside the current terminal agent session. Use when the user explicitly asks you, the terminal agent, to watch a meeting, follow the live transcript, answer during the call, offer strategist thoughts, silently watch for risks, or track decisions. Do not use this skill to start or control the separate Minutes Coach HUD; explicit Coach or HUD lifecycle requests belong to minutes-copilot, and an ambiguous request such as \"coach me live\" requires one short surface clarification.",
+      "category": "other",
+      "surface_support": [
+        "claude-code-plugin"
+      ],
+      "installable_via": "claude-code-plugin",
+      "pack_ids": [],
+      "role_fit": [],
+      "source_path": "skills/minutes-live-sidekick/SKILL.md"
+    },
+    {
+      "skill_name": "minutes-release-notes",
+      "title": "release notes",
+      "description": "Draft user-facing Minutes release notes for a version from the commit range, recent GitHub releases, and the repository release checks. Use when the user asks to write, generate, prepare, revise, or review release notes or a changelog for a Minutes version.",
+      "category": "other",
+      "surface_support": [
+        "claude-code-plugin"
+      ],
+      "installable_via": "claude-code-plugin",
+      "pack_ids": [],
+      "role_fit": [],
+      "source_path": "skills/minutes-release-notes/SKILL.md"
+    },
+    {
+      "skill_name": "minutes-seo-wave",
+      "title": "seo wave",
+      "description": "Plan, build, and review one evidence-backed SEO content wave for the Minutes site, including SERP research, page inventory, design-system compliance, internal linking, generated LLM text, and a shipped-wave retro. Use when the user asks for an SEO wave, a group of comparison or use-case pages, a docs or resource hub expansion, or a coordinated batch of search landing pages.",
+      "category": "other",
+      "surface_support": [
+        "claude-code-plugin"
+      ],
+      "installable_via": "claude-code-plugin",
+      "pack_ids": [],
+      "role_fit": [],
+      "source_path": "skills/minutes-seo-wave/SKILL.md"
     }
   ]
 }

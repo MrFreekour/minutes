@@ -19,7 +19,7 @@ import { listMeetings, searchMeetings, findOpenActions } from 'minutes-sdk';
 const meetings = await listMeetings('~/meetings');
 // → [{ frontmatter: { title, date, action_items, decisions, ... }, body, path }]
 
-// Search across all meetings
+// Search policy-authorized meetings within the supported corpus bounds
 const results = await searchMeetings('~/meetings', 'pricing strategy');
 
 // Find open action items
@@ -31,7 +31,8 @@ const actions = await findOpenActions('~/meetings', 'alex');
 
 ### `listMeetings(dir, limit?)`
 
-List meetings sorted by date (newest first).
+List meetings sorted by date (newest first). `limit` must be an integer from 1
+through `SDK_MEETING_RESULT_MAX` (10,000).
 
 ```typescript
 const meetings = await listMeetings('~/meetings', 50);
@@ -39,7 +40,8 @@ const meetings = await listMeetings('~/meetings', 50);
 
 ### `searchMeetings(dir, query, limit?)`
 
-Full-text search across titles and transcripts.
+Full-text search across titles and transcripts. It uses the same validated
+1–10,000 meeting-result limit as `listMeetings`.
 
 ```typescript
 const results = await searchMeetings('~/meetings', 'Q2 roadmap');
@@ -54,23 +56,54 @@ const meeting = await getMeeting('~/meetings/2026-03-24-planning.md');
 console.log(meeting.frontmatter.decisions);
 ```
 
-### `findOpenActions(dir, assignee?)`
+### `findOpenActions(dir, assignee?, options?)`
 
-Find open action items, optionally filtered by assignee.
+Find open action items, optionally filtered by assignee. Set `options.limit` to
+an integer from 1 through `SDK_OPEN_ACTION_RESULT_MAX` (1,000); omitted limits
+default to that hard cap.
 
 ```typescript
 const allOpen = await findOpenActions('~/meetings');
 const mine = await findOpenActions('~/meetings', 'mat');
+const firstTen = await findOpenActions('~/meetings', undefined, { limit: 10 });
 ```
 
-### `getPersonProfile(dir, name)`
+### `getPersonProfile(dir, name, options?)`
 
-Build a profile for someone across all meetings — their meetings, open action items, and topics.
+Build a profile for someone across policy-authorized meetings within the supported corpus bounds — their meetings, open action items, and topics.
+The three returned collections are independently bounded. Use `meetingLimit`,
+`openActionLimit`, and `topicLimit`; each defaults to and may not exceed its
+exported 1,000-item cap.
 
 ```typescript
 const profile = await getPersonProfile('~/meetings', 'alex');
 // → { name, meetings: [...], openActions: [...], topics: ['pricing', 'api'] }
 ```
+
+## Availability and resource bounds
+
+Multi-meeting reads are fail-closed snapshots, not partial best-effort scans.
+They require local filesystem watcher support and successful sentinel delivery,
+then reverify the canonical root and complete active-Markdown manifest before
+returning. Watcher errors, missing events, unstable roots, or an unsupported
+network/FUSE-style filesystem deny the whole call after bounded retries.
+
+Each Markdown file is limited to 16 MiB and the total decoded corpus to 80 MiB.
+Directory, entry, watcher, helper-process, and result counts are also bounded.
+Exceeding any bound denies the whole multi-meeting operation; it never silently
+returns a partial corpus. Every call performs a full baseline snapshot and a
+final manifest verification. The helper-process pool is constant-bounded, but
+the retained snapshot uses O(corpus bytes) memory within the hard corpus limit.
+
+### `listVoiceMemos(dir, options?)`
+
+List recent memos newest-first. `options.limit` is bounded to 1–1,000 and
+`options.days` to 0–36,500.
+
+### `findDecisions(dir, topic?, limit?, options?)`
+
+List decisions newest-first. `limit` defaults to 50 and must be an integer from
+1 through `SDK_DECISION_RESULT_MAX` (1,000).
 
 ### `parseFrontmatter(content, path)`
 

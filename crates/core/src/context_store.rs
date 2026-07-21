@@ -1003,9 +1003,18 @@ pub fn mark_capture_session_complete(
     ended_at: Option<DateTime<Local>>,
     metadata: Value,
 ) -> Result<(), ContextStoreError> {
-    let conn = open_db()?;
+    let source_root = output_path.parent().ok_or_else(|| {
+        ContextStoreError::InvalidRequest(
+            "completed capture artifact must have a parent directory".into(),
+        )
+    })?;
+    let source = crate::policy_fs::read_bound_utf8_file(source_root, output_path)?;
+    let source_path = source.canonical_path.display().to_string();
+    let source_sha256 = crate::policy_fs::content_sha256_hex(source.content.as_bytes());
+    let mut conn = open_db()?;
+    let transaction = conn.transaction()?;
     update_session_state_with_conn(
-        &conn,
+        &transaction,
         session_id,
         ContextSessionState::Complete,
         ended_at,
@@ -1014,21 +1023,37 @@ pub fn mark_capture_session_complete(
         metadata,
     )?;
     upsert_link_with_conn(
-        &conn,
+        &transaction,
         session_id,
         ContextLinkKind::MarkdownArtifact,
         &output_path.display().to_string(),
-        json!({ "content_type": content_type_to_db(content_type) }),
+        json!({
+            "content_type": content_type_to_db(content_type),
+            "source_path": source_path,
+            "source_sha256": source_sha256,
+        }),
+    )?;
+    // Completion replaces the private processing capability with the exact
+    // durable artifact revision. A stale processing or preserved-capture link
+    // must not remain enumerable after that public boundary commits.
+    transaction.execute(
+        "DELETE FROM context_links WHERE session_id = ?1 AND kind IN (?2, ?3)",
+        params![
+            session_id,
+            ContextLinkKind::AudioCapture.as_str(),
+            ContextLinkKind::PreservedCapture.as_str(),
+        ],
     )?;
     if let Some(audio_path) = audio_path {
         upsert_link_with_conn(
-            &conn,
+            &transaction,
             session_id,
             ContextLinkKind::AudioCapture,
             &audio_path.display().to_string(),
             json!({}),
         )?;
     }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1038,9 +1063,10 @@ pub fn mark_capture_session_failed(
     diagnostic: &str,
     preserved_path: Option<&Path>,
 ) -> Result<(), ContextStoreError> {
-    let conn = open_db()?;
+    let mut conn = open_db()?;
+    let transaction = conn.transaction()?;
     update_session_state_with_conn(
-        &conn,
+        &transaction,
         session_id,
         ContextSessionState::Failed,
         ended_at,
@@ -1048,15 +1074,26 @@ pub fn mark_capture_session_failed(
         None,
         json!({ "diagnostic": diagnostic }),
     )?;
+    // Failure is also a capability replacement. Only an explicitly preserved
+    // capture may remain linked after the terminal state commits.
+    transaction.execute(
+        "DELETE FROM context_links WHERE session_id = ?1 AND kind IN (?2, ?3)",
+        params![
+            session_id,
+            ContextLinkKind::AudioCapture.as_str(),
+            ContextLinkKind::PreservedCapture.as_str(),
+        ],
+    )?;
     if let Some(path) = preserved_path {
         upsert_link_with_conn(
-            &conn,
+            &transaction,
             session_id,
             ContextLinkKind::PreservedCapture,
             &path.display().to_string(),
             json!({}),
         )?;
     }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1640,8 +1677,11 @@ mod tests {
 
     #[test]
     fn capture_session_lifecycle_and_queries_round_trip() {
-        with_temp_home(|_| {
+        with_temp_home(|home| {
             let started_at = Local::now();
+            let output_path = home.path().join("2026-04-22-roadmap-review.md");
+            let output_content = "---\ntitle: Roadmap Review\ntype: meeting\n---\n\nTranscript";
+            std::fs::write(&output_path, output_content).unwrap();
             let session = start_capture_session(
                 CaptureMode::Meeting,
                 Some("Roadmap Review".into()),
@@ -1693,7 +1733,7 @@ mod tests {
 
             mark_capture_session_complete(
                 &session.id,
-                Path::new("/tmp/2026-04-22-roadmap-review.md"),
+                &output_path,
                 Some(Path::new("/tmp/2026-04-22-roadmap-review.wav")),
                 ContentType::Meeting,
                 Some(started_at + Duration::seconds(45)),
@@ -1708,7 +1748,7 @@ mod tests {
 
             let linked = get_session_for_link(
                 ContextLinkKind::MarkdownArtifact,
-                "/tmp/2026-04-22-roadmap-review.md",
+                &output_path.display().to_string(),
             )
             .unwrap()
             .unwrap();
@@ -1719,6 +1759,18 @@ mod tests {
             assert!(links
                 .iter()
                 .any(|link| link.kind == ContextLinkKind::MarkdownArtifact));
+            let artifact_link = links
+                .iter()
+                .find(|link| link.kind == ContextLinkKind::MarkdownArtifact)
+                .unwrap();
+            assert_eq!(
+                artifact_link.metadata["source_path"],
+                output_path.canonicalize().unwrap().display().to_string()
+            );
+            assert_eq!(
+                artifact_link.metadata["source_sha256"],
+                crate::policy_fs::content_sha256_hex(output_content.as_bytes())
+            );
 
             let events = list_events_for_session(
                 &session.id,

@@ -119,7 +119,7 @@ Skip the relationship brief and go straight to a topic brief instead.
 
 ### Phase 2: Relationship brief
 
-Read each matching meeting file with `Read`. Build a relationship brief:
+Treat search paths as hints, not capabilities. Reauthorize each selected normal meeting through `minutes get "<exact path>" --json`, require exit status 0, and use only its returned content. Never reopen a search path with the host `Read` tool. Build a relationship brief from those bounded native results:
 
 **Meeting history:**
 - Total meetings with this person, first and most recent dates

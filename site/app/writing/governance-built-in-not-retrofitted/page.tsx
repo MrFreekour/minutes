@@ -80,9 +80,10 @@ export default function Post() {
             Minutes recording now carries its consent basis in the file&apos;s
             frontmatter. Next: meetings you designate sensitive produce
             structured notes with no audio captured at all, plus a sensitivity
-            field the agent layer is required to respect. A restricted meeting
-            simply never appears in search results, graph queries, or anything
-            an agent assembles.
+            field the agent layer is required to respect. By default, a
+            restricted meeting is excluded from agent search, bounded person
+            profiles, and anything an agent assembles; explicit access requires
+            a human launch grant and a durable audit record.
           </p>
           <p>
             Recording everything is coming either way. I&apos;d rather own my

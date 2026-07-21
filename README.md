@@ -88,14 +88,14 @@ The README is now the product overview and install guide, not the only home for 
 ## How it works
 
 ```
-Audio → Transcribe → Diarize → Summarize → Structured Markdown → Relationship Graph
-         (local)     (local)     (LLM)       (decisions,            (people, commitments,
-        whisper.cpp  pyannote-rs Claude/       action items,          topics, scores)
-        (retained    (native)    Ollama/       people, entities)      SQLite index
+Audio → Transcribe → Diarize → Summarize → Structured Markdown → Policy-safe search
+         (local)     (local)     (LLM)       (decisions,            (bounded live-source
+        whisper.cpp  pyannote-rs Claude/       action items,          profiles and topics)
+        (retained    (native)    Ollama/       people, entities)
         Parakeet → Whisper)      Mistral/OpenAI
 ```
 
-Everything runs locally. Your audio never leaves your machine (unless you opt into cloud LLM summarization). Speakers are identified via native diarization. The relationship graph indexes people, commitments, and topics across all meetings for instant queries.
+Everything runs locally. Your audio never leaves your machine (unless you opt into cloud LLM summarization). Speakers are identified via native diarization. The relationship graph is temporarily unavailable while its bounded privacy-safe rebuild is completed; see roadmap issue #513. Policy-safe search remains available.
 
 ## Features
 
@@ -170,29 +170,19 @@ minutes watch                                     # Auto-process new files in in
 ```bash
 minutes search "pricing"                          # Full-text search
 minutes search "onboarding" -t memo               # Filter by type
-minutes actions                                   # Open action items across all meetings
+minutes actions                                   # Open action items across normal meetings
 minutes actions --assignee sarah                   # Filter by person
 minutes list                                      # Recent recordings
 ```
 
 ### Relationship intelligence
 
-> *"What did I promise Sarah?"* — the query nobody else can answer.
-
-```bash
-minutes people                                     # Who you talk to, how often, about what
-minutes people --rebuild                           # Rebuild the relationship index
-minutes people merge junrei junlei jun-rei          # Confirm variants are one person (canonical first)
-minutes commitments                                # All open + overdue commitments
-minutes commitments --person alex                   # What did I promise Alex?
-```
-
-Tracks people, commitments, topics, and relationship health across every meeting. Detects when you're losing touch with someone. Suggests duplicate contacts ("Sarah Chen" ↔ "Sarah") and name-variant fragments a transcriber spelled several ways ("junrei" ↔ "junlei" ↔ "jun-rei"). `minutes people --rebuild` prints a ready-to-run `minutes people merge` command under each suggested cluster; confirming it records a durable alias so every variant collapses to the canonical person on future rebuilds. Powered by a SQLite index rebuilt from your markdown in <50ms.
+Bounded live-source person profiles and topic research remain available through `minutes person` and `minutes research`. Graph-backed rankings, commitments, alias merging, and losing-touch alerts are temporarily unavailable while their privacy-safe projection is rebuilt. Those graph commands fail closed rather than reading the retired durable index or reporting empty relationship facts. Follow [roadmap issue #513](https://github.com/silverstein/minutes/issues/513) for restoration work.
 
 ### Cross-meeting intelligence
 ```bash
-minutes research "pricing strategy"               # Search across all meetings
-minutes person "Alex"                              # Build a profile from meeting history
+minutes research "pricing strategy"               # Search across normal meetings
+minutes person "Alex"                              # Bounded profile from live normal sources
 minutes consistency                                # Flag contradicting decisions + stale commitments
 ```
 
@@ -241,7 +231,7 @@ minutes demo                                     # Run a pipeline test (bundled 
 
 ## Switching from Granola?
 
-Import your meeting history into Minutes' conversation memory. Once imported, your meetings become searchable context for AI agents, feed the relationship graph for meeting prep, and surface action items and decision patterns across months of conversations.
+Import your meeting history into Minutes' conversation memory. Once imported, your meetings become searchable context for AI agents and surface action items and decision patterns across months of conversations. Cross-meeting relationship projections are temporarily unavailable while the privacy-safe rebuild tracked in issue #513 is completed.
 
 ```bash
 minutes import granola --dry-run    # Preview what will be imported
@@ -412,7 +402,7 @@ minutes service restart        # Restart all services (e.g. after upgrading the 
 |-------|----------|--------------|
 | **watcher** | Always on | Processes voice memos from `~/.minutes/inbox/` |
 | **weekly-summary** | Sundays 7pm | Generates a weekly digest to `~/.minutes/automations/` |
-| **proactive-context** | Daily 8am | Builds a context bundle (recent meetings, stale commitments, losing-touch alerts) |
+| **proactive-context** | Daily 8am | Builds a context bundle from recent meetings, memos, and live stale commitments |
 
 > **Upgrading?** `minutes service install` is idempotent. Re-running it after a binary
 > upgrade rewrites all plists/units and reloads with the new binary path.
@@ -500,9 +490,9 @@ Canonical MCP reference now lives at:
 - <https://useminutes.app/docs/mcp/tools.md>
 - <https://useminutes.app/llms.txt>
 
-The MCP surface currently includes recording control, meeting search/retrieval, relationship memory, structured insights, live transcript reading, dictation, QMD integration, and an interactive dashboard resource. Tool names, resource URIs, and prompt templates are generated from the live product surface instead of hand-maintained in this README.
+The MCP surface currently includes recording control, meeting search/retrieval, policy-bound person profiles, structured insights, live transcript reading, dictation, QMD integration, and an interactive dashboard resource. Tool names, resource URIs, and prompt templates are generated from the live product surface instead of hand-maintained in this README.
 
-**Interactive dashboard (Claude Desktop):** tools render an inline interactive UI via [MCP Apps](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/apps) — meeting list with filter/search, detail view with fullscreen + "Send to Claude" context injection, People tab with relationship cards and click-through profiles, and consistency reports. Text-only clients see the same data as plain text.
+**Interactive dashboard (Claude Desktop):** tools render an inline interactive UI via [MCP Apps](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/apps) — meeting list with filter/search, detail view with fullscreen + "Send to Claude" context injection, and consistency reports. The graph-backed People tab currently reports the privacy-safe rebuild tracked in [issue #513](https://github.com/silverstein/minutes/issues/513) as unavailable; bounded person profiles remain available through `get_person_profile`. Text-only clients see the same data as plain text.
 
 ### OpenCode CLI
 
@@ -1244,7 +1234,7 @@ minutes/
 ├── crates/reader/        Lightweight read-only meeting parser (no audio deps)
 ├── crates/assets/        Bundled assets (demo.wav)
 ├── crates/sdk/           TypeScript SDK — `npm install minutes-sdk` (query meetings programmatically)
-├── crates/mcp/           MCP server — 36 tools + 8 resources + interactive dashboard
+├── crates/mcp/           MCP server — 33 tools + 11 resources + interactive dashboard
 │   └── ui/               MCP App dashboard (vanilla TS → single-file HTML)
 ├── tauri/                Menu bar app — system tray, recording UI, singleton AI Assistant
 └── .claude/plugins/minutes/   Claude Code plugin — 19 skills + 1 agent + 2 hooks
@@ -1262,7 +1252,7 @@ Minutes is designed as infrastructure for AI agents. Files are the durable subst
 - **Record + process**: `start_recording`, `stop_recording`, `process_audio` for pipeline control
 - **Live coaching**: `start_live_transcript`, `read_live_transcript` for transcript access; `start_copilot`, `copilot_status`, `read_copilot_nudges`, and `stop_copilot` control and observe the independent real-time copilot
 - **Local event stream**: `minutes events --follow --since-seq N` tails newline-delimited events, including finalized live utterances, for agents that want a durable cursor
-- **Voice profiles**: `list_voices`, `confirm_speaker` for speaker identification workflows
+- **Voice profiles**: `list_voices` for inspecting speaker identities; `confirm_speaker` remains a compatibility name that directs identity changes to the Minutes app or a human CLI session
 - **Resources**: Stable URIs (`minutes://meetings/recent`, `minutes://actions/open`, `minutes://live/copilot`) for agent context injection and live copilot observation
 
 Any agent framework that speaks MCP can use Minutes as its conversation memory layer — the agent handles the intelligence, Minutes handles the recall.

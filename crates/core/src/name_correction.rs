@@ -153,6 +153,7 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
 /// Case/accent-folded normalization of a name token, shared with the
 /// entity-resolution clustering pass so both layers agree on what "the same
 /// characters" means (lowercase + accent fold, e.g. `José` -> `jose`).
+#[cfg(test)]
 pub(crate) fn normalize_name(s: &str) -> String {
     normalize(s)
 }

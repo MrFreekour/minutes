@@ -22,6 +22,7 @@ pub mod dictation_memory;
 pub(crate) mod engine_process;
 /// Person entity-resolution clustering (issue #385, class 3): suggestion-only
 /// grouping of name-variant fragments. Never merges.
+#[cfg(test)]
 pub(crate) mod entity_cluster;
 /// Entity-resolution evaluation harness (cluster-level). Test-only; the
 /// measurement contract for the entity-clustering lever (issue #385 / #371).
@@ -57,6 +58,7 @@ pub mod parakeet_sidecar;
 pub(crate) mod person_identity;
 pub mod pid;
 pub mod pipeline;
+pub mod policy_fs;
 pub mod process_trace;
 pub mod resummarize;
 pub mod retention;

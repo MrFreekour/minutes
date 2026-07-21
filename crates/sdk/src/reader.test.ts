@@ -1,5 +1,14 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "fs";
+import { describe, it, expect, expectTypeOf, beforeEach, afterEach, vi } from "vitest";
+import type { ExactMeetingResult, ReadOptions, RestrictedMeetingStub } from "./index.js";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -17,6 +26,13 @@ import {
   findDecisions,
   listVoiceMemos,
   isRestricted,
+  SDK_DECISION_RESULT_MAX,
+  SDK_OPEN_ACTION_RESULT_MAX,
+  SDK_PERSON_PROFILE_MEETING_MAX,
+  SDK_PERSON_PROFILE_OPEN_ACTION_MAX,
+  SDK_PERSON_PROFILE_TOPIC_MAX,
+  SDK_VOICE_MEMO_LOOKBACK_MAX_DAYS,
+  SDK_VOICE_MEMO_RESULT_MAX,
   type MeetingFile,
 } from "./reader.js";
 
@@ -126,12 +142,20 @@ intents: []
 // ── Helpers ──────────────────────────────────────────────────
 
 let tempDir: string;
+let previousMeetingsDir: string | undefined;
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "minutes-test-"));
+  previousMeetingsDir = process.env.MEETINGS_DIR;
+  process.env.MEETINGS_DIR = tempDir;
 });
 
 afterEach(() => {
+  if (previousMeetingsDir === undefined) {
+    delete process.env.MEETINGS_DIR;
+  } else {
+    process.env.MEETINGS_DIR = previousMeetingsDir;
+  }
   rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -139,6 +163,67 @@ function writeMeeting(name: string, content: string): string {
   const path = join(tempDir, name);
   writeFileSync(path, content);
   return path;
+}
+
+function restrictedMeetingWithInvalidUtf8Key(canary: string): Buffer {
+  const bytes = Buffer.from(RESTRICTED_MEETING.replace(
+    "Confidential board pricing discussion.",
+    canary
+  ));
+  const key = Buffer.from("sensitivity");
+  const keyOffset = bytes.indexOf(key);
+  if (keyOffset < 0) throw new Error("sensitivity fixture key missing");
+  bytes[keyOffset + 5] = 0xff;
+  return bytes;
+}
+
+function collectionMeeting({
+  title = "Collection Bounds",
+  type = "meeting",
+  date = "2026-07-16T12:00:00Z",
+  actionCount = 0,
+  decisionCount = 0,
+  tagCount = 0,
+  person = "Alex",
+}: {
+  title?: string;
+  type?: "meeting" | "memo";
+  date?: string;
+  actionCount?: number;
+  decisionCount?: number;
+  tagCount?: number;
+  person?: string;
+} = {}): string {
+  const tags = Array.from({ length: tagCount }, (_, index) => `  - topic-${index}`);
+  const actions = Array.from(
+    { length: actionCount },
+    (_, index) =>
+      `  - assignee: ${person}\n    task: task-${index}\n    status: open`
+  );
+  const decisions = Array.from(
+    { length: decisionCount },
+    (_, index) => `  - text: decision-${index}\n    topic: topic-${index}`
+  );
+  return [
+    "---",
+    `title: ${title}`,
+    `type: ${type}`,
+    `date: ${date}`,
+    "duration: 1m",
+    "tags:",
+    ...(tags.length > 0 ? tags : ["  []"]),
+    "attendees:",
+    `  - ${person}`,
+    "people: []",
+    "action_items:",
+    ...(actions.length > 0 ? actions : ["  []"]),
+    "decisions:",
+    ...(decisions.length > 0 ? decisions : ["  []"]),
+    "intents: []",
+    "---",
+    "",
+    `${person} collection body.`,
+  ].join("\n");
 }
 
 // ── splitFrontmatter ─────────────────────────────────────────
@@ -228,6 +313,27 @@ Body text.
     expect(result!.frontmatter.decisions).toEqual([]);
   });
 
+  it("fails closed when required policy-bearing meeting fields are missing or invalid", () => {
+    const valid = `---
+title: Required fields
+type: meeting
+date: "2026-07-15T10:00:00Z"
+---
+
+REQUIRED_FIELD_CANARY
+`;
+    for (const content of [
+      valid.replace("title: Required fields\n", ""),
+      valid.replace("type: meeting\n", ""),
+      valid.replace('date: "2026-07-15T10:00:00Z"\n', ""),
+      valid.replace("title: Required fields", "title: [not, text]"),
+      valid.replace("type: meeting", "type: private-meeting"),
+      valid.replace('date: "2026-07-15T10:00:00Z"', "date: not-a-date"),
+    ]) {
+      expect(parseFrontmatter(content, "/test/policy-uncertain.md")).toBeNull();
+    }
+  });
+
   it("preserves sensitive no-capture frontmatter", () => {
     const content = `---
 title: Board Sync
@@ -284,6 +390,31 @@ describe("listMeetings", () => {
     expect(meetings).toHaveLength(2);
   });
 
+  it("prunes every inactive corpus directory, including mixed-case spellings", async () => {
+    writeMeeting("live.md", VALID_MEETING);
+    for (const [index, directory] of [
+      "archive",
+      "Processed",
+      "FAILED",
+      "Failed-Captures",
+      ".git",
+      ".private",
+    ].entries()) {
+      const inactive = join(tempDir, directory);
+      mkdirSync(inactive);
+      writeFileSync(
+        join(inactive, `private-${index}.md`),
+        MINIMAL_MEETING.replace("Quick Sync", `INACTIVE-CANARY-${index}`)
+      );
+    }
+
+    const meetings = await listMeetings(tempDir, 100);
+    expect(meetings.map((meeting) => meeting.frontmatter.title)).toEqual([
+      "Q2 Pricing Discussion",
+    ]);
+    expect(JSON.stringify(meetings)).not.toContain("INACTIVE-CANARY");
+  });
+
   it("ignores non-.md files", async () => {
     writeMeeting("meeting.md", VALID_MEETING);
     writeFileSync(join(tempDir, "notes.txt"), "not a meeting");
@@ -300,6 +431,48 @@ describe("listMeetings", () => {
 
     const meetings = await listMeetings(tempDir, 2);
     expect(meetings).toHaveLength(2);
+  });
+
+  it("orders ISO offsets by instant and breaks equal-instant ties by path", async () => {
+    const template = (title: string, date: string) =>
+      MINIMAL_MEETING.replace("Quick Sync", title).replace(
+        /date: .+/,
+        `date: ${date}`
+      );
+    writeMeeting(
+      "z-early.md",
+      template("Earlier instant", "2026-01-01T10:00:00+10:00")
+    );
+    writeMeeting(
+      "m-late.md",
+      template("Later instant", "2026-01-01T02:00:00-10:00")
+    );
+    writeMeeting(
+      "b-tie.md",
+      template("Tie B", "2026-01-01T12:00:00Z")
+    );
+    writeMeeting(
+      "a-tie.md",
+      template("Tie A", "2026-01-01T07:00:00-05:00")
+    );
+
+    const meetings = await listMeetings(tempDir, 10);
+    expect(meetings.map((meeting) => meeting.frontmatter.title)).toEqual([
+      "Tie A",
+      "Tie B",
+      "Later instant",
+      "Earlier instant",
+    ]);
+  });
+
+  it("rejects non-positive, fractional, and excessive result limits", async () => {
+    writeMeeting("meeting.md", VALID_MEETING);
+    for (const invalid of [0, -1, 1.5, 10_001]) {
+      await expect(listMeetings(tempDir, invalid)).rejects.toThrow(/limit must be/i);
+      await expect(searchMeetings(tempDir, "pricing", invalid)).rejects.toThrow(
+        /limit must be/i
+      );
+    }
   });
 
   it("skips files with malformed frontmatter", async () => {
@@ -366,7 +539,7 @@ describe("searchMeetings", () => {
 // ── getMeeting ───────────────────────────────────────────────
 
 describe("getMeeting", () => {
-  it("returns parsed meeting for valid path", async () => {
+  it("uses MEETINGS_DIR as the authoritative root for a valid exact path", async () => {
     const path = writeMeeting("meeting.md", VALID_MEETING);
 
     const result = await getMeeting(path);
@@ -379,12 +552,66 @@ describe("getMeeting", () => {
     expect(result).toBeNull();
   });
 
+  it("rejects exact paths outside the configured root and in inactive directories", async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), "minutes-exact-outside-"));
+    try {
+      const outside = join(outsideDir, "outside.md");
+      writeFileSync(outside, VALID_MEETING);
+
+      expect(await getMeeting(outside)).toBeNull();
+      for (const directory of ["archive", "ArChIvE", ".recovery"]) {
+        const inactive = join(tempDir, directory);
+        mkdirSync(inactive);
+        const inactiveMeeting = join(inactive, "meeting.md");
+        writeFileSync(inactiveMeeting, VALID_MEETING);
+        expect(await getMeeting(inactiveMeeting)).toBeNull();
+        // Default macOS volumes are case-insensitive, so exercise mixed-case
+        // spellings sequentially rather than assuming both directory names
+        // can coexist in one corpus.
+        rmSync(inactive, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts an explicit authoritative root without consulting MEETINGS_DIR", async () => {
+    const configuredElsewhere = mkdtempSync(join(tmpdir(), "minutes-configured-elsewhere-"));
+    try {
+      process.env.MEETINGS_DIR = configuredElsewhere;
+      const path = writeMeeting("meeting.md", VALID_MEETING);
+
+      expect(await getMeeting(path)).toBeNull();
+      expect(await getMeeting(path, { rootDir: tempDir })).not.toBeNull();
+    } finally {
+      rmSync(configuredElsewhere, { recursive: true, force: true });
+    }
+  });
+
   it("returns null for malformed file", async () => {
     const path = writeMeeting("bad.md", "not yaml frontmatter at all");
 
     const result = await getMeeting(path);
     expect(result).toBeNull();
   });
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a symlink to a valid meeting outside the active root",
+    async () => {
+      const outsideDir = mkdtempSync(join(tmpdir(), "minutes-outside-"));
+      try {
+        const outside = join(outsideDir, "outside.md");
+        writeFileSync(outside, VALID_MEETING);
+        const linked = join(tempDir, "linked.md");
+        symlinkSync(outside, linked);
+
+        expect(await getMeeting(linked)).toBeNull();
+        expect(await listMeetings(tempDir, 10)).toEqual([]);
+      } finally {
+        rmSync(outsideDir, { recursive: true, force: true });
+      }
+    }
+  );
 });
 
 // ── findOpenActions ──────────────────────────────────────────
@@ -408,6 +635,21 @@ describe("findOpenActions", () => {
     const noActions = await findOpenActions(tempDir, "nobody");
     expect(noActions).toEqual([]);
   });
+
+  it("bounds collection before appending more actions and rejects invalid limits", async () => {
+    writeMeeting(
+      "actions.md",
+      collectionMeeting({ actionCount: 4 })
+    );
+
+    const actions = await findOpenActions(tempDir, undefined, { limit: 2 });
+    expect(actions.map((action) => action.item.task)).toEqual(["task-0", "task-1"]);
+    for (const invalid of [0, -1, 1.5, SDK_OPEN_ACTION_RESULT_MAX + 1, Infinity]) {
+      await expect(
+        findOpenActions(tempDir, undefined, { limit: invalid })
+      ).rejects.toThrow(/findOpenActions limit must be/i);
+    }
+  });
 });
 
 // ── getPersonProfile ─────────────────────────────────────────
@@ -427,6 +669,135 @@ describe("getPersonProfile", () => {
 
     const profile = await getPersonProfile(tempDir, "UnknownPerson");
     expect(profile.meetings).toHaveLength(0);
+  });
+
+  it("independently bounds meetings, actions, and topics", async () => {
+    writeMeeting(
+      "old.md",
+      collectionMeeting({
+        title: "Old",
+        date: "2026-07-14T12:00:00Z",
+        actionCount: 3,
+        tagCount: 3,
+      })
+    );
+    writeMeeting(
+      "new.md",
+      collectionMeeting({
+        title: "New",
+        date: "2026-07-16T12:00:00Z",
+        actionCount: 3,
+        tagCount: 3,
+      })
+    );
+    writeMeeting(
+      "middle.md",
+      collectionMeeting({
+        title: "Middle",
+        date: "2026-07-15T12:00:00Z",
+        actionCount: 3,
+        tagCount: 3,
+      })
+    );
+
+    const profile = await getPersonProfile(tempDir, "Alex", {
+      meetingLimit: 2,
+      openActionLimit: 2,
+      topicLimit: 2,
+    });
+    expect(profile.meetings.map((meeting) => meeting.title)).toEqual([
+      "New",
+      "Middle",
+    ]);
+    expect(profile.openActions).toHaveLength(2);
+    expect(profile.topics).toEqual(["topic-0", "topic-1"]);
+  });
+
+  it("rejects invalid independent profile limits", async () => {
+    const cases = [
+      ["meetingLimit", SDK_PERSON_PROFILE_MEETING_MAX],
+      ["openActionLimit", SDK_PERSON_PROFILE_OPEN_ACTION_MAX],
+      ["topicLimit", SDK_PERSON_PROFILE_TOPIC_MAX],
+    ] as const;
+    for (const [field, max] of cases) {
+      for (const invalid of [0, -1, 1.5, max + 1, Infinity]) {
+        await expect(
+          getPersonProfile(tempDir, "Alex", { [field]: invalid })
+        ).rejects.toThrow(/getPersonProfile .* limit must be/i);
+      }
+    }
+  });
+});
+
+describe("listVoiceMemos", () => {
+  it("bounds recent memo results and preserves newest-first ordering", async () => {
+    for (const [name, title, date] of [
+      ["old.md", "Old memo", "2026-07-14T12:00:00Z"],
+      ["new.md", "New memo", "2026-07-16T12:00:00Z"],
+      ["middle.md", "Middle memo", "2026-07-15T12:00:00Z"],
+    ] as const) {
+      writeMeeting(name, collectionMeeting({ title, type: "memo", date }));
+    }
+
+    const memos = await listVoiceMemos(tempDir, {
+      days: SDK_VOICE_MEMO_LOOKBACK_MAX_DAYS,
+      limit: 2,
+    });
+    expect(memos.map((memo) => memo.frontmatter.title)).toEqual([
+      "New memo",
+      "Middle memo",
+    ]);
+  });
+
+  it("rejects invalid result limits and lookback windows", async () => {
+    for (const invalid of [0, -1, 1.5, SDK_VOICE_MEMO_RESULT_MAX + 1, Infinity]) {
+      await expect(listVoiceMemos(tempDir, { limit: invalid })).rejects.toThrow(
+        /listVoiceMemos limit must be/i
+      );
+    }
+    for (const invalid of [
+      -1,
+      1.5,
+      SDK_VOICE_MEMO_LOOKBACK_MAX_DAYS + 1,
+      Infinity,
+    ]) {
+      await expect(listVoiceMemos(tempDir, { days: invalid })).rejects.toThrow(
+        /listVoiceMemos days must be/i
+      );
+    }
+  });
+});
+
+describe("findDecisions", () => {
+  it("bounds decisions during newest-first collection", async () => {
+    writeMeeting(
+      "old.md",
+      collectionMeeting({
+        title: "Old",
+        date: "2026-07-14T12:00:00Z",
+        decisionCount: 3,
+      })
+    );
+    writeMeeting(
+      "new.md",
+      collectionMeeting({
+        title: "New",
+        date: "2026-07-16T12:00:00Z",
+        decisionCount: 3,
+      })
+    );
+
+    const decisions = await findDecisions(tempDir, undefined, 2);
+    expect(decisions).toHaveLength(2);
+    expect(decisions.every((decision) => decision.title === "New")).toBe(true);
+  });
+
+  it("rejects invalid decision limits", async () => {
+    for (const invalid of [0, -1, 1.5, SDK_DECISION_RESULT_MAX + 1, Infinity]) {
+      await expect(
+        findDecisions(tempDir, undefined, invalid)
+      ).rejects.toThrow(/findDecisions limit must be/i);
+    }
   });
 });
 
@@ -716,6 +1087,82 @@ describe("getMeetingWithOverlays", () => {
     expect(out?.frontmatter.title).toBe("Q2 Pricing Discussion");
   });
 
+  it.skipIf(process.platform === "win32")(
+    "never returns a stale normal snapshot after any failed overlay attempt",
+    async () => {
+      const cases: Array<{
+        name: string;
+        script: string;
+        timeoutMs: number;
+        expected: "restricted" | "unreadable";
+      }> = [
+        {
+          name: "nonzero",
+          script: `writeFileSync(process.argv[3], ${JSON.stringify(RESTRICTED_MEETING)}); process.exit(7);`,
+          timeoutMs: 2_000,
+          expected: "restricted",
+        },
+        {
+          name: "timeout",
+          script: `writeFileSync(process.argv[3], ${JSON.stringify(RESTRICTED_MEETING)}); setTimeout(() => {}, 60_000);`,
+          timeoutMs: 500,
+          expected: "restricted",
+        },
+        {
+          name: "empty-stdout",
+          script: `writeFileSync(process.argv[3], ${JSON.stringify(RESTRICTED_MEETING)});`,
+          timeoutMs: 2_000,
+          expected: "restricted",
+        },
+        {
+          name: "invalid-json",
+          script: `writeFileSync(process.argv[3], ${JSON.stringify(RESTRICTED_MEETING)}); process.stdout.write("{invalid-json");`,
+          timeoutMs: 2_000,
+          expected: "restricted",
+        },
+        {
+          name: "malformed-source",
+          script: `writeFileSync(process.argv[3], "not meeting markdown"); process.exit(9);`,
+          timeoutMs: 2_000,
+          expected: "unreadable",
+        },
+        {
+          name: "removed-source",
+          script: `rmSync(process.argv[3]); process.stdout.write("{invalid-json");`,
+          timeoutMs: 2_000,
+          expected: "unreadable",
+        },
+      ];
+
+      for (const testCase of cases) {
+        const path = writeMeeting("meeting.md", VALID_MEETING);
+        const fakeMinutes = join(tempDir, `fake-${testCase.name}-minutes.mjs`);
+        writeFileSync(
+          fakeMinutes,
+          `#!/usr/bin/env node\n` +
+            `import { rmSync, writeFileSync } from "node:fs";\n` +
+            `${testCase.script}\n`
+        );
+        chmodSync(fakeMinutes, 0o700);
+
+        const out = await getMeetingWithOverlays(path, {
+          rootDir: tempDir,
+          minutesBin: fakeMinutes,
+          timeoutMs: testCase.timeoutMs,
+        });
+
+        if (testCase.expected === "restricted") {
+          expect(out?.restricted_stub, testCase.name).toBe(true);
+        } else {
+          expect(out, testCase.name).toBeNull();
+        }
+        expect(JSON.stringify(out), testCase.name).not.toContain(
+          "Alex proposed monthly billing"
+        );
+      }
+    }
+  );
+
   it("returns null for a nonexistent meeting file even with overlay flag", async () => {
     const out = await getMeetingWithOverlays(
       join(tempDir, "does-not-exist.md"),
@@ -723,6 +1170,112 @@ describe("getMeetingWithOverlays", () => {
     );
     expect(out).toBeNull();
   });
+
+  it("does not invoke the overlay path for a source outside the authoritative root", async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), "minutes-overlay-outside-"));
+    try {
+      const outside = join(outsideDir, "outside.md");
+      const marker = join(outsideDir, "overlay-invoked");
+      const fakeMinutes = join(outsideDir, "fake-minutes.mjs");
+      writeFileSync(outside, VALID_MEETING);
+      writeFileSync(
+        fakeMinutes,
+        `#!/usr/bin/env node\n` +
+          `import { writeFileSync } from "node:fs";\n` +
+          `writeFileSync(${JSON.stringify(marker)}, "invoked");\n` +
+          `process.stdout.write(JSON.stringify({ frontmatter: { speaker_map: [] } }));\n`
+      );
+      chmodSync(fakeMinutes, 0o700);
+
+      const out = await getMeetingWithOverlays(outside, {
+        rootDir: tempDir,
+        minutesBin: fakeMinutes,
+      });
+
+      expect(out).toBeNull();
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the same explicit root for initial read and overlay reauthorization", async () => {
+    const configuredElsewhere = mkdtempSync(join(tmpdir(), "minutes-overlay-config-"));
+    try {
+      process.env.MEETINGS_DIR = configuredElsewhere;
+      const path = writeMeeting("meeting.md", VALID_MEETING);
+      const fakeMinutes = join(tempDir, "fake-overlay-minutes.mjs");
+      writeFileSync(
+        fakeMinutes,
+        `#!/usr/bin/env node\n` +
+          `import { createHash } from "node:crypto";\n` +
+          `import { readFileSync } from "node:fs";\n` +
+          `const source = readFileSync(process.argv[3]);\n` +
+          `process.stdout.write(JSON.stringify({ overlay_applied: true, overlay_source_sha256: createHash("sha256").update(source).digest("hex"), frontmatter: { speaker_map: [{ speaker_label: "SPEAKER_0", name: "EXPLICIT-ROOT-OVERLAY", confidence: "high", source: "manual" }] } }));\n`
+      );
+      chmodSync(fakeMinutes, 0o700);
+
+      const out = await getMeetingWithOverlays(path, {
+        rootDir: tempDir,
+        minutesBin: fakeMinutes,
+      });
+
+      if (!out || out.restricted_stub) {
+        throw new Error("normal overlay read must return a full meeting");
+      }
+      expect(out.frontmatter.speaker_map?.[0]?.name).toBe(
+        "EXPLICIT-ROOT-OVERLAY"
+      );
+    } finally {
+      rmSync(configuredElsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a path-only overlay response without an exact source proof", async () => {
+    const path = writeMeeting("meeting.md", VALID_MEETING);
+    const fakeMinutes = join(tempDir, "fake-stale-overlay-minutes.mjs");
+    writeFileSync(
+      fakeMinutes,
+      `#!/usr/bin/env node\n` +
+        `process.stdout.write(JSON.stringify({ overlay_applied: true, overlay_source_sha256: "${"0".repeat(64)}", frontmatter: { speaker_map: [{ speaker_label: "SPEAKER_0", name: "STALE-PRIVATE-CANARY", confidence: "high", source: "manual" }] } }));\n`
+    );
+    chmodSync(fakeMinutes, 0o700);
+
+    const out = await getMeetingWithOverlays(path, {
+      minutesBin: fakeMinutes,
+      timeoutMs: 2000,
+    });
+
+    expect(JSON.stringify(out)).not.toContain("STALE-PRIVATE-CANARY");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "reauthorizes the exact source after the overlay CLI returns",
+    async () => {
+      const path = writeMeeting("meeting.md", VALID_MEETING);
+      const fakeMinutes = join(tempDir, "fake-minutes.mjs");
+      writeFileSync(
+        fakeMinutes,
+        `#!/usr/bin/env node\n` +
+          `import { writeFileSync } from "node:fs";\n` +
+          `writeFileSync(process.argv[3], ${JSON.stringify(RESTRICTED_MEETING)});\n` +
+          `process.stdout.write(JSON.stringify({ frontmatter: { speaker_map: [{ speaker_label: "SPEAKER_0", name: "OVERLAY-PRIVATE-CANARY", confidence: "high", source: "manual" }] } }));\n`
+      );
+      chmodSync(fakeMinutes, 0o700);
+
+      const out = await getMeetingWithOverlays(path, {
+        minutesBin: fakeMinutes,
+        timeoutMs: 2000,
+      });
+
+      expect(out?.restricted_stub).toBe(true);
+      expect(out && "speaker_map" in out.frontmatter).toBe(false);
+      expect(JSON.stringify(out)).not.toContain("OVERLAY-PRIVATE-CANARY");
+      expect(JSON.stringify(out)).not.toContain(
+        "Confidential board pricing discussion"
+      );
+    }
+  );
 });
 
 // ── Sensitivity enforcement (restricted meetings) ────────────
@@ -731,8 +1284,8 @@ describe("sensitivity enforcement", () => {
   it("isRestricted reflects the sensitivity frontmatter", () => {
     const restricted = parseFrontmatter(RESTRICTED_MEETING, "r.md");
     const normal = parseFrontmatter(VALID_MEETING, "v.md");
-    expect(isRestricted(restricted)).toBe(true);
-    expect(isRestricted(normal)).toBe(false);
+    expect(isRestricted(restricted!)).toBe(true);
+    expect(isRestricted(normal!)).toBe(false);
   });
 
   it("listMeetings excludes restricted meetings by default", async () => {
@@ -742,6 +1295,71 @@ describe("sensitivity enforcement", () => {
     const titles = meetings.map((m) => m.frontmatter.title);
     expect(titles).toContain("Q2 Pricing Discussion");
     expect(titles).not.toContain("Board Pricing Strategy");
+  });
+
+  it("does not publish corpus authorization hooks through ReadOptions", () => {
+    type PublicOptionsExposeHooks =
+      "corpusLeaseHooks" extends keyof ReadOptions ? true : false;
+    const exposesHooks: PublicOptionsExposeHooks = false;
+    expect(exposesHooks).toBe(false);
+  });
+
+  it("fails closed on an explicit unknown sensitivity value", async () => {
+    const malformed = VALID_MEETING.replace(
+      "duration: 42m",
+      "duration: 42m\nsensitivity: confidential"
+    );
+    const path = writeMeeting("unknown-sensitivity.md", malformed);
+
+    expect(parseFrontmatter(malformed, path)).toBeNull();
+    expect(await getMeeting(path)).toBeNull();
+    expect(await getMeeting(path, { includeRestricted: true })).toBeNull();
+    expect(
+      (await listMeetings(tempDir, 10, { includeRestricted: true })).map(
+        (meeting) => meeting.path
+      )
+    ).not.toContain(path);
+    expect(
+      (await searchMeetings(tempDir, "pricing", 10, {
+        includeRestricted: true,
+      })).map((meeting) => meeting.path)
+    ).not.toContain(path);
+  });
+
+  it("fails closed before policy parsing when the sensitivity key is invalid UTF-8", async () => {
+    const privateCanary = "INVALID-UTF8-RESTRICTED-CANARY";
+    const normalCanary = "INVALID-UTF8-NORMAL-CANARY";
+    const invalidPath = join(tempDir, "invalid-utf8.md");
+    writeFileSync(
+      invalidPath,
+      restrictedMeetingWithInvalidUtf8Key(privateCanary)
+    );
+    writeMeeting(
+      "normal.md",
+      VALID_MEETING.replace(
+        "Alex proposed monthly billing instead of annual.",
+        normalCanary
+      )
+    );
+
+    expect(await getMeeting(invalidPath)).toBeNull();
+    expect(await getMeeting(invalidPath, { includeRestricted: true })).toBeNull();
+
+    // One undecodable policy source denies the entire stable multi-source
+    // authorization. It must not silently disappear and return the other
+    // meeting as a partially authorized corpus.
+    const outcomes = await Promise.allSettled([
+      listMeetings(tempDir, 10),
+      searchMeetings(tempDir, privateCanary, 10),
+      listMeetings(tempDir, 10, { includeRestricted: true }),
+    ]);
+    expect(outcomes.every((outcome) => outcome.status === "rejected")).toBe(
+      true
+    );
+    const serialized = JSON.stringify(outcomes);
+    expect(serialized).not.toContain(privateCanary);
+    expect(serialized).not.toContain(normalCanary);
+    expect(serialized).not.toContain(invalidPath);
   });
 
   it("listMeetings includes restricted meetings with the explicit override", async () => {
@@ -769,21 +1387,49 @@ describe("sensitivity enforcement", () => {
   });
 
   it("getMeeting returns a minimal stub for a restricted meeting fetched by path", async () => {
-    const path = writeMeeting("restricted.md", RESTRICTED_MEETING);
+    const pathCanary = "RESTRICTED-PARENT-PATH-CANARY";
+    const fileCanary = "RESTRICTED-FILENAME-CANARY";
+    const privateParent = join(tempDir, pathCanary);
+    mkdirSync(privateParent);
+    const path = join(privateParent, `${fileCanary}.md`);
+    writeFileSync(path, RESTRICTED_MEETING);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const stub = await getMeeting(path);
     expect(stub).not.toBeNull();
     expect(stub!.restricted_stub).toBe(true);
+    if (!stub || !stub.restricted_stub) {
+      throw new Error("restricted exact read must return the public path-free stub type");
+    }
+    expectTypeOf(stub).toEqualTypeOf<RestrictedMeetingStub>();
+    expectTypeOf<Awaited<ReturnType<typeof getMeeting>>>().toEqualTypeOf<
+      ExactMeetingResult | null
+    >();
     // The stub keeps only title/date/type/sensitivity...
     expect(stub!.frontmatter.title).toBe("Board Pricing Strategy");
     expect(stub!.frontmatter.sensitivity).toBe("restricted");
     expect(stub!.frontmatter.date).not.toBe("");
     // ...and points at the override, never the content.
     expect(stub!.body).toContain("excluded by default");
-    expect(stub!.body).toContain("include_restricted");
+    expect(stub!.body).toContain("includeRestricted: true");
     expect(stub!.body).not.toContain("Confidential board pricing discussion");
-    expect(stub!.frontmatter.action_items).toEqual([]);
-    expect(stub!.frontmatter.decisions).toEqual([]);
-    expect(stub!.frontmatter.attendees).toEqual([]);
+    expect(Object.keys(stub!.frontmatter).sort()).toEqual([
+      "date",
+      "sensitivity",
+      "title",
+      "type",
+    ]);
+    expect(Object.keys(stub!).sort()).toEqual([
+      "body",
+      "frontmatter",
+      "restricted_stub",
+    ]);
+    const serialized = JSON.stringify(stub);
+    expect(serialized).not.toContain(pathCanary);
+    expect(serialized).not.toContain(fileCanary);
+    expect(serialized).not.toContain(tempDir);
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning.mock.calls.flat().join(" ")).not.toContain(path);
+    warning.mockRestore();
   });
 
   it("getMeeting returns the full restricted meeting with the explicit override", async () => {
@@ -791,7 +1437,10 @@ describe("sensitivity enforcement", () => {
     const overridden = await getMeeting(path, { includeRestricted: true });
     expect(overridden?.restricted_stub).toBeUndefined();
     expect(overridden?.frontmatter.title).toBe("Board Pricing Strategy");
-    expect(overridden?.frontmatter.action_items.length).toBeGreaterThan(0);
+    if (!overridden || overridden.restricted_stub) {
+      throw new Error("explicit override must return a full meeting");
+    }
+    expect(overridden.frontmatter.action_items.length).toBeGreaterThan(0);
     expect(overridden?.body).toContain("Confidential board pricing discussion");
   });
 

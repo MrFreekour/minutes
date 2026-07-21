@@ -3,7 +3,7 @@
   "name": "minutes",
   "display_name": "Minutes Conversation Memory",
   "description": "The private, owned conversation-memory layer for AI. Record, transcribe, and search every meeting, voice memo, and dictation entirely on your own machine — nothing uploaded — then let any AI you connect recall it. Plain-markdown output you keep forever; no cloud, no API key, no vendor to outlive.",
-  "long_description": "Minutes is the private, owned conversation-memory layer. Record meetings, voice memos, and dictation; transcribe them on your own machine; and get structured markdown in `~/meetings/` that Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi, and any MCP-compatible client read from the same folder — no proprietary SDK, no API key. Nothing is uploaded: when a cloud memory tool gets acquired or subpoenaed, your recordings aren't theirs to hand over. No vendor to outlive — ten years from now, `grep` still works on your corpus.\n\n36 tools • 7 resources • Interactive MCP App dashboard • Prompt templates\n\nWhat you get:\n• On-device transcription with sealed local whisper.cpp and optional on-device summarization (Apple Foundation Models on macOS 26+) — your audio never leaves the machine. Retained Parakeet and Apple Speech preferences resolve to Whisper until those helpers support secure byte transport.\n• A native chat panel that recalls your meetings, with token streaming and read-only search of your own corpus.\n• Dictation that types straight at your cursor, on the same local engine.\n• Live sessions that promote into diarized, summarized meetings when you stop.\n• Consent provenance in every file, and sensitivity gating agents must respect.\n• Diarized speaker labels, structured action items and decisions, and a cross-meeting relationship graph — all queryable via MCP.",
+  "long_description": "Minutes is the private, owned conversation-memory layer. Record meetings, voice memos, and dictation; transcribe them on your own machine; and get structured markdown in `~/meetings/` that Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi, and any MCP-compatible client read from the same folder — no proprietary SDK, no API key. Nothing is uploaded: when a cloud memory tool gets acquired or subpoenaed, your recordings aren't theirs to hand over. No vendor to outlive — ten years from now, `grep` still works on your corpus.\n\n33 tools • 11 resources • Interactive MCP App dashboard • 6 prompt templates\n\nWhat you get:\n• On-device transcription with sealed local whisper.cpp and optional on-device summarization (Apple Foundation Models on macOS 26+) — your audio never leaves the machine. Retained Parakeet and Apple Speech preferences resolve to Whisper until those helpers support secure byte transport.\n• A native chat panel that recalls your meetings, with token streaming and read-only search of your own corpus.\n• Dictation that types straight at your cursor, on the same local engine.\n• Live sessions that promote into diarized, summarized meetings when you stop.\n• Consent provenance in every file, and sensitivity gating agents must respect.\n• Diarized speaker labels, structured action items and decisions, and policy-safe search over owned markdown. The cross-meeting relationship graph is temporarily unavailable while its privacy-safe bounded rebuild is completed (roadmap issue #513); compatibility-only derived insight and annotation reads fail explicitly until their source provenance can be revalidated.",
   "version": "0.23.0",
   "author": {
     "name": "Mat Silverstein",
@@ -57,39 +57,39 @@
     },
     {
       "name": "list_meetings",
-      "description": "List recent meetings and voice memos"
+      "description": "List recent normal meetings and voice memos; restricted items are excluded unless an explicit logged override is enabled and requested"
     },
     {
       "name": "search_meetings",
-      "description": "Search meeting transcripts and voice memos"
+      "description": "Search normal meeting transcripts and voice memos; restricted items are excluded unless an explicit logged override is enabled and requested"
     },
     {
       "name": "get_meeting",
-      "description": "Get full transcript of a specific meeting"
+      "description": "Get a normal meeting transcript; restricted meetings return a content-free stub unless an explicit logged override is enabled and requested"
     },
     {
       "name": "activity_summary",
-      "description": "Summarize meeting-adjacent desktop context for a linked artifact, context session, or time window"
+      "description": "Summarize desktop context bound to one exact normal meeting source"
     },
     {
       "name": "search_context",
-      "description": "Search desktop-context events across app focus and captured window titles, including opted-in browser titles"
+      "description": "Search desktop-context events bound to one exact normal meeting source"
     },
     {
       "name": "get_moment",
-      "description": "Show the local desktop-context rewind around a linked artifact, session, or timestamp"
+      "description": "Show the local desktop-context rewind bound to one exact normal meeting source"
     },
     {
       "name": "get_screen_context",
-      "description": "Retrieve bounded, verified screenshots linked to a Minutes context session"
+      "description": "Retrieve bounded, verified screenshots bound to one exact normal meeting source"
     },
     {
       "name": "process_audio",
-      "description": "Process an audio file through the transcription pipeline"
+      "description": "On macOS and Linux, process bounded inbox or Downloads WAV audio; compressed/private containers and Windows fail closed without reading audio; retained library recordings are unavailable"
     },
     {
       "name": "add_note",
-      "description": "Add a timestamped note to the current recording or an existing meeting"
+      "description": "Add a timestamped note to the current active recording; existing meeting files are not mutable from this assistant tool"
     },
     {
       "name": "consistency_report",
@@ -97,19 +97,11 @@
     },
     {
       "name": "get_person_profile",
-      "description": "Build a profile for a person across all meetings"
+      "description": "Build a profile from policy-authorized meetings within supported corpus bounds"
     },
     {
       "name": "research_topic",
-      "description": "Research a topic across meetings, decisions, and follow-ups"
-    },
-    {
-      "name": "qmd_collection_status",
-      "description": "Check if the Minutes output directory is registered as a QMD collection"
-    },
-    {
-      "name": "register_qmd_collection",
-      "description": "Register the Minutes output directory as a QMD collection"
+      "description": "Research a topic across policy-authorized meetings within supported corpus bounds"
     },
     {
       "name": "start_dictation",
@@ -125,7 +117,7 @@
     },
     {
       "name": "relationship_map",
-      "description": "All contacts with relationship scores and losing-touch alerts"
+      "description": "Temporarily unavailable while the privacy-safe relationship graph is rebuilt; see roadmap issue #513"
     },
     {
       "name": "list_voices",
@@ -133,11 +125,11 @@
     },
     {
       "name": "confirm_speaker",
-      "description": "Confirm or correct speaker attribution in a meeting transcript"
+      "description": "Compatibility name only: agent-controlled speaker mutation is unavailable; use the Minutes app or human CLI"
     },
     {
       "name": "get_meeting_insights",
-      "description": "Query structured meeting insights (decisions, commitments, questions) with confidence filtering"
+      "description": "Compatibility name only: unavailable until derived insight records carry live-verifiable canonical source policy provenance"
     },
     {
       "name": "start_live_transcript",
@@ -164,10 +156,6 @@
       "description": "Read observed copilot nudges incrementally by cursor or time window"
     },
     {
-      "name": "open_dashboard",
-      "description": "Open the Meeting Intelligence Dashboard in the browser — visual overview of conversation memory"
-    },
-    {
       "name": "ingest_meeting",
       "description": "Extract facts from a meeting and update the knowledge base (person profiles, log, index)"
     },
@@ -181,7 +169,7 @@
     },
     {
       "name": "get_agent_annotations",
-      "description": "Read append-only agent.annotation events separately from human-authored meeting markdown and frontmatter"
+      "description": "Compatibility name only: unavailable until agent annotations carry live-verifiable canonical source policy provenance"
     }
   ],
   "prompts": [
@@ -212,15 +200,15 @@
       "arguments": [
         "name"
       ],
-      "text": "Build a profile for ${arguments.name} across all my meetings. What topics do we discuss? What commitments are open? What decisions have we made together?"
+      "text": "Build a profile for ${arguments.name} from policy-authorized meetings within supported corpus bounds. What topics do we discuss? What commitments are open? What decisions have we made together?"
     },
     {
       "name": "topic_research",
-      "description": "Research a topic across all meetings",
+      "description": "Research a topic across policy-authorized meetings within supported corpus bounds",
       "arguments": [
         "topic"
       ],
-      "text": "Research ${arguments.topic} across all my meetings. Show related decisions, open follow-ups, and which meetings discussed it most."
+      "text": "Research ${arguments.topic} across policy-authorized meetings within supported corpus bounds. Show related decisions, open follow-ups, and which meetings discussed it most."
     },
     {
       "name": "start_meeting",

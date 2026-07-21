@@ -5,7 +5,7 @@
 > Regenerate: node scripts/generate_llms_txt.mjs
 > Last generated: 2026-07-25
 
-Minutes exposes 36 tools, 8 resources, and 6 prompt templates through the MCP server.
+Minutes exposes 33 tools, 11 resources, and 6 prompt templates through the MCP server.
 
 ## Install
 
@@ -96,7 +96,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-list-processing-jobs
 
 #### `list_meetings`
 
-List recent meetings and voice memos
+List recent normal meetings and voice memos; restricted items are excluded unless an explicit logged override is enabled and requested
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-list-meetings
 
@@ -104,7 +104,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-list-meetings
 
 #### `search_meetings`
 
-Search meeting transcripts and voice memos
+Search normal meeting transcripts and voice memos; restricted items are excluded unless an explicit logged override is enabled and requested
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-search-meetings
 
@@ -112,7 +112,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-search-meetings
 
 #### `get_meeting`
 
-Get full transcript of a specific meeting
+Get a normal meeting transcript; restricted meetings return a content-free stub unless an explicit logged override is enabled and requested
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-meeting
 
@@ -120,7 +120,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-meeting
 
 #### `activity_summary`
 
-Summarize meeting-adjacent desktop context for a linked artifact, context session, or time window
+Summarize desktop context bound to one exact normal meeting source
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-activity-summary
 
@@ -128,7 +128,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-activity-summary
 
 #### `search_context`
 
-Search desktop-context events across app focus and captured window titles, including opted-in browser titles
+Search desktop-context events bound to one exact normal meeting source
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-search-context
 
@@ -136,7 +136,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-search-context
 
 #### `get_moment`
 
-Show the local desktop-context rewind around a linked artifact, session, or timestamp
+Show the local desktop-context rewind bound to one exact normal meeting source
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-moment
 
@@ -144,7 +144,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-moment
 
 #### `get_screen_context`
 
-Retrieve bounded, verified screenshots linked to a Minutes context session
+Retrieve bounded, verified screenshots bound to one exact normal meeting source
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-screen-context
 
@@ -152,7 +152,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-screen-context
 
 #### `research_topic`
 
-Research a topic across meetings, decisions, and follow-ups
+Research a topic across policy-authorized meetings within supported corpus bounds
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-research-topic
 
@@ -170,7 +170,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-consistency-report
 
 #### `get_person_profile`
 
-Build a profile for a person across all meetings
+Build a profile from policy-authorized meetings within supported corpus bounds
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-person-profile
 
@@ -186,7 +186,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-track-commitments
 
 #### `relationship_map`
 
-All contacts with relationship scores and losing-touch alerts
+Temporarily unavailable while the privacy-safe relationship graph is rebuilt; see roadmap issue #513
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 
@@ -196,7 +196,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 
 #### `get_meeting_insights`
 
-Query structured meeting insights (decisions, commitments, questions) with confidence filtering
+Compatibility name only: unavailable until derived insight records carry live-verifiable canonical source policy provenance
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
 
@@ -256,7 +256,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-read-live-transcript
 
 #### `process_audio`
 
-Process an audio file through the transcription pipeline
+On macOS and Linux, process bounded inbox or Downloads WAV audio; compressed/private containers and Windows fail closed without reading audio; retained library recordings are unavailable
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-process-audio
 
@@ -264,17 +264,9 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-process-audio
 
 #### `add_note`
 
-Add a timestamped note to the current recording or an existing meeting
+Add a timestamped note to the current active recording; existing meeting files are not mutable from this assistant tool
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-add-note
-
-<a id="tool-open-dashboard"></a>
-
-#### `open_dashboard`
-
-Open the Meeting Intelligence Dashboard in the browser — visual overview of conversation memory
-
-Reference URL: https://useminutes.app/docs/mcp/tools#tool-open-dashboard
 
 ### Voice and speaker ID
 
@@ -290,27 +282,9 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-list-voices
 
 #### `confirm_speaker`
 
-Confirm or correct speaker attribution in a meeting transcript
+Compatibility name only: agent-controlled speaker mutation is unavailable; use the Minutes app or human CLI
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-confirm-speaker
-
-### Integration
-
-<a id="tool-qmd-collection-status"></a>
-
-#### `qmd_collection_status`
-
-Check if the Minutes output directory is registered as a QMD collection
-
-Reference URL: https://useminutes.app/docs/mcp/tools#tool-qmd-collection-status
-
-<a id="tool-register-qmd-collection"></a>
-
-#### `register_qmd_collection`
-
-Register the Minutes output directory as a QMD collection
-
-Reference URL: https://useminutes.app/docs/mcp/tools#tool-register-qmd-collection
 
 ### Agent Event Bus
 
@@ -326,7 +300,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-add-agent-annotation
 
 #### `get_agent_annotations`
 
-Read append-only agent.annotation events separately from human-authored meeting markdown and frontmatter
+Compatibility name only: unavailable until agent annotations carry live-verifiable canonical source policy provenance
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-agent-annotations
 
@@ -374,7 +348,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#resource-recording-status
 
 #### `minutes://events/recent`
 
-Recent pipeline events (recordings, processing, notes)
+Recent pipeline events with meeting-derived content withheld until source policy provenance is available
 
 Reference URL: https://useminutes.app/docs/mcp/tools#resource-recent-events
 
@@ -382,7 +356,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#resource-recent-events
 
 #### `minutes://events/agent-annotations`
 
-Recent append-only agent.annotation events, separate from human meeting markdown
+Agent annotations are withheld until their source policy provenance can be revalidated
 
 Reference URL: https://useminutes.app/docs/mcp/tools#resource-agent-annotations
 
@@ -403,6 +377,32 @@ Reference URL: https://useminutes.app/docs/mcp/tools#resource-open-actions
 Recent voice memos and ideas captured from any device (last 14 days)
 
 Reference URL: https://useminutes.app/docs/mcp/tools#resource-recent-ideas
+
+### Live
+
+<a id="resource-live-events"></a>
+
+#### `minutes://events/live`
+
+Live events are currently withheld because raw cursors can reveal restricted activity; reads return a constant unavailable response.
+
+Reference URL: https://useminutes.app/docs/mcp/tools#resource-live-events
+
+<a id="resource-live-copilot"></a>
+
+#### `minutes://live/copilot`
+
+Current copilot state and latest observed nudge. Subscribe for notifications/resources/updated or poll this URI; MCP only controls and observes the independent minutes copilot engine.
+
+Reference URL: https://useminutes.app/docs/mcp/tools#resource-live-copilot
+
+<a id="resource-live-events-since-seq"></a>
+
+#### `minutes://events/live{?since_seq,limit}`
+
+Live event cursor reads are currently withheld because raw cursors can reveal restricted activity; reads return a constant unavailable response.
+
+Reference URL: https://useminutes.app/docs/mcp/tools#resource-live-events-since-seq
 
 ## Prompt templates
 
@@ -428,7 +428,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#prompt-person-briefing
 
 #### `topic_research`
 
-Research a topic across all meetings
+Research a topic across policy-authorized meetings within supported corpus bounds
 
 Reference URL: https://useminutes.app/docs/mcp/tools#prompt-topic-research
 

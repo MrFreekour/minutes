@@ -93,12 +93,27 @@ pub fn add_note(text: &str) -> Result<String, String> {
         return crate::sensitive::add_marker(text).map_err(|error| error.to_string());
     }
 
-    // Check recording is in progress
+    add_recording_note(text).map_err(|error| {
+        if error == "No active recording is available for a note." {
+            "No recording or sensitive meeting in progress. Start one with: minutes record or minutes sensitive start".into()
+        } else {
+            error
+        }
+    })
+}
+
+/// Add a note only to a live captured recording.
+///
+/// Assistant surfaces use this entry point so agent-authored text can never
+/// fall through to the human-only no-capture sensitive-session marker path.
+pub fn add_recording_note(text: &str) -> Result<String, String> {
+    if crate::sensitive::is_active() {
+        return Err("Sensitive sessions accept user-authored markers only.".into());
+    }
+
     let pid_path = crate::pid::pid_path();
-    if !pid_path.exists() {
-        return Err(
-            "No recording or sensitive meeting in progress. Start one with: minutes record or minutes sensitive start".into(),
-        );
+    if !crate::pid::inspect_pid_file(&pid_path).is_active() {
+        return Err("No active recording is available for a note.".into());
     }
 
     let timestamp = elapsed_timestamp().unwrap_or_else(|| "?:??".into());

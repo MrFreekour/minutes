@@ -33,7 +33,6 @@ const toolGroupOrder = [
   "Live and dictation",
   "Notes and processing",
   "Voice and speaker ID",
-  "Integration",
   "Agent Event Bus",
 ];
 
@@ -45,26 +44,37 @@ function extractQuotedValue(input) {
 function parseResources(source) {
   const resources = [];
 
+  const resolveUri = (rawUri) => {
+    if (rawUri.startsWith('"')) return rawUri.slice(1, -1);
+    const declaration = source.match(
+      new RegExp(`export\\s+const\\s+${rawUri}\\s*=\\s*"([^"]+)"`)
+    );
+    if (!declaration) {
+      throw new Error(`Could not resolve MCP resource URI constant ${rawUri}`);
+    }
+    return declaration[1];
+  };
+
   const appResourcePattern =
-    /registerAppResource\(\s*server,\s*"([^"]+)",\s*([A-Z0-9_":/.{}-]+),\s*\{\s*description:\s*"([^"]+)"\s*\}/gs;
+    /registerAppResource\(\s*server,\s*"([^"]+)",\s*([A-Z0-9_":/.{}-]+),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
   for (const match of source.matchAll(appResourcePattern)) {
     const [, name, rawUri, description] = match;
-    const uri = rawUri === "UI_RESOURCE_URI" ? "ui://minutes/dashboard" : rawUri.replace(/"/g, "");
+    const uri = rawUri === "UI_RESOURCE_URI" ? "ui://minutes/dashboard" : resolveUri(rawUri);
     resources.push({ name, uri, description });
   }
 
   const directResourcePattern =
-    /server\.resource\(\s*"([^"]+)",\s*"([^"]+)",\s*\{\s*description:\s*"([^"]+)"\s*\}/gs;
+    /server\.resource\(\s*"([^"]+)",\s*("[^"]+"|[A-Z][A-Z0-9_]*),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
   for (const match of source.matchAll(directResourcePattern)) {
-    const [, name, uri, description] = match;
-    resources.push({ name, uri, description });
+    const [, name, rawUri, description] = match;
+    resources.push({ name, uri: resolveUri(rawUri), description });
   }
 
   const templateResourcePattern =
-    /server\.resource\(\s*"([^"]+)",\s*new ResourceTemplate\("([^"]+)",[\s\S]*?\),\s*\{\s*description:\s*"([^"]+)"\s*\}/gs;
+    /server\.resource\(\s*"([^"]+)",\s*new ResourceTemplate\(("[^"]+"|[A-Z][A-Z0-9_]*),[\s\S]*?\),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
   for (const match of source.matchAll(templateResourcePattern)) {
-    const [, name, uri, description] = match;
-    resources.push({ name, uri, description });
+    const [, name, rawUri, description] = match;
+    resources.push({ name, uri: resolveUri(rawUri), description });
   }
 
   const seen = new Set();
@@ -212,9 +222,8 @@ function categorizeTool(name) {
     Insights: new Set(["get_meeting_insights", "ingest_meeting", "knowledge_status"]),
     "Live and dictation": new Set(["start_live_transcript", "read_live_transcript", "start_dictation", "stop_dictation"]),
     "Real-time Coach": new Set(["start_copilot", "stop_copilot", "copilot_status", "read_copilot_nudges"]),
-    "Notes and processing": new Set(["add_note", "process_audio", "open_dashboard"]),
+    "Notes and processing": new Set(["add_note", "process_audio"]),
     "Voice and speaker ID": new Set(["list_voices", "confirm_speaker"]),
-    Integration: new Set(["qmd_collection_status", "register_qmd_collection"]),
     "Agent Event Bus": new Set(["add_agent_annotation", "get_agent_annotations"]),
   };
 
@@ -230,6 +239,7 @@ function categorizeResource(name) {
     Status: new Set(["recording_status", "recent_events", "agent_annotations"]),
     Meetings: new Set(["recent_meetings", "meeting"]),
     Memory: new Set(["open_actions", "recent-ideas"]),
+    Live: new Set(["live_events", "live_events_since_seq", "live_copilot"]),
   };
 
   for (const [group, names] of Object.entries(groups)) {
@@ -374,7 +384,7 @@ decisions:
 ## Capabilities For Agents
 
 1. Meeting recall — Search and retrieve past meetings, memos, and transcripts.
-2. Relationship memory — Build person profiles, find commitments, and detect losing-touch risk.
+2. Policy-bound people context — Build bounded live-source profiles and find live commitments. Graph rankings and losing-touch signals are temporarily unavailable; see roadmap issue #513.
 3. Decision and action-item tracking — Query structured decisions, commitments, and open follow-ups.
 4. Recording and live transcript control — Start or stop capture and read live transcript deltas.
 5. Local-first context — Audio processing happens on-device and the durable output is inspectable markdown.

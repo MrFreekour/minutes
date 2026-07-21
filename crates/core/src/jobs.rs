@@ -1351,16 +1351,18 @@ fn recording_duration(job: &ProcessingJob) -> String {
 }
 
 fn refresh_qmd_collection(config: &Config) {
-    let Some(collection) = config.search.qmd_collection.as_ref() else {
+    if config.search.qmd_collection.is_none() {
         return;
-    };
-    let status = crate::engine_process::command("qmd")
-        .args(["update", "-c", collection])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if let Err(error) = status {
-        tracing::debug!(error = %error, collection = %collection, "qmd update skipped");
+    }
+    match crate::knowledge::refresh_qmd_collection(config) {
+        Ok(mirror) => tracing::debug!(
+            path = %mirror.path.display(),
+            files = mirror.files,
+            "QMD policy mirror refreshed"
+        ),
+        Err(error) => {
+            tracing::warn!(error = %error, "QMD policy-safe refresh skipped");
+        }
     }
 }
 

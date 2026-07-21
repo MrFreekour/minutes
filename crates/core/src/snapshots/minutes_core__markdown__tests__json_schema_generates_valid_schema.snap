@@ -654,7 +654,7 @@ expression: schema
           "const": "normal"
         },
         {
-          "description": "Restricted artifact; agent surfaces enforce this in a later wave.",
+          "description": "Restricted artifact; agent surfaces exclude it unless an explicit,\nsurface-specific audited override exists.",
           "type": "string",
           "const": "restricted"
         }

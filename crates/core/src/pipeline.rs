@@ -3200,6 +3200,117 @@ impl AuthorizedProcessAudioInput {
         })
     }
 
+    /// Consume the exact fd 3 capability claimed by the CLI before startup.
+    ///
+    /// The bridge has already copied and attested the source revision into an
+    /// owner-private, single-link file. This constructor never reopens a
+    /// pathname: it copies only from the inherited handle into Minutes'
+    /// sealed private-audio store, then closes the bridge handle before any
+    /// decoder or enrichment work can run.
+    #[cfg(unix)]
+    pub fn from_claimed_inherited_file(
+        source: File,
+        expected_byte_length: u64,
+        original_format_extension: &str,
+    ) -> Result<Self, MinutesError> {
+        Self::from_claimed_inherited_file_with_hook(
+            source,
+            expected_byte_length,
+            original_format_extension,
+            true,
+            || Ok(()),
+        )
+    }
+
+    #[cfg(unix)]
+    fn from_claimed_inherited_file_with_hook<F>(
+        mut source: File,
+        expected_byte_length: u64,
+        original_format_extension: &str,
+        require_fd_three: bool,
+        after_copy: F,
+    ) -> Result<Self, MinutesError>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        if require_fd_three && source.as_raw_fd() != 3 {
+            return Err(reject_authorized_input(
+                "claimed inherited descriptor was not fd 3",
+            ));
+        }
+        let descriptor_flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) };
+        if descriptor_flags < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if descriptor_flags & libc::FD_CLOEXEC == 0 {
+            return Err(reject_authorized_input(
+                "claimed inherited descriptor was not close-on-exec",
+            ));
+        }
+        if expected_byte_length > MAX_AUTHORIZED_PROCESS_AUDIO_BYTES {
+            return Err(reject_authorized_input(
+                "audio copy resource budget exceeded",
+            ));
+        }
+        let format_extension = normalize_authorized_format(original_format_extension)?;
+        let before = source.metadata()?;
+        if !before.file_type().is_file()
+            || before.nlink() != 1
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o077 != 0
+            || before.len() != expected_byte_length
+        {
+            return Err(reject_authorized_input(
+                "inherited source must be an exact owner-private single-link file",
+            ));
+        }
+        source.rewind()?;
+        let mut private_audio = PrivateAudioTempFile::new(
+            "minutes-authorized-process-",
+            &format!(".{format_extension}"),
+        )?;
+        {
+            let mut writer = private_audio.prepare_for_write()?;
+            copy_authorized_bytes_from_reader(
+                &mut source,
+                &mut writer,
+                None,
+                expected_byte_length,
+                MAX_AUTHORIZED_PROCESS_AUDIO_BYTES,
+                AUTHORIZED_PROCESS_AUDIO_COPY_TIMEOUT,
+            )?;
+        }
+        private_audio.finish_write()?;
+        after_copy()?;
+        let after = source.metadata()?;
+        if !after.file_type().is_file()
+            || after.nlink() != 1
+            || after.uid() != before.uid()
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
+            || after.mode() != before.mode()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+        {
+            return Err(reject_authorized_input(
+                "inherited source identity changed during authorization",
+            ));
+        }
+        drop(source);
+        let processing_path = private_audio.processing_path();
+        Ok(Self {
+            private_audio,
+            processing_path,
+            format_extension,
+        })
+    }
+
     pub(crate) fn from_proof(
         source_path: &Path,
         expected_sha256: &str,
@@ -3585,6 +3696,83 @@ mod authorized_process_input_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn inherited_bridge_copies_only_an_owner_private_exact_revision() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("bridge.wav");
+        let bytes = b"synthetic inherited wav revision";
+        let mut create = std::fs::OpenOptions::new();
+        create.read(true).write(true).create_new(true).mode(0o600);
+        let mut created = create.open(&source).unwrap();
+        created.write_all(bytes).unwrap();
+        created.sync_all().unwrap();
+        drop(created);
+
+        let exact = std::fs::File::open(&source).unwrap();
+        let input = AuthorizedProcessAudioInput::from_claimed_inherited_file_with_hook(
+            exact,
+            bytes.len() as u64,
+            "wav",
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_registered_private_audio(input.processing_path()).unwrap(),
+            bytes
+        );
+        assert!(!input.processing_path().exists());
+
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let public = std::fs::File::open(&source).unwrap();
+        let error = AuthorizedProcessAudioInput::from_claimed_inherited_file_with_hook(
+            public,
+            bytes.len() as u64,
+            "wav",
+            false,
+            || Ok(()),
+        )
+        .err()
+        .expect("group-readable bridge staging must fail closed");
+        assert!(error.to_string().contains("owner-private"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inherited_bridge_rejects_a_source_changed_during_copy() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("bridge.wav");
+        let bytes = b"synthetic inherited wav revision";
+        let mut create = std::fs::OpenOptions::new();
+        create.read(true).write(true).create_new(true).mode(0o600);
+        let mut created = create.open(&source).unwrap();
+        created.write_all(bytes).unwrap();
+        created.sync_all().unwrap();
+        drop(created);
+
+        let exact = std::fs::File::open(&source).unwrap();
+        let changed = source.clone();
+        let error = AuthorizedProcessAudioInput::from_claimed_inherited_file_with_hook(
+            exact,
+            bytes.len() as u64,
+            "wav",
+            false,
+            move || {
+                let mut replacement = bytes.to_vec();
+                replacement[0] ^= 1;
+                std::fs::write(changed, replacement)
+            },
+        )
+        .err()
+        .expect("a changed inherited revision must fail closed");
+        assert!(error.to_string().contains("changed during authorization"));
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn authorized_input_is_rejected_before_either_linux_child_can_spawn() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3893,7 +4081,7 @@ where
 /// caller to obtain descriptor-authorized behavior by supplying a boolean or
 /// format string beside an unrelated path.
 #[allow(dead_code)] // Public bridge is enabled by the dependent policy slice B.
-pub(crate) fn process_with_template_authorized<F>(
+pub fn process_with_template_authorized<F>(
     input: &AuthorizedProcessAudioInput,
     content_type: ContentType,
     title: Option<&str>,

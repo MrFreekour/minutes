@@ -93,7 +93,6 @@ def main() -> None:
         "list_meetings",
         "search_meetings",
         "get_meeting",
-        "open_dashboard",
     }
     missing_tools = sorted(required_tools - tool_names)
     if missing_tools:

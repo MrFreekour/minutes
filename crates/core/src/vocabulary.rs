@@ -12,10 +12,7 @@ use thiserror::Error;
 /// projects, acronyms, and recurring terms that help Minutes bias future
 /// transcription and canonicalize derived search/graph projections.
 pub fn default_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".minutes")
-        .join("vocabulary.toml")
+    crate::overlays::correction_state_dir().join("vocabulary.toml")
 }
 
 #[derive(Debug, Error)]

@@ -12,10 +12,18 @@
 //                            v                   v
 //                      listMeetings()      searchMeetings()
 
-import { readFile, readdir, stat } from "fs/promises";
-import { join, extname } from "path";
+import { realpath, stat } from "fs/promises";
+import { extname, isAbsolute, join, relative, resolve } from "path";
 import { homedir } from "os";
 import { parse as parseYaml } from "yaml";
+import {
+  withStableCorpusLease,
+  type StableCorpusSnapshot,
+} from "./corpus-lease.js";
+import {
+  decodePolicyUtf8,
+  readTextFileFromBoundParent,
+} from "./secure-read.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -131,15 +139,29 @@ export interface MeetingFile {
   frontmatter: Frontmatter;
   body: string;
   path: string;
-  /**
-   * True when this object is a minimal placeholder for a meeting designated
-   * `sensitivity: restricted`, returned by `getMeeting` without the
-   * `includeRestricted` override. A stub carries only title, date, type, and
-   * the sensitivity designation — never the transcript body, action items,
-   * decisions, or attendees.
-   */
-  restricted_stub?: boolean;
+  /** Discriminant retained for ergonomic narrowing of exact-read results. */
+  restricted_stub?: false;
 }
+
+/**
+ * Path-free placeholder for an exact read of a restricted meeting.
+ *
+ * This is deliberately not a `MeetingFile`: source paths, capture metadata,
+ * transcript-shaped arrays, and every other field that could carry restricted
+ * identifiers are absent from the type as well as the serialized value.
+ */
+export interface RestrictedMeetingStub {
+  restricted_stub: true;
+  body: string;
+  frontmatter: {
+    title: string;
+    type: string;
+    date: string;
+    sensitivity: "restricted";
+  };
+}
+
+export type ExactMeetingResult = MeetingFile | RestrictedMeetingStub;
 
 function parseRawAttendees(raw?: string): string[] {
   if (!raw) return [];
@@ -290,10 +312,38 @@ export function parseFrontmatter(
     const parsed = parseYaml(yaml);
     if (!parsed || typeof parsed !== "object") return null;
 
+    if (typeof parsed.title !== "string" || parsed.title.trim() === "") {
+      return null;
+    }
+    if (
+      typeof parsed.type !== "string" ||
+      !["meeting", "memo", "dictation"].includes(parsed.type)
+    ) {
+      return null;
+    }
+    const parsedDate =
+      parsed.date instanceof Date ? parsed.date : new Date(String(parsed.date ?? ""));
+    if (Number.isNaN(parsedDate.getTime())) {
+      return null;
+    }
+
+    // Sensitivity is an agent-enforcement field. A document that explicitly
+    // declares an unknown value must not be silently reclassified as a normal
+    // meeting: doing so would turn a typo or future policy value into an
+    // exfiltration bypass. Legacy documents with no sensitivity key remain
+    // normal and readable.
+    if (
+      Object.prototype.hasOwnProperty.call(parsed, "sensitivity") &&
+      parsed.sensitivity !== "normal" &&
+      parsed.sensitivity !== "restricted"
+    ) {
+      return null;
+    }
+
     const fm: Frontmatter = {
-      title: String(parsed.title || ""),
-      type: String(parsed.type || "meeting"),
-      date: parsed.date instanceof Date ? parsed.date.toISOString() : String(parsed.date || ""),
+      title: parsed.title,
+      type: parsed.type,
+      date: parsed.date instanceof Date ? parsed.date.toISOString() : String(parsed.date),
       duration: String(parsed.duration || ""),
       source: parsed.source ? String(parsed.source) : undefined,
       status: parsed.status ? String(parsed.status) : undefined,
@@ -362,45 +412,60 @@ export function parseFrontmatter(
 
 // ── File scanning ────────────────────────────────────────────
 
-/**
- * Recursively find all .md files in a directory.
- */
-async function findMarkdownFiles(dir: string): Promise<string[]> {
-  const results: string[] = [];
+const INACTIVE_CORPUS_DIRS = new Set([
+  "archive",
+  "processed",
+  "failed",
+  "failed-captures",
+]);
 
-  try {
-    const entries = await readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        // Skip hidden directories and common non-meeting dirs
-        if (!entry.name.startsWith(".")) {
-          const nested = await findMarkdownFiles(fullPath);
-          results.push(...nested);
-        }
-      } else if (
-        entry.isFile() &&
-        extname(entry.name).toLowerCase() === ".md"
-      ) {
-        results.push(fullPath);
-      }
-    }
-  } catch {
-    // Directory doesn't exist or permission denied — return empty
-  }
-
-  return results;
+function isInactiveCorpusDirectory(name: string): boolean {
+  return INACTIVE_CORPUS_DIRS.has(name.toLowerCase());
 }
 
-/**
- * Parse a single meeting file from disk.
- */
-async function readMeetingFile(
-  filePath: string
+function isActiveCorpusPath(filePath: string, root: string): boolean {
+  const scoped = relative(root, filePath);
+  if (
+    scoped === "" ||
+    isAbsolute(scoped) ||
+    scoped.split(/[\\/]+/).some((component) => component === "..")
+  ) {
+    return false;
+  }
+  return !scoped
+    .split(/[\\/]+/)
+    .some(
+      (component) => component.startsWith(".") || isInactiveCorpusDirectory(component)
+    );
+}
+
+async function canonicalCorpusRoot(root: string): Promise<string | null> {
+  try {
+    const canonicalRoot = await realpath(root);
+    return (await stat(canonicalRoot)).isDirectory() ? canonicalRoot : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readMeetingFileAtCanonicalRoot(
+  filePath: string,
+  canonicalRoot: string
 ): Promise<MeetingFile | null> {
   try {
-    const content = await readFile(filePath, "utf-8");
-    return parseFrontmatter(content, filePath);
+    const canonicalPath = await realpath(filePath);
+    if (
+      extname(canonicalPath).toLowerCase() !== ".md" ||
+      !isActiveCorpusPath(canonicalPath, canonicalRoot)
+    ) {
+      return null;
+    }
+    const content = decodePolicyUtf8(
+      await readTextFileFromBoundParent(canonicalPath)
+    );
+    const meeting = parseFrontmatter(content, canonicalPath);
+    if (meeting) meetingSnapshotContent.set(meeting, content);
+    return meeting;
   } catch {
     return null;
   }
@@ -410,11 +475,65 @@ async function readMeetingFile(
  * Sort meetings by date descending (newest first).
  */
 function sortByDateDesc(meetings: MeetingFile[]): MeetingFile[] {
-  return meetings.sort((a, b) => {
-    const dateA = a.frontmatter.date || "";
-    const dateB = b.frontmatter.date || "";
-    return dateB.localeCompare(dateA);
-  });
+  return meetings.sort((a, b) =>
+    compareDatePathNewestFirst(
+      a.frontmatter.date,
+      a.path,
+      b.frontmatter.date,
+      b.path
+    )
+  );
+}
+
+function compareDatePathNewestFirst(
+  dateAValue: string,
+  pathA: string,
+  dateBValue: string,
+  pathB: string
+): number {
+  const dateA = Date.parse(dateAValue);
+  const dateB = Date.parse(dateBValue);
+  const validA = Number.isFinite(dateA);
+  const validB = Number.isFinite(dateB);
+  if (validA && validB && dateA !== dateB) return dateA > dateB ? -1 : 1;
+  if (validA !== validB) return validA ? -1 : 1;
+  return pathA.localeCompare(pathB);
+}
+
+/** Maximum meetings returned by list/search APIs in one call. */
+export const SDK_MEETING_RESULT_MAX = 10_000;
+/** Maximum voice memos returned by `listVoiceMemos` in one call. */
+export const SDK_VOICE_MEMO_RESULT_MAX = 1_000;
+/** Maximum open actions returned by `findOpenActions` in one call. */
+export const SDK_OPEN_ACTION_RESULT_MAX = 1_000;
+/** Maximum decisions returned by `findDecisions` in one call. */
+export const SDK_DECISION_RESULT_MAX = 1_000;
+/** Per-collection caps for `getPersonProfile`. */
+export const SDK_PERSON_PROFILE_MEETING_MAX = 1_000;
+export const SDK_PERSON_PROFILE_OPEN_ACTION_MAX = 1_000;
+export const SDK_PERSON_PROFILE_TOPIC_MAX = 1_000;
+/** Maximum accepted voice-memo lookback window (100 years). */
+export const SDK_VOICE_MEMO_LOOKBACK_MAX_DAYS = 36_500;
+
+function normalizeResultLimit(
+  limit: number,
+  max: number,
+  surface: string
+): number {
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > max
+  ) {
+    throw new RangeError(
+      `${surface} limit must be an integer between 1 and ${max}`
+    );
+  }
+  return limit;
+}
+
+function normalizeMeetingResultLimit(limit: number): number {
+  return normalizeResultLimit(limit, SDK_MEETING_RESULT_MAX, "meeting result");
 }
 
 // ── Sensitivity enforcement ──────────────────────────────────
@@ -432,7 +551,39 @@ function sortByDateDesc(meetings: MeetingFile[]): MeetingFile[] {
 export interface ReadOptions {
   /** Include `sensitivity: restricted` meetings. Default false. */
   includeRestricted?: boolean;
+  /**
+   * Authoritative active-corpus root for exact-path reads. Defaults to
+   * `defaultDir()` (and therefore honors `MEETINGS_DIR`). A requested path
+   * outside this root, or beneath an inactive/hidden directory, is rejected.
+   */
+  rootDir?: string;
 }
+
+/** Options for `findOpenActions`; results never exceed the exported cap. */
+export interface OpenActionOptions extends ReadOptions {
+  /** Maximum actions to return (1-`SDK_OPEN_ACTION_RESULT_MAX`). */
+  limit?: number;
+}
+
+/** Independent collection bounds for `getPersonProfile`. */
+export interface PersonProfileOptions extends ReadOptions {
+  /** Maximum matching meetings to return. */
+  meetingLimit?: number;
+  /** Maximum matching open actions to return. */
+  openActionLimit?: number;
+  /** Maximum distinct topics to return. */
+  topicLimit?: number;
+}
+
+/** Options for `listVoiceMemos`; both window and result size are bounded. */
+export interface VoiceMemoOptions extends ReadOptions {
+  /** Non-negative lookback window, capped at 100 years. */
+  days?: number;
+  /** Maximum memos to return (1-`SDK_VOICE_MEMO_RESULT_MAX`). */
+  limit?: number;
+}
+
+const meetingSnapshotContent = new WeakMap<object, string>();
 
 /** True when a meeting is marked `sensitivity: restricted`. */
 export function isRestricted(meeting: MeetingFile): boolean {
@@ -448,38 +599,63 @@ export function isRestricted(meeting: MeetingFile): boolean {
  */
 function enforceSensitivity<T extends MeetingFile>(
   meetings: T[],
-  opts: ReadOptions,
-  surface: string
+  opts: ReadOptions
 ): T[] {
-  if (opts.includeRestricted) {
-    const restricted = meetings.filter(isRestricted).length;
-    if (restricted > 0) {
-      console.warn(
-        `[minutes] include_restricted override: surfacing ${restricted} restricted meeting(s) via ${surface}`
-      );
-    }
-    return meetings;
+  if (opts.includeRestricted) return meetings;
+  let retained = 0;
+  for (const meeting of meetings) {
+    if (isRestricted(meeting)) continue;
+    meetings[retained] = meeting;
+    retained += 1;
   }
-  return meetings.filter((m) => !isRestricted(m));
+  meetings.length = retained;
+  return meetings;
 }
 
-/**
- * Read every file in `files` into a parsed meeting, dropping unreadable ones,
- * then apply the sensitivity policy. All directory-scanning read functions
- * route through here so restricted-meeting exclusion cannot be forgotten by a
- * new caller.
- */
-async function readMeetings(
-  files: string[],
-  opts: ReadOptions,
-  surface: string
-): Promise<MeetingFile[]> {
+function meetingsFromStableSnapshot(snapshot: StableCorpusSnapshot): MeetingFile[] {
   const meetings: MeetingFile[] = [];
-  for (const file of files) {
-    const meeting = await readMeetingFile(file);
-    if (meeting) meetings.push(meeting);
+  for (const file of snapshot.files) {
+    const meeting = parseFrontmatter(file.content, file.path);
+    if (!meeting) continue;
+    meetingSnapshotContent.set(meeting, file.content);
+    meetings.push(meeting);
   }
-  return enforceSensitivity(meetings, opts, surface);
+  return meetings;
+}
+
+async function stableMeetingOperation<T>(
+  dir: string,
+  opts: ReadOptions,
+  surface: string,
+  operation: (meetings: MeetingFile[]) => T
+): Promise<T> {
+  const canonicalRoot = await canonicalCorpusRoot(dir);
+  // A missing/unreadable corpus has no source bytes to authorize. Preserve the
+  // SDK's empty-corpus contract without weakening reads from an existing root.
+  if (!canonicalRoot) return operation([]);
+  let restrictedOverrideCount = 0;
+  // Every caller below supplies a synchronous, local-only projection. Its
+  // result remains inside the lease until the final journal fence succeeds;
+  // no callback performs I/O, publishes output, or invokes user code.
+  const result = await withStableCorpusLease(
+    canonicalRoot,
+    (snapshot) => {
+      const meetings = meetingsFromStableSnapshot(snapshot);
+      restrictedOverrideCount = 0;
+      if (opts.includeRestricted) {
+        for (const meeting of meetings) {
+          if (isRestricted(meeting)) restrictedOverrideCount += 1;
+        }
+      }
+      return operation(enforceSensitivity(meetings, opts));
+    }
+  );
+  if (restrictedOverrideCount > 0) {
+    console.warn(
+      `[minutes] includeRestricted override: surfacing ${restrictedOverrideCount} restricted meeting(s) via ${surface}`
+    );
+  }
+  return result;
 }
 
 // ── Public API ───────────────────────────────────────────────
@@ -495,9 +671,10 @@ export async function listMeetings(
   limit: number = 20,
   opts: ReadOptions = {}
 ): Promise<MeetingFile[]> {
-  const files = await findMarkdownFiles(dir);
-  const meetings = await readMeetings(files, opts, "list_meetings");
-  return sortByDateDesc(meetings).slice(0, limit);
+  const boundedLimit = normalizeMeetingResultLimit(limit);
+  return stableMeetingOperation(dir, opts, "list_meetings", (meetings) =>
+    sortByDateDesc(meetings).slice(0, boundedLimit)
+  );
 }
 
 /**
@@ -513,20 +690,23 @@ export async function searchMeetings(
   limit: number = 20,
   opts: ReadOptions = {}
 ): Promise<MeetingFile[]> {
+  const boundedLimit = normalizeMeetingResultLimit(limit);
   if (!query) return [];
 
   const queryLower = query.toLowerCase();
-  const files = await findMarkdownFiles(dir);
-  const meetings = await readMeetings(files, opts, "search_meetings");
-  const results = meetings.filter((meeting) => {
-    const titleMatch = meeting.frontmatter.title
-      .toLowerCase()
-      .includes(queryLower);
-    const bodyMatch = meeting.body.toLowerCase().includes(queryLower);
-    return titleMatch || bodyMatch;
+  return stableMeetingOperation(dir, opts, "search_meetings", (meetings) => {
+    const results: MeetingFile[] = [];
+    for (const meeting of sortByDateDesc(meetings)) {
+      const titleMatch = meeting.frontmatter.title
+        .toLowerCase()
+        .includes(queryLower);
+      const bodyMatch = meeting.body.toLowerCase().includes(queryLower);
+      if (!titleMatch && !bodyMatch) continue;
+      results.push(meeting);
+      if (results.length >= boundedLimit) break;
+    }
+    return results;
   });
-
-  return sortByDateDesc(results).slice(0, limit);
 }
 
 /**
@@ -534,7 +714,7 @@ export async function searchMeetings(
  */
 const RESTRICTED_STUB_NOTE =
   "Content excluded by default: this meeting is designated `sensitivity: restricted`. " +
-  "Pass the include_restricted parameter for an explicit, logged override.";
+  "Pass `{ includeRestricted: true }` for an explicit, logged override.";
 
 /**
  * Build the minimal placeholder returned for a restricted meeting fetched by
@@ -542,24 +722,15 @@ const RESTRICTED_STUB_NOTE =
  * designation only. The transcript body, action items, decisions, and
  * attendees are never included.
  */
-function restrictedStub(meeting: MeetingFile): MeetingFile {
+function restrictedStub(meeting: MeetingFile): RestrictedMeetingStub {
   return {
-    path: meeting.path,
     restricted_stub: true,
     body: RESTRICTED_STUB_NOTE,
     frontmatter: {
       title: meeting.frontmatter.title,
       type: meeting.frontmatter.type,
       date: meeting.frontmatter.date,
-      duration: "",
-      capture: meeting.frontmatter.capture,
       sensitivity: "restricted",
-      tags: [],
-      attendees: [],
-      people: [],
-      action_items: [],
-      decisions: [],
-      intents: [],
     },
   };
 }
@@ -577,19 +748,27 @@ function restrictedStub(meeting: MeetingFile): MeetingFile {
 export async function getMeeting(
   filePath: string,
   opts: ReadOptions = {}
-): Promise<MeetingFile | null> {
-  const meeting = await readMeetingFile(filePath);
+): Promise<ExactMeetingResult | null> {
+  const canonicalRoot = await canonicalCorpusRoot(opts.rootDir ?? defaultDir());
+  if (!canonicalRoot) return null;
+  return getMeetingAtCanonicalRoot(filePath, opts, canonicalRoot);
+}
+
+async function getMeetingAtCanonicalRoot(
+  filePath: string,
+  opts: ReadOptions,
+  canonicalRoot: string
+): Promise<ExactMeetingResult | null> {
+  const meeting = await readMeetingFileAtCanonicalRoot(filePath, canonicalRoot);
   if (!meeting) return null;
   if (isRestricted(meeting)) {
     if (!opts.includeRestricted) {
       console.warn(
-        `[minutes] get_meeting: ${filePath} is restricted; returning stub (content excluded by default)`
+        "[minutes] get_meeting: restricted source; returning stub (content excluded by default)"
       );
       return restrictedStub(meeting);
     }
-    console.warn(
-      `[minutes] include_restricted override: returning restricted meeting ${filePath}`
-    );
+    console.warn("[minutes] includeRestricted override: returning one restricted meeting");
   }
   return meeting;
 }
@@ -713,8 +892,8 @@ function humanizeOneLine(line: string, highMap: Map<string, string>): string {
  * `speaker_map`. Best-effort convenience: shells to the local `minutes`
  * CLI (`minutes get <path> --json`) which reads `~/.minutes/overlays.db`
  * server-side and returns an overlay-applied payload. If the CLI is not
- * available or the call fails, falls back to plain `getMeeting()` so
- * consumers always get a usable result.
+ * available or the call fails, re-reads the source through plain
+ * `getMeeting()` authorization before returning its current state.
  *
  * For full control over which overlays apply (e.g. to layer a remote
  * overlay store, or to test against fixtures), use `applySpeakerOverlays`
@@ -722,52 +901,100 @@ function humanizeOneLine(line: string, highMap: Map<string, string>): string {
  */
 export async function getMeetingWithOverlays(
   filePath: string,
-  options: { minutesBin?: string; timeoutMs?: number; includeRestricted?: boolean } = {}
-): Promise<MeetingFile | null> {
-  const fallback = await getMeeting(filePath, {
-    includeRestricted: options.includeRestricted,
-  });
+  options: ReadOptions & { minutesBin?: string; timeoutMs?: number } = {}
+): Promise<ExactMeetingResult | null> {
+  // Resolve the authority once. The overlay subprocess is untrusted to change
+  // the root used by either the initial read or the post-overlay recheck.
+  const canonicalRoot = await canonicalCorpusRoot(options.rootDir ?? defaultDir());
+  if (!canonicalRoot) return null;
+  const fallback = await getMeetingAtCanonicalRoot(
+    filePath,
+    options,
+    canonicalRoot
+  );
   if (!fallback) return null;
   // A restricted stub never goes through the CLI overlay path: overlays would
   // add speaker names to a meeting whose content is excluded by default.
   if (fallback.restricted_stub) return fallback;
 
+  const expected = meetingSnapshotContent.get(fallback);
+  const reauthorizeSource = async () => {
+    const current = await getMeetingAtCanonicalRoot(
+      filePath,
+      options,
+      canonicalRoot
+    );
+    return {
+      current,
+      unchanged:
+        expected !== undefined &&
+        current !== null &&
+        !current.restricted_stub &&
+        meetingSnapshotContent.get(current) === expected,
+    };
+  };
+
   // Dynamically import child_process so this module still loads in
   // environments without it (browsers, Edge runtimes). The function
   // simply degrades to non-overlay behavior in those cases.
   let execFile: typeof import("child_process").execFile;
+  let sha256: (content: string) => string;
   try {
     ({ execFile } = await import("child_process"));
+    const { createHash } = await import("crypto");
+    sha256 = (content) => createHash("sha256").update(content).digest("hex");
   } catch {
-    return fallback;
+    return (await reauthorizeSource()).current;
   }
 
   const bin = options.minutesBin ?? process.env.MINUTES_BIN ?? "minutes";
   const timeoutMs = options.timeoutMs ?? 10_000;
 
   const stdout = await new Promise<string | null>((resolve) => {
-    execFile(
-      bin,
-      ["get", filePath, "--json", "--compact-json"],
-      { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 },
-      (err, out) => {
-        if (err) resolve(null);
-        else resolve(out.toString());
-      }
-    );
+    try {
+      execFile(
+        bin,
+        ["get", filePath, "--json", "--compact-json"],
+        { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 },
+        (err, out) => {
+          if (err) resolve(null);
+          else resolve(out.toString());
+        }
+      );
+    } catch {
+      resolve(null);
+    }
   });
 
-  if (!stdout) return fallback;
+  // This fence is deliberately unconditional after the awaited overlay
+  // attempt. Even a timeout, non-zero exit, or empty stdout may have raced a
+  // normal source into a restricted, unreadable, or malformed state.
+  const authorization = await reauthorizeSource();
+  if (!authorization.current || authorization.current.restricted_stub) {
+    return authorization.current;
+  }
+  if (expected === undefined || !authorization.unchanged) {
+    return authorization.current;
+  }
+
+  if (!stdout) return authorization.current;
 
   try {
     const payload = JSON.parse(stdout);
     const overlaidMap = payload?.frontmatter?.speaker_map;
-    if (!Array.isArray(overlaidMap)) return fallback;
+
+    if (
+      !Array.isArray(overlaidMap) ||
+      payload?.overlay_applied !== true ||
+      payload?.overlay_source_sha256 !== sha256(expected)
+    ) {
+      return authorization.current;
+    }
 
     return {
-      ...fallback,
+      ...authorization.current,
       frontmatter: {
-        ...fallback.frontmatter,
+        ...authorization.current.frontmatter,
         speaker_map: overlaidMap.map((attr: any) => ({
           speaker_label: String(attr.speaker_label || ""),
           name: String(attr.name || ""),
@@ -781,100 +1008,133 @@ export async function getMeetingWithOverlays(
       },
     };
   } catch {
-    return fallback;
+    return authorization.current;
   }
 }
 
 /**
- * Find open action items across all meetings.
+ * Find open action items across policy-authorized meetings within the
+ * supported corpus bounds.
  */
 export async function findOpenActions(
   dir: string,
   assignee?: string,
-  opts: ReadOptions = {}
+  opts: OpenActionOptions = {}
 ): Promise<Array<{ path: string; item: ActionItem }>> {
-  const files = await findMarkdownFiles(dir);
-  const meetings = await readMeetings(files, opts, "find_open_actions");
-  const results: Array<{ path: string; item: ActionItem }> = [];
-
-  for (const meeting of meetings) {
-    for (const item of meeting.frontmatter.action_items) {
-      if (item.status !== "open") continue;
-      if (
-        assignee &&
-        item.assignee.toLowerCase() !== assignee.toLowerCase()
-      ) {
-        continue;
+  const boundedLimit = normalizeResultLimit(
+    opts.limit ?? SDK_OPEN_ACTION_RESULT_MAX,
+    SDK_OPEN_ACTION_RESULT_MAX,
+    "findOpenActions"
+  );
+  return stableMeetingOperation(dir, opts, "find_open_actions", (meetings) => {
+    const results: Array<{ path: string; item: ActionItem }> = [];
+    for (const meeting of sortByDateDesc(meetings)) {
+      for (const item of meeting.frontmatter.action_items) {
+        if (item.status !== "open") continue;
+        if (
+          assignee &&
+          item.assignee.toLowerCase() !== assignee.toLowerCase()
+        ) {
+          continue;
+        }
+        results.push({ path: meeting.path, item });
+        if (results.length >= boundedLimit) return results;
       }
-      results.push({ path: meeting.path, item });
     }
-  }
-
-  return results;
+    return results;
+  });
 }
 
 /**
- * Build a person profile from all meetings mentioning them.
+ * Build a person profile from policy-authorized meetings within the supported
+ * corpus bounds that mention them.
  */
 export async function getPersonProfile(
   dir: string,
   name: string,
-  opts: ReadOptions = {}
+  opts: PersonProfileOptions = {}
 ): Promise<{
   name: string;
   meetings: Array<{ title: string; date: string; path: string }>;
   openActions: ActionItem[];
   topics: string[];
 }> {
+  const meetingLimit = normalizeResultLimit(
+    opts.meetingLimit ?? SDK_PERSON_PROFILE_MEETING_MAX,
+    SDK_PERSON_PROFILE_MEETING_MAX,
+    "getPersonProfile meeting"
+  );
+  const openActionLimit = normalizeResultLimit(
+    opts.openActionLimit ?? SDK_PERSON_PROFILE_OPEN_ACTION_MAX,
+    SDK_PERSON_PROFILE_OPEN_ACTION_MAX,
+    "getPersonProfile open-action"
+  );
+  const topicLimit = normalizeResultLimit(
+    opts.topicLimit ?? SDK_PERSON_PROFILE_TOPIC_MAX,
+    SDK_PERSON_PROFILE_TOPIC_MAX,
+    "getPersonProfile topic"
+  );
   const nameLower = name.toLowerCase();
-  const files = await findMarkdownFiles(dir);
-  const sourceMeetings = await readMeetings(files, opts, "person_profile");
-  const meetings: Array<{ title: string; date: string; path: string }> = [];
-  const openActions: ActionItem[] = [];
-  const topicSet = new Set<string>();
+  return stableMeetingOperation(dir, opts, "person_profile", (sourceMeetings) => {
+    const meetings: Array<{ title: string; date: string; path: string }> = [];
+    const openActions: ActionItem[] = [];
+    const topicSet = new Set<string>();
 
-  for (const meeting of sourceMeetings) {
-    const attendees = [
-      ...meeting.frontmatter.attendees,
-      ...parseRawAttendees(meeting.frontmatter.attendees_raw),
-    ];
+    for (const meeting of sortByDateDesc(sourceMeetings)) {
+      const attendees = [
+        ...meeting.frontmatter.attendees,
+        ...parseRawAttendees(meeting.frontmatter.attendees_raw),
+      ];
 
-    const inAttendees = attendees.some((a) =>
-      a.toLowerCase().includes(nameLower)
-    );
-    const inPeople = meeting.frontmatter.people.some((p) =>
-      p.toLowerCase().includes(nameLower)
-    );
-    const inBody = meeting.body.toLowerCase().includes(nameLower);
+      const inAttendees = attendees.some((a) =>
+        a.toLowerCase().includes(nameLower)
+      );
+      const inPeople = meeting.frontmatter.people.some((p) =>
+        p.toLowerCase().includes(nameLower)
+      );
+      const inBody = meeting.body.toLowerCase().includes(nameLower);
 
-    if (inAttendees || inPeople || inBody) {
-      meetings.push({
-        title: meeting.frontmatter.title,
-        date: meeting.frontmatter.date,
-        path: meeting.path,
-      });
+      if (inAttendees || inPeople || inBody) {
+        if (meetings.length < meetingLimit) {
+          meetings.push({
+            title: meeting.frontmatter.title,
+            date: meeting.frontmatter.date,
+            path: meeting.path,
+          });
+        }
 
-      for (const tag of meeting.frontmatter.tags) {
-        topicSet.add(tag);
-      }
-
-      for (const item of meeting.frontmatter.action_items) {
+        if (topicSet.size < topicLimit) {
+          for (const tag of meeting.frontmatter.tags) {
+            if (topicSet.has(tag)) continue;
+            topicSet.add(tag);
+            if (topicSet.size >= topicLimit) break;
+          }
+        }
+        for (const item of meeting.frontmatter.action_items) {
+          if (openActions.length >= openActionLimit) break;
+          if (
+            item.status === "open" &&
+            item.assignee.toLowerCase().includes(nameLower)
+          ) {
+            openActions.push(item);
+          }
+        }
         if (
-          item.status === "open" &&
-          item.assignee.toLowerCase().includes(nameLower)
+          meetings.length >= meetingLimit &&
+          openActions.length >= openActionLimit &&
+          topicSet.size >= topicLimit
         ) {
-          openActions.push(item);
+          break;
         }
       }
     }
-  }
-
-  return {
-    name,
-    meetings: meetings.sort((a, b) => b.date.localeCompare(a.date)),
-    openActions,
-    topics: Array.from(topicSet),
-  };
+    return {
+      name,
+      meetings,
+      openActions,
+      topics: Array.from(topicSet),
+    };
+  });
 }
 
 /**
@@ -891,24 +1151,40 @@ export function defaultDir(): string {
  */
 export async function listVoiceMemos(
   dir: string,
-  options: { days?: number; limit?: number; includeRestricted?: boolean } = {}
+  options: VoiceMemoOptions = {}
 ): Promise<MeetingFile[]> {
-  const { days = 14, limit = 20, includeRestricted } = options;
+  const { days = 14, limit = 20 } = options;
+  if (
+    !Number.isSafeInteger(days) ||
+    days < 0 ||
+    days > SDK_VOICE_MEMO_LOOKBACK_MAX_DAYS
+  ) {
+    throw new RangeError(
+      `listVoiceMemos days must be an integer between 0 and ${SDK_VOICE_MEMO_LOOKBACK_MAX_DAYS}`
+    );
+  }
+  const boundedLimit = normalizeResultLimit(
+    limit,
+    SDK_VOICE_MEMO_RESULT_MAX,
+    "listVoiceMemos"
+  );
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
-
-  const meetings = await listMeetings(dir, 500, { includeRestricted });
-  const memos = meetings.filter((m) => {
-    if (m.frontmatter.type !== "memo") return false;
-    const date = new Date(m.frontmatter.date);
-    return date >= cutoff;
+  return stableMeetingOperation(dir, options, "list_voice_memos", (meetings) => {
+    const results: MeetingFile[] = [];
+    for (const meeting of sortByDateDesc(meetings)) {
+      if (meeting.frontmatter.type !== "memo") continue;
+      if (new Date(meeting.frontmatter.date) < cutoff) continue;
+      results.push(meeting);
+      if (results.length >= boundedLimit) break;
+    }
+    return results;
   });
-
-  return memos.slice(0, limit);
 }
 
 /**
- * Find decisions across all meetings, optionally filtered by topic keyword.
+ * Find decisions across policy-authorized meetings within the supported corpus
+ * bounds, optionally filtered by topic keyword.
  */
 export async function findDecisions(
   dir: string,
@@ -916,29 +1192,31 @@ export async function findDecisions(
   limit: number = 50,
   opts: ReadOptions = {}
 ): Promise<Array<{ path: string; title: string; date: string; decision: Decision }>> {
-  const files = await findMarkdownFiles(dir);
-  const meetings = await readMeetings(files, opts, "find_decisions");
-  const results: Array<{ path: string; title: string; date: string; decision: Decision }> = [];
-
-  for (const meeting of meetings) {
-    for (const decision of meeting.frontmatter.decisions) {
-      if (topic) {
-        const topicLower = topic.toLowerCase();
-        const matches =
-          decision.text.toLowerCase().includes(topicLower) ||
-          (decision.topic && decision.topic.toLowerCase().includes(topicLower));
-        if (!matches) continue;
+  const boundedLimit = normalizeResultLimit(
+    limit,
+    SDK_DECISION_RESULT_MAX,
+    "findDecisions"
+  );
+  const topicLower = topic?.toLowerCase();
+  return stableMeetingOperation(dir, opts, "find_decisions", (meetings) => {
+    const results: Array<{ path: string; title: string; date: string; decision: Decision }> = [];
+    for (const meeting of sortByDateDesc(meetings)) {
+      for (const decision of meeting.frontmatter.decisions) {
+        if (topicLower) {
+          const matches =
+            decision.text.toLowerCase().includes(topicLower) ||
+            (decision.topic && decision.topic.toLowerCase().includes(topicLower));
+          if (!matches) continue;
+        }
+        results.push({
+          path: meeting.path,
+          title: meeting.frontmatter.title,
+          date: meeting.frontmatter.date,
+          decision,
+        });
+        if (results.length >= boundedLimit) return results;
       }
-      results.push({
-        path: meeting.path,
-        title: meeting.frontmatter.title,
-        date: meeting.frontmatter.date,
-        decision,
-      });
     }
-  }
-
-  return results
-    .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, limit);
+    return results;
+  });
 }

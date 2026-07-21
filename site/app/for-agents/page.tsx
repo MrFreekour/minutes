@@ -2,7 +2,11 @@ import type { Metadata } from "next";
 import { CopyButton } from "@/components/copy-button";
 import { PublicFooter } from "@/components/public-footer";
 import surfaces from "@/lib/product-surfaces.json";
-import { MINUTES_MCP_TOOL_COUNT } from "@/lib/release";
+import {
+  MINUTES_MCP_PROMPT_COUNT,
+  MINUTES_MCP_RESOURCE_COUNT,
+  MINUTES_MCP_TOOL_COUNT,
+} from "@/lib/release";
 import skillsCatalog from "@/lib/skills-catalog.json";
 
 export const metadata: Metadata = {
@@ -36,18 +40,18 @@ const toolGroups = [
     tools: [
       ["list_meetings", "List recent meetings and voice memos."],
       ["get_meeting", "Retrieve the full transcript and frontmatter of a specific meeting."],
-      ["search_meetings", "Full-text search across all meeting transcripts."],
+      ["search_meetings", "Policy-authorized full-text search across meeting transcripts."],
       ["research_topic", "Cross-meeting research: decisions, follow-ups, and mentions of a topic."],
-      ["activity_summary", "Summarize meeting-adjacent desktop context for an artifact, session, or time window."],
-      ["search_context", "Search opted-in desktop context across app focus and window titles."],
-      ["get_moment", "Show the local desktop-context rewind around an artifact, session, or timestamp."],
+      ["activity_summary", "Summarize desktop context bound to one exact normal meeting source."],
+      ["search_context", "Search opted-in desktop context bound to one exact normal meeting source."],
+      ["get_moment", "Show the local desktop-context rewind bound to one exact normal meeting source."],
     ],
   },
   {
     label: "People and relationships",
     tools: [
-      ["get_person_profile", "Build a profile for a person across all meetings."],
-      ["relationship_map", "Contacts with relationship scores and losing-touch alerts."],
+      ["get_person_profile", "Build a profile from policy-authorized meetings within supported corpus bounds."],
+      ["relationship_map", "Temporarily unavailable during the privacy-safe bounded rebuild; see roadmap issue #513."],
       ["track_commitments", "Open and stale commitments, optionally filtered by person."],
       ["consistency_report", "Flag contradicting decisions and stale commitments."],
     ],
@@ -55,7 +59,7 @@ const toolGroups = [
   {
     label: "Insights",
     tools: [
-      ["get_meeting_insights", "Structured insights (decisions, commitments, questions) with confidence filtering."],
+      ["get_meeting_insights", "Compatibility name only; returns an explicit unavailable error until derived records have live-verifiable source provenance."],
       ["ingest_meeting", "Extract facts from a meeting into the knowledge base."],
       ["knowledge_status", "Current state of the knowledge base."],
     ],
@@ -73,25 +77,39 @@ const toolGroups = [
     label: "Notes and processing",
     tools: [
       ["add_note", "Add a timestamped note to the current recording or an existing meeting."],
-      ["process_audio", "Process an audio file through the transcription pipeline."],
-      ["open_dashboard", "Open the interactive meeting dashboard in the browser."],
+      ["process_audio", "Process inbox or Downloads audio on macOS/Linux; Windows fails closed without reading audio; retained library recordings are unavailable."],
     ],
   },
   {
     label: "Voice and speaker ID",
     tools: [
       ["list_voices", "List enrolled voice profiles for speaker identification."],
-      ["confirm_speaker", "Confirm or correct speaker attribution in a meeting transcript."],
+      ["confirm_speaker", "Compatibility name; speaker identity changes require the Minutes app or human CLI."],
     ],
   },
   {
-    label: "Integration",
+    label: "Coach, screen context, and collaboration",
     tools: [
-      ["qmd_collection_status", "Check if the meetings directory is registered as a QMD collection."],
-      ["register_qmd_collection", "Register the meetings directory as a QMD collection."],
+      ["get_screen_context", "Retrieve bounded, verified screenshots bound to one exact normal meeting source."],
+      ["start_copilot", "Start Coach for a goal and observe its live nudge stream."],
+      ["stop_copilot", "Stop Coach without changing recording or live transcription."],
+      ["copilot_status", "Read the current Coach session and provider health."],
+      ["read_copilot_nudges", "Read observed Coach nudges incrementally by cursor or time window."],
+      ["add_agent_annotation", "Append allowlisted agent commentary without editing meeting markdown or frontmatter."],
+      ["get_agent_annotations", "Compatibility name only; unavailable until annotations have live-verifiable source-policy provenance."],
     ],
   },
 ] as const;
+
+const groupedToolCount = toolGroups.reduce(
+  (total, group) => total + group.tools.length,
+  0,
+);
+if (groupedToolCount !== MINUTES_MCP_TOOL_COUNT) {
+  throw new Error(
+    `for-agents MCP grouping documents ${groupedToolCount} of ${MINUTES_MCP_TOOL_COUNT} tools`,
+  );
+}
 
 const frontmatterExample = `---
 title: Q2 Pricing Discussion
@@ -156,7 +174,7 @@ const tasks = [
     steps: [
       "Call get_person_profile with the person's name.",
       "For deeper context, call track_commitments filtered to that person.",
-      "Call relationship_map if the user wants a broader view of all contacts.",
+      "If the user asks for graph rankings or a broader relationship map, report that surface temporarily unavailable and link roadmap issue #513.",
     ],
   },
   {
@@ -185,7 +203,7 @@ export default function ForAgentsPage() {
     "@type": "ItemList",
     name: "Minutes skill catalog",
     description:
-      "Workflow-level skills that turn Minutes MCP tools into operator motions like meeting prep, debrief, and cross-meeting graph queries.",
+      "Workflow-level skills that turn Minutes MCP tools into operator motions like meeting prep, debrief, bounded person/topic research, and honest graph deferrals.",
     numberOfItems: skillsCatalog.length,
     itemListElement: skillsCatalog.map((skill, index) => ({
       "@type": "ListItem",
@@ -513,7 +531,7 @@ export default function ForAgentsPage() {
           <p className="mt-3 text-[13px] leading-6 text-[var(--text-secondary)]">
             Skills are the workflow layer above raw MCP tools. They tell the agent
             how to turn Minutes primitives into useful operator motions like
-            meeting prep, debrief, graph queries, and artifact review. The
+            meeting prep, debrief, bounded person/topic research, and artifact review. The
             catalog below is generated from the canonical skill sources so the
             website stays in sync with what the plugin and portable skill pack
             actually ship.
@@ -585,10 +603,13 @@ export default function ForAgentsPage() {
             Obsidian, or any markdown tool.
           </p>
           <p>
-            The MCP server ({MINUTES_MCP_TOOL_COUNT} tools, 7 resources, 6
+            The MCP server ({MINUTES_MCP_TOOL_COUNT} tools,{" "}
+            {MINUTES_MCP_RESOURCE_COUNT} resources, {MINUTES_MCP_PROMPT_COUNT}{" "}
             prompt templates) is the main active agent interface. Any
-            MCP-compatible client can search, record, query structured insights,
-            and read live transcript deltas through it.
+            MCP-compatible client can search, record, and read live transcript
+            deltas through it. Compatibility-only derived insight and annotation
+            reads return explicit unavailable errors until their source policy
+            provenance can be revalidated live.
           </p>
         </div>
       </section>

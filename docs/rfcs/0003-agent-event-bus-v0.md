@@ -13,9 +13,10 @@ Minutes already ships the durable bus plumbing:
 - append-only JSONL at `~/.minutes/events.jsonl`
 - monotonic `seq` assigned under the writer lock
 - `events.seq` sidecar cursor for O(1) normal appends
-- `minutes events --follow --since-seq N`
+- human CLI `minutes events --follow --since-seq N`
 - MCP `minutes://events/live` and `minutes://events/live{?since_seq,limit}`
-- MCP `resources/subscribe` with `notifications/resources/updated`
+  remain registered but return a constant unavailable response
+- MCP live-event subscriptions are disabled
 - `live.utterance.final` emission from the live transcript writer
 
 ## Wire Envelope
@@ -32,8 +33,23 @@ The v0 wire format is a flat JSON object, not a nested event object:
 }
 ```
 
-This shape is the canonical v0 persistence and streaming contract for CLI and
-MCP consumers.
+This shape remains the canonical v0 persistence and human-CLI streaming
+contract. It is not exposed through the current MCP trust boundary.
+
+## Current Agent Trust Boundary
+
+The durable JSONL contains both normal operational events and restricted
+markers/override records under one raw sequence namespace. Removing event
+bodies is not sufficient for an assistant surface: sequence gaps, cursor
+movement, filtered reads, or subscription timing can still reveal that a
+restricted event occurred.
+
+Accordingly, the raw stream remains available to the human CLI only. Assistant
+CLI children fail closed for every event read/follow shape. MCP live-event reads
+return a constant empty/unavailable payload, never inspect the raw log, and do
+not accept subscriptions. A future agent stream requires live-verifiable source
+policy provenance plus a cursor namespace that does not advance for restricted
+records.
 
 Compatibility rules:
 
@@ -49,11 +65,13 @@ Compatibility rules:
 
 Why not migrate to the original #194 top-level envelope immediately?
 
-The current flat shape is already shipped through the CLI and MCP live resource.
-Changing the persisted JSONL shape now would force a compatibility layer before
-the remaining emitters are even implemented. v0 therefore freezes the shipped
-shape and reserves a future v2 envelope for a cleaner nested/projection model if
-real subscribers prove that need.
+The current flat shape is already shipped on disk and through the human CLI; it
+was also exposed by the earlier MCP live resource before that surface was
+withheld at the agent trust boundary. Changing the persisted JSONL shape now
+would force a compatibility layer before the remaining emitters are even
+implemented. v0 therefore freezes the shipped shape and reserves a future v2
+envelope for a cleaner nested/projection model if real subscribers prove that
+need.
 
 ## Event Taxonomy
 

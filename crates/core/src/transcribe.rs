@@ -2711,7 +2711,7 @@ pub(crate) fn combined_parakeet_boost_phrases(config: &Config, hints: &DecodeHin
 
     let limit = config.transcription.parakeet_boost_limit;
     if limit > 0 {
-        match crate::graph::parakeet_boost_phrases(limit) {
+        match crate::graph::parakeet_boost_phrases(config, limit) {
             Ok(global_phrases) => {
                 for phrase in global_phrases {
                     let key = phrase.to_ascii_lowercase();

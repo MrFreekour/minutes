@@ -3,11 +3,10 @@
 //! Used by:
 //! - the legacy walkdir-based search path in [`crate::search`]
 //! - sync (full per-file mtime scan) in [`crate::search_index`]
-//! - the watcher coalescer that feeds incremental upserts to the index
 //!
-//! Without a single source of truth, the watcher would silently breach the
-//! existing `archive/` / `processed/` / `failed/` / `failed-captures/` exclusion
-//! that the rest of Minutes relies on.
+//! A single source of truth keeps the private projection aligned with the
+//! existing `archive/` / `processed/` / `failed/` / `failed-captures/`
+//! exclusion that the rest of Minutes relies on.
 
 use std::path::{Component, Path};
 
@@ -16,7 +15,7 @@ const EXCLUDED_DIR_NAMES: &[&str] = &["archive", "processed", "failed", "failed-
 
 /// Returns true if the path lives under an excluded directory or is outside
 /// `output_dir` entirely. A `.md` file that hits this predicate must not enter
-/// the index from any path (walker, watcher, sync).
+/// the private index from any path.
 pub fn is_excluded_path(path: &Path, output_dir: &Path) -> bool {
     let rel = match path.strip_prefix(output_dir) {
         Ok(r) => r,
@@ -32,8 +31,8 @@ pub fn is_excluded_path(path: &Path, output_dir: &Path) -> bool {
     })
 }
 
-/// Editor-temp / dotfile guard. Used by the watcher coalescer so atomic-save
-/// patterns don't briefly index a partially-written tempfile.
+/// Editor-temp / dotfile classifier retained as a direct regression contract.
+#[cfg(test)]
 pub fn is_temp_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())

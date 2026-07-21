@@ -2316,7 +2316,7 @@ fn build_proactive_context_markdown(
     recent_meetings: &[String],
     recent_memos: &[String],
     stale_commitments: &[String],
-    losing_touch: &[String],
+    losing_touch: Option<&[String]>,
 ) -> String {
     let meetings_block = if recent_meetings.is_empty() {
         "- No recent meetings.".to_string()
@@ -2345,14 +2345,18 @@ fn build_proactive_context_markdown(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let touch_block = if losing_touch.is_empty() {
-        "- No losing-touch alerts.".to_string()
+    let touch_block = if let Some(losing_touch) = losing_touch {
+        if losing_touch.is_empty() {
+            "- No losing-touch alerts.".to_string()
+        } else {
+            losing_touch
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     } else {
-        losing_touch
-            .iter()
-            .map(|line| format!("- {line}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        "- Relationship alerts are temporarily unavailable during the privacy-safe graph rebuild; see roadmap issue #513.".to_string()
     };
 
     format!(
@@ -7066,20 +7070,24 @@ pub fn cmd_proactive_context_bundle() -> Result<ProactiveContextBundleView, Stri
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .ok();
 
+    let relationship_summary = losing_touch
+        .as_ref()
+        .map(|alerts| format!("{} losing-touch alerts", alerts.len()))
+        .unwrap_or_else(|| "relationship alerts unavailable (#513)".to_string());
     let summary = format!(
-        "{} meetings · {} memos · {} stale commitments · {} losing-touch alerts",
+        "{} meetings · {} memos · {} stale commitments · {}",
         recent_meetings.len(),
         recent_memos.len(),
         stale_commitments.len(),
-        losing_touch.len()
+        relationship_summary
     );
     let markdown = build_proactive_context_markdown(
         &recent_meetings,
         &recent_memos,
         &stale_commitments,
-        &losing_touch,
+        losing_touch.as_deref(),
     );
 
     Ok(ProactiveContextBundleView {
@@ -7088,7 +7096,7 @@ pub fn cmd_proactive_context_bundle() -> Result<ProactiveContextBundleView, Stri
         recent_meeting_count: recent_meetings.len(),
         recent_memo_count: recent_memos.len(),
         stale_commitment_count: stale_commitments.len(),
-        losing_touch_count: losing_touch.len(),
+        losing_touch_count: losing_touch.as_ref().map_or(0, Vec::len),
     })
 }
 
@@ -14464,6 +14472,15 @@ mod tests {
         assert!(markdown.contains("## Stale Commitments"));
         assert!(markdown.contains("## Open Actions"));
         assert!(markdown.contains("## Monday Brief"));
+    }
+
+    #[test]
+    fn proactive_context_marks_deferred_graph_unavailable_instead_of_empty() {
+        let markdown = build_proactive_context_markdown(&[], &[], &[], None);
+
+        assert!(markdown.contains("temporarily unavailable"));
+        assert!(markdown.contains("#513"));
+        assert!(!markdown.contains("No losing-touch alerts"));
     }
 
     #[test]

@@ -1474,6 +1474,27 @@ impl Config {
         Self::load_from(&path)
     }
 
+    /// Load the authoritative config without treating an unreadable or
+    /// malformed existing file as an empty/default policy. Security-sensitive
+    /// bridges use this before reading persistent derivatives so a syntax
+    /// error cannot silently disable enforcement while another parser still
+    /// recovers a knowledge path from the same bytes.
+    pub fn load_strict() -> Result<Self, String> {
+        Self::load_strict_from(&Self::config_path())
+    }
+
+    pub fn load_strict_from(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = std::fs::read_to_string(path)
+            .map_err(|_| "Minutes config exists but could not be read safely.".to_string())?;
+        let mut config: Self = toml::from_str(&contents)
+            .map_err(|_| "Minutes config exists but is malformed.".to_string())?;
+        apply_raw_toml_compat(&mut config, inspect_raw_toml_compat(&contents));
+        Ok(config)
+    }
+
     /// Load the config file with first-run and upgrade migrations applied.
     ///
     /// This is the entry point the Tauri desktop app uses at startup. The
@@ -1505,6 +1526,16 @@ impl Config {
     /// create the config later via `cmd_set_setting` if the user
     /// changes anything.
     pub fn load_with_migrations() -> Self {
+        // Retire durable search/graph projections from versions that predate
+        // process-private policy views. Answer-time graph/search boundaries
+        // repeat this check and fail closed; startup cleanup is deliberately
+        // best-effort so an unsafe legacy entry cannot brick recording.
+        if let Err(error) = crate::policy_fs::retire_legacy_policy_caches() {
+            tracing::warn!(
+                error = %error,
+                "legacy policy caches could not be retired at desktop startup"
+            );
+        }
         let path = Self::config_path();
         Self::load_with_migrations_from(&path)
     }
@@ -1630,26 +1661,13 @@ impl Config {
             return Self::default();
         }
 
-        match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(mut config) => {
-                    apply_raw_toml_compat(&mut config, inspect_raw_toml_compat(&contents));
-                    config
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "invalid config at {}: {}. Using defaults.",
-                        path.display(),
-                        e
-                    );
-                    Self::default()
-                }
-            },
-            Err(e) => {
+        match Self::load_strict_from(path) {
+            Ok(config) => config,
+            Err(error) => {
                 tracing::warn!(
-                    "could not read config at {}: {}. Using defaults.",
+                    "could not safely load config at {}: {}. Using defaults.",
                     path.display(),
-                    e
+                    error
                 );
                 Self::default()
             }
@@ -2127,6 +2145,17 @@ mod tests {
     fn missing_config_file_returns_defaults() {
         let config = Config::load_from(Path::new("/nonexistent/config.toml"));
         assert_eq!(config.transcription.model, "small");
+    }
+
+    #[test]
+    fn strict_load_rejects_malformed_existing_config_without_leaking_contents() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[knowledge\nPRIVATE-CONFIG-CANARY").unwrap();
+        let error = Config::load_strict_from(&path).unwrap_err();
+        assert!(error.contains("malformed"));
+        assert!(!error.contains("PRIVATE-CONFIG-CANARY"));
+        assert!(!Config::load_from(&path).knowledge.enabled);
     }
 
     #[test]
