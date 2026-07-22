@@ -17,7 +17,7 @@ Last reviewed: 2026-06-10
 
 - Built for what happens after the meeting: structured markdown with YAML frontmatter that agents query across months of conversations
 - Broader agent surface: MCP server, CLI, SDK, live transcript reads, Claude Code plugin
-- Governance lives in the data: consent basis stamped into every recording, with sensitive no-capture meetings and agent-enforced sensitivity on the roadmap
+- Governance lives in the data: consent basis stamped into every recording, sensitive no-capture meetings supported, and restricted meetings excluded from agents by default with audited overrides
 
 ## When Minutes is not the right fit
 

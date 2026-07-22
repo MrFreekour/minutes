@@ -86,7 +86,7 @@ If none return anything, ask once: "I can't find an upcoming meeting. Who do you
 
 ### Phase 1: Gather data in parallel
 
-The Minutes CLI already does the hard work. Graph-backed rankings and commitments are temporarily unavailable while the privacy-safe rebuild tracked in [issue #513](https://github.com/silverstein/minutes/issues/513) is completed. Bounded live-source person profiles, search, and research remain available. Run the commands below in parallel and require exit status 0 before interpreting their output.
+The Minutes CLI already does the hard work. Person profiles, search, relationship rankings, and commitments are bounded policy-safe projections. Run the commands below in parallel and require exit status 0 before interpreting their output.
 
 ```bash
 # 1. Bounded live-source person profile.
@@ -103,7 +103,7 @@ minutes search "<name>" --limit 10 --since <60-days-ago> --format json
 **CLI stream-handling notes** — the Minutes CLI is actively developed and its stream contract is not fully settled. Today (0.8.0):
 
 - `minutes person`, `minutes insights`, and `minutes search --format json` are bounded live-source surfaces.
-- `minutes people`, `minutes people merge`, and `minutes commitments` intentionally fail with the #513 unavailable message. Never suppress that error or translate it into an empty fact.
+- `minutes people`, `minutes commitments`, and `minutes person` fail closed on authorization, resource-budget, or correction races. Never suppress a nonzero exit or translate it into an empty fact.
 - Any nonzero exit from a live-source command means the source is unavailable. Do not interpret empty stdout as “no history.”
 - **Do not invent new flags** on top of what's shown above — e.g. `minutes insights --json` is not a real flag, `minutes export --since` is not a real flag. The CLI will reject unknown flags with a usage error.
 
@@ -140,7 +140,7 @@ Produce a brief in this exact shape — every section is one tight chunk, total 
 
 **They've been thinking about**: <comma-separated list of 3–5 hot topics from the last 30 days, ordered by recency × frequency>
 
-**Commitments**: Temporarily unavailable while the privacy-safe relationship projection is rebuilt ([#513](https://github.com/silverstein/minutes/issues/513)).
+**Commitments**: Use `minutes commitments --person "<name>" --json`; require exit status 0.
 
 **Where things stand**: <one-line read of the relationship vibe — warming, cooling, stable, urgent, drifting>
 
@@ -221,4 +221,4 @@ node "${CLAUDE_PLUGIN_ROOT}/hooks/lib/minutes-learn-cli.mjs" set-alias "Sarah Ch
 - **Briefs are sensitive.** Always `chmod 600`. They contain relationship intelligence the user wouldn't want leaked.
 - **Be honest about staleness.** If the most recent meeting with this person is 3+ months old, lead with that fact: "**Last conversation** (4 months ago): …" — the user's mental model of the relationship may be more recent than reality.
 - **Run the three live-source CLI calls in parallel.** They're independent. Synthesize only from returned source-backed results after all three exit successfully.
-- **Commitments are unavailable, not empty.** Omit the commitments section or say that relationship commitments are temporarily unavailable with issue #513. Never claim “No open commitments” from a failed graph command.
+- **A failed commitment projection is unavailable, not empty.** Never claim “No open commitments” from a nonzero graph command.

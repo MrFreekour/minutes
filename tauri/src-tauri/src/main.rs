@@ -1426,6 +1426,17 @@ fn spawn_meetings_refresh_watcher(app: &tauri::AppHandle, output_dir: std::path:
 }
 
 fn main() {
+    if let Some(code) = minutes_core::graph_worker::maybe_run_policy_projection_worker() {
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(sidecar) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("minutes")))
+        .filter(|candidate| candidate.is_file())
+    {
+        let _ = minutes_core::graph_worker::install_policy_projection_worker_executable(sidecar);
+    }
     // Route whisper.cpp + ggml C-level logs through Rust `tracing` so they
     // do not leak to raw stderr. The Tauri menu-bar app records audio in
     // process and runs the same VAD path the CLI does, so the

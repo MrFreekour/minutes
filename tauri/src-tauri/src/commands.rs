@@ -14,7 +14,7 @@ use reqwest::header::{ACCEPT, CONTENT_LENGTH};
 use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::Path;
@@ -100,11 +100,10 @@ pub struct AppState {
     /// from the cancel bit so the detector can tell an explicit user cancel
     /// from an internal reset or teardown path.
     pub call_end_countdown_terminal_state: Arc<AtomicU8>,
-    /// Conversation history for the native Recall chat panel.
-    /// Each entry is `(user_message, assistant_response)`. Cleared via
-    /// `cmd_recall_chat_clear`. Capped to the last 6 turns in the prompt
-    /// to keep token usage bounded.
-    pub recall_chat_history: Arc<Mutex<Vec<(String, String)>>>,
+    /// Conversation history for the native Recall chat panel. Every turn
+    /// retains the exact normal-sensitivity source snapshots that produced it;
+    /// history is reused only after those bytes are reauthorized.
+    pub(crate) recall_chat_history: Arc<Mutex<Vec<RecallChatHistoryTurn>>>,
     /// The one Recall chat turn currently in flight. The child stays here so a
     /// separate cancel command can terminate its complete process tree.
     pub(crate) recall_chat_turn: Arc<Mutex<Option<RecallChatTurn>>>,
@@ -151,6 +150,41 @@ pub(crate) struct RecallChatTurn {
     id: u64,
     cancelled: Arc<AtomicBool>,
     child: Option<Child>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RecallChatHistoryTurn {
+    user_message: String,
+    assistant_response: String,
+    sources: Vec<RecallSourceBinding>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RecallSourceBinding {
+    canonical_path: PathBuf,
+    content_sha256: String,
+    byte_len: usize,
+}
+
+impl std::fmt::Debug for RecallSourceBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecallSourceBinding")
+            .field("byte_len", &self.byte_len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecallSourceBinding {
+    fn from_snapshot(snapshot: &minutes_core::search::AuthorizedMeetingSnapshot) -> Self {
+        Self {
+            canonical_path: snapshot.path.clone(),
+            content_sha256: minutes_core::policy_fs::content_sha256_hex(
+                snapshot.content.as_bytes(),
+            ),
+            byte_len: snapshot.content.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2356,7 +2390,7 @@ fn build_proactive_context_markdown(
                 .join("\n")
         }
     } else {
-        "- Relationship alerts are temporarily unavailable during the privacy-safe graph rebuild; see roadmap issue #513.".to_string()
+        "- Relationship alerts are unavailable because the bounded live projection could not be verified.".to_string()
     };
 
     format!(
@@ -7008,7 +7042,13 @@ pub fn cmd_weekly_summary() -> Result<WeeklySummaryView, String> {
 }
 
 #[tauri::command]
-pub fn cmd_proactive_context_bundle() -> Result<ProactiveContextBundleView, String> {
+pub async fn cmd_proactive_context_bundle() -> Result<ProactiveContextBundleView, String> {
+    tauri::async_runtime::spawn_blocking(build_proactive_context_bundle)
+        .await
+        .map_err(|error| format!("proactive context worker failed: {error}"))?
+}
+
+fn build_proactive_context_bundle() -> Result<ProactiveContextBundleView, String> {
     let config = Config::load();
     let since = (chrono::Local::now() - chrono::Duration::days(7)).to_rfc3339();
     let filters = minutes_core::search::SearchFilters {
@@ -7055,27 +7095,34 @@ pub fn cmd_proactive_context_bundle() -> Result<ProactiveContextBundleView, Stri
         })
         .collect();
 
-    let losing_touch = minutes_core::graph::relationship_map(&config)
-        .map(|people| {
-            people
-                .into_iter()
-                .filter(|person| person.losing_touch)
-                .take(4)
-                .map(|person| {
-                    format!(
-                        "{} (last {}d ago)",
-                        person.name,
-                        person.days_since.round() as i64
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .ok();
+    let losing_touch = minutes_core::graph_worker::run_policy_projection_worker(
+        &config,
+        minutes_core::graph::PolicyProjectionRequest::LosingTouch { limit: 4 },
+    )
+    .and_then(|response| match response {
+        minutes_core::graph::PolicyProjectionResponse::LosingTouch(people) => Ok(people),
+        _ => Err("policy graph worker returned the wrong losing-touch response".into()),
+    })
+    .map(|people| {
+        people
+            .into_iter()
+            .map(|person| {
+                format!(
+                    "{} (last {}d ago)",
+                    person.name,
+                    person.days_since.round() as i64
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .ok();
 
     let relationship_summary = losing_touch
         .as_ref()
         .map(|alerts| format!("{} losing-touch alerts", alerts.len()))
-        .unwrap_or_else(|| "relationship alerts unavailable (#513)".to_string());
+        .unwrap_or_else(|| {
+            "relationship alerts unavailable (projection could not be verified)".to_string()
+        });
     let summary = format!(
         "{} meetings · {} memos · {} stale commitments · {}",
         recent_meetings.len(),
@@ -8461,21 +8508,6 @@ pub async fn cmd_confirm_speaker(
     )
     .map_err(|e| format!("Could not write speaker overlay: {}", e))?;
 
-    // Refresh graph projection so other surfaces reflect the correction
-    // immediately. Run on a blocking thread so we don't stall the async
-    // Tauri runtime — graph rebuild walks every meeting file and can take
-    // seconds on a large corpus. Failure is non-fatal because the overlay
-    // already persisted and future rebuilds will pick it up.
-    tauri::async_runtime::spawn_blocking(|| {
-        let config = Config::load();
-        if let Err(e) = minutes_core::graph::rebuild_index(&config) {
-            eprintln!(
-                "[confirm_speaker] overlay saved, but graph rebuild failed: {}",
-                e
-            );
-        }
-    });
-
     Ok(format!("Confirmed: {} = {}", speaker_label, name))
 }
 
@@ -8502,7 +8534,7 @@ pub fn cmd_remember_vocabulary_person(name: String) -> Result<VocabularyRemember
             canonical: existing.canonical.clone(),
             already_exists: true,
             note: format!(
-                "{} is already in vocabulary. Future transcripts, search, and graph rebuilds can use it; existing raw transcripts stay unchanged.",
+                "{} is already in vocabulary. Future transcripts, search, and live graph answers can use it; existing raw transcripts stay unchanged.",
                 existing.canonical
             ),
         });
@@ -8530,25 +8562,12 @@ pub fn cmd_remember_vocabulary_person(name: String) -> Result<VocabularyRemember
 
     minutes_core::vocabulary::save_at(&path, &normalized).map_err(|e| e.to_string())?;
 
-    #[cfg(not(test))]
-    {
-        tauri::async_runtime::spawn_blocking(|| {
-            let config = Config::load();
-            if let Err(e) = minutes_core::graph::rebuild_index(&config) {
-                eprintln!(
-                    "[remember_vocabulary_person] vocabulary saved, but graph rebuild failed: {}",
-                    e
-                );
-            }
-        });
-    }
-
     Ok(VocabularyRememberView {
         entry_id: saved_entry.id,
         canonical: saved_entry.canonical.clone(),
         already_exists: false,
         note: format!(
-            "Saved {} to vocabulary. Future transcripts, search, and graph rebuilds can use it; existing raw transcripts stay unchanged.",
+            "Saved {} to vocabulary. Future transcripts, search, and live graph answers can use it; existing raw transcripts stay unchanged.",
             saved_entry.canonical
         ),
     })
@@ -9131,65 +9150,12 @@ pub fn spawn_terminal(
 
 // ── Recall native chat ────────────────────────────────────────
 
-/// Written to `chat_cwd/CLAUDE.md` on every `cmd_recall_chat_send` call so
-/// claude auto-loads it from cwd at process start (see `build_chat_invocation`
-/// in `minutes_core::summarize` for the matching `--allowedTools` scope this
-/// describes). Deliberately honest about the constraints of a single-shot,
-/// non-interactive process instead of pretending to be a full agentic
-/// session — see PR #404 review discussion: a chat-scoped CLAUDE.md that's
-/// honest about the non-interactive context is a better foundation than a
-/// hard `--tools ""` lockout, and leaves room to grow the allow-list later.
-const CHAT_WORKSPACE_CLAUDE_MD: &str = "\
-# Minutes — Recall chat (single-shot session)
-
-You are answering one message inside the Minutes app's Recall chat panel, not running an interactive \
-agent loop. Each message is a fresh, non-interactive `claude -p` process — there is no persistent \
-session, no shell, and no file write access of any kind. There is nobody watching this session to \
-approve a permission prompt, so an unlisted tool call is rejected immediately rather than pausing to ask.
-
-## What's already in front of you
-
-The current user message below already includes: the currently focused meeting's content (if any), \
-up to 5 keyword-matched excerpts from other meetings, and the last few turns of this conversation. \
-Read that first — it answers most questions without any tool call.
-
-## Tools you do have (read-only, pre-approved)
-
-A small allow-list of the Minutes MCP server's read-only tools is available for lookups the inline \
-context doesn't cover:
-
-- `search_meetings`, `get_meeting`, `list_meetings`, `research_topic` — find and read past meetings/memos
-- `get_person_profile`, `relationship_map`, `track_commitments` — relationship and commitment memory
-- `get_meeting_insights`, `consistency_report`, `get_agent_annotations` — structured decisions/insights
-- `list_processing_jobs`, `get_status`, `list_voices`, `knowledge_status`, `qmd_collection_status` — status/inventory checks
-- `read_live_transcript` — read an in-progress recording or live-transcript session
-- `activity_summary`, `search_context`, `get_moment` — desktop-context lookups (app focus, window titles)
-- `get_screen_context` — retrieve up to three verified screenshots linked to the selected Minutes session
-
-Prefer these over guessing when the inline context is missing something concrete and answerable.
-
-## Visual claims
-
-Screen screenshots and desktop app/window metadata are separate. Call `get_screen_context` only when \
-the user's question depends on visible content; screenshots are never attached automatically. Never \
-say you can see the screen or describe a slide unless this turn actually received a specific image. \
-Configured, waiting, unavailable, degraded, stopped, and cleaned states do not prove visual awareness.
-
-## What you don't have
-
-No shell, no file access, no writes of any kind — no starting/stopping recordings or dictation, no \
-adding notes or agent annotations, no confirming speakers, no changing config, no opening the dashboard. \
-If you're unsure whether something is allowed, assume it isn't. If a tool call fails or the context is \
-missing what's needed, say so briefly and suggest the user open or select the relevant meeting — don't \
-narrate or retry failed tool calls.
-";
-
 /// Build a prompt string combining conversation history (last 6 turns) and
 /// the current enriched user message.
-fn build_recall_chat_prompt(history: &[(String, String)], enriched_message: &str) -> String {
+fn build_recall_chat_prompt(history: &[RecallChatHistoryTurn], enriched_message: &str) -> String {
     let mut prompt = String::new();
 
-    let recent: &[(String, String)] = if history.len() > 6 {
+    let recent: &[RecallChatHistoryTurn] = if history.len() > 6 {
         &history[history.len() - 6..]
     } else {
         history
@@ -9197,12 +9163,12 @@ fn build_recall_chat_prompt(history: &[(String, String)], enriched_message: &str
 
     if !recent.is_empty() {
         prompt.push_str("[Previous conversation]\n");
-        for (user_msg, assistant_msg) in recent {
+        for turn in recent {
             prompt.push_str("User: ");
-            prompt.push_str(user_msg);
+            prompt.push_str(&turn.user_message);
             prompt.push('\n');
             prompt.push_str("Assistant: ");
-            prompt.push_str(assistant_msg);
+            prompt.push_str(&turn.assistant_response);
             prompt.push('\n');
         }
         prompt.push_str("\n[Current question]\n");
@@ -9210,6 +9176,491 @@ fn build_recall_chat_prompt(history: &[(String, String)], enriched_message: &str
 
     prompt.push_str(enriched_message);
     prompt
+}
+
+#[derive(Clone)]
+struct RecallAgentSafeContext {
+    text: String,
+    sources: Vec<RecallSourceBinding>,
+}
+
+const RECALL_MAX_SOURCE_BINDINGS: usize = 32;
+const RECALL_MAX_REAUTH_BYTES: usize = 80 * 1024 * 1024;
+const RECALL_REAUTH_DEADLINE: Duration = Duration::from_secs(15);
+const RECALL_MAX_USER_MESSAGE_BYTES: usize = 32 * 1024;
+const RECALL_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const RECALL_MAX_HISTORY_BYTES: usize = 384 * 1024;
+const RECALL_MAX_PROMPT_BYTES: usize = 448 * 1024;
+const RECALL_MAX_STREAM_LINE_BYTES: usize = RECALL_MAX_RESPONSE_BYTES + 32 * 1024;
+const RECALL_MAX_STREAM_EVENTS: usize = 8_192;
+
+fn recall_history_bytes(history: &[RecallChatHistoryTurn]) -> Option<usize> {
+    history.iter().try_fold(0usize, |total, turn| {
+        total
+            .checked_add(turn.user_message.len())?
+            .checked_add(turn.assistant_response.len())
+    })
+}
+
+fn recall_history_is_bounded(history: &[RecallChatHistoryTurn]) -> bool {
+    history.len() <= 6
+        && history.iter().all(|turn| {
+            turn.user_message.len() <= RECALL_MAX_USER_MESSAGE_BYTES
+                && turn.assistant_response.len() <= RECALL_MAX_RESPONSE_BYTES
+        })
+        && recall_history_bytes(history).is_some_and(|bytes| bytes <= RECALL_MAX_HISTORY_BYTES)
+}
+
+fn append_recall_response(response: &mut String, text: &str) -> Result<(), String> {
+    let next = response
+        .len()
+        .checked_add(text.len())
+        .filter(|bytes| *bytes <= RECALL_MAX_RESPONSE_BYTES)
+        .ok_or_else(|| "Recall provider response exceeded its private size budget.".to_string())?;
+    response.reserve(next.saturating_sub(response.len()));
+    response.push_str(text);
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecallBoundedLineDecoder {
+    pending: Vec<u8>,
+    events: usize,
+}
+
+impl RecallBoundedLineDecoder {
+    fn push(&mut self, mut chunk: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        let mut lines = Vec::new();
+        while let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
+            self.extend_pending(&chunk[..newline])?;
+            self.events = self
+                .events
+                .checked_add(1)
+                .filter(|events| *events <= RECALL_MAX_STREAM_EVENTS)
+                .ok_or_else(|| {
+                    "Recall provider stream exceeded its private event budget.".to_string()
+                })?;
+            lines.push(std::mem::take(&mut self.pending));
+            chunk = &chunk[newline + 1..];
+        }
+        self.extend_pending(chunk)?;
+        Ok(lines)
+    }
+
+    fn finish(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        self.events = self
+            .events
+            .checked_add(1)
+            .filter(|events| *events <= RECALL_MAX_STREAM_EVENTS)
+            .ok_or_else(|| {
+                "Recall provider stream exceeded its private event budget.".to_string()
+            })?;
+        Ok(Some(std::mem::take(&mut self.pending)))
+    }
+
+    fn extend_pending(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.pending
+            .len()
+            .checked_add(bytes.len())
+            .filter(|length| *length <= RECALL_MAX_STREAM_LINE_BYTES)
+            .ok_or_else(|| {
+                "Recall provider stream exceeded its private line budget.".to_string()
+            })?;
+        self.pending.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+enum RecallClaudeText<'a> {
+    Delta(&'a str),
+    Complete(String),
+}
+
+fn parse_recall_claude_text(value: &serde_json::Value) -> Option<RecallClaudeText<'_>> {
+    match value.get("type")?.as_str()? {
+        "stream_event"
+            if value
+                .pointer("/event/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("content_block_delta")
+                && value
+                    .pointer("/event/delta/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("text_delta") =>
+        {
+            value
+                .pointer("/event/delta/text")
+                .and_then(serde_json::Value::as_str)
+                .map(RecallClaudeText::Delta)
+        }
+        "assistant" => {
+            let content = value.pointer("/message/content")?.as_array()?;
+            let mut text = String::new();
+            for block in content {
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                    text.push_str(block.get("text")?.as_str()?);
+                }
+            }
+            (!text.is_empty()).then_some(RecallClaudeText::Complete(text))
+        }
+        _ => None,
+    }
+}
+
+fn recall_text_delta_payload(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "delta": { "type": "text_delta", "text": text }
+        }
+    })
+}
+
+fn truncate_recall_text(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn push_unique_recall_source(
+    sources: &mut Vec<RecallSourceBinding>,
+    snapshot: &minutes_core::search::AuthorizedMeetingSnapshot,
+) -> Result<(), String> {
+    let binding = RecallSourceBinding::from_snapshot(snapshot);
+    if sources.contains(&binding) {
+        return Ok(());
+    }
+    let total_bytes = sources
+        .iter()
+        .try_fold(binding.byte_len, |total, source| {
+            total.checked_add(source.byte_len)
+        })
+        .ok_or_else(|| "Recall context exceeded its private authorization budget.".to_string())?;
+    if sources.len() >= RECALL_MAX_SOURCE_BINDINGS || total_bytes > RECALL_MAX_REAUTH_BYTES {
+        return Err("Recall context exceeded its private authorization budget.".into());
+    }
+    sources.push(binding);
+    Ok(())
+}
+
+fn recall_focused_meeting_context(
+    path: &Path,
+    config: &Config,
+) -> Result<(String, minutes_core::search::AuthorizedMeetingSnapshot), String> {
+    let snapshot = minutes_core::search::read_authorized_meeting(path, config, false).map_err(|_| {
+        "The selected meeting is restricted or could not be verified safely. Recall was blocked locally."
+            .to_string()
+    })?;
+    let (_, body) = minutes_core::markdown::split_frontmatter(&snapshot.content);
+    let section = format!(
+        "## Currently focused meeting: {}\n{}",
+        snapshot.frontmatter.title,
+        truncate_recall_text(body.trim(), 6_000)
+    );
+    Ok((section, snapshot))
+}
+
+fn collect_recall_agent_safe_context(
+    message: &str,
+    config: &Config,
+) -> Result<RecallAgentSafeContext, String> {
+    let mut sections = Vec::new();
+    let mut sources = Vec::new();
+
+    if let Some(raw_path) =
+        load_recall_workspace_state_from(&recall_workspace_state_path()).current_meeting_path
+    {
+        let (section, snapshot) = recall_focused_meeting_context(Path::new(&raw_path), config)?;
+        push_unique_recall_source(&mut sources, &snapshot)?;
+        sections.push(section);
+    }
+
+    let filters = minutes_core::search::SearchFilters::default();
+    if let Ok(results) = minutes_core::search::search(message, config, &filters) {
+        let mut snippets = Vec::new();
+        for result in results.iter().take(5) {
+            let Ok(snapshot) =
+                minutes_core::search::read_authorized_meeting(&result.path, config, false)
+            else {
+                continue;
+            };
+            if sources
+                .iter()
+                .any(|source| source.canonical_path == snapshot.path)
+            {
+                continue;
+            }
+            let live_query = result.matched_via_alias.as_deref().unwrap_or(message);
+            let Some(snippet) =
+                minutes_core::search::authorized_snapshot_search_snippet(&snapshot, live_query)
+            else {
+                continue;
+            };
+            if push_unique_recall_source(&mut sources, &snapshot).is_err() {
+                break;
+            }
+            snippets.push(format!(
+                "## {} ({})\n{}",
+                snapshot.frontmatter.title,
+                snapshot.frontmatter.date,
+                truncate_recall_text(snippet.trim(), 1_200)
+            ));
+        }
+        if !snippets.is_empty() {
+            sections.push(format!(
+                "## Other relevant excerpts from your meetings\n\n{}",
+                snippets.join("\n\n")
+            ));
+        }
+    }
+
+    let text = if sections.is_empty() {
+        String::new()
+    } else {
+        let raw = format!("Meeting context:\n\n{}\n\n---\n\n", sections.join("\n\n"));
+        truncate_recall_text(&raw, 12_000).to_string()
+    };
+    Ok(RecallAgentSafeContext { text, sources })
+}
+
+fn recall_history_sources(
+    history: &[RecallChatHistoryTurn],
+    current: &[RecallSourceBinding],
+) -> Result<Vec<RecallSourceBinding>, String> {
+    let mut sources = Vec::new();
+    for source in history
+        .iter()
+        .flat_map(|turn| turn.sources.iter())
+        .chain(current.iter())
+    {
+        if !sources.contains(source) {
+            let total_bytes = sources
+                .iter()
+                .try_fold(source.byte_len, |total, existing: &RecallSourceBinding| {
+                    total.checked_add(existing.byte_len)
+                })
+                .ok_or_else(|| {
+                    "Recall history exceeded its private authorization budget.".to_string()
+                })?;
+            if sources.len() >= RECALL_MAX_SOURCE_BINDINGS || total_bytes > RECALL_MAX_REAUTH_BYTES
+            {
+                return Err("Recall history exceeded its private authorization budget.".into());
+            }
+            sources.push(source.clone());
+        }
+    }
+    Ok(sources)
+}
+
+fn reauthorize_recall_sources(
+    sources: &[RecallSourceBinding],
+    config: &Config,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut total_bytes = 0usize;
+    if sources.len() > RECALL_MAX_SOURCE_BINDINGS {
+        return Err("Recall context is no longer available to agents.".into());
+    }
+    for source in sources {
+        if started.elapsed() >= RECALL_REAUTH_DEADLINE {
+            return Err("Recall context is no longer available to agents.".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(source.byte_len)
+            .filter(|total| *total <= RECALL_MAX_REAUTH_BYTES)
+            .ok_or_else(|| "Recall context is no longer available to agents.".to_string())?;
+        let snapshot =
+            minutes_core::search::read_authorized_meeting(&source.canonical_path, config, false)
+                .map_err(|_| "Recall context is no longer available to agents.".to_string())?;
+        let digest = minutes_core::policy_fs::content_sha256_hex(snapshot.content.as_bytes());
+        if snapshot.path != source.canonical_path
+            || snapshot.content.len() != source.byte_len
+            || digest != source.content_sha256
+        {
+            return Err("Recall context is no longer available to agents.".into());
+        }
+    }
+    Ok(())
+}
+
+fn reauthorize_recall_ollama_egress(
+    expected_url: &str,
+    expected_model: &str,
+    sources: &[RecallSourceBinding],
+    config: &Config,
+) -> Result<(), String> {
+    let current_url = recall_ollama_chat_url(&config.summarization.ollama_url)?;
+    if config.summarization.engine != "ollama"
+        || current_url != expected_url
+        || config.summarization.ollama_model != expected_model
+    {
+        return Err("Recall context or local provider changed before use.".into());
+    }
+    reauthorize_recall_sources(sources, config)
+}
+
+fn reauthorize_recall_claude_egress(
+    expected_engine: &str,
+    sources: &[RecallSourceBinding],
+    config: &Config,
+) -> Result<(), String> {
+    if config.summarization.engine != expected_engine || config.summarization.engine == "ollama" {
+        return Err("Recall provider changed before use.".into());
+    }
+    reauthorize_recall_sources(sources, config)
+}
+
+fn store_recall_history_if_still_authorized(
+    history: &Arc<Mutex<Vec<RecallChatHistoryTurn>>>,
+    entry: RecallChatHistoryTurn,
+) -> bool {
+    let Ok(config) = Config::load_strict() else {
+        history.lock().unwrap().clear();
+        return false;
+    };
+    if reauthorize_recall_sources(&entry.sources, &config).is_err() {
+        history.lock().unwrap().clear();
+        return false;
+    }
+    let mut history = history.lock().unwrap();
+    history.push(entry);
+    if history.len() > 6 {
+        let remove = history.len() - 6;
+        history.drain(..remove);
+    }
+    true
+}
+
+fn recall_ollama_chat_url(raw: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(raw)
+        .map_err(|_| "Recall Ollama URL must be a valid loopback HTTP URL.".to_string())?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.path() != "" && url.path() != "/")
+    {
+        return Err(
+            "Recall Ollama URL must be a plain loopback HTTP origin with no path or credentials."
+                .into(),
+        );
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Recall Ollama URL is missing a loopback host.".to_string())?;
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !is_loopback {
+        return Err("Recall Ollama is local-only; remote destinations are refused.".into());
+    }
+    url.set_path("/api/chat");
+    Ok(url.into())
+}
+
+fn recall_ollama_agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .max_redirects(0)
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(120)))
+            .http_status_as_error(false)
+            .build(),
+    )
+}
+
+struct RecallClaudeExecutable {
+    #[cfg(target_os = "linux")]
+    file: File,
+}
+
+impl RecallClaudeExecutable {
+    #[cfg(target_os = "linux")]
+    fn open(path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let file = File::open(path)
+            .map_err(|_| "Native Recall could not authorize the Claude executable.".to_string())?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "Native Recall could not authorize the Claude executable.".to_string())?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err("Native Recall refused an invalid Claude executable.".into());
+        }
+        let mut magic = [0u8; 4];
+        if file.read_at(&mut magic, 0).ok() != Some(magic.len()) || magic != *b"\x7fELF" {
+            return Err("Native Recall requires a native held Claude executable.".into());
+        }
+        Ok(Self { file })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open(_path: &Path) -> Result<Self, String> {
+        Err(
+            "Native Recall cannot prove handle-bound Claude execution on this platform; use local Ollama instead."
+                .into(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn command(&self) -> Command {
+        use std::os::fd::AsRawFd;
+
+        Command::new(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn command(&self) -> Command {
+        unreachable!("unsupported platforms fail while opening the executable capability")
+    }
+}
+
+fn configure_recall_claude_environment(
+    command: &mut Command,
+    private_home: &Path,
+    anthropic_api_key: Option<&str>,
+) {
+    command.env_clear();
+    command.env("HOME", private_home);
+    command.env("LANG", "C.UTF-8");
+    command.env("LC_ALL", "C.UTF-8");
+    if let Some(api_key) = anthropic_api_key {
+        command.env("ANTHROPIC_API_KEY", api_key);
+    }
+}
+
+fn authorize_recall_claude_executable(
+    path: &Path,
+    private_home: &Path,
+) -> Result<RecallClaudeExecutable, String> {
+    let capability = RecallClaudeExecutable::open(path)?;
+    let mut probe = capability.command();
+    configure_recall_claude_environment(&mut probe, private_home, None);
+    let output = probe
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| "Native Recall could not validate the Claude executable.".to_string())?;
+    if !output.status.success()
+        || !minutes_core::summarize::recall_claude_version_is_known(&output.stdout)
+    {
+        return Err("Native Recall refused an unverified Claude executable.".into());
+    }
+    Ok(capability)
 }
 
 fn current_screen_context_prompt() -> String {
@@ -9234,9 +9685,8 @@ fn current_screen_context_prompt() -> String {
 - state: {}\n\
 - successful_captures: {}\n\
 - last_successful_capture_at: {}\n\
-Use the bounded read-only get_screen_context tool only if the question depends on pixels. If this \
-provider cannot call that tool, say image retrieval is unavailable in this provider instead of \
-claiming visual awareness.\n\n",
+Native Recall has no image-retrieval tool. Treat this as state metadata only and do not claim to \
+see or describe screen pixels.\n\n",
         session.id,
         state,
         status.successful_capture_count,
@@ -9446,11 +9896,7 @@ fn cancel_recall_chat_turn(current_turn: &Arc<Mutex<Option<RecallChatTurn>>>) ->
 ///
 /// Provider priority:
 ///   1. `config.summarization.engine == "ollama"` — HTTP to Ollama (localhost:11434)
-///   2. `detect_agent_cli()` found something — use that CLI:
-///      - `claude`: stream-json via `build_chat_invocation` — scoped to a
-///        read-only `--allowedTools` allow-list on the Minutes MCP server
-///        only (no shell, no writes, prompt on stdin), streamed token-by-token
-///      - others (codex/gemini/opencode): captured as plain-text stdout
+///   2. hardened Claude CLI — stream-json with empty settings, MCP, and tools
 ///   3. Nothing found — descriptive error returned to frontend, pointing the
 ///      user at installing Claude Code. Minutes intentionally has no direct
 ///      cloud-API fallback for chat: no-API-key-required is core to the
@@ -9480,122 +9926,47 @@ pub async fn cmd_recall_chat_send(
             .map_err(|e| format!("Cannot create workspace dir: {}", e))?;
     }
 
-    // The native chat panel's context mostly comes from the keyword-search
-    // injection below, plus (for claude) a small read-only MCP tool allow-list —
-    // see build_chat_invocation. Run the CLI from a dedicated neutral directory —
-    // NOT the shared ~/.minutes/assistant workspace — so it does not auto-load
-    // that workspace's CLAUDE.md / AGENTS.md. Those files are written for the
-    // full-tool PTY assistant and instruct the model to read CURRENT_MEETING.md
-    // and run `minutes` commands via a shell it doesn't have here, so it would
-    // narrate a cascade of failed tool calls straight into the chat. Instead this
-    // cwd gets its own CHAT_WORKSPACE_CLAUDE_MD, honest about the single-shot,
-    // read-only-tools-only context. Claude/agents auto-load memory files from cwd
-    // regardless of `--strict-mcp-config` / `--allowedTools`, so isolating cwd
-    // (and writing our own CLAUDE.md into it) is the fix.
+    // Run from a dedicated neutral directory rather than the full-tool PTY
+    // workspace. The verified Claude launch also disables all setting sources,
+    // tools, MCP, plugins, hooks, and session persistence. Remove the obsolete
+    // chat memory file written by older builds so the on-disk contract is honest
+    // even though the hardened launch would ignore it.
     let chat_cwd = workspace
         .parent()
         .map(|p| p.join("chat"))
         .unwrap_or_else(|| workspace.clone());
     let _ = std::fs::create_dir_all(&chat_cwd);
-    // Rewritten on every message (cheap, static content) so a binary upgrade
-    // picks up new wording without requiring the user to clear the chat cwd.
-    let _ = std::fs::write(chat_cwd.join("CLAUDE.md"), CHAT_WORKSPACE_CLAUDE_MD);
+    let _ = std::fs::remove_file(chat_cwd.join("CLAUDE.md"));
 
     // ── Step 1: inject meeting context ────────────────────────────────────────
-    let config = minutes_core::config::Config::load();
-    let meeting_context = {
-        let mut sections: Vec<String> = Vec::new();
-
-        // Prioritize the meeting the panel currently has focused. Keyword
-        // search on the raw question ("what did we discuss in this
-        // meeting?") often has no content-bearing terms and returns
-        // nothing, even though the user is clearly pointing at a specific,
-        // already-open meeting — see the Recall panel header context label.
-        if let Some(focused_path) = recall_workspace_current_meeting() {
-            if let Ok(content) = std::fs::read_to_string(&focused_path) {
-                let (frontmatter_str, body) = minutes_core::markdown::split_frontmatter(&content);
-                let title = serde_yaml::from_str::<minutes_core::markdown::Frontmatter>(
-                    frontmatter_str.trim(),
-                )
-                .ok()
-                .map(|fm| fm.title)
-                .unwrap_or_else(|| {
-                    focused_path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                });
-                let body = body.trim();
-                // Floor to a UTF-8 char boundary: a bare `&body[..6000]` panics
-                // when a multi-byte char (accents, CJK, emoji) straddles 6000.
-                let truncated_body = if body.len() > 6000 {
-                    let mut end = 6000;
-                    while end > 0 && !body.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    &body[..end]
-                } else {
-                    body
-                };
-                sections.push(format!(
-                    "## Currently focused meeting: {}\n{}",
-                    title, truncated_body
-                ));
-            }
-        }
-
-        let filters = minutes_core::search::SearchFilters::default();
-        if let Ok(results) = minutes_core::search::search(&message, &config, &filters) {
-            let snippets: Vec<String> = results
-                .iter()
-                .take(5)
-                .map(|r| format!("## {} ({})\n{}", r.title, r.date, r.snippet))
-                .collect();
-            if !snippets.is_empty() {
-                sections.push(format!(
-                    "## Other relevant excerpts from your meetings\n\n{}",
-                    snippets.join("\n\n")
-                ));
-            }
-        }
-
-        if sections.is_empty() {
-            String::new()
-        } else {
-            let raw = format!("Meeting context:\n\n{}\n\n---\n\n", sections.join("\n\n"));
-            // Floor to a UTF-8 char boundary: `raw[..12000]` panics if a
-            // multi-byte char straddles 12000 (non-ASCII meeting content).
-            if raw.len() > 12000 {
-                let mut end = 12000;
-                while end > 0 && !raw.is_char_boundary(end) {
-                    end -= 1;
-                }
-                raw[..end].to_string()
-            } else {
-                raw
-            }
-        }
-    };
-    // The honest, single-shot / read-only-tools framing now lives in
-    // CHAT_WORKSPACE_CLAUDE_MD, written to chat_cwd/CLAUDE.md above — claude
-    // auto-loads CLAUDE.md from cwd at process start, so it doesn't need to be
-    // repeated inline on every message the way the old CHAT_NO_TOOLS_PREAMBLE
-    // was. Non-claude agent CLIs invoked via build_chat_invocation don't read
-    // that file's tool-scoping the same way, but the "single-shot, ground
-    // answers in the excerpts below" guidance still applies to them, so it's
-    // still useful context — just no longer claiming zero tool access, since
-    // claude's chat session does have a pre-approved read-only allow-list.
+    let config = Config::load_strict()?;
+    let safe_context = collect_recall_agent_safe_context(&message, &config)?;
     let screen_context = current_screen_context_prompt();
     let enriched_message = format!(
         "{}{}User question: {}",
-        meeting_context, screen_context, message
+        safe_context.text, screen_context, message
     );
 
     // ── Step 2: build prompt with history ─────────────────────────────────────
-    let history_snapshot: Vec<(String, String)> = {
+    let history_snapshot: Vec<RecallChatHistoryTurn> = {
         let h = state.recall_chat_history.lock().unwrap();
         h.clone()
     };
+    let egress_sources = match recall_history_sources(&history_snapshot, &safe_context.sources) {
+        Ok(sources) => sources,
+        Err(error) => {
+            state.recall_chat_history.lock().unwrap().clear();
+            return Err(format!(
+                "{error} Recall history was cleared; retry the question."
+            ));
+        }
+    };
+    if let Err(error) = reauthorize_recall_sources(&egress_sources, &config) {
+        state.recall_chat_history.lock().unwrap().clear();
+        return Err(format!(
+            "{error} Recall history was cleared; retry the question."
+        ));
+    }
     let full_prompt = build_recall_chat_prompt(&history_snapshot, &enriched_message);
 
     // ── Step 3: detect provider ────────────────────────────────────────────────
@@ -9603,21 +9974,21 @@ pub async fn cmd_recall_chat_send(
 
     // ── Ollama path ────────────────────────────────────────────────────────────
     if use_ollama {
+        let prepared_url = recall_ollama_chat_url(&config.summarization.ollama_url)?;
         let (turn_id, cancelled) = begin_recall_chat_turn(&state)?;
-        let ollama_url = config.summarization.ollama_url.clone();
         let ollama_model = config.summarization.ollama_model.clone();
+        let expected_ollama_model = ollama_model.clone();
         let app_clone = app.clone();
         let message_clone = message.clone();
         let history_arc = state.recall_chat_history.clone();
         let current_turn = state.recall_chat_turn.clone();
+        let source_bindings = egress_sources.clone();
 
         let task_result = tauri::async_runtime::spawn_blocking(move || {
-            let url = format!("{}/api/chat", ollama_url);
-
             let mut messages: Vec<serde_json::Value> = Vec::new();
-            for (u, a) in &history_snapshot {
-                messages.push(serde_json::json!({"role": "user", "content": u}));
-                messages.push(serde_json::json!({"role": "assistant", "content": a}));
+            for turn in &history_snapshot {
+                messages.push(serde_json::json!({"role": "user", "content": turn.user_message}));
+                messages.push(serde_json::json!({"role": "assistant", "content": turn.assistant_response}));
             }
             messages.push(serde_json::json!({"role": "user", "content": enriched_message}));
 
@@ -9627,23 +9998,57 @@ pub async fn cmd_recall_chat_send(
                 "stream": true,
             });
 
-            let agent = ureq::Agent::new_with_config(
-                ureq::config::Config::builder()
-                    .timeout_global(Some(std::time::Duration::from_secs(120)))
-                    .http_status_as_error(false)
-                    .build(),
-            );
+            let agent = recall_ollama_agent();
 
-            let mut resp = match agent
-                .post(&url)
+            let fresh_config = match Config::load_strict() {
+                Ok(config) => config,
+                Err(_) => {
+                    history_arc.lock().unwrap().clear();
+                    app_clone
+                        .emit_to(
+                            "main",
+                            "recall-chat-error",
+                            "Recall context could not be reauthorized safely. The conversation was cleared; retry the question.",
+                        )
+                        .ok();
+                    finish_recall_chat_turn(&app_clone, &current_turn, turn_id);
+                    return;
+                }
+            };
+            if reauthorize_recall_ollama_egress(
+                &prepared_url,
+                &expected_ollama_model,
+                &source_bindings,
+                &fresh_config,
+            )
+            .is_err()
+            {
+                history_arc.lock().unwrap().clear();
+                app_clone
+                    .emit_to(
+                        "main",
+                        "recall-chat-error",
+                        "Recall context or local provider changed before use. The request was blocked locally.",
+                    )
+                    .ok();
+                finish_recall_chat_turn(&app_clone, &current_turn, turn_id);
+                return;
+            }
+
+            let resp = match agent
+                .post(&prepared_url)
                 .header("Content-Type", "application/json")
                 .send_json(&body)
             {
                 Ok(r) => r,
-                Err(e) => {
+                Err(_) => {
                     if !cancelled.load(Ordering::Relaxed) {
                         app_clone
-                            .emit_to("main", "recall-chat-error", format!("Ollama error: {}", e))
+                            .emit_to(
+                                "main",
+                                "recall-chat-error",
+                                "The local Recall provider could not be reached safely.",
+                            )
                             .ok();
                     }
                     finish_recall_chat_turn(&app_clone, &current_turn, turn_id);
@@ -9651,15 +10056,14 @@ pub async fn cmd_recall_chat_send(
                 }
             };
 
-            if resp.status().as_u16() >= 400 {
+            if resp.status().as_u16() >= 300 {
                 let status = resp.status().as_u16();
-                let body_text = resp.body_mut().read_to_string().unwrap_or_default();
                 if !cancelled.load(Ordering::Relaxed) {
                     app_clone
                         .emit_to(
                             "main",
                             "recall-chat-error",
-                            format!("Ollama HTTP {}: {}", status, body_text),
+                            format!("The local Recall provider returned HTTP {status}."),
                         )
                         .ok();
                 }
@@ -9705,8 +10109,14 @@ pub async fn cmd_recall_chat_send(
             }
 
             if !cancelled.load(Ordering::Relaxed) && !full_response.is_empty() {
-                let mut h = history_arc.lock().unwrap();
-                h.push((message_clone, full_response));
+                store_recall_history_if_still_authorized(
+                    &history_arc,
+                    RecallChatHistoryTurn {
+                        user_message: message_clone,
+                        assistant_response: full_response,
+                        sources: source_bindings,
+                    },
+                );
             }
             finish_recall_chat_turn(&app_clone, &current_turn, turn_id);
         })
@@ -9721,11 +10131,11 @@ pub async fn cmd_recall_chat_send(
     }
 
     // ── CLI agent path ─────────────────────────────────────────────────────────
-    let agent_bin = minutes_core::summarize::detect_agent_cli().ok_or_else(|| {
-        "No AI agent found for Recall chat. Install Claude Code (npm install -g \
-         @anthropic-ai/claude-code), Codex, or Gemini CLI to enable chat — or configure \
+    let agent_bin = minutes_core::summarize::detect_recall_chat_cli().ok_or_else(|| {
+        "No safely isolated AI provider found for Recall chat. Install Claude Code (npm install -g \
+         @anthropic-ai/claude-code) — or configure \
          Ollama ([summarization] engine = \"ollama\" in config.toml) for a fully local \
-         option. Minutes doesn't require an API key for this feature."
+         loopback-only option. Other agent CLIs stay disabled until their no-tools mode is verified."
             .to_string()
     })?;
 
@@ -9734,22 +10144,18 @@ pub async fn cmd_recall_chat_send(
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case("claude"))
         .unwrap_or(false);
+    if !is_claude_cli {
+        return Err("Native Recall refused an unverified agent CLI.".into());
+    }
 
     let history_arc = state.recall_chat_history.clone();
     let message_clone = message.clone();
+    let expected_engine = config.summarization.engine.clone();
 
     if is_claude_cli {
-        // Claude CLI: incremental stream-json output, prompt via stdin.
-        // Built by build_chat_invocation's claude-specific path (separate from
-        // the #382 zero-MCP/zero-tools lean branch used by speaker mapping):
-        // `--strict-mcp-config` + an inline `--mcp-config` register only the
-        // Minutes MCP server, and `--allowedTools` pre-approves a read-only
-        // subset of its tools, upgraded to `--output-format stream-json
-        // --verbose` for token-by-token rendering. Passing the prompt on stdin
-        // (not as a `-p <arg>`) also avoids the Windows command-line length
-        // limit on long transcripts. This replaced a hand-rolled arg list that
-        // carried a non-existent `--no-interactive` flag and errored on every
-        // message.
+        // Claude CLI: incremental stream-json output, prompt via stdin, with
+        // empty settings sources, MCP, and tools. Passing the prompt on stdin
+        // also avoids the Windows command-line length limit on long transcripts.
         let invocation =
             minutes_core::summarize::build_chat_invocation(&agent_bin, &full_prompt, true)
                 .map_err(|e| format!("Failed to prepare claude invocation: {}", e))?;
@@ -9788,6 +10194,20 @@ pub async fn cmd_recall_chat_send(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let fresh_config = Config::load_strict().map_err(|_| {
+            state.recall_chat_history.lock().unwrap().clear();
+            "Recall context could not be reauthorized safely. The conversation was cleared; retry the question."
+                .to_string()
+        })?;
+        if reauthorize_recall_claude_egress(&expected_engine, &egress_sources, &fresh_config)
+            .is_err()
+        {
+            state.recall_chat_history.lock().unwrap().clear();
+            return Err(
+                "Recall context or provider changed before use. The conversation was cleared and the request was blocked locally."
+                    .into(),
+            );
+        }
         let (turn_id, cancelled) = begin_recall_chat_turn(&state)?;
         let process =
             match spawn_tracked_recall_chat_child(command, &state.recall_chat_turn, turn_id) {
@@ -9804,8 +10224,17 @@ pub async fn cmd_recall_chat_send(
         } = process;
 
         if let Some(payload) = invocation.stdin_payload {
-            if let Some(mut stdin_handle) = stdin.take() {
-                let _ = stdin_handle.write_all(&payload);
+            let write_result = stdin
+                .take()
+                .ok_or_else(|| "Recall chat agent stdin was unavailable.".to_string())
+                .and_then(|mut stdin_handle| {
+                    stdin_handle.write_all(&payload).map_err(|_| {
+                        "Recall chat prompt could not be delivered safely.".to_string()
+                    })
+                });
+            if let Err(error) = write_result {
+                cancel_recall_chat_turn(&state.recall_chat_turn);
+                return Err(error);
             }
         }
 
@@ -9816,19 +10245,22 @@ pub async fn cmd_recall_chat_send(
         tauri::async_runtime::spawn_blocking(move || {
             let stderr_thread = std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
-                let mut buf = String::new();
+                let mut reported_error = false;
                 for line in reader.lines().map_while(Result::ok) {
                     if stderr_cancelled.load(Ordering::Relaxed) {
                         break;
                     }
                     if !line.trim().is_empty() {
-                        buf.push_str(&line);
-                        buf.push('\n');
+                        reported_error = true;
                     }
                 }
-                if !stderr_cancelled.load(Ordering::Relaxed) && !buf.is_empty() {
+                if !stderr_cancelled.load(Ordering::Relaxed) && reported_error {
                     app_stderr
-                        .emit_to("main", "recall-chat-error", buf.trim().to_string())
+                        .emit_to(
+                            "main",
+                            "recall-chat-error",
+                            "The Recall provider reported an error while answering.",
+                        )
                         .ok();
                 }
             });
@@ -9872,8 +10304,14 @@ pub async fn cmd_recall_chat_send(
             let _ = stderr_thread.join();
 
             if !cancelled.load(Ordering::Relaxed) && !full_response.is_empty() {
-                let mut h = history_arc.lock().unwrap();
-                h.push((message_clone, full_response));
+                store_recall_history_if_still_authorized(
+                    &history_arc,
+                    RecallChatHistoryTurn {
+                        user_message: message_clone,
+                        assistant_response: full_response,
+                        sources: egress_sources,
+                    },
+                );
             }
 
             reap_recall_chat_child(&worker_turn, turn_id);
@@ -9883,135 +10321,6 @@ pub async fn cmd_recall_chat_send(
         .map_err(|e| {
             clear_recall_chat_turn_if_current(&current_turn, turn_id);
             format!("Recall chat streaming task failed: {e}")
-        })?;
-    } else {
-        // Other CLIs (codex / gemini / opencode): capture plain-text stdout.
-        let invocation =
-            minutes_core::summarize::build_chat_invocation(&agent_bin, &full_prompt, false)
-                .map_err(|e| format!("Failed to prepare agent invocation: {}", e))?;
-
-        let stdin_stdio = if invocation.stdin_payload.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        };
-
-        #[cfg(target_os = "windows")]
-        let mut command = {
-            let ext = std::path::Path::new(&invocation.cmd)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if ext == "cmd" || ext == "bat" {
-                let mut command = Command::new("cmd");
-                command.arg("/C").arg(&invocation.cmd);
-                command
-            } else {
-                Command::new(&invocation.cmd)
-            }
-        };
-
-        #[cfg(not(target_os = "windows"))]
-        let mut command = Command::new(&invocation.cmd);
-        // This block was missing its cfg gate, so on Windows both it and the
-        // windows block below ran, moving the non-Copy `stdin_stdio` twice
-        // (E0382). Gate it to non-windows to match its `command` definition.
-        #[cfg(not(target_os = "windows"))]
-        command
-            .args(&invocation.args)
-            .current_dir(&chat_cwd)
-            .stdin(stdin_stdio)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        #[cfg(target_os = "windows")]
-        command
-            .args(&invocation.args)
-            .current_dir(&chat_cwd)
-            .stdin(stdin_stdio)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let (turn_id, cancelled) = begin_recall_chat_turn(&state)?;
-        let process =
-            match spawn_tracked_recall_chat_child(command, &state.recall_chat_turn, turn_id) {
-                Ok(process) => process,
-                Err(error) => {
-                    clear_recall_chat_turn_if_current(&state.recall_chat_turn, turn_id);
-                    return Err(error);
-                }
-            };
-        let RecallChatProcessIo {
-            mut stdin,
-            stdout,
-            stderr,
-        } = process;
-
-        if let Some(payload) = invocation.stdin_payload {
-            if let Some(mut stdin_handle) = stdin.take() {
-                let _ = stdin_handle.write_all(&payload);
-            }
-        }
-
-        let cleanup_path = invocation.cleanup_path;
-        let app_clone = app.clone();
-        let stderr_cancelled = cancelled.clone();
-        let current_turn = state.recall_chat_turn.clone();
-        let worker_turn = current_turn.clone();
-
-        tauri::async_runtime::spawn_blocking(move || {
-            let app_stderr2 = app_clone.clone();
-            let stderr_thread = std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                let mut buf = String::new();
-                for line in reader.lines().map_while(Result::ok) {
-                    if stderr_cancelled.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if !line.trim().is_empty() {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                }
-                if !stderr_cancelled.load(Ordering::Relaxed) && !buf.is_empty() {
-                    app_stderr2
-                        .emit_to("main", "recall-chat-error", buf.trim().to_string())
-                        .ok();
-                }
-            });
-
-            use std::io::Read;
-            let mut full_response = String::new();
-            let mut reader = BufReader::new(stdout);
-            let _ = reader.read_to_string(&mut full_response);
-
-            let _ = stderr_thread.join();
-
-            if let Some(path) = cleanup_path {
-                let _ = std::fs::remove_file(path);
-            }
-
-            let trimmed = full_response.trim().to_string();
-            if !cancelled.load(Ordering::Relaxed) && !trimmed.is_empty() {
-                app_clone
-                    .emit_to(
-                        "main",
-                        "recall-chat-chunk",
-                        serde_json::json!({"type": "text", "text": &trimmed}),
-                    )
-                    .ok();
-                let mut h = history_arc.lock().unwrap();
-                h.push((message_clone, trimmed));
-            }
-
-            reap_recall_chat_child(&worker_turn, turn_id);
-            finish_recall_chat_turn(&app_clone, &worker_turn, turn_id);
-        })
-        .await
-        .map_err(|e| {
-            clear_recall_chat_turn_if_current(&current_turn, turn_id);
-            format!("Recall chat agent task failed: {e}")
         })?;
     }
 
@@ -11509,12 +11818,158 @@ mod tests {
     }
 
     #[test]
-    fn recall_chat_contract_exposes_bounded_screen_tool_and_visual_claim_rule() {
-        assert!(CHAT_WORKSPACE_CLAUDE_MD.contains("`get_screen_context`"));
-        assert!(CHAT_WORKSPACE_CLAUDE_MD.contains("screenshots are never attached automatically"));
-        assert!(CHAT_WORKSPACE_CLAUDE_MD
-            .contains("unless this turn actually received a specific image"));
-        assert!(CHAT_WORKSPACE_CLAUDE_MD.contains("desktop app/window metadata are separate"));
+    fn recall_ollama_url_accepts_only_plain_loopback_origins() {
+        for accepted in [
+            "http://localhost:11434",
+            "http://127.0.0.1:11434/",
+            "http://127.23.4.5:9988",
+            "http://[::1]:11434",
+        ] {
+            let endpoint = recall_ollama_chat_url(accepted).unwrap();
+            assert!(endpoint.ends_with("/api/chat"), "{accepted}");
+        }
+
+        for rejected in [
+            "https://localhost:11434",
+            "http://localhost.example.com:11434",
+            "http://192.168.1.10:11434",
+            "http://0.0.0.0:11434",
+            "http://user@localhost:11434",
+            "http://localhost:11434/base",
+            "http://localhost:11434/?token=x",
+            "http://localhost:11434/#fragment",
+            "not a url",
+        ] {
+            assert!(recall_ollama_chat_url(rejected).is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn recall_ollama_client_never_follows_redirects() {
+        let agent = recall_ollama_agent();
+        assert_eq!(agent.config().max_redirects(), 0);
+        assert!(agent.config().proxy().is_none());
+    }
+
+    #[test]
+    fn recall_provider_bindings_reject_last_moment_changes() {
+        let mut ollama = Config::default();
+        ollama.summarization.engine = "ollama".into();
+        ollama.summarization.ollama_url = "http://127.0.0.1:11434".into();
+        ollama.summarization.ollama_model = "trusted-model".into();
+        let endpoint = recall_ollama_chat_url(&ollama.summarization.ollama_url).unwrap();
+        assert!(reauthorize_recall_ollama_egress(&endpoint, "trusted-model", &[], &ollama).is_ok());
+
+        let mut changed_model = ollama.clone();
+        changed_model.summarization.ollama_model = "different-model".into();
+        assert!(
+            reauthorize_recall_ollama_egress(&endpoint, "trusted-model", &[], &changed_model)
+                .is_err()
+        );
+
+        let mut changed_url = ollama.clone();
+        changed_url.summarization.ollama_url = "http://localhost:11435".into();
+        assert!(
+            reauthorize_recall_ollama_egress(&endpoint, "trusted-model", &[], &changed_url)
+                .is_err()
+        );
+
+        let mut claude = Config::default();
+        claude.summarization.engine = "agent".into();
+        assert!(reauthorize_recall_claude_egress("agent", &[], &claude).is_ok());
+        claude.summarization.engine = "auto".into();
+        assert!(reauthorize_recall_claude_egress("agent", &[], &claude).is_err());
+    }
+
+    fn recall_test_markdown(sensitivity: Option<&str>, body: &str) -> String {
+        let sensitivity = sensitivity
+            .map(|value| format!("sensitivity: {value}\n"))
+            .unwrap_or_default();
+        format!(
+            "---\ntitle: Private Planning\ntype: meeting\ndate: 2026-07-21T12:00:00Z\n{sensitivity}---\n\n## Transcript\n\n{body}\n"
+        )
+    }
+
+    #[test]
+    fn recall_focused_context_and_egress_reauthorization_fail_closed() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("planning.md");
+        fs::write(
+            &path,
+            recall_test_markdown(None, "NORMAL_CONTEXT_CANARY roadmap"),
+        )
+        .unwrap();
+        let config = Config {
+            output_dir: directory.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let (section, snapshot) = recall_focused_meeting_context(&path, &config).unwrap();
+        assert!(section.contains("NORMAL_CONTEXT_CANARY"));
+        let binding = RecallSourceBinding::from_snapshot(&snapshot);
+
+        fs::write(
+            &path,
+            recall_test_markdown(Some("restricted"), "RESTRICTED_CONTEXT_CANARY"),
+        )
+        .unwrap();
+        let error = reauthorize_recall_sources(std::slice::from_ref(&binding), &config)
+            .expect_err("a sensitivity flip must revoke the prepared prompt");
+        assert!(!error.contains(path.to_string_lossy().as_ref()));
+        assert!(recall_focused_meeting_context(&path, &config).is_err());
+
+        fs::write(
+            &path,
+            recall_test_markdown(Some("future-policy"), "UNKNOWN_CONTEXT_CANARY"),
+        )
+        .unwrap();
+        let error = recall_focused_meeting_context(&path, &config).unwrap_err();
+        assert!(!error.contains(path.to_string_lossy().as_ref()));
+        assert!(!error.contains("UNKNOWN_CONTEXT_CANARY"));
+    }
+
+    #[test]
+    fn recall_history_source_union_is_transitive_deduplicated_and_bounded() {
+        let source = |name: &str, byte_len: usize| RecallSourceBinding {
+            canonical_path: PathBuf::from(format!("/private/{name}.md")),
+            content_sha256: format!("digest-{name}"),
+            byte_len,
+        };
+        let alpha = source("alpha", 100);
+        let beta = source("beta", 200);
+        let history = vec![
+            RecallChatHistoryTurn {
+                user_message: "one".into(),
+                assistant_response: "first".into(),
+                sources: vec![alpha.clone()],
+            },
+            RecallChatHistoryTurn {
+                user_message: "two".into(),
+                assistant_response: "second".into(),
+                sources: vec![alpha.clone(), beta.clone()],
+            },
+        ];
+
+        assert_eq!(
+            recall_history_sources(&history, std::slice::from_ref(&beta)).unwrap(),
+            vec![alpha, beta]
+        );
+
+        let oversized = source("oversized", RECALL_MAX_REAUTH_BYTES + 1);
+        assert!(recall_history_sources(&[], &[oversized]).is_err());
+    }
+
+    #[test]
+    fn recall_source_binding_debug_is_path_and_digest_free() {
+        let binding = RecallSourceBinding {
+            canonical_path: PathBuf::from("/private/meeting/canary.md"),
+            content_sha256: "secret-digest-canary".into(),
+            byte_len: 42,
+        };
+        let rendered = format!("{binding:?}");
+        assert!(rendered.contains("42"));
+        assert!(!rendered.contains("canary.md"));
+        assert!(!rendered.contains("secret-digest-canary"));
     }
 
     #[test]
@@ -14475,11 +14930,10 @@ mod tests {
     }
 
     #[test]
-    fn proactive_context_marks_deferred_graph_unavailable_instead_of_empty() {
+    fn proactive_context_marks_unverified_graph_unavailable_instead_of_empty() {
         let markdown = build_proactive_context_markdown(&[], &[], &[], None);
 
-        assert!(markdown.contains("temporarily unavailable"));
-        assert!(markdown.contains("#513"));
+        assert!(markdown.contains("projection could not be verified"));
         assert!(!markdown.contains("No losing-touch alerts"));
     }
 

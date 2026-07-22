@@ -9,7 +9,7 @@ Dictation is the most personal audio there is, and it's where cloud processing i
 - Occasional sentence → **built-in macOS dictation** (already installed; Apple processes many languages on-device on Apple Silicon, with auto-punctuation)
 - Heavy daily dictation with per-app formatting → **superwhisper** (local models by default, closed source, subscription)
 - File transcription first, dictation included → **MacWhisper** (one-time Pro purchase; dictation is in the direct-download version only, not the App Store build)
-- Dictation as part of a conversation-memory system → **Minutes** (open source, free; text typed at your cursor — or clipboard via CLI — plus a timestamped daily note, alongside meetings/memos/live transcription, all agent-searchable)
+- Dictation as part of a conversation-memory system → **Minutes** (open source, free; text typed at your cursor — or clipboard via CLI — plus a timestamped daily note, alongside meetings/memos/live transcription; policy-authorized normal entries are agent-searchable and restricted meetings are excluded by default)
 
 Careful if "local" is your requirement: several popular dictation apps (Wispr Flow best known) process speech in the cloud — a different privacy contract.
 

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
@@ -35,6 +36,7 @@ import {
   afterContentResourceReadiness,
   afterAgentTrustReadiness,
   assistantSafeContextLinks,
+  boundedCorePersonProfile,
   buildMcpProcessAudioArgs,
   buildLiveCopilotResourcePayload,
   buildLiveEventsResourcePayload,
@@ -51,6 +53,7 @@ import {
   extractMarkdownSection,
   getEffectiveMeetingsDir,
   handleMcpProcessAudioRequest,
+  historicalCommitmentRows,
   isActiveCorpusMeetingPath,
   isPathWithinCanonicalRoot,
   LIVE_COPILOT_RESOURCE_URI,
@@ -69,12 +72,16 @@ import {
   MCP_INTENT_RESULT_MAX,
   MCP_MEETING_RESULT_MAX,
   MCP_MEETING_INSIGHTS_UNAVAILABLE_DESCRIPTION,
+  MCP_PERSON_PROFILE_DECISION_MAX,
   MCP_PERSON_PROFILE_MEETING_MAX,
   MCP_PERSON_PROFILE_OPEN_ACTION_MAX,
   MCP_PERSON_PROFILE_TOPIC_MAX,
   MCP_POLICY_MEETING_RESULT_MAX,
   MCP_PROCESSING_JOB_RESULT_MAX,
   MCP_PROCESS_AUDIO_MAX_ACTIVE_JOBS,
+  MCP_PROCESS_AUDIO_CLI_TIMEOUT_MS,
+  MCP_PROCESS_AUDIO_MAX_STDERR_BYTES,
+  MCP_PROCESS_AUDIO_MAX_STDOUT_BYTES,
   MCP_RELATIONSHIP_RESULT_MAX,
   MCP_RESEARCH_DECISION_RESULT_MAX,
   MCP_RESEARCH_MEETING_RESULT_MAX,
@@ -82,9 +89,11 @@ import {
   MEETING_INSIGHT_KINDS,
   normalizeCanonicalPathWire,
   normalizeMcpMeetingResultLimit,
+  relationshipMapStructuredContent,
   mcpProcessAudioPlatformPolicy,
   openActionsFromMeetings,
   personProfileFromMeetings,
+  policyCommitmentResults,
   policyIntentResults,
   parseCopilotNudgeLog,
   parseCopilotStatusOutput,
@@ -105,7 +114,8 @@ import {
   readKnowledgeStatusSnapshot,
   readLiveEventsResource,
   readVerifiedScreenImage,
-  relationshipMapFromMeetings,
+  createCapabilityRepairCoordinator,
+  repairCliCapabilities,
   researchTopicProjection,
   runAgentToolPolicies,
   stopCopilotBeforeStatusRead,
@@ -115,7 +125,6 @@ import {
   terminalControlBeforeContentReadiness,
   selectCopilotNudges,
   shouldRunMainEntry,
-  runMcpProcessAudioCli,
   runIsolatedMcpProcessAudio,
   validateMcpProcessAudioInput,
   withAuthorizedMcpProcessAudioInput,
@@ -150,6 +159,129 @@ function rustCanonicalPathWire(path: string): string {
   return path.startsWith("\\\\")
     ? `\\\\?\\UNC\\${path.slice(2)}`
     : `\\\\?\\${path}`;
+}
+
+type ProcessAudioFixtureOptions = {
+  binary: string;
+  timeoutMs?: number;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+  extraEnv?: Record<string, string>;
+};
+
+function boundedFixtureLimit(
+  requested: number | undefined,
+  productionLimit: number
+): number {
+  const value = requested ?? productionLimit;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("process_audio resource budget was invalid");
+  }
+  return Math.min(value, productionLimit);
+}
+
+function killFixtureGroup(child: ReturnType<typeof spawn>): void {
+  const pid = child.pid;
+  if (process.platform !== "win32" && Number.isSafeInteger(pid) && (pid ?? 0) > 0) {
+    try {
+      process.kill(-(pid as number), "SIGKILL");
+      return;
+    } catch {
+      // Fall through to the exact child handle for a pre-group spawn race.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // The fixture may already have exited.
+  }
+}
+
+/** Synthetic-executable harness only; production has no direct fd-3 runner. */
+async function runProcessAudioFixtureCli(
+  input: AuthorizedMcpProcessAudioInput,
+  contentType: "meeting" | "memo",
+  language: string | undefined,
+  options: ProcessAudioFixtureOptions
+): Promise<{ stdout: string; stderr: string }> {
+  const args = buildMcpProcessAudioArgs(input, contentType, language);
+  const safeExtraEnv = { ...(options.extraEnv ?? {}) };
+  delete safeExtraEnv.MINUTES_MCP_OUTER_PROCESS_GROUP;
+  const timeoutMs = boundedFixtureLimit(
+    options.timeoutMs,
+    MCP_PROCESS_AUDIO_CLI_TIMEOUT_MS
+  );
+  const maxStdoutBytes = boundedFixtureLimit(
+    options.maxStdoutBytes,
+    MCP_PROCESS_AUDIO_MAX_STDOUT_BYTES
+  );
+  const maxStderrBytes = boundedFixtureLimit(
+    options.maxStderrBytes,
+    MCP_PROCESS_AUDIO_MAX_STDERR_BYTES
+  );
+
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(options.binary, args, {
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe", input.fd],
+      env: mcpCliChildEnv({ RUST_LOG: "info", ...safeExtraEnv }),
+    });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let failure: string | undefined;
+    let settled = false;
+    const requestFailure = (message: string): void => {
+      if (failure === undefined) failure = message;
+      killFixtureGroup(child);
+    };
+    const timer = setTimeout(
+      () => requestFailure("process_audio CLI exceeded its time budget"),
+      timeoutMs
+    );
+    child.stdout?.on("data", (value: Buffer | string) => {
+      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      stdoutBytes += bytes.byteLength;
+      if (stdoutBytes > maxStdoutBytes) {
+        requestFailure("process_audio CLI stdout exceeded its byte budget");
+      } else {
+        stdoutChunks.push(bytes);
+      }
+    });
+    child.stderr?.on("data", (value: Buffer | string) => {
+      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      stderrBytes += bytes.byteLength;
+      if (stderrBytes > maxStderrBytes) {
+        requestFailure("process_audio CLI stderr exceeded its byte budget");
+      } else {
+        stderrChunks.push(bytes);
+      }
+    });
+    child.once("error", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      killFixtureGroup(child);
+      rejectRun(new Error("process_audio CLI could not be started safely"));
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      killFixtureGroup(child);
+      if (failure !== undefined) {
+        rejectRun(new Error(failure));
+      } else if (code !== 0) {
+        rejectRun(new Error("process_audio CLI failed safely"));
+      } else {
+        resolveRun({
+          stdout: Buffer.concat(stdoutChunks).toString("utf8").trim(),
+          stderr: Buffer.concat(stderrChunks).toString("utf8").trim(),
+        });
+      }
+    });
+  });
 }
 
 describe("verified screen image reads", () => {
@@ -478,6 +610,10 @@ describe("assistant child and derived-input policy", () => {
         mcpCliChildEnv({ MINUTES_CLI_RESTRICTED_POLICY: "allow" })
           .MINUTES_CLI_RESTRICTED_POLICY
       ).toBe("deny");
+      expect(
+        mcpCliChildEnv({ MINUTES_POLICY_GRAPH_CORPUS_ROOT: "/synthetic/meetings" })
+          .MINUTES_POLICY_GRAPH_CORPUS_ROOT
+      ).toBe("/synthetic/meetings");
       delete process.env.MINUTES_CLI_RESTRICTED_POLICY;
       expect(mcpCliChildEnv().MINUTES_CLI_RESTRICTED_POLICY).toBe("deny");
     } finally {
@@ -487,6 +623,65 @@ describe("assistant child and derived-input policy", () => {
         process.env.MINUTES_CLI_RESTRICTED_POLICY = previous;
       }
     }
+  });
+
+  it("repairs an installed same-major CLI that lacks new graph capabilities", async () => {
+    const oldProbe = {
+      kind: "report" as const,
+      report: {
+        version: "0.23.0",
+        api_version: 1,
+        features: { policy_projection_worker_v1: false },
+      },
+    };
+    const repairedProbe = {
+      kind: "report" as const,
+      report: {
+        version: "0.23.1",
+        api_version: 1,
+        features: { policy_projection_worker_v1: true },
+      },
+    };
+    let repairs = 0;
+    let reprobes = 0;
+    await expect(
+      repairCliCapabilities(
+        ["policy_projection_worker_v1"],
+        oldProbe,
+        async () => {
+          repairs += 1;
+          return true;
+        },
+        () => {
+          reprobes += 1;
+          return repairedProbe;
+        }
+      )
+    ).resolves.toEqual(repairedProbe);
+    expect(repairs).toBe(1);
+    expect(reprobes).toBe(1);
+  });
+
+  it("deduplicates concurrent capability repair and permits one bounded retry", async () => {
+    let finishFirst!: (value: boolean) => void;
+    let attempts = 0;
+    const first = new Promise<boolean>((resolve) => {
+      finishFirst = resolve;
+    });
+    const repair = createCapabilityRepairCoordinator(async () => {
+      attempts += 1;
+      if (attempts === 1) return first;
+      return true;
+    }, 2);
+
+    const left = repair();
+    const right = repair();
+    expect(attempts).toBe(1);
+    finishFirst(false);
+    await expect(Promise.all([left, right])).resolves.toEqual([false, false]);
+    await expect(repair()).resolves.toBe(true);
+    await expect(repair()).resolves.toBe(false);
+    expect(attempts).toBe(2);
   });
 
   it("fails Windows process_audio closed before CLI, validation, reads, or fd retention", async () => {
@@ -879,6 +1074,16 @@ describe("assistant child and derived-input policy", () => {
         "  fs.writeFileSync(process.env.MINUTES_DESCENDANT_PID_FILE, String(descendant.pid));",
         "  setInterval(() => {}, 1000);",
         "}",
+        "else if (mode === 'success-descendant') {",
+        // The real CLI marks fd 4 close-on-exec before launching engines. This
+        // synthetic CLI cannot set FD_CLOEXEC from Node, so close its copy
+        // before spawning to model the same descendant inheritance boundary.
+        "  fs.closeSync(4);",
+        "  const descendant = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+        "  descendant.unref();",
+        "  fs.writeFileSync(process.env.MINUTES_DESCENDANT_PID_FILE, String(descendant.pid));",
+        "  process.stdout.write('{}');",
+        "}",
         "else if (mode === 'stdout') { process.stdout.write('S'.repeat(4096)); setInterval(() => {}, 1000); }",
         "else if (mode === 'stderr') { process.stderr.write('E'.repeat(4096)); setInterval(() => {}, 1000); }",
         "else {",
@@ -1030,7 +1235,7 @@ describe("assistant child and derived-input policy", () => {
         "Synthetic review",
         async (authorized) => {
           retainedFd = authorized.fd;
-          return runMcpProcessAudioCli(authorized, "meeting", "en", {
+          return runProcessAudioFixtureCli(authorized, "meeting", "en", {
             binary: childPath,
             extraEnv: {
               MINUTES_CLI_RESTRICTED_POLICY: "allow",
@@ -1095,11 +1300,34 @@ describe("assistant child and derived-input policy", () => {
         createHash("sha256").update(fixture.content).digest("hex")
       );
       expect(payload.restrictedPolicy).toBe("deny");
-      expect(payload.outerProcessGroup).toBeUndefined();
+      expect(Number(payload.outerProcessGroup)).toBeGreaterThan(1);
       expect(JSON.stringify(result)).not.toContain(fixture.source);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
+  });
+
+  it("routes the production process_audio tool only through the isolated helper", () => {
+    const implementation = readFileSync(
+      new URL("./index.ts", import.meta.url),
+      "utf8"
+    );
+    const registrationStart = implementation.indexOf(
+      'registerTool(\n  "process_audio"'
+    );
+    const registrationEnd = implementation.indexOf(
+      "// ── Tool: add_note",
+      registrationStart
+    );
+    expect(registrationStart).toBeGreaterThan(0);
+    expect(registrationEnd).toBeGreaterThan(registrationStart);
+    const registration = implementation.slice(
+      registrationStart,
+      registrationEnd
+    );
+    expect(registration).toContain("runIsolatedMcpProcessAudio(");
+    expect(registration).not.toContain("runProcessAudioFixtureCli(");
+    expect(implementation).not.toContain("runMcpProcessAudioCli");
   });
 
   it("isolated authorization rejects a post-open source replacement", async () => {
@@ -1131,6 +1359,50 @@ describe("assistant child and derived-input policy", () => {
       expect(replacementRan).toBe(true);
       expect(failure).toMatch(/failed safely/i);
       expect(failure).not.toContain(fixture.source);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("retires same-group descendants after a normal isolated helper close", async () => {
+    if (process.platform !== "linux" && process.platform !== "darwin") return;
+    const fixture = processAudioFixture("synthetic-isolated-normal-close");
+    const childPath = writeProcessAudioFdChild(fixture.root);
+    const descendantPidFile = join(fixture.root, "normal-close-descendant.pid");
+    try {
+      const result = await runIsolatedMcpProcessAudio(
+        fixture.source,
+        [fixture.inbox],
+        [".wav"],
+        async () => fixture.meetings,
+        undefined,
+        "memo",
+        undefined,
+        {
+          binary: childPath,
+          timeoutMs: 2_000,
+          extraEnv: {
+            MINUTES_FD_CHILD_MODE: "success-descendant",
+            MINUTES_DESCENDANT_PID_FILE: descendantPidFile,
+          },
+        }
+      );
+      expect(result.stdout).toBe("{}");
+      expect(existsSync(descendantPidFile)).toBe(true);
+      const descendantPid = Number.parseInt(
+        readFileSync(descendantPidFile, "utf8"),
+        10
+      );
+      let alive = true;
+      for (let attempt = 0; attempt < 30 && alive; attempt += 1) {
+        try {
+          process.kill(descendantPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } catch {
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
@@ -1313,7 +1585,7 @@ describe("assistant child and derived-input policy", () => {
           undefined,
           async (authorized) => {
             retainedFd = authorized.fd;
-            return runMcpProcessAudioCli(authorized, "memo", undefined, {
+            return runProcessAudioFixtureCli(authorized, "memo", undefined, {
               binary: childPath,
               timeoutMs: mode === "timeout" ? 50 : 2_000,
               maxStdoutBytes: 64,
@@ -1341,7 +1613,7 @@ describe("assistant child and derived-input policy", () => {
         undefined,
         async (authorized) => {
           retainedFd = authorized.fd;
-          return runMcpProcessAudioCli(authorized, "memo", undefined, {
+          return runProcessAudioFixtureCli(authorized, "memo", undefined, {
             binary: join(fixture.root, "missing-binary"),
           });
         }
@@ -1361,7 +1633,7 @@ describe("assistant child and derived-input policy", () => {
         async () => fixture.meetings,
         undefined,
         (authorized) =>
-          runMcpProcessAudioCli(authorized, "memo", undefined, {
+          runProcessAudioFixtureCli(authorized, "memo", undefined, {
             binary: childPath,
             timeoutMs: 200,
             extraEnv: {
@@ -2143,10 +2415,11 @@ describe("restricted content policy", () => {
       MCP_PERSON_PROFILE_OPEN_ACTION_MAX
     );
     expect(profile.topics).toHaveLength(MCP_PERSON_PROFILE_TOPIC_MAX);
+    expect(profile.recentDecisions).toHaveLength(MCP_PERSON_PROFILE_DECISION_MAX);
     expect(profile.meetings.every((meeting) => meeting.title.length <= 2_048)).toBe(
       true
     );
-    expect(profile.openActions.every((action) => action.task.length <= 2_048)).toBe(
+    expect(profile.openActions.every((action) => action.what.length <= 2_048)).toBe(
       true
     );
     for (const [field, max] of [
@@ -2180,31 +2453,347 @@ describe("restricted content policy", () => {
       true
     );
 
-    const relationshipMeeting = {
-      ...baseMeeting,
+  });
+
+  it("person profiles use exact identity evidence and reject ambiguous aliases", () => {
+    const makeMeeting = (name: string, body: string, task: string) => ({
+      path: `/profiles/${name.toLowerCase()}.md`,
+      body,
       frontmatter: {
-        ...baseMeeting.frontmatter,
-        attendees: Array.from(
-          { length: MCP_RELATIONSHIP_RESULT_MAX + 25 },
-          (_, index) => `person-${index}-${long}`
-        ),
+        title: `${name} review`,
+        type: "meeting",
+        date: "2026-07-20T12:00:00Z",
+        duration: "10m",
+        tags: ["planning"],
+        attendees: [name],
+        attendees_raw: "",
+        people: [],
+        action_items: [{ assignee: name, task, status: "open" }],
+        decisions: [],
+        intents: [],
+      },
+    }) as any;
+    const meetings = [
+      makeMeeting("Ann", "Ordinary discussion.", "Ann task"),
+      makeMeeting("Joanna", "Planning announcement mentions Ann in prose.", "Joanna task"),
+    ];
+    const profile = personProfileFromMeetings(meetings, "Ann");
+    expect(profile.meetings.map((meeting) => meeting.title)).toEqual(["Ann review"]);
+    expect(profile.openActions.map((action) => action.what)).toEqual(["Ann task"]);
+    expect(() => personProfileFromMeetings(meetings, "   ")).toThrow(/empty/i);
+
+    const mentionOnly = makeMeeting("Actual Contact", "", "Actual task") as any;
+    mentionOnly.frontmatter.people = ["Discussed Person"];
+    mentionOnly.frontmatter.action_items = [{
+      assignee: "Discussed Person",
+      task: "Owner-specific task",
+      status: "open",
+    }];
+    mentionOnly.frontmatter.decisions = [{ text: "Participant-only decision" }];
+    const mentionedProfile = personProfileFromMeetings([mentionOnly], "Discussed Person");
+    expect(mentionedProfile.meetings).toEqual([]);
+    expect(mentionedProfile.topics).toEqual([]);
+    expect(mentionedProfile.recentDecisions).toEqual([]);
+    expect(mentionedProfile.openActions.map((action) => action.what)).toEqual([
+      "Owner-specific task",
+    ]);
+
+    const legacy = makeMeeting("Placeholder", "", "Unused") as any;
+    legacy.frontmatter.attendees = [];
+    legacy.frontmatter.attendees_raw = "Alice Smith (alice@example.com)";
+    legacy.frontmatter.action_items = [
+      { assignee: "Alice Smith", task: "Legacy attendee task", status: "open" },
+    ];
+    expect(personProfileFromMeetings([legacy], "Alice Smith").openActions[0].what)
+      .toBe("Legacy attendee task");
+
+    const aliasMeeting = makeMeeting("Avery Quinn", "", "Canonical owner task") as any;
+    aliasMeeting.frontmatter.entities = {
+      people: [{ slug: "avery-quinn", label: "Avery Quinn", aliases: ["AQ"] }],
+    };
+    expect(personProfileFromMeetings([aliasMeeting], "AQ").openActions[0].what)
+      .toBe("Canonical owner task");
+
+    const ambiguous = ["Alex North", "Alex South"].map((label) => ({
+      ...makeMeeting(label, "", `${label} task`),
+      frontmatter: {
+        ...makeMeeting(label, "", `${label} task`).frontmatter,
+        entities: {
+          people: [{ slug: label.toLowerCase().replace(/\s+/g, "-"), label, aliases: ["Shared Alias"] }],
+        },
+      },
+    })) as any;
+    expect(() => personProfileFromMeetings(ambiguous, "Shared Alias")).toThrow(/ambiguous/i);
+  });
+
+  it("validates and preserves the correction-aware core person profile schema", () => {
+    const profile = boundedCorePersonProfile({
+      name: "Avery Quinn",
+      recent_meetings: [
+        { title: "Review", date: "2026-07-20T12:00:00Z", path: "/meetings/review.md" },
+      ],
+      open_intents: [
+        {
+          date: "2026-07-20T12:00:00Z",
+          title: "Review",
+          content_type: "meeting",
+          path: "/meetings/review.md",
+          kind: "commitment",
+          what: "Send the plan",
+          who: "Avery Quinn",
+          status: "open",
+          by_date: null,
+        },
+      ],
+      recent_decisions: [
+        {
+          title: "Review",
+          date: "2026-07-20T12:00:00Z",
+          path: "/meetings/review.md",
+          what: "Use the synthetic rollout",
+          authority: "high",
+        },
+      ],
+      top_topics: [{ topic: "planning", count: 3 }],
+    });
+    expect(profile.name).toBe("Avery Quinn");
+    expect(profile.openIntents[0].what).toBe("Send the plan");
+    expect(profile.topicCounts).toEqual([{ topic: "planning", count: 3 }]);
+    expect(profile.recentDecisions).toEqual([
+      {
+        title: "Review",
+        date: "2026-07-20T12:00:00Z",
+        path: "/meetings/review.md",
+        what: "Use the synthetic rollout",
+        authority: "high",
+      },
+    ]);
+  });
+
+  it("preserves the historical commitment row keys and enum values", () => {
+    const rows = historicalCommitmentRows([
+      {
+        date: "2026-07-20T12:00:00Z",
+        title: "Planning",
+        content_type: "meeting",
+        path: "/meetings/planning.md",
+        kind: "action-item",
+        what: "Send the plan",
+        who: "Avery Quinn",
+        status: "stale",
+        by_date: "2026-07-20",
+      },
+      {
+        date: "2026-07-21T12:00:00Z",
+        title: "Follow-up",
+        content_type: "meeting",
+        path: "/meetings/follow-up.md",
+        kind: "commitment",
+        what: "Review the plan",
+        status: "open",
+      },
+    ]);
+    expect(rows).toEqual([
+      {
+        text: "Send the plan",
+        status: "stale",
+        due_date: "2026-07-20",
+        created_at: "2026-07-20T12:00:00Z",
+        commitment_type: "action_item",
+        meeting_title: "Planning",
+        meeting_date: "2026-07-20T12:00:00Z",
+        person_name: "Avery Quinn",
+      },
+      {
+        text: "Review the plan",
+        status: "open",
+        due_date: null,
+        created_at: "2026-07-21T12:00:00Z",
+        commitment_type: "intent",
+        meeting_title: "Follow-up",
+        meeting_date: "2026-07-21T12:00:00Z",
+        person_name: null,
+      },
+    ]);
+    expect(Object.keys(rows[0])).toEqual([
+      "text",
+      "status",
+      "due_date",
+      "created_at",
+      "commitment_type",
+      "meeting_title",
+      "meeting_date",
+      "person_name",
+    ]);
+  });
+
+  it("preserves the relationship map structured payload contract", () => {
+    const person = {
+      slug: "avery-quinn",
+      name: "Avery Quinn",
+      meeting_count: 3,
+      last_seen: "2026-07-20T12:00:00Z",
+      days_since: 1,
+      open_commitments: 1,
+      top_topics: ["planning"],
+      score: 4.5,
+      losing_touch: false,
+    };
+    expect(relationshipMapStructuredContent([person])).toEqual({
+      people: [person],
+      view: "relationship_map",
+    });
+    expect(Object.keys(relationshipMapStructuredContent([]))).toEqual([
+      "people",
+      "view",
+    ]);
+  });
+
+  it("research projections omit unrelated structured facts from a matching meeting", () => {
+    const meeting = {
+      path: "/research/mixed-topics.md",
+      body: "We mentioned pricing and then moved to hiring.",
+      frontmatter: {
+        title: "Mixed topic review",
+        type: "meeting",
+        date: "2026-07-20T12:00:00Z",
+        duration: "30m",
+        tags: ["pricing", "hiring"],
+        attendees: [],
+        attendees_raw: "",
+        people: [],
         action_items: [],
+        decisions: [
+          { text: "Keep the current price", topic: "pricing" },
+          { text: "Open a design role", topic: "hiring" },
+        ],
+        intents: [
+          {
+            kind: "commitment",
+            what: "Model the pricing change",
+            who: "Alex",
+            status: "open",
+          },
+          {
+            kind: "commitment",
+            what: "Draft the hiring scorecard",
+            who: "Case",
+            status: "open",
+          },
+        ],
       },
     } as any;
-    const relationships = relationshipMapFromMeetings(
-      [relationshipMeeting],
-      10,
-      20
+
+    const research = researchTopicProjection([meeting], "pricing");
+    expect(research.decisions).toHaveLength(1);
+    expect(research.decisions[0]).toContain("current price");
+    expect(research.openIntents.map((intent) => intent.what)).toEqual([
+      "Model the pricing change",
+    ]);
+    expect(research.topics).toEqual([{ topic: "pricing", count: 1 }]);
+    expect(research.text).not.toContain("design role");
+    expect(research.text).not.toContain("hiring scorecard");
+  });
+
+  it("commitment projections deduplicate mirrors and derive overdue status", () => {
+    const meeting = {
+      path: "/commitments/source.md",
+      body: "",
+      frontmatter: {
+        title: "Commitment review",
+        type: "meeting",
+        date: "2026-07-20T12:00:00Z",
+        duration: "30m",
+        tags: [],
+        attendees: ["Alex"],
+        attendees_raw: "",
+        people: [],
+        action_items: [
+          {
+            assignee: "Alex",
+            task: "Send the pricing memo",
+            due: "2026-07-19",
+            status: "open",
+          },
+          {
+            assignee: "Alex",
+            task: "Review the forecast",
+            due: "2026-07-30",
+            status: "open",
+          },
+          {
+            assignee: "Alex",
+            task: "Finish the due-date item",
+            due: "2026-07-21",
+            status: "open",
+          },
+          {
+            assignee: "Alex",
+            task: "Finish the offset item",
+            due: "2026-07-20T23:30:00-07:00",
+            status: "open",
+          },
+        ],
+        decisions: [],
+        intents: [
+          {
+            kind: "commitment",
+            what: "  send   the pricing memo ",
+            who: "alex",
+            by_date: "2026-07-19",
+            status: "open",
+          },
+          {
+            kind: "open-question",
+            what: "Should hiring accelerate?",
+            who: "Alex",
+            status: "open",
+          },
+        ],
+      },
+    } as any;
+
+    const commitments = policyCommitmentResults(
+      [meeting],
+      "Alex",
+      MCP_INTENT_RESULT_MAX,
+      Date.parse("2026-07-21T00:00:00Z")
     );
-    expect(relationships).toHaveLength(10);
-    expect(relationships.every((person) => person.name.length <= 2_048)).toBe(
-      true
-    );
-    for (const invalid of [0, -1, 1.5, MCP_RELATIONSHIP_RESULT_MAX + 1]) {
-      expect(() => relationshipMapFromMeetings([relationshipMeeting], invalid)).toThrow(
-        /relationship limit must be/i
-      );
-    }
+    expect(commitments).toHaveLength(4);
+    expect(
+      commitments.filter((item) =>
+        item.what.toLowerCase().includes("pricing memo")
+      )
+    ).toHaveLength(1);
+    expect(commitments[0].status).toBe("stale");
+    expect(commitments.find((item) => item.what.includes("due-date"))?.status).toBe("open");
+    expect(commitments.find((item) => item.what.includes("offset"))?.status).toBe("open");
+    expect(commitments.some((item) => item.what.includes("hiring"))).toBe(false);
+  });
+
+  it("commitment owner selectors never substring-match another person", () => {
+    const meeting = {
+      path: "/commitments/overlap.md",
+      body: "",
+      frontmatter: {
+        title: "Owner overlap",
+        type: "meeting",
+        date: "2026-07-20T12:00:00Z",
+        duration: "10m",
+        tags: [],
+        attendees: ["Ann", "Joanna"],
+        attendees_raw: "",
+        people: [],
+        decisions: [],
+        intents: [],
+        action_items: [
+          { assignee: "Ann", task: "Send Ann item", status: "open" },
+          { assignee: "Joanna", task: "Send Joanna item", status: "open" },
+        ],
+      },
+    } as any;
+    const commitments = policyCommitmentResults([meeting], "Ann");
+    expect(commitments.map((item) => item.what)).toEqual(["Send Ann item"]);
   });
 
   it("fails closed on malformed or unknown sensitivity frontmatter", () => {

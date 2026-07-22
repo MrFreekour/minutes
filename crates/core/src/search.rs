@@ -265,6 +265,16 @@ impl AuthorizedMeetingSnapshot {
     }
 }
 
+/// Derive one search excerpt only from a descriptor-authorized live snapshot.
+/// Ranked candidate metadata is never reused after this second policy read.
+pub fn authorized_snapshot_search_snippet(
+    snapshot: &AuthorizedMeetingSnapshot,
+    query: &str,
+) -> Option<String> {
+    let (_, body) = split_frontmatter(&snapshot.content);
+    crate::search_index::live_fts_match_snippet(&snapshot.frontmatter.title, body, query)
+}
+
 /// Capability-bound handle for one human-requested meeting mutation.
 ///
 /// The corpus root and source parent directory stay open from authorization
@@ -4058,6 +4068,36 @@ mod tests {
         )
         .unwrap();
         assert!(authorized.reauthorize_exact(&config, false).is_err());
+    }
+
+    #[test]
+    fn authorized_search_snippet_is_derived_from_the_supplied_live_snapshot() {
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let path = dir.path().join("meeting.md");
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let first = read_authorized_meeting(&path, &config, false).unwrap();
+        assert!(authorized_snapshot_search_snippet(&first, "pricing")
+            .is_some_and(|snippet| snippet.contains("pricing")));
+
+        std::fs::write(
+            &path,
+            NORMAL_MEETING
+                .replace("Pricing Sync", "Roadmap Sync")
+                .replace(
+                    "We discussed pricing.",
+                    "We discussed the release calendar instead.",
+                ),
+        )
+        .unwrap();
+        let current = read_authorized_meeting(&path, &config, false).unwrap();
+        assert!(authorized_snapshot_search_snippet(&current, "pricing").is_none());
+        assert!(authorized_snapshot_search_snippet(&current, "calendar")
+            .is_some_and(|snippet| snippet.contains("calendar")));
     }
 
     #[test]

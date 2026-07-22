@@ -139,7 +139,7 @@
     },
     {
       "name": "relationship_map",
-      "description": "Temporarily unavailable while the privacy-safe relationship graph is rebuilt; see roadmap issue #513",
+      "description": "Rank relationships from the bounded process-private policy-safe graph projection",
       "group": "People and relationships",
       "anchorId": "tool-relationship-map",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-relationship-map"

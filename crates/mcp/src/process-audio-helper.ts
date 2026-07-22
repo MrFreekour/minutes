@@ -25,6 +25,7 @@ import {
   type BigIntStats,
 } from "node:fs";
 import { createInterface } from "node:readline";
+import type { Duplex } from "node:stream";
 import {
   basename,
   dirname,
@@ -404,14 +405,28 @@ async function main(): Promise<void> {
     delete extraEnv.MINUTES_MCP_OUTER_PROCESS_GROUP;
     const child = spawn(request.cliBinary, args, {
       detached: false,
-      stdio: ["ignore", "inherit", "inherit", sourceFd],
+      // fd 3 is the exact source. fd 4 is a separate lifecycle capability:
+      // this helper retains its peer until the CLI exits, and the CLI monitors
+      // it so an environment/topology claim cannot enable shared grouping.
+      stdio: ["ignore", "inherit", "inherit", sourceFd, "pipe"],
       env: {
         ...process.env,
         ...extraEnv,
         RUST_LOG: "info",
         MINUTES_CLI_RESTRICTED_POLICY: "deny",
+        // This helper is the detached process-group leader. The CLI validates
+        // the marker against its real parent and PGID before the core lets any
+        // decoder inherit this outer containment boundary.
+        MINUTES_MCP_OUTER_PROCESS_GROUP: String(process.pid),
       },
     });
+    const supervisorPeer = child.stdio[4] as Duplex | null;
+    if (!supervisorPeer) fail();
+    // fd 4 is a duplex libuv pipe. Drain its silent read side and destroy the
+    // parent endpoint once the CLI closes its peer; otherwise ChildProcess's
+    // `close` event can remain pending on this extra stdio stream.
+    supervisorPeer.once("end", () => supervisorPeer.destroy());
+    supervisorPeer.resume();
     childStarted = true;
     child.once("error", fail);
     child.once("close", (code) => {

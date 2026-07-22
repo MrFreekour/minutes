@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -26,6 +27,8 @@ import {
   findDecisions,
   listVoiceMemos,
   isRestricted,
+  canonicalPathWireEquals,
+  normalizeCanonicalPathWire,
   SDK_DECISION_RESULT_MAX,
   SDK_OPEN_ACTION_RESULT_MAX,
   SDK_PERSON_PROFILE_MEETING_MAX,
@@ -1076,6 +1079,23 @@ describe("humanizeTranscript", () => {
 // ── getMeetingWithOverlays graceful fallback ─────────────────
 
 describe("getMeetingWithOverlays", () => {
+  it("compares only equivalent Rust and Node Windows canonical wire prefixes", () => {
+    const drive = "C:\\Meetings\\normal.md";
+    const unc = "\\\\server\\share\\normal.md";
+    expect(normalizeCanonicalPathWire(`\\\\?\\${drive}`)).toBe(drive);
+    expect(
+      normalizeCanonicalPathWire("\\\\?\\UNC\\server\\share\\normal.md")
+    ).toBe(unc);
+    expect(canonicalPathWireEquals(`\\\\?\\${drive}`, drive)).toBe(true);
+    expect(canonicalPathWireEquals(drive, drive.toLowerCase())).toBe(false);
+    expect(canonicalPathWireEquals(drive, drive.replaceAll("\\", "/"))).toBe(
+      false
+    );
+    expect(
+      canonicalPathWireEquals("\\\\?\\GLOBALROOT\\Device\\x", "GLOBALROOT\\Device\\x")
+    ).toBe(false);
+  });
+
   it("falls back to plain getMeeting when the CLI is unavailable", async () => {
     const path = writeMeeting("meeting.md", VALID_MEETING);
     // Point at a binary that definitely doesn't exist so the helper's
@@ -1211,7 +1231,7 @@ describe("getMeetingWithOverlays", () => {
           `import { createHash } from "node:crypto";\n` +
           `import { readFileSync } from "node:fs";\n` +
           `const source = readFileSync(process.argv[3]);\n` +
-          `process.stdout.write(JSON.stringify({ overlay_applied: true, overlay_source_sha256: createHash("sha256").update(source).digest("hex"), frontmatter: { speaker_map: [{ speaker_label: "SPEAKER_0", name: "EXPLICIT-ROOT-OVERLAY", confidence: "high", source: "manual" }] } }));\n`
+          `process.stdout.write(JSON.stringify({ path: process.argv[3], overlay_applied: true, overlay_source_sha256: createHash("sha256").update(source).digest("hex"), frontmatter: { speaker_map: [{ speaker_label: "SPEAKER_0", name: "EXPLICIT-ROOT-OVERLAY", confidence: "high", source: "manual" }] } }));\n`
       );
       chmodSync(fakeMinutes, 0o700);
 
@@ -1248,6 +1268,60 @@ describe("getMeetingWithOverlays", () => {
 
     expect(JSON.stringify(out)).not.toContain("STALE-PRIVATE-CANARY");
   });
+
+  it("rejects an exact-byte overlay attributed to a different canonical source", async () => {
+    const path = writeMeeting("meeting.md", VALID_MEETING);
+    const other = writeMeeting("duplicate.md", VALID_MEETING);
+    const fakeMinutes = join(tempDir, "fake-wrong-source-overlay-minutes.mjs");
+    writeFileSync(
+      fakeMinutes,
+      `#!/usr/bin/env node\n` +
+        `import { createHash } from "node:crypto";\n` +
+        `import { readFileSync } from "node:fs";\n` +
+        `const source = readFileSync(process.argv[3]);\n` +
+        `process.stdout.write(JSON.stringify({ path: ${JSON.stringify(other)}, overlay_applied: true, overlay_source_sha256: createHash("sha256").update(source).digest("hex"), frontmatter: { speaker_map: [{ speaker_label: "SPEAKER_0", name: "WRONG-SOURCE-CANARY", confidence: "high", source: "manual" }] } }));\n`
+    );
+    chmodSync(fakeMinutes, 0o700);
+
+    const out = await getMeetingWithOverlays(path, {
+      rootDir: tempDir,
+      minutesBin: fakeMinutes,
+      timeoutMs: 2000,
+    });
+
+    expect(JSON.stringify(out)).not.toContain("WRONG-SOURCE-CANARY");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "invokes overlay enrichment with the initially canonical source path",
+    async () => {
+      const path = writeMeeting("canonical.md", VALID_MEETING);
+      const alias = join(tempDir, "alias.md");
+      const marker = join(tempDir, "overlay-argv.txt");
+      symlinkSync(path, alias);
+      const fakeMinutes = join(tempDir, "fake-canonical-argv-minutes.mjs");
+      writeFileSync(
+        fakeMinutes,
+        `#!/usr/bin/env node\n` +
+          `import { createHash } from "node:crypto";\n` +
+          `import { readFileSync, writeFileSync } from "node:fs";\n` +
+          `const source = readFileSync(process.argv[3]);\n` +
+          `writeFileSync(${JSON.stringify(marker)}, process.argv[3]);\n` +
+          `process.stdout.write(JSON.stringify({ path: process.argv[3], overlay_applied: true, overlay_source_sha256: createHash("sha256").update(source).digest("hex"), frontmatter: { speaker_map: [{ speaker_label: "SPEAKER_0", name: "CANONICAL-OVERLAY", confidence: "high", source: "manual" }] } }));\n`
+      );
+      chmodSync(fakeMinutes, 0o700);
+
+      const out = await getMeetingWithOverlays(alias, {
+        rootDir: tempDir,
+        minutesBin: fakeMinutes,
+      });
+      if (!out || out.restricted_stub) {
+        throw new Error("normal overlay read must return a full meeting");
+      }
+      expect(readFileSync(marker, "utf8")).toBe(path);
+      expect(out.frontmatter.speaker_map?.[0]?.name).toBe("CANONICAL-OVERLAY");
+    }
+  );
 
   it.skipIf(process.platform === "win32")(
     "reauthorizes the exact source after the overlay CLI returns",

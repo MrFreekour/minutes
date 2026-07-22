@@ -134,6 +134,16 @@ describe("stable corpus lease", () => {
     });
   });
 
+  it("reassembles paced chunks before strict UTF-8 decoding", async () => {
+    await withCorpus(async (root) => {
+      const content = `${"a".repeat(64 * 1024 - 1)}😀${"z".repeat(64 * 1024)}`;
+      writeFileSync(join(root, "chunked.md"), content);
+      await expect(
+        withStableCorpusLease(root, (snapshot) => snapshot.files[0].content)
+      ).resolves.toBe(content);
+    });
+  });
+
   it("holds process-global retained-memory admission for the entire lease", async () => {
     const parent = mkdtempSync(join(tmpdir(), "minutes-corpus-memory-"));
     let release!: () => void;
@@ -568,10 +578,10 @@ describe("stable corpus lease", () => {
             operationCalls += 1;
           },
           {
-            timeoutMs: 100,
+            timeoutMs: 500,
             afterBaseline: () => {
               baselineCalls += 1;
-              return new Promise((resolve) => setTimeout(resolve, 150));
+              return new Promise((resolve) => setTimeout(resolve, 750));
             },
           }
         )
@@ -598,6 +608,171 @@ describe("stable corpus lease", () => {
         )
       ).rejects.toThrow("stable meeting corpus authorization failed");
       expect(Date.now() - started).toBeLessThan(1_000);
+    });
+  });
+
+  it("kills a worker stalled before baseline publication and reuses admission", async () => {
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "stalled baseline canary");
+      let operationCalls = 0;
+      const started = Date.now();
+      await expect(
+        withStableCorpusLease(
+          root,
+          () => {
+            operationCalls += 1;
+          },
+          { timeoutMs: 300, workerStallPhaseForTest: "before-baseline" }
+        )
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(Date.now() - started).toBeLessThan(2_500);
+      expect(operationCalls).toBe(0);
+      await expect(withStableCorpusLease(root, () => "reused")).resolves.toBe(
+        "reused"
+      );
+    });
+  });
+
+  it("never publishes a projection when final authorization stalls", async () => {
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "stalled finalize canary");
+      let projections = 0;
+      await expect(
+        withStableCorpusLease(
+          root,
+          () => {
+            projections += 1;
+            return "MUST_NOT_PUBLISH";
+          },
+          { timeoutMs: 500, workerStallPhaseForTest: "before-authorized" }
+        )
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(projections).toBe(1);
+    });
+  });
+
+  it("rejects an out-of-order worker protocol and remains reusable", async () => {
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "protocol canary");
+      const fixture = join(root, "invalid-worker.mjs");
+      writeFileSync(
+        fixture,
+        `process.stdin.once("data", () => {\n` +
+          `  process.stdout.write(JSON.stringify({ type: "authorized" }) + "\\n");\n` +
+          `  setTimeout(() => {}, 60_000);\n` +
+          `});\n`
+      );
+      await expect(
+        withStableCorpusLease(root, () => "must not publish", {
+          timeoutMs: 500,
+          workerScriptForTest: fixture,
+        })
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+      await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
+        "recovered"
+      );
+    });
+  });
+
+  it("charges paced protocol transients against global memory admission", async () => {
+    await withCorpus(async (root) => {
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let ready!: () => void;
+      const retained = new Promise<void>((resolve) => {
+        ready = resolve;
+      });
+      const leanBudgets = {
+        maxFileBytes: 0,
+        // Without the charged 5 MiB protocol transient, two of these
+        // reservations would fit below the 256 MiB process cap.
+        maxCorpusBytes: 61 * 1024 * 1024,
+        maxRetainedPathBytes: 1024 * 1024,
+        maxFileCount: 0,
+        maxDirectoryCount: 1,
+        maxDirectoryEntries: 2,
+        maxWatcherCount: 4,
+        maxReaderCount: 1,
+      };
+      const first = withStableCorpusLease(root, () => 0, {
+        budgets: leanBudgets,
+        afterBaseline: async () => {
+          ready();
+          await hold;
+        },
+      });
+      await retained;
+      await expect(
+        withStableCorpusLease(root, () => "must not allocate", {
+          budgets: leanBudgets,
+        })
+      ).rejects.toThrow("retained snapshots exceeded their process budget");
+      release();
+      await expect(first).resolves.toBe(0);
+    });
+  });
+
+  it("rejects a worker line above the fixed protocol cap and recovers", async () => {
+    await withCorpus(async (root) => {
+      const fixture = join(root, "oversized-worker.mjs");
+      writeFileSync(
+        fixture,
+        `process.stdin.once("data", () => {\n` +
+          `  process.stdout.write("X".repeat(512 * 1024 + 1));\n` +
+          `  setTimeout(() => {}, 60_000);\n` +
+          `});\n`
+      );
+      await expect(
+        withStableCorpusLease(root, () => "must not publish", {
+          timeoutMs: 500,
+          workerScriptForTest: fixture,
+        })
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+      await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
+        "recovered"
+      );
+    });
+  });
+
+  it("rejects coalesced phase, snapshot, and authorization transitions", async () => {
+    await withCorpus(async (root) => {
+      const fixture = join(root, "coalesced-worker.mjs");
+      writeFileSync(
+        fixture,
+        `process.stdin.once("data", () => {\n` +
+          `  const lines = [\n` +
+          `    { type: "phase", name: "afterBaseline", attempt: 1 },\n` +
+          `    { type: "snapshot-start", attempt: 1, canonicalRoot: "/synthetic", fileCount: 0 },\n` +
+          `    { type: "authorized" },\n` +
+          `  ];\n` +
+          `  process.stdout.write(lines.map(JSON.stringify).join("\\n") + "\\n");\n` +
+          `  setTimeout(() => {}, 60_000);\n` +
+          `});\n`
+      );
+      let phaseCalls = 0;
+      let operationCalls = 0;
+      await expect(
+        withStableCorpusLease(
+          root,
+          () => {
+            operationCalls += 1;
+          },
+          {
+            timeoutMs: 500,
+            workerScriptForTest: fixture,
+            afterBaseline: () => {
+              phaseCalls += 1;
+            },
+          }
+        )
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(phaseCalls).toBe(0);
+      expect(operationCalls).toBe(0);
+      await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
+        "recovered"
+      );
     });
   });
 
@@ -737,7 +912,7 @@ describe("stable corpus lease", () => {
             operationCalls += 1;
           },
           {
-            timeoutMs: 100,
+            timeoutMs: 1_000,
             onWatcherReady: ({ controls }) => controls.failNextFencePulse(),
           }
         )
@@ -762,7 +937,7 @@ describe("stable corpus lease", () => {
       try {
         await expect(
           withStableCorpusLease(root, () => "must not authorize", {
-            timeoutMs: 100,
+            timeoutMs: 1_000,
             beforeFinalFence: ({ attempt, controls }) => {
               if (attempt > 1) {
                 controls.failWatcher("replacement cleanup retry");
@@ -1044,5 +1219,23 @@ describe("stable corpus lease", () => {
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }
+  });
+
+  it("poisons admission when an asynchronous projection ignores cancellation", async () => {
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "uncancellable projection canary");
+      const started = Date.now();
+      await expect(
+        withStableCorpusLease(
+          root,
+          () => new Promise<never>(() => {}),
+          { timeoutMs: 300 }
+        )
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(Date.now() - started).toBeLessThan(2_500);
+      await expect(
+        withStableCorpusLease(root, () => "must not reuse")
+      ).rejects.toThrow("requires a process restart");
+    });
   });
 });

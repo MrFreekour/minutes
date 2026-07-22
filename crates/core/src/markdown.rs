@@ -95,6 +95,11 @@ struct ActiveCorpusReadUsage {
 }
 
 #[derive(Debug, Clone)]
+/// Shared cumulative limits for an in-process active-corpus read.
+///
+/// The deadline is checked between filesystem operations; it cannot interrupt
+/// a kernel syscall that is already blocked. Agent-facing SDK/MCP reads add a
+/// supervised, killable worker around this cooperative native boundary.
 pub(crate) struct ActiveCorpusReadBudget {
     max_file_count: usize,
     max_directory_count: usize,

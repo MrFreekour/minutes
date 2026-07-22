@@ -186,7 +186,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-track-commitments
 
 #### `relationship_map`
 
-Temporarily unavailable while the privacy-safe relationship graph is rebuilt; see roadmap issue #513
+Rank relationships from the bounded process-private policy-safe graph projection
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 

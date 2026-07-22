@@ -4,7 +4,7 @@
 > Source: manifest.json + crates/mcp/src/index.ts + site/lib/skills-catalog.json
 > Last generated: 2026-07-25
 
-Minutes is the private, owned conversation-memory layer. Record meetings, voice memos, and dictation; transcribe them on your own machine; and get structured markdown in `~/meetings/` that Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi, and any MCP-compatible client read from the same folder — no proprietary SDK, no API key. Nothing is uploaded: when a cloud memory tool gets acquired or subpoenaed, your recordings aren't theirs to hand over. No vendor to outlive — ten years from now, `grep` still works on your corpus.
+Minutes is the private, owned conversation-memory layer. Record meetings, voice memos, and dictation; transcribe them on your own machine; and get structured markdown in `~/meetings/` that policy-aware local tools expose to Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi, and MCP-compatible clients — no proprietary SDK, no API key. Restricted meetings are excluded from agent results by default; explicit access requires a trusted launch policy, a per-call request, and a durable audit record. Minutes never uploads your audio; meeting text leaves your device only when you explicitly send policy-authorized context to a connected cloud agent or summarizer. When a cloud memory tool gets acquired or subpoenaed, your recordings aren't theirs to hand over. No vendor to outlive — ten years from now, `grep` still works on your corpus.
 
 ## Key Facts
 
@@ -62,7 +62,7 @@ Recommended install:
 - `start_dictation` — Start dictation mode — speech to clipboard and daily notes Docs: https://useminutes.app/docs/mcp/tools#tool-start-dictation
 - `stop_dictation` — Stop dictation mode Docs: https://useminutes.app/docs/mcp/tools#tool-stop-dictation
 - `track_commitments` — List open and stale commitments, optionally filtered by person Docs: https://useminutes.app/docs/mcp/tools#tool-track-commitments
-- `relationship_map` — Temporarily unavailable while the privacy-safe relationship graph is rebuilt; see roadmap issue #513 Docs: https://useminutes.app/docs/mcp/tools#tool-relationship-map
+- `relationship_map` — Rank relationships from the bounded process-private policy-safe graph projection Docs: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 - `list_voices` — List enrolled voice profiles for speaker identification Docs: https://useminutes.app/docs/mcp/tools#tool-list-voices
 - `confirm_speaker` — Compatibility name only: agent-controlled speaker mutation is unavailable; use the Minutes app or human CLI Docs: https://useminutes.app/docs/mcp/tools#tool-confirm-speaker
 - `get_meeting_insights` — Compatibility name only: unavailable until derived insight records carry live-verifiable canonical source policy provenance Docs: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
@@ -114,7 +114,7 @@ Workflow-level skills that wrap MCP tools into operator motions. Install in Clau
 - `/minutes-verify` — Health-check the install, models, mic, and stale state before trusting it in production. Category: Capture. Example: `/minutes-verify`. Docs: https://useminutes.app/for-agents#minutes-verify
 - `/minutes-mirror` — Review your own talk-time, hedging, and performance patterns across meetings. Category: Coaching. Example: `/minutes-mirror`. Docs: https://useminutes.app/for-agents#minutes-mirror
 - `/minutes-tag` — Label a meeting outcome in five seconds so later coaching gets smarter. Category: Coaching. Example: `/minutes-tag won`. Docs: https://useminutes.app/for-agents#minutes-tag
-- `/minutes-graph` — Build a bounded person profile or research a topic; report graph-only requests unavailable with roadmap issue 513. Category: Intelligence. Example: `/minutes-graph profile Alex from my normal meeting history`. Docs: https://useminutes.app/for-agents#minutes-graph
+- `/minutes-graph` — Rank relationships, inspect commitments, confirm aliases, build a person profile, or research a topic. Category: Intelligence. Example: `/minutes-graph profile Alex from my normal meeting history`. Docs: https://useminutes.app/for-agents#minutes-graph
 - `/minutes-ideas` — Surface recent voice memos and loose ideas captured from any device. Category: Knowledge. Example: `/minutes-ideas`. Docs: https://useminutes.app/for-agents#minutes-ideas
 - `/minutes-ingest` — Extract structured facts from meetings into an external knowledge base. Category: Knowledge. Example: `/minutes-ingest`. Docs: https://useminutes.app/for-agents#minutes-ingest
 - `/minutes-lint` — Audit meeting memory for contradictions, stale commitments, and decision conflicts. Category: Knowledge. Example: `/minutes-lint`. Docs: https://useminutes.app/for-agents#minutes-lint
@@ -149,7 +149,7 @@ decisions:
 ## Capabilities For Agents
 
 1. Meeting recall — Search and retrieve past meetings, memos, and transcripts.
-2. Policy-bound people context — Build bounded live-source profiles and find live commitments. Graph rankings and losing-touch signals are temporarily unavailable; see roadmap issue #513.
+2. Policy-bound people context — Build bounded live-source profiles, relationship rankings, losing-touch signals, and commitments.
 3. Decision and action-item tracking — Query structured decisions, commitments, and open follow-ups.
 4. Recording and live transcript control — Start or stop capture and read live transcript deltas.
 5. Local-first context — Audio processing happens on-device and the durable output is inspectable markdown.

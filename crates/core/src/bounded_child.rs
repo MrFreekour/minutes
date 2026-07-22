@@ -3,9 +3,11 @@
 //! Callers construct the command (including the executable allow-list and
 //! environment policy); this module owns only process-tree lifetime and pipe
 //! budgets. A timeout or budget failure terminates the supervised Unix process
-//! group or Windows Job. This is not a sandbox or child-RSS limiter: a
-//! deliberately daemonizing user-configured Unix executable can call `setsid`
-//! after it has already received the user's authority and leave that group.
+//! group or Windows Job. Callers that opt into `address_space_limit` also get
+//! an OS-enforced RLIMIT_AS / Job Object memory ceiling. This is not a sandbox:
+//! a deliberately daemonizing user-configured Unix executable can call
+//! `setsid` after it has already received the user's authority and leave that
+//! group.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -15,6 +17,363 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
+
+pub(crate) struct BoundExecutable {
+    /// An immutable private snapshot on Unix and a non-write/non-delete-shared
+    /// exact source handle on Windows. Worker execution never trusts a later
+    /// reopen of the caller-provided source bytes.
+    file: std::fs::File,
+    source_path: PathBuf,
+    #[cfg(windows)]
+    bytes: u64,
+    #[cfg(windows)]
+    digest: [u8; 32],
+    #[cfg(windows)]
+    snapshot_owner: Arc<WindowsExecutableSnapshotOwner>,
+}
+
+#[cfg(windows)]
+struct WindowsExecutableSnapshotOwner {
+    // Drop the no-delete chain before TempDir attempts recursive cleanup.
+    _directory_guard: crate::policy_fs::BoundRecoveryDirectory,
+    _temp_dir: tempfile::TempDir,
+}
+
+impl BoundExecutable {
+    #[cfg(unix)]
+    fn verify(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = self.file.metadata()?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "worker executable snapshot was not immutable",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    fn verify(&self) -> std::io::Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::{Seek, SeekFrom};
+
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read as u64)
+                .ok_or_else(|| std::io::Error::other("worker executable byte count overflowed"))?;
+            hasher.update(&buffer[..read]);
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        if total != self.bytes || digest != self.digest {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "worker executable changed after its authority was bound",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn verify(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bound worker executables are unsupported on this platform",
+        ))
+    }
+
+    fn launch_path(&self) -> PathBuf {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "linux")]
+        return PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+        #[cfg(target_os = "macos")]
+        return PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return self.source_path.clone();
+    }
+
+    pub(crate) fn bind(path: &Path) -> std::io::Result<Self> {
+        bind_executable(path, false)
+    }
+
+    pub(crate) fn current() -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            // This procfs link resolves the already-running image rather than
+            // a replaceable ambient pathname returned by current_exe().
+            bind_executable(Path::new("/proc/self/exe"), true)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let path = std::env::current_exe()?;
+            bind_executable(&path, false)
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            source_path: self.source_path.clone(),
+            #[cfg(windows)]
+            bytes: self.bytes,
+            #[cfg(windows)]
+            digest: self.digest,
+            #[cfg(windows)]
+            snapshot_owner: Arc::clone(&self.snapshot_owner),
+        })
+    }
+}
+
+fn bind_executable(path: &Path, allow_proc_self_image: bool) -> std::io::Result<BoundExecutable> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bound worker executable path must be absolute",
+        ));
+    }
+
+    #[cfg(unix)]
+    let source = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let no_follow = if allow_proc_self_image {
+            0
+        } else {
+            libc::O_NOFOLLOW
+        };
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | no_follow)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let source = {
+        let _ = allow_proc_self_image;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = {
+        let _ = allow_proc_self_image;
+        std::fs::OpenOptions::new().read(true).open(path)?
+    };
+
+    #[cfg(unix)]
+    let metadata = source.metadata()?;
+    #[cfg(windows)]
+    let metadata = source.metadata()?;
+    #[cfg(not(any(unix, windows)))]
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bound worker executable was not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "bound worker executable was not executable",
+            ));
+        }
+    }
+    #[cfg(unix)]
+    let file = immutable_unix_executable_snapshot(&source)?;
+    #[cfg(windows)]
+    let (file, source_path, snapshot_owner, bytes, digest) =
+        immutable_windows_executable_snapshot(&source)?;
+    #[cfg(not(windows))]
+    let source_path = path.to_path_buf();
+
+    Ok(BoundExecutable {
+        file,
+        source_path,
+        #[cfg(windows)]
+        bytes,
+        #[cfg(windows)]
+        digest,
+        #[cfg(windows)]
+        snapshot_owner,
+    })
+}
+
+#[cfg(any(unix, windows))]
+const MAX_BOUND_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+
+#[cfg(any(unix, windows))]
+fn copy_executable_snapshot(
+    source: &std::fs::File,
+    destination: &mut std::fs::File,
+) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut source = source.try_clone()?;
+    source.seek(SeekFrom::Start(0))?;
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("worker executable byte count overflowed"))?;
+        if total > MAX_BOUND_EXECUTABLE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "worker executable exceeded its immutable snapshot budget",
+            ));
+        }
+        destination.write_all(&buffer[..read])?;
+    }
+    destination.flush()?;
+    destination.sync_all()?;
+    destination.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn immutable_windows_executable_snapshot(
+    source: &std::fs::File,
+) -> std::io::Result<(
+    std::fs::File,
+    PathBuf,
+    Arc<WindowsExecutableSnapshotOwner>,
+    u64,
+    [u8; 32],
+)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("minutes-policy-worker-")
+        .tempdir()?;
+    let directory_guard =
+        crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(temp_dir.path())?;
+    let snapshot_path = temp_dir.path().join("worker.exe");
+    let mut snapshot = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&snapshot_path)?;
+    copy_executable_snapshot(source, &mut snapshot)?;
+
+    let mut reader = snapshot.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let bytes = std::io::copy(&mut reader, &mut hasher)?;
+    snapshot.seek(SeekFrom::Start(0))?;
+    let owner = Arc::new(WindowsExecutableSnapshotOwner {
+        _directory_guard: directory_guard,
+        _temp_dir: temp_dir,
+    });
+    Ok((
+        snapshot,
+        snapshot_path,
+        owner,
+        bytes,
+        hasher.finalize().into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn immutable_unix_executable_snapshot(source: &std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    let name = b"minutes-policy-worker\0";
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            name.as_ptr().cast::<libc::c_char>(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a new owned descriptor.
+    let mut snapshot = unsafe { std::fs::File::from_raw_fd(descriptor as i32) };
+    copy_executable_snapshot(source, &mut snapshot)?;
+    if unsafe { libc::fchmod(descriptor as i32, 0o500) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(descriptor as i32, libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(snapshot)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn immutable_unix_executable_snapshot(source: &std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // tempfile() creates an unlinked private inode. Once the writable setup
+    // handle is changed to mode 0500 and retained only inside BoundExecutable,
+    // there is no ambient pathname through which another process can reopen or
+    // replace the executable bytes before /dev/fd execution. The platform
+    // acceptance gate must also prove that its kernel accepts execution through
+    // this retained descriptor; no ambient-path fallback is permitted.
+    let mut snapshot = tempfile::tempfile()?;
+    copy_executable_snapshot(source, &mut snapshot)?;
+    snapshot.set_permissions(std::fs::Permissions::from_mode(0o500))?;
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+static VALIDATED_OUTER_PROCESS_GROUP: AtomicBool = AtomicBool::new(false);
+
+/// Install the MCP process-audio helper's already-validated outer process
+/// group as the containment boundary for subsequent child launches. The CLI
+/// admits this mode only while holding a separate live supervisor capability;
+/// this function repeats the Unix topology checks before changing behavior.
+#[cfg(unix)]
+pub(crate) fn install_validated_outer_process_group(process_group: i32) -> std::io::Result<()> {
+    let parent = unsafe { libc::getppid() };
+    let current_group = unsafe { libc::getpgrp() };
+    let parent_group = unsafe { libc::getpgid(parent) };
+    if process_group <= 1
+        || parent != process_group
+        || current_group != process_group
+        || parent_group != process_group
+        || unsafe { libc::getpid() } == process_group
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "outer process containment topology was not verified",
+        ));
+    }
+    VALIDATED_OUTER_PROCESS_GROUP
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| std::io::Error::other("outer process containment was already installed"))?;
+    Ok(())
+}
 
 pub(crate) const DEFAULT_STDOUT_LIMIT: u64 = 64 * 1024 * 1024;
 #[cfg(feature = "parakeet")]
@@ -53,6 +412,10 @@ pub(crate) struct BoundedCommand {
     environment_clear: bool,
     environment: std::collections::BTreeMap<OsString, Option<OsString>>,
     current_dir: Option<PathBuf>,
+    address_space_limit: Option<u64>,
+    single_process: bool,
+    close_extra_descriptors: bool,
+    executable_authority: Option<BoundExecutable>,
 }
 
 impl BoundedCommand {
@@ -66,7 +429,24 @@ impl BoundedCommand {
             environment_clear: false,
             environment: std::collections::BTreeMap::new(),
             current_dir: None,
+            address_space_limit: None,
+            single_process: false,
+            close_extra_descriptors: false,
+            executable_authority: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_bound_executable(path: &Path) -> std::io::Result<Self> {
+        Self::from_bound_executable(BoundExecutable::bind(path)?)
+    }
+
+    pub(crate) fn from_bound_executable(authority: BoundExecutable) -> std::io::Result<Self> {
+        authority.verify()?;
+        let launch_path = authority.launch_path();
+        let mut command = Self::new(launch_path);
+        command.executable_authority = Some(authority);
+        Ok(command)
     }
 
     pub(crate) fn arg<S: AsRef<OsStr>>(&mut self, argument: S) -> &mut Self {
@@ -124,6 +504,37 @@ impl BoundedCommand {
     pub(crate) fn current_dir<P: AsRef<Path>>(&mut self, directory: P) -> &mut Self {
         self.command.current_dir(directory.as_ref());
         self.current_dir = Some(directory.as_ref().to_path_buf());
+        self
+    }
+
+    /// Install an OS-enforced child memory ceiling. Unix applies RLIMIT_AS
+    /// before exec; Windows applies both process and job memory limits before
+    /// resuming the initially suspended process. This is the hard boundary
+    /// used for adversarial graph inputs; SQLite limits alone do not bound all
+    /// transient allocations.
+    pub(crate) fn address_space_limit(&mut self, bytes: u64) -> &mut Self {
+        self.address_space_limit = Some(bytes);
+        self
+    }
+
+    /// Refuse descendant process creation where the OS exposes a process-tree
+    /// primitive that does not also block trusted worker threads. Windows
+    /// installs a Job active-process limit of one before the suspended worker
+    /// is resumed. Unix callers pair this flag with an exact bound executable;
+    /// RLIMIT_NPROC is deliberately not used because it counts pthreads too.
+    pub(crate) fn single_process(&mut self) -> &mut Self {
+        self.single_process = true;
+        self
+    }
+
+    /// Prevent ambient parent descriptors from becoming worker capabilities.
+    /// The three explicit stdio pipes remain available; every other Unix
+    /// descriptor is marked close-on-exec in the child. Windows callers that
+    /// need this boundary must additionally retire inherited HANDLEs inside an
+    /// immutable trusted worker before reading any authority; graph_worker does
+    /// so as its first operation.
+    pub(crate) fn close_extra_descriptors(&mut self) -> &mut Self {
+        self.close_extra_descriptors = true;
         self
     }
 
@@ -436,17 +847,84 @@ fn write_input_cancelable(
 }
 
 #[cfg(unix)]
-fn configure_process_tree(command: &mut std::process::Command) {
+fn configure_process_tree(
+    command: &mut std::process::Command,
+    use_outer_group: bool,
+    address_space_limit: Option<u64>,
+    single_process: bool,
+    close_extra_descriptors: bool,
+) {
     use std::os::unix::process::CommandExt;
 
-    // SAFETY: `setpgid` is async-signal-safe and touches no Rust-managed state.
+    // SAFETY: setpgid, setrlimit, getrlimit, and fcntl are async-signal-safe
+    // and touch no Rust-managed state. All policy values are copied in.
     unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
+        command.pre_exec(move || {
+            if !use_outer_group && libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
             }
+            if let Some(bytes) = address_space_limit {
+                // `rlim_t` is u64 on our current Unix builders but is not
+                // guaranteed to match u64 on every supported Unix target.
+                #[allow(clippy::useless_conversion)]
+                let limit: libc::rlim_t = bytes.try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "child address-space limit exceeds platform range",
+                    )
+                })?;
+                let limits = libc::rlimit {
+                    rlim_cur: limit,
+                    rlim_max: limit,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limits) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let _ = single_process;
+            if close_extra_descriptors {
+                #[cfg(target_os = "linux")]
+                {
+                    // close_range(CLOEXEC) is one async-signal-safe syscall
+                    // regardless of a container's often-million-fd rlimit.
+                    // It preserves Rust's spawn-error pipe until successful
+                    // exec while closing every ambient capability at exec.
+                    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+                    if libc::syscall(
+                        libc::SYS_close_range,
+                        3 as libc::c_uint,
+                        u32::MAX,
+                        CLOSE_RANGE_CLOEXEC,
+                    ) == 0
+                    {
+                        return Ok(());
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if !matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOSYS) | Some(libc::EINVAL)
+                    ) {
+                        return Err(error);
+                    }
+                }
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let upper = limit.rlim_cur.min(i32::MAX as libc::rlim_t) as i32;
+                for descriptor in 3..upper {
+                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                    if flags >= 0
+                        && libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
+            Ok(())
         });
     }
 }
@@ -624,7 +1102,13 @@ fn configure_direct_exec(command: &mut BoundedCommand) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn configure_process_tree(command: &mut std::process::Command) {
+fn configure_process_tree(
+    command: &mut std::process::Command,
+    _use_outer_group: bool,
+    _address_space_limit: Option<u64>,
+    _single_process: bool,
+    _close_extra_descriptors: bool,
+) {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
@@ -635,7 +1119,14 @@ fn configure_process_tree(command: &mut std::process::Command) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_process_tree(_command: &mut std::process::Command) {}
+fn configure_process_tree(
+    _command: &mut std::process::Command,
+    _use_outer_group: bool,
+    _address_space_limit: Option<u64>,
+    _single_process: bool,
+    _close_extra_descriptors: bool,
+) {
+}
 
 #[cfg(unix)]
 fn synthetic_terminated_status() -> ExitStatus {
@@ -709,13 +1200,23 @@ struct ProcessTree {
 }
 
 impl ProcessTree {
-    fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
+    fn attach(
+        child: &mut std::process::Child,
+        use_outer_group: bool,
+        address_space_limit: Option<u64>,
+        single_process: bool,
+    ) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
+            let _ = (address_space_limit, single_process);
             Ok(Self {
-                process_group: Some(i32::try_from(child.id()).map_err(|_| {
-                    std::io::Error::other("child pid exceeded process-group range")
-                })?),
+                process_group: if use_outer_group {
+                    None
+                } else {
+                    Some(i32::try_from(child.id()).map_err(|_| {
+                        std::io::Error::other("child pid exceeded process-group range")
+                    })?)
+                },
             })
         }
 
@@ -727,7 +1228,8 @@ impl ProcessTree {
             use windows_sys::Win32::System::JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
                 SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
             };
 
             let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -736,6 +1238,22 @@ impl ProcessTree {
             }
             let mut limits = unsafe { zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if let Some(bytes) = address_space_limit {
+                let bytes = usize::try_from(bytes).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "child memory limit exceeds Windows address range",
+                    )
+                })?;
+                limits.BasicLimitInformation.LimitFlags |=
+                    JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
+                limits.ProcessMemoryLimit = bytes;
+                limits.JobMemoryLimit = bytes;
+            }
+            if single_process {
+                limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                limits.BasicLimitInformation.ActiveProcessLimit = 1;
+            }
             if unsafe {
                 SetInformationJobObject(
                     job,
@@ -762,12 +1280,13 @@ impl ProcessTree {
                     resume_status as u32
                 )));
             }
+            let _ = use_outer_group;
             Ok(Self { job })
         }
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = child;
+            let _ = (child, use_outer_group, address_space_limit, single_process);
             Ok(Self {})
         }
     }
@@ -862,12 +1381,39 @@ fn run_with_stdin_completion(
         } else {
             Stdio::null()
         });
-    configure_process_tree(&mut command.command);
+    #[cfg(unix)]
+    let use_outer_group = VALIDATED_OUTER_PROCESS_GROUP.load(Ordering::Acquire);
+    #[cfg(not(unix))]
+    let use_outer_group = false;
+    configure_process_tree(
+        &mut command.command,
+        use_outer_group,
+        command.address_space_limit,
+        command.single_process,
+        command.close_extra_descriptors,
+    );
     #[cfg(unix)]
     configure_direct_exec(command).map_err(child_spawn_failure)?;
 
+    command
+        .executable_authority
+        .as_ref()
+        .map_or(Ok(()), BoundExecutable::verify)
+        .map_err(child_spawn_failure)?;
     let mut child = command.command.spawn().map_err(child_spawn_failure)?;
-    let tree = match ProcessTree::attach(&mut child) {
+    if let Some(authority) = &command.executable_authority {
+        if let Err(error) = authority.verify() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(child_spawn_failure(error));
+        }
+    }
+    let tree = match ProcessTree::attach(
+        &mut child,
+        use_outer_group,
+        command.address_space_limit,
+        command.single_process,
+    ) {
         Ok(tree) => tree,
         Err(error) => {
             let _ = child.kill();
@@ -1114,6 +1660,13 @@ mod tests {
             wall_clock: Duration::from_millis(milliseconds),
             stderr_tail: 32,
         }
+    }
+
+    #[test]
+    fn address_space_limit_is_explicit_and_nonzero_for_bounded_workers() {
+        let mut command = BoundedCommand::new("sh");
+        command.address_space_limit(64 * 1024 * 1024);
+        assert_eq!(command.address_space_limit, Some(64 * 1024 * 1024));
     }
 
     #[test]
@@ -1479,11 +2032,11 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        configure_process_tree(&mut command);
+        configure_process_tree(&mut command, false, None, false, false);
 
         let mut child = command.spawn().unwrap();
         let child_pid = i32::try_from(child.id()).unwrap();
-        let tree = ProcessTree::attach(&mut child).unwrap();
+        let tree = ProcessTree::attach(&mut child, false, None, false).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !observe_child_exit(&mut child).unwrap() {
             assert!(
@@ -1595,6 +2148,91 @@ mod tests {
         unsafe {
             libc::kill(-escaped_pid, libc::SIGKILL);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_executable_runs_the_retained_identity_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("worker");
+        std::fs::copy("/bin/true", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = BoundedCommand::new_bound_executable(&executable).unwrap();
+        let replacement = directory.path().join("replacement");
+        std::fs::copy("/bin/false", &replacement).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+
+        let run = run(
+            &mut command,
+            None,
+            StdoutTarget::Capture { max_bytes: 1024 },
+            budget(5_000),
+        )
+        .unwrap();
+        assert!(run.output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_executable_runs_immutable_snapshot_after_in_place_source_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("worker");
+        std::fs::copy("/bin/true", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = BoundedCommand::new_bound_executable(&executable).unwrap();
+        std::fs::copy("/bin/false", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let run = run(
+            &mut command,
+            None,
+            StdoutTarget::Capture { max_bytes: 1024 },
+            budget(5_000),
+        )
+        .unwrap();
+        assert!(run.output.status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_executable_can_be_snapshotted_immutably() {
+        BoundExecutable::current().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_extra_descriptors_removes_an_inheritable_parent_canary() {
+        use std::os::fd::AsRawFd;
+
+        let canary = tempfile::tempfile().unwrap();
+        let descriptor = canary.as_raw_fd();
+        unsafe {
+            assert_eq!(libc::fcntl(descriptor, libc::F_SETFD, 0), 0);
+        }
+        let descriptor_text = descriptor.to_string();
+        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        let mut command = BoundedCommand::new_bound_executable(&shell).unwrap();
+        command
+            .args([
+                "-c",
+                "test ! -e \"/proc/self/fd/$1\"",
+                "minutes-fd-canary",
+                descriptor_text.as_str(),
+            ])
+            .close_extra_descriptors();
+        let run = run(
+            &mut command,
+            None,
+            StdoutTarget::Capture { max_bytes: 1024 },
+            budget(5_000),
+        )
+        .unwrap();
+        assert!(run.output.status.success());
     }
 }
 

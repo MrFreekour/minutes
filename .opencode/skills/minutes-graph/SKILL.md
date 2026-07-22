@@ -1,12 +1,12 @@
 ---
 name: minutes-graph
-description: Policy-safe live-source person profiles and topic research, with honest fail-closed handling for deferred graph rankings, commitments, aliases, and losing-touch signals. Always use Minutes' bounded native CLI surfaces; never build or read a durable graph cache.
+description: Policy-safe relationship rankings, commitments, aliases, person profiles, and topic research. Always use Minutes' bounded native CLI surfaces; never build or read a durable graph cache.
 compatibility: opencode
 ---
 
 # /minutes-graph
 
-The durable relationship projection is temporarily unavailable while the bounded privacy-safe rebuild tracked in [roadmap issue #513](https://github.com/silverstein/minutes/issues/513) is completed. Bounded live-source person profiles and topic research remain available. Do not fall back to the retired index or read meeting files directly.
+Minutes builds relationship rankings, exact person profiles, and commitments from one supervised, process-private SQLite projection of stable policy-authorized Markdown plus confirmed identity corrections. One ordered snapshot authority spans corpus and corrections, and the worker is hard-limited for memory, output, and wall time. Topic research uses the separately bounded live-source search boundary. Both paths re-attest policy before returning facts. Do not fall back to a retired durable index or read meeting files directly.
 
 ## Privacy boundary
 
@@ -14,33 +14,31 @@ The durable relationship projection is temporarily unavailable while the bounded
 - Never run `graph_build.py` or read `~/.minutes/graph/index.json`; those are retired legacy surfaces.
 - Never create a replacement graph cache, spreadsheet, JSON file, or database.
 - Never pass `--include-restricted`. Restricted meetings are intentionally absent from this agent-facing skill.
-- Treat the temporary-unavailability response or any resource-budget error as a hard stop. Do not fall back to filesystem reads.
+- Treat any authorization, resource-budget, correction-race, or projection error as a hard stop. Do not fall back to filesystem reads.
 
-## Temporary availability
+## Available commands
 
-The durable graph commands are fail-closed during this deferral. Do not run
-`minutes people`, `minutes people merge`, or `minutes commitments`; rankings,
-aliases, losing-touch signals, and graph commitments remain unavailable until
-issue #513 is resolved. The bounded live-source `minutes person` and
-`minutes research` commands remain available and do not read the retired index.
+- `minutes people --json` — bounded relationship rankings and losing-touch signals.
+- `minutes commitments --json` — bounded graph commitments.
+- `minutes people merge <canonical> <alias...>` — confirm an identity correction in the local vocabulary; uncertain names are never merged automatically.
+- `minutes person "<name>"` — bounded person profile.
+- `minutes research "<topic>"` — bounded topic research.
 
 ## Workflow
 
-1. Classify the request. For a person profile, run `minutes person "<name>"`; for topic research, run `minutes research "<topic>"`.
+1. Classify the request and use the narrowest command above.
 2. Require exit status 0. Use only the bounded native result and never substitute filesystem reads.
-3. For rankings, losing-touch, aliases, or commitments, state that the graph projection is temporarily unavailable and link roadmap issue #513.
+3. For a proposed alias, show the suggestion and ask for confirmation before running `minutes people merge`; a wrong merge is worse than no merge.
 4. Do not imply that restricted history or a relationship fact is absent when any command fails.
 
 ## Output
 
-Return bounded live-source profiles or topic research when requested. For graph-only
-requests, tell the user the graph projection is temporarily unavailable and link
-issue #513. Never invent rankings, commitments, or relationship signals from raw files.
+Return only the bounded native result. Never invent rankings, commitments, or relationship signals from raw files.
 
 ## Gotchas
 
 - A failed person profile cannot be interpreted as “never met.” Report the source unavailable.
-- Do not imply that a later sensitivity change removed a result; no graph result is being produced during the deferral.
-- Alias and merge operations remain unavailable with the graph projection. Never simulate them from names in live results.
+- Do not imply that a later sensitivity change proves a historical fact absent; report only the current authorized projection.
+- Alias suggestions are evidence, not permission to rewrite identity. Require explicit confirmation before merging.
 - Use `minutes research "<topic>"` for bounded company, product, or topic research. If it fails, report the source unavailable; never fall back to raw corpus reads.
 

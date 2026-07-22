@@ -2711,7 +2711,19 @@ pub(crate) fn combined_parakeet_boost_phrases(config: &Config, hints: &DecodeHin
 
     let limit = config.transcription.parakeet_boost_limit;
     if limit > 0 {
-        match crate::graph::parakeet_boost_phrases(config, limit) {
+        #[cfg(test)]
+        let global_phrases = crate::graph::parakeet_boost_phrases(config, limit);
+        #[cfg(not(test))]
+        let global_phrases = crate::graph_worker::run_policy_projection_worker(
+            config,
+            crate::graph::PolicyProjectionRequest::ParakeetBoostPhrases { limit },
+        )
+        .and_then(|response| match response {
+            crate::graph::PolicyProjectionResponse::ParakeetBoostPhrases(phrases) => Ok(phrases),
+            _ => Err("policy graph worker returned the wrong boost-phrase response".into()),
+        })
+        .map_err(|error| crate::graph::GraphError::Io(std::io::Error::other(error)));
+        match global_phrases {
             Ok(global_phrases) => {
                 for phrase in global_phrases {
                     let key = phrase.to_ascii_lowercase();

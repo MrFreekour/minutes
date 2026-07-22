@@ -676,13 +676,13 @@ enum Commands {
         name: String,
     },
 
-    /// Graph rankings are temporarily unavailable during the privacy-safe rebuild (#513)
+    /// Rank relationships from a bounded, process-private projection of authorized meetings
     People {
-        /// Compatibility subcommand; graph actions fail closed with roadmap issue #513
+        /// Confirm that multiple names identify one person
         #[command(subcommand)]
         action: Option<PeopleAction>,
 
-        /// Compatibility flag; rebuilding is unavailable until roadmap issue #513 lands
+        /// Rebuild and report projection statistics before listing people
         #[arg(long)]
         rebuild: bool,
 
@@ -701,7 +701,7 @@ enum Commands {
         action: VocabularyAction,
     },
 
-    /// Graph commitments are temporarily unavailable during the privacy-safe rebuild (#513)
+    /// Show commitments from a bounded, process-private projection of authorized meetings
     Commitments {
         /// Filter by person name or slug
         #[arg(short, long)]
@@ -710,6 +710,10 @@ enum Commands {
         /// Output raw JSON
         #[arg(long)]
         json: bool,
+
+        /// Maximum number of commitments to return
+        #[arg(short, long, default_value = "10000")]
+        limit: usize,
     },
 
     /// Research a topic across meetings, decisions, and open follow-ups
@@ -1315,17 +1319,14 @@ enum SensitiveAction {
 
 #[derive(Subcommand)]
 enum PeopleAction {
-    /// Temporarily unavailable while identity merging is rebuilt privacy-safe (#513).
-    ///
-    /// This command is retained for CLI compatibility but fails closed before
-    /// reading or writing graph-backed identity state.
+    /// Confirm a canonical name and its variants for future projections.
     Merge {
         /// Canonical (surviving) person: a slug or exact name.
         canonical: String,
         /// Variant people to fold into the canonical: slugs or exact names.
         #[arg(required = true)]
         aliases: Vec<String>,
-        /// Compatibility flag retained while the graph rebuild is unavailable.
+        /// Save the correction without immediately rebuilding the projection.
         #[arg(long)]
         no_rebuild: bool,
         /// Output raw JSON instead of formatted text
@@ -1727,15 +1728,15 @@ fn claim_authorized_process_input(command: &mut Commands) -> Result<Option<std::
     {
         use std::os::fd::{AsRawFd, FromRawFd};
 
+        let current = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if current < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         // SAFETY: the MCP bridge transfers ownership of exactly fd 3. The
         // value was removed from the parsed command, so no later path can take
         // ownership of or close the raw descriptor a second time.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let current = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        if current < 0
-            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, current | libc::FD_CLOEXEC) }
-                < 0
-        {
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, current | libc::FD_CLOEXEC) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(Some(file))
@@ -1748,13 +1749,128 @@ fn claim_authorized_process_input(command: &mut Commands) -> Result<Option<std::
     }
 }
 
+#[cfg(unix)]
+fn claim_authorized_process_supervisor() -> Result<std::fs::File> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::FileTypeExt;
+
+    const SUPERVISOR_FD: i32 = 4;
+    let current = unsafe { libc::fcntl(SUPERVISOR_FD, libc::F_GETFD) };
+    if current < 0 {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    // SAFETY: the process-audio helper transfers ownership of exactly fd 4.
+    // The returned File is moved into the lifecycle watcher below, so the raw
+    // descriptor cannot be closed or claimed a second time.
+    let mut supervisor = unsafe { std::fs::File::from_raw_fd(SUPERVISOR_FD) };
+    if unsafe {
+        libc::fcntl(
+            supervisor.as_raw_fd(),
+            libc::F_SETFD,
+            current | libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    let file_type = supervisor.metadata()?.file_type();
+    if !file_type.is_fifo() && !file_type.is_socket() {
+        anyhow::bail!("outer process supervisor capability was invalid");
+    }
+
+    // A pipe/socket object is not enough: its peer must still be alive when
+    // containment is installed. Probe without blocking, then restore the
+    // original status flags before the watcher takes ownership.
+    let status_flags = unsafe { libc::fcntl(supervisor.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0
+        || unsafe {
+            libc::fcntl(
+                supervisor.as_raw_fd(),
+                libc::F_SETFL,
+                status_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+    {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    let mut probe = [0_u8; 1];
+    let probe_result = supervisor.read(&mut probe);
+    if unsafe { libc::fcntl(supervisor.as_raw_fd(), libc::F_SETFL, status_flags) } < 0 {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    match probe_result {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(supervisor),
+        _ => anyhow::bail!("outer process supervisor capability was not live"),
+    }
+}
+
+#[cfg(unix)]
+fn watch_authorized_process_supervisor(mut supervisor: std::fs::File) -> Result<()> {
+    use std::io::Read;
+
+    std::thread::Builder::new()
+        .name("minutes-process-audio-supervisor".into())
+        .spawn(move || {
+            let mut byte = [0_u8; 1];
+            loop {
+                match supervisor.read(&mut byte) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // The helper never sends data. EOF or any protocol/error
+                    // transition means the outer supervisor was lost, so the
+                    // shared group must fail closed instead of being orphaned.
+                    _ => unsafe {
+                        libc::kill(-libc::getpgrp(), libc::SIGKILL);
+                        return;
+                    },
+                }
+            }
+        })?;
+    Ok(())
+}
+
+fn install_authorized_process_containment(has_authorized_input: bool) -> Result<()> {
+    const MARKER: &str = "MINUTES_MCP_OUTER_PROCESS_GROUP";
+    let marker = std::env::var_os(MARKER);
+    std::env::remove_var(MARKER);
+    match (has_authorized_input, marker) {
+        (false, None) => Ok(()),
+        (false, Some(_)) => anyhow::bail!("outer process containment requires authorized input"),
+        (true, None) => anyhow::bail!("authorized process input requires outer containment"),
+        (true, Some(raw)) => {
+            #[cfg(unix)]
+            {
+                let process_group = raw
+                    .to_str()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("outer process containment marker was invalid")
+                    })?;
+                let supervisor = claim_authorized_process_supervisor()?;
+                minutes_core::install_validated_outer_process_group(process_group)?;
+                watch_authorized_process_supervisor(supervisor)?;
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = raw;
+                anyhow::bail!("outer process containment is unavailable")
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    if let Some(code) = minutes_core::graph_worker::maybe_run_policy_projection_worker() {
+        std::process::exit(code);
+    }
     let mut cli = Cli::parse();
     let verbose = cli.verbose;
     // This must remain the first action after parsing. In particular, do not
     // move logging, config loading, readiness checks, or any subprocess work
     // above the fd claim.
     let mut claimed_authorized_process_input = claim_authorized_process_input(&mut cli.command)?;
+    install_authorized_process_containment(claimed_authorized_process_input.is_some())?;
 
     // Initialize logging.
     //
@@ -1795,6 +1911,7 @@ fn main() -> Result<()> {
     let agent_trust_readiness = command_requires_agent_trust_readiness(&cli.command)
         .then(minutes_core::knowledge::establish_agent_trust_readiness_from_strict_config);
     let mut config = load_cli_config(strict_bridge)?;
+    apply_agent_policy_graph_corpus(&cli.command, &mut config)?;
     install_parakeet_panic_hook();
 
     // Rotate old log files at startup
@@ -2044,7 +2161,11 @@ fn main() -> Result<()> {
             None => cmd_people(rebuild, json, limit, &config),
         },
         Commands::Vocabulary { action } => cmd_vocabulary(action, &config),
-        Commands::Commitments { person, json } => cmd_commitments(person.as_deref(), json, &config),
+        Commands::Commitments {
+            person,
+            json,
+            limit,
+        } => cmd_commitments(person.as_deref(), json, limit, &config),
         Commands::Research {
             query,
             content_type,
@@ -3011,7 +3132,7 @@ fn cmd_mic_toggle(force_state: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stop(config: &Config) -> Result<()> {
+fn cmd_stop(_config: &Config) -> Result<()> {
     match minutes_core::pid::check_recording() {
         Ok(Some(pid)) => {
             let capture_mode = minutes_core::pid::read_recording_metadata()
@@ -3067,10 +3188,7 @@ fn cmd_stop(config: &Config) -> Result<()> {
                 println!("{}", result);
                 std::fs::remove_file(&result_path).ok();
 
-                // Update relationship graph index
-                if let Err(e) = minutes_core::graph::rebuild_index(config) {
-                    tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-                }
+                // Graph consumers project the newly written Markdown on use.
             } else {
                 let active_jobs = minutes_core::jobs::active_jobs();
                 if let Some(job) = active_jobs.first() {
@@ -3801,6 +3919,43 @@ fn load_cli_config(strict_bridge: bool) -> Result<Config> {
     }
 }
 
+const POLICY_GRAPH_CORPUS_ROOT_ENV: &str = "MINUTES_POLICY_GRAPH_CORPUS_ROOT";
+
+fn apply_agent_policy_graph_corpus(command: &Commands, config: &mut Config) -> Result<()> {
+    let root = std::env::var_os(POLICY_GRAPH_CORPUS_ROOT_ENV);
+    std::env::remove_var(POLICY_GRAPH_CORPUS_ROOT_ENV);
+    let Some(root) = root else {
+        return Ok(());
+    };
+    if assistant_policy_allows_restricted_content()
+        || !matches!(
+            command,
+            Commands::Person { .. } | Commands::People { .. } | Commands::Commitments { .. }
+        )
+    {
+        return Ok(());
+    }
+    let root = PathBuf::from(root);
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        anyhow::bail!("policy graph corpus root was invalid");
+    }
+    let canonical = root
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("policy graph corpus root could not be verified"))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("policy graph corpus root was not a directory");
+    }
+    config.output_dir = canonical;
+    Ok(())
+}
+
 /// One descriptor-stable authorization boundary for every CLI command that
 /// accepts an exact meeting path. Human CLI sessions retain their historical
 /// ability to operate on explicitly restricted meetings; assistant children
@@ -4135,8 +4290,17 @@ fn cmd_consistency(owner: Option<&str>, stale_after_days: i64, config: &Config) 
 }
 
 fn cmd_person(name: &str, config: &Config) -> Result<()> {
-    let profile =
-        minutes_core::search::person_profile(config, name).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let profile = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        minutes_core::graph::PolicyProjectionRequest::PersonProfile {
+            selector: name.to_string(),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        minutes_core::graph::PolicyProjectionResponse::PersonProfile(profile) => profile,
+        _ => anyhow::bail!("policy graph worker returned the wrong person-profile response"),
+    };
 
     if profile.recent_meetings.is_empty()
         && profile.open_intents.is_empty()
@@ -4174,6 +4338,18 @@ fn cmd_person(name: &str, config: &Config) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&profile)?);
     Ok(())
+}
+
+fn run_graph_rebuild_worker(config: &Config) -> Result<minutes_core::graph::GraphStats> {
+    match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        minutes_core::graph::PolicyProjectionRequest::RebuildStats,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        minutes_core::graph::PolicyProjectionResponse::RebuildStats(stats) => Ok(stats),
+        _ => anyhow::bail!("policy graph worker returned the wrong rebuild response"),
+    }
 }
 
 /// Shell-quote a token for a copy-pasteable command (slugs rarely need it).
@@ -4238,9 +4414,17 @@ fn cmd_people_merge(
     use minutes_core::graph;
     use minutes_core::vocabulary;
 
-    // Graph-backed identity resolution is intentionally unavailable until the
-    // privacy-safe rebuild lands; do not fall back to an unbound durable path.
-    let people = graph::relationship_map(config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Resolve from the same policy-authorized, process-private projection used
+    // by every other graph command. No durable graph cache is trusted here.
+    let people = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        graph::PolicyProjectionRequest::RelationshipMap { limit: 10_000 },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        graph::PolicyProjectionResponse::RelationshipMap(people) => people,
+        _ => anyhow::bail!("policy graph worker returned the wrong relationship response"),
+    };
 
     let (canonical_name, canonical_resolved) = resolve_person_token(canonical, &people);
     let mut unresolved: Vec<String> = Vec::new();
@@ -4331,15 +4515,15 @@ fn cmd_people_merge(
     let mut rebuilt = false;
     let mut people_after = None;
     if !no_rebuild {
-        match graph::rebuild_index(config) {
+        match run_graph_rebuild_worker(config) {
             Ok(stats) => {
                 rebuilt = true;
                 people_after = Some(stats.people_count);
             }
             Err(e) => {
                 eprintln!(
-                    "  Saved the merge, but the graph rebuild failed ({e}). \
-                     Run `minutes people --rebuild` to apply it."
+                    "  Saved the merge, but its live projection could not be verified ({e}). \
+                     The correction will be read automatically by future graph commands."
                 );
             }
         }
@@ -4365,10 +4549,12 @@ fn cmd_people_merge(
         );
         if rebuilt {
             if let (Some(b), Some(a)) = (people_before, people_after) {
-                eprintln!("  Graph rebuilt: {b} → {a} people.");
+                eprintln!("  Correction verified: {b} → {a} people in the current projection.");
             }
         } else if no_rebuild {
-            eprintln!("  Not rebuilt (--no-rebuild). Run `minutes people --rebuild` to apply.");
+            eprintln!(
+                "  Saved without validation (--no-rebuild); future graph commands read it automatically."
+            );
         }
     }
     Ok(())
@@ -4377,11 +4563,24 @@ fn cmd_people_merge(
 fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Result<()> {
     use minutes_core::graph;
 
-    if rebuild {
-        eprintln!("Building relationship index...");
-        let stats = graph::rebuild_index(config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let projection = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        graph::PolicyProjectionRequest::People {
+            limit,
+            include_commitments: !json,
+            include_stats: rebuild,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        graph::PolicyProjectionResponse::People(projection) => projection,
+        _ => anyhow::bail!("policy graph worker returned the wrong people response"),
+    };
+
+    if let Some(stats) = &projection.stats {
+        eprintln!("Verifying relationship projection...");
         eprintln!(
-            "Index rebuilt: {} people, {} meetings, {} commitments in {}ms",
+            "Projection verified: {} people, {} meetings, {} commitments in {}ms",
             stats.people_count, stats.meeting_count, stats.commitment_count, stats.rebuild_ms
         );
         if !stats.alias_clusters.is_empty() {
@@ -4409,10 +4608,8 @@ fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Resul
         }
         eprintln!();
     }
-
-    let all_people = graph::relationship_map(config).map_err(|e| anyhow::anyhow!("{}", e))?;
-    // Apply limit to all output modes (JSON and formatted)
-    let people: Vec<_> = all_people.into_iter().take(limit).collect();
+    let people = projection.people;
+    let commitments = projection.commitments;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&people)?);
@@ -4421,7 +4618,7 @@ fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Resul
 
     if people.is_empty() {
         eprintln!(
-            "No people found. Record some meetings first, then run: minutes people --rebuild"
+            "No relationship contacts found yet. Record a meeting with verified attendees or speakers first."
         );
         return Ok(());
     }
@@ -4464,8 +4661,6 @@ fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Resul
     }
 
     // Stale commitments
-    let commitments =
-        graph::query_commitments(config, None).map_err(|e| anyhow::anyhow!("{}", e))?;
     let stale: Vec<_> = commitments.iter().filter(|c| c.status == "stale").collect();
     if !stale.is_empty() {
         eprintln!("\nSTALE COMMITMENTS");
@@ -4595,13 +4790,13 @@ fn cmd_vocabulary_add(kind: &str, canonical: &str, aliases: Vec<String>, json: b
     let output = VocabularyMutationOutput {
         path: path.display().to_string(),
         entries: store.entries,
-        note: "Saved. Future transcripts, search, and graph rebuilds can use this vocabulary; existing raw transcripts stay unchanged.".into(),
+        note: "Saved. Future transcripts, search, and live graph answers can use this vocabulary; existing raw transcripts stay unchanged.".into(),
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         eprintln!("Saved vocabulary entry for \"{}\".", canonical.trim());
-        eprintln!("Future transcripts/search/graph rebuilds can use it.");
+        eprintln!("Future transcripts, search, and live graph answers can use it.");
         eprintln!("Existing raw transcripts stay unchanged.");
     }
     Ok(())
@@ -4669,12 +4864,12 @@ fn cmd_vocabulary_suggest(meeting: &Path, json: bool, config: &Config) -> Result
 }
 
 fn cmd_vocabulary_rebuild(json: bool, config: &Config) -> Result<()> {
-    let stats = minutes_core::graph::rebuild_index(config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let stats = run_graph_rebuild_worker(config)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
         eprintln!(
-            "Rebuilt graph with vocabulary context: {} people, {} meetings, {} commitments in {}ms",
+            "Verified vocabulary against a live graph projection: {} people, {} meetings, {} commitments in {}ms",
             stats.people_count, stats.meeting_count, stats.commitment_count, stats.rebuild_ms
         );
         eprintln!("Existing raw transcripts stay unchanged.");
@@ -4912,11 +5107,21 @@ fn vocabulary_key(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn cmd_commitments(person: Option<&str>, json: bool, config: &Config) -> Result<()> {
+fn cmd_commitments(person: Option<&str>, json: bool, limit: usize, config: &Config) -> Result<()> {
     use minutes_core::graph;
 
-    let commitments =
-        graph::query_commitments(config, person).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let commitments = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        graph::PolicyProjectionRequest::Commitments {
+            selector: person.map(str::to_string),
+            limit,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        graph::PolicyProjectionResponse::Commitments(commitments) => commitments,
+        _ => anyhow::bail!("policy graph worker returned the wrong commitment response"),
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&commitments)?);
@@ -6080,11 +6285,6 @@ fn cmd_process(
         };
         eprintln!("Saved: {}", result.path.display());
 
-        // Update relationship graph index
-        if let Err(e) = minutes_core::graph::rebuild_index(config) {
-            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-        }
-
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "status": "done",
             "file": result.path.display().to_string(),
@@ -6669,6 +6869,9 @@ fn build_capability_report_with_parakeet(
     features.insert("read_live_transcript".into(), true);
     features.insert("register_qmd_collection".into(), false);
     features.insert("relationship_map".into(), true);
+    features.insert("relationship_map_policy_fresh_v1".into(), true);
+    features.insert("policy_projection_worker_v1".into(), true);
+    features.insert("person_profile_policy_fresh_v1".into(), true);
     features.insert("research_topic".into(), true);
     features.insert("search_meetings".into(), true);
     features.insert("start_dictation".into(), true);
@@ -8989,7 +9192,19 @@ life (qmd://life/)
     }
 
     #[test]
-    fn deferred_graph_cli_help_is_honest() {
+    fn graph_cli_help_advertises_the_restored_bounded_projection() {
+        assert_eq!(
+            build_capability_report()
+                .features
+                .get("relationship_map_policy_fresh_v1"),
+            Some(&true)
+        );
+        assert_eq!(
+            build_capability_report()
+                .features
+                .get("policy_projection_worker_v1"),
+            Some(&true)
+        );
         for args in [
             ["minutes", "people", "--help"].as_slice(),
             ["minutes", "people", "merge", "--help"].as_slice(),
@@ -9000,8 +9215,8 @@ life (qmd://life/)
                 .expect("graph help exits through clap")
                 .to_string()
                 .to_lowercase();
-            assert!(help.contains("temporarily unavailable"), "{help}");
-            assert!(help.contains("#513"), "{help}");
+            assert!(!help.contains("temporarily unavailable"), "{help}");
+            assert!(!help.contains("#513"), "{help}");
         }
     }
 
@@ -15206,12 +15421,6 @@ struct TextImportSummary {
 fn import_text(source_dir: &Path, dry_run: bool, verbose: bool, config: &Config) -> Result<()> {
     let summary = import_text_files(source_dir, dry_run, verbose, config)?;
 
-    if !dry_run && summary.imported > 0 {
-        if let Err(e) = minutes_core::graph::rebuild_index(config) {
-            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-        }
-    }
-
     let action = if dry_run { "Would import" } else { "Imported" };
     let json = serde_json::json!({
         "imported": summary.imported,
@@ -15832,13 +16041,6 @@ fn import_granola(dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<
         imported += 1;
     }
 
-    // Update relationship graph index after batch import
-    if !dry_run && imported > 0 {
-        if let Err(e) = minutes_core::graph::rebuild_index(config) {
-            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-        }
-    }
-
     let action = if dry_run { "Would import" } else { "Imported" };
     let json = serde_json::json!({
         "imported": imported,
@@ -16199,17 +16401,6 @@ fn cmd_demo_full(config: &Config) -> Result<()> {
     if paths.is_empty() {
         eprintln!("All demo meetings already exist. Run `minutes demo --clean --full` to re-seed.");
         return Ok(());
-    }
-
-    // Rebuild the relationship graph silently (suppress tracing for clean animation)
-    {
-        let quiet = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_target(false)
-            .finish();
-        tracing::subscriber::with_default(quiet, || {
-            minutes_core::graph::rebuild_index(config).ok();
-        });
     }
 
     // Demo has a fixed cast of 6 characters
@@ -16805,15 +16996,6 @@ fn cmd_confirm(
             Some("minutes confirm"),
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    }
-
-    if !overlay_writes.is_empty() {
-        if let Err(error) = minutes_core::graph::rebuild_index(config) {
-            eprintln!(
-                "Warning: speaker overlay saved, but graph rebuild failed: {}",
-                error
-            );
-        }
     }
 
     let confirmed_count = frontmatter

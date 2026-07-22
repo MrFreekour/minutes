@@ -78,11 +78,11 @@ const capabilityColumns = [
       ],
       [
         "Policy-bound people context",
-        "Build bounded live-source profiles and topic research; graph rankings are being rebuilt privacy-safe.",
+        "Build bounded policy-safe person profiles, topic research, relationship rankings, and commitments.",
       ],
       [
         "Cross-meeting search",
-        "Search everything or ask your assistant to pull the thread for you.",
+        "Search policy-authorized history or ask your assistant to pull the thread for you.",
       ],
       [
         "Voice memo pipeline",

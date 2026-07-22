@@ -29,7 +29,7 @@
   "author": "Mat Silverstein",
   "scripts": {
     "build": "tsc",
-    "test": "vitest run",
+    "test": "npm run build && vitest run",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

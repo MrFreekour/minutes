@@ -1,7 +1,7 @@
 {
   "generatedAt": "2026-07-23",
-  "visibleCount": 60,
-  "hiddenCount": 14,
+  "visibleCount": 61,
+  "hiddenCount": 16,
   "groups": [
     {
       "enumName": "CaptureError",
@@ -723,15 +723,15 @@
       "count": 1,
       "entries": [
         {
-          "id": "grapherror-temporarilyunavailable",
+          "id": "grapherror-dirnotfound",
           "enumName": "GraphError",
-          "variant": "TemporarilyUnavailable",
+          "variant": "DirNotFound",
           "cfg": null,
-          "message": "cross-meeting graph is temporarily unavailable while its privacy-safe bounded rebuild is completed; see roadmap issue #513",
+          "message": "meetings directory does not exist: {0}",
           "sourceFile": "crates/core/src/graph.rs",
           "hidden": false,
-          "anchorId": "error-grapherror-temporarilyunavailable",
-          "docsUrl": "https://useminutes.app/docs/errors#error-grapherror-temporarilyunavailable"
+          "anchorId": "error-grapherror-dirnotfound",
+          "docsUrl": "https://useminutes.app/docs/errors#error-grapherror-dirnotfound"
         }
       ]
     },
@@ -808,6 +808,16 @@
       "enumName": "MinutesError",
       "variant": "Io",
       "sourceFile": "crates/core/src/error.rs"
+    },
+    {
+      "enumName": "GraphError",
+      "variant": "Sqlite",
+      "sourceFile": "crates/core/src/graph.rs"
+    },
+    {
+      "enumName": "GraphError",
+      "variant": "Io",
+      "sourceFile": "crates/core/src/graph.rs"
     },
     {
       "enumName": "VoiceError",

@@ -93,4 +93,4 @@ ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
 ndarray = "0.16"
 
 # SQLite (relationship graph index)
-rusqlite = { version = "0.33", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.33", features = ["bundled", "hooks", "limits"] }

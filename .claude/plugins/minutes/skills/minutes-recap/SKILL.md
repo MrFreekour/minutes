@@ -6,7 +6,9 @@ user_invocable: true
 
 # /minutes-recap
 
-Synthesize all of today's meetings and voice memos into a single daily brief.
+Synthesize today's policy-authorized normal meetings and voice memos into a
+single daily brief. Restricted history is excluded from this agent workflow by
+default and must never be treated as absent evidence.
 
 ## How to generate the recap
 

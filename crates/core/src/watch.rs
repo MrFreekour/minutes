@@ -791,11 +791,6 @@ fn process_candidate_with_ffmpeg_availability(
                 });
             }
 
-            // Update relationship graph index
-            if let Err(e) = crate::graph::rebuild_index(config) {
-                tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-            }
-
             archive_successful_candidate(&candidate.path)?;
             Ok(())
         }
@@ -936,9 +931,6 @@ fn process_parakeet_memo_batch(
             source_path: candidate.path.display().to_string(),
             device: candidate.sidecar.as_ref().and_then(|s| s.device.clone()),
         });
-        if let Err(e) = crate::graph::rebuild_index(config) {
-            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-        }
         archive_successful_candidate(&candidate.path)?;
     }
 

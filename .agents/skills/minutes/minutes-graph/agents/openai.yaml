@@ -1,4 +1,4 @@
 interface:
   display_name: "Minutes Graph"
-  short_description: "Bounded person profiles and topic research; graph rankings and commitments are temporarily unavailable."
+  short_description: "Bounded policy-safe relationship intelligence from owned meeting history."
   default_prompt: "Use Minutes Graph for this task."

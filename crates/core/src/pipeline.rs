@@ -3202,11 +3202,11 @@ impl AuthorizedProcessAudioInput {
 
     /// Consume the exact fd 3 capability claimed by the CLI before startup.
     ///
-    /// The bridge has already copied and attested the source revision into an
-    /// owner-private, single-link file. This constructor never reopens a
-    /// pathname: it copies only from the inherited handle into Minutes'
-    /// sealed private-audio store, then closes the bridge handle before any
-    /// decoder or enrichment work can run.
+    /// The caller has opened and attested the user's exact source revision.
+    /// Ordinary imports may legitimately be group/world-readable (for example
+    /// a 0644 Downloads file); privacy begins at the immediate copy into
+    /// Minutes' sealed private-audio store. This constructor never reopens a
+    /// pathname and closes the source handle before decoder or enrichment work.
     #[cfg(unix)]
     pub fn from_claimed_inherited_file(
         source: File,
@@ -3260,11 +3260,10 @@ impl AuthorizedProcessAudioInput {
         if !before.file_type().is_file()
             || before.nlink() != 1
             || before.uid() != unsafe { libc::geteuid() }
-            || before.mode() & 0o077 != 0
             || before.len() != expected_byte_length
         {
             return Err(reject_authorized_input(
-                "inherited source must be an exact owner-private single-link file",
+                "inherited source must be an exact caller-owned single-link file",
             ));
         }
         source.rewind()?;
@@ -3697,7 +3696,7 @@ mod authorized_process_input_tests {
 
     #[test]
     #[cfg(unix)]
-    fn inherited_bridge_copies_only_an_owner_private_exact_revision() {
+    fn inherited_source_accepts_an_exact_caller_owned_0644_revision() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -3710,6 +3709,7 @@ mod authorized_process_input_tests {
         created.sync_all().unwrap();
         drop(created);
 
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
         let exact = std::fs::File::open(&source).unwrap();
         let input = AuthorizedProcessAudioInput::from_claimed_inherited_file_with_hook(
             exact,
@@ -3724,19 +3724,6 @@ mod authorized_process_input_tests {
             bytes
         );
         assert!(!input.processing_path().exists());
-
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let public = std::fs::File::open(&source).unwrap();
-        let error = AuthorizedProcessAudioInput::from_claimed_inherited_file_with_hook(
-            public,
-            bytes.len() as u64,
-            "wav",
-            false,
-            || Ok(()),
-        )
-        .err()
-        .expect("group-readable bridge staging must fail closed");
-        assert!(error.to_string().contains("owner-private"));
     }
 
     #[test]

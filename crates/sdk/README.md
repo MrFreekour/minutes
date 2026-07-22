@@ -29,38 +29,50 @@ const actions = await findOpenActions('~/meetings', 'alex');
 
 ## API
 
-### `listMeetings(dir, limit?)`
+### `listMeetings(dir, limit?, options?)`
 
 List meetings sorted by date (newest first). `limit` must be an integer from 1
-through `SDK_MEETING_RESULT_MAX` (10,000).
+through `SDK_MEETING_RESULT_MAX` (10,000). Restricted meetings are excluded by
+default; pass `{ includeRestricted: true }` only for an explicit override.
 
 ```typescript
 const meetings = await listMeetings('~/meetings', 50);
 ```
 
-### `searchMeetings(dir, query, limit?)`
+### `searchMeetings(dir, query, limit?, options?)`
 
 Full-text search across titles and transcripts. It uses the same validated
-1–10,000 meeting-result limit as `listMeetings`.
+1–10,000 meeting-result limit and restricted-meeting policy as `listMeetings`.
 
 ```typescript
 const results = await searchMeetings('~/meetings', 'Q2 roadmap');
 ```
 
-### `getMeeting(path)`
+### `getMeeting(path, options?)`
 
-Read a single meeting file.
+Read one meeting inside `options.rootDir` (the configured meetings directory by
+default). The result is `Promise<ExactMeetingResult | null>`: missing, unsafe,
+or out-of-root paths return `null`. A restricted meeting returns a path-free
+`restricted_stub` by default; `{ includeRestricted: true }` is the explicit,
+logged override.
 
 ```typescript
 const meeting = await getMeeting('~/meetings/2026-03-24-planning.md');
-console.log(meeting.frontmatter.decisions);
+if (!meeting) {
+  console.log('Meeting unavailable');
+} else if (meeting.restricted_stub) {
+  console.log(meeting.body); // exclusion notice; never the transcript
+} else {
+  console.log(meeting.frontmatter.decisions);
+}
 ```
 
 ### `findOpenActions(dir, assignee?, options?)`
 
 Find open action items, optionally filtered by assignee. Set `options.limit` to
 an integer from 1 through `SDK_OPEN_ACTION_RESULT_MAX` (1,000); omitted limits
-default to that hard cap.
+default to that hard cap. Restricted meetings are excluded unless
+`options.includeRestricted` is explicitly set.
 
 ```typescript
 const allOpen = await findOpenActions('~/meetings');
@@ -73,7 +85,7 @@ const firstTen = await findOpenActions('~/meetings', undefined, { limit: 10 });
 Build a profile for someone across policy-authorized meetings within the supported corpus bounds — their meetings, open action items, and topics.
 The three returned collections are independently bounded. Use `meetingLimit`,
 `openActionLimit`, and `topicLimit`; each defaults to and may not exceed its
-exported 1,000-item cap.
+exported 1,000-item cap. `includeRestricted` defaults to false.
 
 ```typescript
 const profile = await getPersonProfile('~/meetings', 'alex');
@@ -98,12 +110,22 @@ the retained snapshot uses O(corpus bytes) memory within the hard corpus limit.
 ### `listVoiceMemos(dir, options?)`
 
 List recent memos newest-first. `options.limit` is bounded to 1–1,000 and
-`options.days` to 0–36,500.
+`options.days` to 0–36,500. Restricted memos are excluded unless
+`options.includeRestricted` is explicitly set.
 
 ### `findDecisions(dir, topic?, limit?, options?)`
 
 List decisions newest-first. `limit` defaults to 50 and must be an integer from
-1 through `SDK_DECISION_RESULT_MAX` (1,000).
+1 through `SDK_DECISION_RESULT_MAX` (1,000). Restricted meetings are excluded
+unless `options.includeRestricted` is explicitly set.
+
+### Restricted-read options
+
+Every agent-facing collection read excludes `sensitivity: restricted` sources
+by default. Passing `{ includeRestricted: true }` is an explicit override and
+writes a warning naming the surfaced count and read surface to stderr. For
+exact-path `getMeeting` reads, `options.rootDir` selects the authoritative
+active-corpus root; paths outside that root still return `null`.
 
 ### `parseFrontmatter(content, path)`
 

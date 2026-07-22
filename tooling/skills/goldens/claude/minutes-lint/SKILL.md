@@ -6,7 +6,9 @@ user_invocable: true
 
 # /minutes-lint
 
-Run a consistency check across all meetings to find decision conflicts and stale commitments.
+Run a consistency check across policy-authorized normal meetings to find
+decision conflicts and stale commitments. Restricted meetings are excluded from
+this agent workflow by default and must never be described as absent evidence.
 
 ## How to run the lint
 
@@ -65,7 +67,7 @@ If no conflicts and no stale commitments, say: "No decision conflicts or stale c
 
 - If there are decision conflicts: suggest running `/minutes-debrief` on the most recent conflicting meeting, or `/minutes-search "{topic}"` to review the full decision history
 - If there are stale commitments: suggest the user update the action item status in the meeting file, or bring it up in the next meeting with that person
-- If the user wants to dig deeper into a specific person's commitments: suggest `minutes commitments --person "{name}"`
+- Relationship-graph commitments come from `minutes commitments --json`; treat a nonzero exit as unavailable, never empty
 
 ## Gotchas
 

@@ -18,7 +18,7 @@ the operator's own files stay fully readable.
 | Core cross-meeting research (`cross_meeting_research`) | excluded | `SearchFilters::include_restricted` | caller's responsibility (CLI does it) |
 | Core consistency report (`consistency_report`) | excluded | none this wave | n/a |
 | Core person profile (`person_profile`) | excluded | none this wave | n/a |
-| Knowledge graph rebuild (`graph.rs`) | excluded at rebuild time | none this wave | n/a; Native Recall keeps graph tools absent until policy-revision invalidation exists |
+| Core relationship graph (`graph.rs`) | excluded from every process-private rebuild | none | n/a; every answer is re-attested before return and the projection is discarded |
 | Knowledge ingest (`knowledge.rs`, `minutes ingest`) | skipped in batch; explicit ingest of a restricted meeting is refused with a message | none this wave | n/a |
 | CLI `search` / `list` / `actions` / `research` | excluded | `--include-restricted` | `sensitivity.override` event appended before results are returned |
 | SDK reader (`crates/sdk/src/reader.ts`: list, search, actions, decisions, person profiles, voice memos) | excluded; explicit unknown sensitivity fails closed | `includeRestricted` option | stderr warning naming count + surface |
@@ -26,7 +26,9 @@ the operator's own files stay fully readable.
 | Standalone MCP tools (`list_meetings`, `search_meetings`, `get_meeting`, `research_topic`, `get_person_profile`) | excluded / stub; unknown policy and uncertain files fail closed | on macOS, Linux, and Windows, trusted launch policy `MINUTES_MCP_RESTRICTED_POLICY=logged-override` **and** per-call `include_restricted: true` | Rust capability-bound, cross-process serialized durable JSONL append to `$MINUTES_HOME/audit/sensitivity-overrides.jsonl`; Windows uses a protected owner-only DACL and reparse-safe handles; audit failure denies the request |
 | MCP meeting resources (recent, open actions, exact slug, recent ideas) | excluded / unavailable | no resource-level override | n/a |
 | Native Recall chat | exact live normal-sensitivity context only; no MCP servers and no tools | none | n/a |
-| MCP graph-backed tools (`track_commitments`, `relationship_map`, `get_person_profile` graph path) | outside Native Recall; standalone derived-store freshness is a separate boundary | none this wave | n/a |
+| Standalone MCP person profile (`get_person_profile`) | recomputed from policy-authorized live meeting snapshots; restricted excluded by default | same trusted-launch plus per-call override as other standalone MCP meeting tools | same durable MCP override audit |
+| Standalone MCP commitments (`track_commitments`) | recomputed from normal live meeting snapshots; restricted always excluded | none | n/a |
+| Standalone MCP `relationship_map` | bounded process-private core graph; restricted excluded during every rebuild | none | n/a |
 
 Desktop app search, list, palette actions, and other in-app navigation are the
 **operator's own surface**, not an agent surface: restricted meetings stay
@@ -106,15 +108,19 @@ all rejected, MCP falls back to the safe CLI path.
 
 ## No override surfaces (this wave)
 
-The knowledge graph, knowledge ingest, consistency reports, and person
-profiles have **no override**. A graph rebuild excludes currently restricted
-meetings, and an explicitly named restricted meeting passed to `minutes
-ingest` is refused; batch ingest skips restricted meetings and reports the
-count. Stored derived rows do not yet carry a source policy revision, so a
-meeting designated restricted after an older graph/event build may require a
-rebuild. Graph, annotation, insight, and live-event tools therefore remain
-absent from Native Recall until derived records have live sensitivity
-provenance or mandatory invalidation.
+The core relationship graph, knowledge ingest, and core consistency/person-profile
+commands have **no override**. Standalone MCP `get_person_profile` and
+`track_commitments` are deliberately different because they are live
+projections, not durable graph reads. The person-profile tool uses the same
+trusted-launch plus per-call override and durable audit boundary as other MCP
+meeting tools; commitments remain normal-only and expose no restricted
+override. An explicitly named restricted meeting passed to `minutes ingest`
+is refused; batch ingest skips restricted meetings and reports the count.
+Core graph rows exist only in a bounded process-private projection, are bound to
+the current corpus and correction revisions, and are discarded after the answer.
+Derived annotation, insight, and live-event tools remain
+absent from Native Recall until their records have live sensitivity provenance
+or mandatory invalidation.
 
 ## Compatibility notes
 

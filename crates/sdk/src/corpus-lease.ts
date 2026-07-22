@@ -1,7 +1,22 @@
 import { createHash, randomBytes } from "node:crypto";
-import { constants, watch, type Dirent, type FSWatcher } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+  watch,
+  type Dirent,
+  type FSWatcher,
+} from "node:fs";
 import { lstat, mkdir, open, opendir, realpath, stat } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   decodePolicyUtf8,
@@ -32,6 +47,22 @@ const INACTIVE_CORPUS_DIRS = new Set([
   "failed",
   "failed-captures",
 ]);
+// Snapshot bytes cross the worker boundary in paced chunks. The fixed line cap
+// makes transient protocol memory independent of maxCorpusBytes: in the worst
+// case one line may coexist as a decoder chunk, the stdout accumulator, an
+// extracted line, a parsed string, and parser/stream backing storage. Charge
+// five widened UTF-16 copies plus the decoded raw chunk to every admission.
+const CORPUS_WORKER_CONTENT_CHUNK_BYTES = 64 * 1024;
+const CORPUS_WORKER_PROTOCOL_MAX_BYTES = 512 * 1024;
+const CORPUS_WORKER_PROTOCOL_UTF16_COPIES = 5;
+const CORPUS_WORKER_PROTOCOL_TRANSIENT_BYTES =
+  CORPUS_WORKER_PROTOCOL_MAX_BYTES *
+    2 *
+    CORPUS_WORKER_PROTOCOL_UTF16_COPIES +
+  CORPUS_WORKER_CONTENT_CHUNK_BYTES;
+const CORPUS_WORKER_TERMINATION_GRACE_MS = 2_000;
+const CORPUS_OPERATION_TERMINATION_GRACE_MS = 100;
+let corpusLeaseWorkerProcess = false;
 
 export type CorpusReadBudgets = {
   maxFileBytes: number;
@@ -128,6 +159,14 @@ export type CorpusLeaseHooks = {
   beforeFinalFence?: (
     context: { attempt: number; controls: CorpusLeaseControls }
   ) => void | Promise<void>;
+  /** Test-only worker entry override for hostile protocol fixtures. */
+  workerScriptForTest?: string;
+  /** Test-only deterministic worker stall injection. */
+  workerStallPhaseForTest?:
+    | "before-baseline"
+    | "after-baseline"
+    | "before-finalize"
+    | "before-authorized";
 };
 
 type RootIdentity = {
@@ -195,14 +234,17 @@ function reserveCorpusMemory(
   // Retained UTF-8 may widen to two-byte JS strings. Path/name metadata has
   // the same widening risk, and each retained file has a fixed conservative
   // object/array/hash overhead. One max-sized source Buffer may coexist with
-  // the already-retained strings while it is decoded.
+  // the already-retained strings while it is decoded. The final fixed term
+  // reserves every simultaneous representation of the single paced protocol
+  // line; the protocol rejects a second line until the first is dispatched.
   const bytes =
     budgets.maxCorpusBytes * 2 +
     budgets.maxFileBytes +
     budgets.maxRetainedPathBytes * 2 +
     budgets.maxFileCount * RETAINED_FILE_OBJECT_OVERHEAD_BYTES +
     budgets.maxDirectoryEntries * RETAINED_DIRECTORY_ENTRY_OVERHEAD_BYTES +
-    budgets.maxDirectoryCount * RETAINED_DIRECTORY_OVERHEAD_BYTES;
+    budgets.maxDirectoryCount * RETAINED_DIRECTORY_OVERHEAD_BYTES +
+    CORPUS_WORKER_PROTOCOL_TRANSIENT_BYTES;
   if (
     !Number.isSafeInteger(bytes) ||
     bytes < 0 ||
@@ -723,6 +765,112 @@ async function boundedDirectoryEntries(
   return entries;
 }
 
+function scanWorkerFile(
+  fd: number,
+  maxBytes: number,
+  retainContent: boolean
+): { byteLength: number; content?: Buffer; sha256: string } {
+  const chunks: Buffer[] | undefined = retainContent ? [] : undefined;
+  const digest = createHash("sha256");
+  const reusable = retainContent
+    ? undefined
+    : Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, maxBytes)));
+  let position = 0;
+  for (;;) {
+    if (position >= maxBytes) {
+      const probe = Buffer.allocUnsafe(1);
+      if (readSync(fd, probe, 0, 1, position) !== 0) {
+        throw new CorpusLeaseBudgetError("meeting corpus file exceeded its byte budget");
+      }
+      break;
+    }
+    const length = Math.min(64 * 1024, maxBytes - position);
+    const chunk = reusable ?? Buffer.allocUnsafe(length);
+    const count = readSync(fd, chunk, 0, length, position);
+    if (count === 0) break;
+    const bytes = chunk.subarray(0, count);
+    digest.update(bytes);
+    chunks?.push(bytes);
+    position += count;
+  }
+  return {
+    byteLength: position,
+    content: chunks ? Buffer.concat(chunks, position) : undefined,
+    sha256: digest.digest("hex"),
+  };
+}
+
+/**
+ * The corpus worker is itself the killable filesystem boundary, so it reads
+ * exact files directly rather than creating grandchildren. This matters on
+ * Windows, where terminating the worker cannot otherwise retire a nested
+ * bound-reader process that is blocked in the kernel.
+ */
+function readTextFileInsideCorpusWorker(
+  canonicalPath: string,
+  maxBytes: number,
+  retainContent: boolean
+): { content?: Buffer; revision: BoundFileRevision } {
+  const parent = dirname(canonicalPath);
+  const parentBefore = statSync(parent, { bigint: true });
+  if (!parentBefore.isDirectory() || realpathSync(parent) !== parent) {
+    throw new CorpusLeaseChangedError("meeting corpus parent changed");
+  }
+  const lexicalBefore = lstatSync(canonicalPath, { bigint: true });
+  if (
+    lexicalBefore.isSymbolicLink() ||
+    !lexicalBefore.isFile() ||
+    BigInt(lexicalBefore.nlink) !== 1n
+  ) {
+    throw new CorpusLeaseChangedError("meeting corpus member was not a regular file");
+  }
+  const fd = openSync(
+    canonicalPath,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
+  );
+  try {
+    const openedBefore = fstatSync(fd, { bigint: true });
+    if (!openedBefore.isFile() || BigInt(openedBefore.nlink) !== 1n) {
+      throw new CorpusLeaseChangedError("meeting corpus member was not a regular file");
+    }
+    const first = scanWorkerFile(fd, maxBytes, retainContent);
+    const second = scanWorkerFile(fd, maxBytes, false);
+    const openedAfter = fstatSync(fd, { bigint: true });
+    const lexicalAfter = lstatSync(canonicalPath, { bigint: true });
+    const liveAfter = statSync(canonicalPath, { bigint: true });
+    const parentAfter = statSync(parent, { bigint: true });
+    if (
+      !openedAfter.isFile() ||
+      !lexicalAfter.isFile() ||
+      lexicalAfter.isSymbolicLink() ||
+      !liveAfter.isFile() ||
+      BigInt(openedAfter.nlink) !== 1n ||
+      BigInt(lexicalAfter.nlink) !== 1n ||
+      BigInt(liveAfter.nlink) !== 1n ||
+      realpathSync(canonicalPath) !== canonicalPath ||
+      realpathSync(parent) !== parent ||
+      metadataFingerprint(parentBefore) !== metadataFingerprint(parentAfter) ||
+      metadataFingerprint(openedBefore) !== metadataFingerprint(openedAfter) ||
+      metadataFingerprint(openedAfter) !== metadataFingerprint(lexicalAfter) ||
+      metadataFingerprint(openedAfter) !== metadataFingerprint(liveAfter) ||
+      first.byteLength !== second.byteLength ||
+      first.sha256 !== second.sha256
+    ) {
+      throw new CorpusLeaseChangedError("meeting corpus member changed during manifest read");
+    }
+    return {
+      content: first.content,
+      revision: Object.freeze({
+        byteLength: first.byteLength,
+        leafFingerprint: metadataFingerprint(openedAfter),
+        sha256: first.sha256,
+      }),
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function chargeDirectory(
   resources: TraversalResources,
   budgets: Readonly<CorpusReadBudgets>
@@ -795,7 +943,15 @@ async function collectManifest(
       const maxBytes = Math.min(budgets.maxFileBytes, remainingCorpusBytes);
       let content: Buffer | undefined;
       let revision: BoundFileRevision;
-      if (retainContent) {
+      if (corpusLeaseWorkerProcess) {
+        const read = readTextFileInsideCorpusWorker(
+          canonicalPath,
+          maxBytes,
+          retainContent
+        );
+        content = read.content;
+        revision = read.revision;
+      } else if (retainContent) {
         const read = await readTextFileWithRevisionFromBoundParent(canonicalPath, {
           maxBytes,
           maxReaders: budgets.maxReaderCount,
@@ -1145,7 +1301,7 @@ class WatchedCorpusAttempt {
  * complete in-budget manifest must also agree before return. No claim is made
  * that uncontrolled writers cannot mutate in the JS check-to-return gap.
  */
-export async function withStableCorpusLease<T>(
+async function withStableCorpusLeaseInProcess<T>(
   root: string,
   operation: (
     snapshot: StableCorpusSnapshot,
@@ -1296,5 +1452,687 @@ export async function withStableCorpusLease<T>(
     throw new Error("Access denied: stable meeting corpus authorization failed");
   } finally {
     releaseCorpusMemory(memoryReservation);
+  }
+}
+
+type WorkerControlCommand =
+  | { kind: "fail-watcher"; reason?: string }
+  | { kind: "suppress-next-fence" }
+  | { kind: "repulse-next-fence" }
+  | { kind: "fail-next-pulse" }
+  | { kind: "fail-next-sentinel-open" }
+  | { kind: "pause-next-sentinel-open"; id: number }
+  | { kind: "pause-next-fence-pending"; id: number };
+
+export type CorpusLeaseWorkerRequest = Readonly<{
+  root: string;
+  budgets: Readonly<CorpusReadBudgets>;
+  timeoutMs: number;
+  hookNames: readonly string[];
+  stallPhase?: CorpusLeaseHooks["workerStallPhaseForTest"];
+}>;
+
+export type CorpusLeaseWorkerBridge = {
+  exchange: (message: unknown) => Promise<any>;
+  pause: (id: number, reservedEvent: string) => {
+    promise: Promise<void>;
+    onReserved: () => void;
+  };
+};
+
+/** Mark this short-lived helper before it touches the caller's corpus. */
+export function markCorpusLeaseWorkerProcess(): void {
+  corpusLeaseWorkerProcess = true;
+}
+
+function applyWorkerControlCommands(
+  controls: CorpusLeaseControls,
+  commands: readonly WorkerControlCommand[],
+  bridge: CorpusLeaseWorkerBridge
+): void {
+  for (const command of commands) {
+    switch (command.kind) {
+      case "fail-watcher":
+        controls.failWatcher(command.reason);
+        break;
+      case "suppress-next-fence":
+        controls.suppressNextFence();
+        break;
+      case "repulse-next-fence":
+        controls.requireRepulseForNextFence();
+        break;
+      case "fail-next-pulse":
+        controls.failNextFencePulse();
+        break;
+      case "fail-next-sentinel-open":
+        controls.failNextSentinelOpen();
+        break;
+      case "pause-next-sentinel-open": {
+        const pause = bridge.pause(command.id, "sentinel-open-reserved");
+        controls.pauseNextSentinelOpen(pause.promise, pause.onReserved);
+        break;
+      }
+      case "pause-next-fence-pending": {
+        const pause = bridge.pause(command.id, "fence-pending");
+        controls.pauseNextFenceAfterPending(pause.promise, pause.onReserved);
+        break;
+      }
+    }
+  }
+}
+
+/** Worker-only entry point used by corpus-lease-worker.ts. */
+export async function runCorpusLeaseWorkerRequest(
+  request: CorpusLeaseWorkerRequest,
+  bridge: CorpusLeaseWorkerBridge
+): Promise<void> {
+  const namedHooks = new Set(request.hookNames);
+  const phase = async (
+    name: string,
+    context: { attempt: number; controls: CorpusLeaseControls },
+    extra?: Record<string, unknown>
+  ): Promise<void> => {
+    if (!namedHooks.has(name)) return;
+    const response = await bridge.exchange({
+      type: "phase",
+      name,
+      attempt: context.attempt,
+      ...extra,
+    });
+    if (!response || response.type !== "phase-result" || !Array.isArray(response.commands)) {
+      throw new CorpusLeaseChangedError("meeting corpus worker protocol changed");
+    }
+    applyWorkerControlCommands(context.controls, response.commands, bridge);
+  };
+  const stall = async (name: CorpusLeaseHooks["workerStallPhaseForTest"]) => {
+    if (request.stallPhase === name) await new Promise<void>(() => {});
+  };
+  const hooks: CorpusLeaseHooks = {
+    budgets: request.budgets,
+    timeoutMs: request.timeoutMs,
+    beforeSentinelCreate: namedHooks.has("beforeSentinelCreate")
+      ? async (context) => {
+          const response = await bridge.exchange({
+            type: "phase",
+            name: "beforeSentinelCreate",
+            attempt: context.attempt,
+            slot: context.slot,
+            capacity: context.capacity,
+          });
+          if (!response || response.type !== "phase-result") {
+            throw new CorpusLeaseChangedError("meeting corpus worker protocol changed");
+          }
+        }
+      : undefined,
+    onWatcherReady: async (context) => {
+      await stall("before-baseline");
+      await phase("onWatcherReady", context);
+    },
+    afterBaseline: async (context) => {
+      await phase("afterBaseline", context);
+      await stall("after-baseline");
+    },
+    beforeFinalManifest: async (context) => {
+      await phase("beforeFinalManifest", context);
+    },
+    afterFinalManifest: async (context) => {
+      await phase("afterFinalManifest", context, {
+        verification: context.verification,
+      });
+    },
+    beforeFinalFence: async (context) => {
+      await phase("beforeFinalFence", context);
+      await stall("before-authorized");
+    },
+  };
+
+  await withStableCorpusLeaseInProcess(
+    request.root,
+    async (snapshot, attempt) => {
+      const exchangeStreamMessage = async (message: unknown): Promise<void> => {
+        const response = await bridge.exchange(message);
+        if (!response || response.type !== "stream-ack") {
+          throw new CorpusLeaseChangedError(
+            "meeting corpus worker protocol changed"
+          );
+        }
+      };
+      await exchangeStreamMessage({
+        type: "snapshot-start",
+        attempt,
+        canonicalRoot: snapshot.canonicalRoot,
+        fileCount: snapshot.files.length,
+      });
+      for (const file of snapshot.files) {
+        const bytes = Buffer.from(file.content, "utf8");
+        await exchangeStreamMessage({
+          type: "file-start",
+          path: file.path,
+          relativePath: file.relativePath,
+          byteLength: bytes.byteLength,
+        });
+        for (
+          let offset = 0;
+          offset < bytes.byteLength;
+          offset += CORPUS_WORKER_CONTENT_CHUNK_BYTES
+        ) {
+          await exchangeStreamMessage({
+            type: "file-chunk",
+            content: bytes
+              .subarray(offset, offset + CORPUS_WORKER_CONTENT_CHUNK_BYTES)
+              .toString("base64"),
+          });
+        }
+        await exchangeStreamMessage({ type: "file-end" });
+      }
+      const response = await bridge.exchange({
+        type: "snapshot-end",
+      });
+      if (!response || response.type !== "finalize") {
+        throw new CorpusLeaseChangedError("meeting corpus worker protocol changed");
+      }
+      await stall("before-finalize");
+      return undefined;
+    },
+    hooks
+  );
+  await bridge.exchange({ type: "authorized" });
+}
+
+type ParentPause = {
+  onReserved?: () => void;
+  until: Promise<void>;
+};
+
+let corpusWorkerPoisoned = false;
+let activeCorpusWorkerCount = 0;
+let nextPauseId = 1;
+
+function corpusWorkerInvocation(scriptOverride?: string): {
+  binary: string;
+  args: string[];
+} {
+  if (scriptOverride) return { binary: process.execPath, args: [scriptOverride] };
+  const sourceMode = import.meta.url.endsWith(".ts");
+  const helper = fileURLToPath(
+    new URL(`./corpus-lease-worker.${sourceMode ? "ts" : "js"}`, import.meta.url)
+  );
+  if (!sourceMode) return { binary: process.execPath, args: [helper] };
+  try {
+    import.meta.resolve("tsx");
+    return { binary: process.execPath, args: ["--import", "tsx", helper] };
+  } catch {
+    const built = fileURLToPath(new URL("../dist/corpus-lease-worker.js", import.meta.url));
+    if (existsSync(built)) return { binary: process.execPath, args: [built] };
+    throw new Error("Access denied: meeting corpus worker is unavailable");
+  }
+}
+
+function killCorpusWorker(child: ChildProcess): void {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // Fall back to the direct handle during the spawn/group creation race.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // The worker may already have exited.
+  }
+}
+
+function workerHookNames(hooks: CorpusLeaseHooks): string[] {
+  return [
+    "beforeSentinelCreate",
+    "onWatcherReady",
+    "afterBaseline",
+    "beforeFinalManifest",
+    "afterFinalManifest",
+    "beforeFinalFence",
+  ].filter((name) => typeof (hooks as any)[name] === "function");
+}
+
+function parentControls(
+  commands: WorkerControlCommand[],
+  pauses: Map<number, ParentPause>
+): CorpusLeaseControls {
+  return Object.freeze({
+    failWatcher: (reason?: string) => commands.push({ kind: "fail-watcher", reason }),
+    suppressNextFence: () => commands.push({ kind: "suppress-next-fence" }),
+    requireRepulseForNextFence: () => commands.push({ kind: "repulse-next-fence" }),
+    failNextFencePulse: () => commands.push({ kind: "fail-next-pulse" }),
+    failNextSentinelOpen: () => commands.push({ kind: "fail-next-sentinel-open" }),
+    pauseNextSentinelOpen: (until: Promise<void>, onReserved?: () => void) => {
+      const id = nextPauseId++;
+      pauses.set(id, { until, onReserved });
+      commands.push({ kind: "pause-next-sentinel-open", id });
+    },
+    pauseNextFenceAfterPending: (until: Promise<void>, onPending?: () => void) => {
+      const id = nextPauseId++;
+      pauses.set(id, { until, onReserved: onPending });
+      commands.push({ kind: "pause-next-fence-pending", id });
+    },
+  });
+}
+
+/**
+ * Run a multi-source projection while a killable worker owns every corpus
+ * traversal, exact read, watcher, fence, and cleanup filesystem operation.
+ */
+export async function withStableCorpusLease<T>(
+  root: string,
+  operation: (
+    snapshot: StableCorpusSnapshot,
+    attempt: number,
+    signal: AbortSignal
+  ) => T | Promise<T>,
+  hooks: CorpusLeaseHooks = {}
+): Promise<T> {
+  // This reservation hook is a deterministic in-process concurrency probe.
+  // Production call sites never provide it; keeping it local preserves its
+  // atomic process-global observations without weakening production reads.
+  if (hooks.beforeSentinelCreate) {
+    return withStableCorpusLeaseInProcess(root, operation, hooks);
+  }
+  if (corpusWorkerPoisoned) {
+    throw new Error("Access denied: meeting corpus worker requires a process restart");
+  }
+  const budgets = resolveCorpusReadBudgets(hooks.budgets);
+  const deadline = authorizationDeadline(hooks.timeoutMs);
+  const timeoutMs = remainingAuthorizationMs(deadline);
+  const invocation = corpusWorkerInvocation(hooks.workerScriptForTest);
+  const reservation = reserveCorpusMemory(budgets);
+  const workerLimit = Math.min(MAX_ACTIVE_WATCHERS, budgets.maxWatcherCount);
+  if (activeCorpusWorkerCount >= workerLimit) {
+    releaseCorpusMemory(reservation);
+    throw new Error("Access denied: stable meeting corpus authorization failed");
+  }
+  activeCorpusWorkerCount += 1;
+  const pauses = new Map<number, ParentPause>();
+  const operationAbort = new AbortController();
+  let operationResult!: T;
+  let operationCompleted = false;
+  let operationActive = false;
+  let operationTermination: Promise<void> = Promise.resolve();
+  let lastAttempt = 0;
+  let authorized = false;
+  let settled = false;
+  let terminated = false;
+  let protocolBytes = 0;
+  let stdout = "";
+  let protocolMessagePending = false;
+  let protocolQueue: Promise<void> = Promise.resolve();
+  let releaseReservation = true;
+  let releaseWorkerAdmission = true;
+
+  const child = spawn(invocation.binary, invocation.args, {
+    detached: process.platform !== "win32",
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    env: { ...process.env },
+  });
+  child.stderr?.resume();
+  let resolveTermination!: () => void;
+  const termination = new Promise<void>((resolve) => {
+    resolveTermination = resolve;
+  });
+  child.once("close", () => {
+    terminated = true;
+    resolveTermination();
+  });
+
+  const send = (message: unknown): void => {
+    const serialized = JSON.stringify(message);
+    if (Buffer.byteLength(serialized) > CORPUS_WORKER_PROTOCOL_MAX_BYTES || !child.stdin) {
+      throw new CorpusLeaseBudgetError("meeting corpus worker protocol exceeded its budget");
+    }
+    child.stdin.write(serialized + "\n");
+  };
+
+  try {
+    const result = await new Promise<T>((resolve, reject) => {
+      const fail = (message: string): void => {
+        if (settled) return;
+        settled = true;
+        operationAbort.abort(new CorpusLeaseChangedError(message));
+        killCorpusWorker(child);
+        reject(new Error("Access denied: stable meeting corpus authorization failed"));
+      };
+      const timer = setTimeout(
+        () => fail("meeting corpus authorization deadline elapsed"),
+        remainingAuthorizationMs(deadline)
+      );
+      timer.unref();
+      child.once("error", () => fail("meeting corpus worker failed"));
+      child.once("close", (code) => {
+        clearTimeout(timer);
+        if (settled) return;
+        if (code !== 0 || !authorized || !operationCompleted) {
+          fail("meeting corpus worker exited before authorization");
+          return;
+        }
+        settled = true;
+        resolve(operationResult);
+      });
+      type StreamFile = {
+        bytes: Buffer;
+        offset: number;
+        path: string;
+        relativePath: string;
+      };
+      type SnapshotStream = {
+        attempt: number;
+        canonicalRoot: string;
+        expectedFileCount: number;
+        files: StableCorpusFile[];
+        current?: StreamFile;
+        retainedBytes: number;
+        retainedPathBytes: number;
+      };
+      let stream: SnapshotStream | undefined;
+      const streamAck = (): void => send({ type: "stream-ack" });
+      const handleProtocolLine = async (line: string): Promise<void> => {
+        if (settled) return;
+        let message: any;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          fail("meeting corpus worker protocol was invalid");
+          return;
+        }
+        if (message?.type === "phase") {
+          const attempt = Number(message.attempt);
+          const hook = (hooks as any)[message.name];
+          if (
+            stream ||
+            authorized ||
+            !Number.isSafeInteger(attempt) ||
+            attempt < Math.max(1, lastAttempt) ||
+            attempt > lastAttempt + 1 ||
+            typeof hook !== "function"
+          ) {
+            fail("meeting corpus worker phase protocol was invalid");
+            return;
+          }
+          const commands: WorkerControlCommand[] = [];
+          const context: any = {
+            attempt,
+            controls: parentControls(commands, pauses),
+          };
+          if (message.capacity) context.capacity = Object.freeze(message.capacity);
+          if (message.slot !== undefined) context.slot = message.slot;
+          if (message.verification) {
+            context.verification = Object.freeze(message.verification);
+          }
+          await hook(Object.freeze(context));
+          send({ type: "phase-result", commands });
+          return;
+        }
+        if (
+          message?.type === "sentinel-open-reserved" ||
+          message?.type === "fence-pending"
+        ) {
+          if (stream || authorized) {
+            fail("meeting corpus worker pause protocol was invalid");
+            return;
+          }
+          const pause = pauses.get(message.id);
+          if (!pause) {
+            fail("meeting corpus worker pause protocol was invalid");
+            return;
+          }
+          pause.onReserved?.();
+          await pause.until;
+          pauses.delete(message.id);
+          send({ type: "resume", id: message.id });
+          return;
+        }
+        if (message?.type === "snapshot-start") {
+          const attempt = Number(message.attempt);
+          const fileCount = Number(message.fileCount);
+          if (
+            stream ||
+            authorized ||
+            !operationCompleted && lastAttempt > 0 ||
+            !Number.isSafeInteger(attempt) ||
+            attempt !== lastAttempt + 1 ||
+            typeof message.canonicalRoot !== "string" ||
+            !Number.isSafeInteger(fileCount) ||
+            fileCount < 0 ||
+            fileCount > budgets.maxFileCount
+          ) {
+            fail("meeting corpus worker snapshot protocol was invalid");
+            return;
+          }
+          const rootBytes = Buffer.byteLength(message.canonicalRoot);
+          if (rootBytes > budgets.maxRetainedPathBytes) {
+            fail("meeting corpus worker snapshot protocol exceeded its budget");
+            return;
+          }
+          lastAttempt = attempt;
+          operationCompleted = false;
+          stream = {
+            attempt,
+            canonicalRoot: message.canonicalRoot,
+            expectedFileCount: fileCount,
+            files: [],
+            retainedBytes: 0,
+            retainedPathBytes: rootBytes,
+          };
+          streamAck();
+          return;
+        }
+        if (message?.type === "file-start") {
+          const byteLength = Number(message.byteLength);
+          if (
+            !stream ||
+            stream.current ||
+            stream.files.length >= stream.expectedFileCount ||
+            typeof message.path !== "string" ||
+            typeof message.relativePath !== "string" ||
+            !Number.isSafeInteger(byteLength) ||
+            byteLength < 0 ||
+            byteLength > budgets.maxFileBytes ||
+            stream.retainedBytes > budgets.maxCorpusBytes - byteLength
+          ) {
+            fail("meeting corpus worker file protocol was invalid");
+            return;
+          }
+          const pathBytes =
+            Buffer.byteLength(message.path) +
+            Buffer.byteLength(message.relativePath);
+          if (
+            stream.retainedPathBytes >
+            budgets.maxRetainedPathBytes - pathBytes
+          ) {
+            fail("meeting corpus worker file protocol exceeded its budget");
+            return;
+          }
+          stream.retainedBytes += byteLength;
+          stream.retainedPathBytes += pathBytes;
+          stream.current = {
+            bytes: Buffer.allocUnsafe(byteLength),
+            offset: 0,
+            path: message.path,
+            relativePath: message.relativePath,
+          };
+          streamAck();
+          return;
+        }
+        if (message?.type === "file-chunk") {
+          if (!stream?.current || typeof message.content !== "string") {
+            fail("meeting corpus worker file protocol was invalid");
+            return;
+          }
+          const bytes = Buffer.from(message.content, "base64");
+          if (
+            bytes.byteLength < 1 ||
+            bytes.byteLength > CORPUS_WORKER_CONTENT_CHUNK_BYTES ||
+            bytes.toString("base64") !== message.content ||
+            stream.current.offset >
+              stream.current.bytes.byteLength - bytes.byteLength
+          ) {
+            fail("meeting corpus worker file protocol was invalid");
+            return;
+          }
+          bytes.copy(stream.current.bytes, stream.current.offset);
+          stream.current.offset += bytes.byteLength;
+          streamAck();
+          return;
+        }
+        if (message?.type === "file-end") {
+          if (
+            !stream?.current ||
+            stream.current.offset !== stream.current.bytes.byteLength
+          ) {
+            fail("meeting corpus worker file protocol was invalid");
+            return;
+          }
+          const current = stream.current;
+          stream.current = undefined;
+          stream.files.push(
+            Object.freeze({
+              path: current.path,
+              relativePath: current.relativePath,
+              content: decodePolicyUtf8(current.bytes),
+            })
+          );
+          streamAck();
+          return;
+        }
+        if (message?.type === "snapshot-end") {
+          if (
+            !stream ||
+            stream.current ||
+            stream.files.length !== stream.expectedFileCount
+          ) {
+            fail("meeting corpus worker snapshot protocol was invalid");
+            return;
+          }
+          const completedStream = stream;
+          stream = undefined;
+          const snapshot: StableCorpusSnapshot = Object.freeze({
+            canonicalRoot: completedStream.canonicalRoot,
+            files: Object.freeze(completedStream.files),
+          });
+          operationActive = true;
+          let resolveOperationTermination!: () => void;
+          operationTermination = new Promise<void>((resolve) => {
+            resolveOperationTermination = resolve;
+          });
+          try {
+            operationResult = await operation(
+              snapshot,
+              completedStream.attempt,
+              operationAbort.signal
+            );
+          } finally {
+            operationActive = false;
+            resolveOperationTermination();
+          }
+          operationCompleted = true;
+          send({ type: "finalize" });
+          return;
+        }
+        if (message?.type === "authorized") {
+          if (stream || !operationCompleted || authorized || lastAttempt < 1) {
+            fail("meeting corpus worker authorization protocol was invalid");
+            return;
+          }
+          authorized = true;
+          send({ type: "acknowledged" });
+          return;
+        }
+        fail("meeting corpus worker protocol was invalid");
+      };
+      child.stdout?.setEncoding("utf8");
+      child.stdout?.on("data", (chunk: string) => {
+        if (settled) return;
+        // The worker must await one response for every outbound line. Reject a
+        // second complete or partial line while dispatch is pending so no two
+        // async handlers can observe or advance protocol state concurrently.
+        if (protocolMessagePending) {
+          fail("meeting corpus worker protocol was not paced");
+          return;
+        }
+        stdout += chunk;
+        protocolBytes = Buffer.byteLength(stdout);
+        if (protocolBytes > CORPUS_WORKER_PROTOCOL_MAX_BYTES) {
+          fail("meeting corpus worker protocol exceeded its budget");
+          return;
+        }
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) return;
+        if (newline !== stdout.length - 1) {
+          fail("meeting corpus worker protocol was not paced");
+          return;
+        }
+        const line = stdout.slice(0, newline);
+        stdout = "";
+        protocolBytes = 0;
+        protocolMessagePending = true;
+        protocolQueue = protocolQueue
+          .then(() => handleProtocolLine(line))
+          .catch(() => fail("meeting corpus worker phase failed"))
+          .finally(() => {
+            protocolMessagePending = false;
+          });
+      });
+      try {
+        send({
+          type: "begin",
+          request: {
+            root,
+            budgets,
+            timeoutMs,
+            hookNames: workerHookNames(hooks),
+            stallPhase: hooks.workerStallPhaseForTest,
+          } satisfies CorpusLeaseWorkerRequest,
+        });
+      } catch {
+        fail("meeting corpus worker request was invalid");
+      }
+    });
+    return result;
+  } finally {
+    if (!terminated) {
+      killCorpusWorker(child);
+      const confirmed = await Promise.race([
+        termination.then(() => true),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), CORPUS_WORKER_TERMINATION_GRACE_MS);
+          timer.unref();
+        }),
+      ]);
+      if (!confirmed) {
+        corpusWorkerPoisoned = true;
+        releaseReservation = false;
+        releaseWorkerAdmission = false;
+      }
+    }
+    if (operationActive) {
+      const operationConfirmed = await Promise.race([
+        operationTermination.then(() => true),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(
+            () => resolve(false),
+            CORPUS_OPERATION_TERMINATION_GRACE_MS
+          );
+          timer.unref();
+        }),
+      ]);
+      if (!operationConfirmed) {
+        corpusWorkerPoisoned = true;
+        releaseReservation = false;
+        releaseWorkerAdmission = false;
+      }
+    }
+    if (releaseWorkerAdmission) {
+      activeCorpusWorkerCount = Math.max(0, activeCorpusWorkerCount - 1);
+    }
+    if (releaseReservation) releaseCorpusMemory(reservation);
   }
 }

@@ -7029,13 +7029,55 @@
       }
     }
 
+    let proactiveContextLoadedAt = 0;
+    let proactiveContextLoadPromise = null;
+    let proactiveContextLoadGeneration = -1;
+    let proactiveContextGeneration = 0;
     async function loadProactiveContextBundle() {
-      try {
-        proactiveContextBundle = await invoke('cmd_proactive_context_bundle');
-      } catch (e) {
-        console.error('Proactive context bundle:', e);
-        proactiveContextBundle = null;
+      const now = Date.now();
+      if (proactiveContextBundle && now - proactiveContextLoadedAt < 60_000) {
+        return proactiveContextBundle;
       }
+      if (proactiveContextLoadPromise) {
+        const inFlight = proactiveContextLoadPromise;
+        if (proactiveContextLoadGeneration === proactiveContextGeneration) {
+          return inFlight;
+        }
+        await inFlight;
+        return loadProactiveContextBundle();
+      }
+      const generation = proactiveContextGeneration;
+      const loadPromise = (async () => {
+        try {
+          const bundle = await invoke('cmd_proactive_context_bundle');
+          if (generation === proactiveContextGeneration) {
+            proactiveContextBundle = bundle;
+            proactiveContextLoadedAt = Date.now();
+          }
+        } catch (e) {
+          console.error('Proactive context bundle:', e);
+          if (generation === proactiveContextGeneration) {
+            proactiveContextBundle = null;
+          }
+        }
+        return proactiveContextBundle;
+      })();
+      proactiveContextLoadPromise = loadPromise;
+      proactiveContextLoadGeneration = generation;
+      try {
+        return await loadPromise;
+      } finally {
+        if (proactiveContextLoadPromise === loadPromise) {
+          proactiveContextLoadPromise = null;
+          proactiveContextLoadGeneration = -1;
+        }
+      }
+    }
+
+    function invalidateProactiveContextBundle() {
+      proactiveContextGeneration += 1;
+      proactiveContextBundle = null;
+      proactiveContextLoadedAt = 0;
     }
 
     function appendProactiveContextCard() {
@@ -9897,21 +9939,64 @@
       }
     }
 
+    let meetingInventoryGeneration = 0;
+    let meetingInventoryRetryTimer = null;
+    let meetingInventoryFingerprint = null;
+
+    function fingerprintMeetingInventory(meetings) {
+      return JSON.stringify(meetings.map((meeting) => [
+        meeting.path || '',
+        meeting.title || '',
+        meeting.date || '',
+        meeting.content_type || '',
+      ]));
+    }
+
+    function isPrivateProjectionCapacityError(error) {
+      const message = String(error || '').toLowerCase();
+      return message.includes('private') &&
+        message.includes('projection') &&
+        (message.includes('capacity') || message.includes('already active'));
+    }
+
+    function scheduleMeetingInventoryRetry() {
+      if (meetingInventoryRetryTimer) return;
+      meetingInventoryRetryTimer = setTimeout(() => {
+        meetingInventoryRetryTimer = null;
+        loadMeetings();
+      }, 250);
+    }
+
     async function loadMeetings() {
       if (documentsViewActive) {
         await loadDocuments();
         return;
       }
+      const generation = ++meetingInventoryGeneration;
       let meetings = [];
       try {
         meetings = await withUiDeadline(
           invoke('cmd_list_meetings', { limit: 30 }),
           'Meeting inventory'
         );
+        if (generation !== meetingInventoryGeneration) return;
+        const nextFingerprint = fingerprintMeetingInventory(meetings);
+        if (meetingInventoryFingerprint !== null && meetingInventoryFingerprint !== nextFingerprint) {
+          invalidateProactiveContextBundle();
+        }
+        meetingInventoryFingerprint = nextFingerprint;
         setSearchError(null);
         renderMeetings(meetings);
       } catch (e) {
+        if (generation !== meetingInventoryGeneration) return;
         console.error('Load:', e);
+        if (isPrivateProjectionCapacityError(e)) {
+          // Ambient graph work is optional. If it briefly owns the shared
+          // private-projection budget, preserve the already-rendered primary
+          // inventory and retry instead of flashing an empty or error state.
+          scheduleMeetingInventoryRetry();
+          return;
+        }
         setSearchError(e);
         renderMeetings([]);
         return;
@@ -9922,7 +10007,11 @@
       // never gated on it. (It was previously awaited *before* the list — the
       // dominant cause of the blank window at startup.)
       loadProactiveContextBundle()
-        .then(() => { if (!documentsViewActive) renderMeetings(meetings); })
+        .then(() => {
+          if (!documentsViewActive && generation === meetingInventoryGeneration) {
+            renderMeetings(meetings);
+          }
+        })
         .catch((e) => console.error('Proactive bundle:', e));
     }
 
@@ -9953,6 +10042,10 @@
           await refreshOpenMeetingDetail();
         } catch (e) {
           console.error('Search refresh:', e);
+          if (isPrivateProjectionCapacityError(e)) {
+            scheduleMeetingsRefresh(250);
+            return;
+          }
           setSearchError(e);
         }
         return;
@@ -9997,6 +10090,14 @@
         } catch (e) {
           if (reqId !== searchRequestId) return;
           console.error('Search:', e);
+          if (isPrivateProjectionCapacityError(e)) {
+            searchTimeout = setTimeout(() => {
+              if (reqId === searchRequestId && activeSearchQuery === query) {
+                searchInput.dispatchEvent(new Event('input'));
+              }
+            }, 250);
+            return;
+          }
           setSearchError(e);
         }
       }, 80);

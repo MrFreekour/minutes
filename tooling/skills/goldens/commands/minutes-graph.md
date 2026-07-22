@@ -1,5 +1,5 @@
 ---
-description: Policy-safe relationship intelligence across normal meeting history. Use for top contacts, relationship summaries, commitments, losing-touch signals, person profiles, topic research, or questions about people across meetings. Always use Minutes' native CLI projections; never build or read a durable graph cache.
+description: Policy-safe relationship rankings, commitments, aliases, person profiles, and topic research. Always use Minutes' bounded native CLI surfaces; never build or read a durable graph cache.
 ---
 
 Load the `minutes-graph` skill and follow it exactly for this request.

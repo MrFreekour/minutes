@@ -1,6 +1,6 @@
 # CLAUDE.md — Minutes
 
-> Your AI remembers every conversation you've had.
+> Your AI remembers the conversations you authorize.
 
 ## Project Overview
 

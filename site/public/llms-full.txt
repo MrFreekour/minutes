@@ -6,17 +6,17 @@
 
 ## Product
 
-Minutes is the private, owned conversation-memory layer. Record meetings, voice memos, and dictation; transcribe them on your own machine; and get structured markdown in `~/meetings/` that Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi, and any MCP-compatible client read from the same folder — no proprietary SDK, no API key. Nothing is uploaded: when a cloud memory tool gets acquired or subpoenaed, your recordings aren't theirs to hand over. No vendor to outlive — ten years from now, `grep` still works on your corpus.
+Minutes is the private, owned conversation-memory layer. Record meetings, voice memos, and dictation; transcribe them on your own machine; and get structured markdown in `~/meetings/` that policy-aware local tools expose to Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi, and MCP-compatible clients — no proprietary SDK, no API key. Restricted meetings are excluded from agent results by default; explicit access requires a trusted launch policy, a per-call request, and a durable audit record. Minutes never uploads your audio; meeting text leaves your device only when you explicitly send policy-authorized context to a connected cloud agent or summarizer. When a cloud memory tool gets acquired or subpoenaed, your recordings aren't theirs to hand over. No vendor to outlive — ten years from now, `grep` still works on your corpus.
 
 33 tools • 11 resources • Interactive MCP App dashboard • 6 prompt templates
 
 What you get:
 • On-device transcription with sealed local whisper.cpp and optional on-device summarization (Apple Foundation Models on macOS 26+) — your audio never leaves the machine. Retained Parakeet and Apple Speech preferences resolve to Whisper until those helpers support secure byte transport.
-• A native chat panel that recalls your meetings, with token streaming and read-only search of your own corpus.
+• A native chat panel that recalls policy-authorized meetings, with token streaming and read-only policy-bound search.
 • Dictation that types straight at your cursor, on the same local engine.
 • Live sessions that promote into diarized, summarized meetings when you stop.
 • Consent provenance in every file, and sensitivity gating agents must respect.
-• Diarized speaker labels, structured action items and decisions, and policy-safe search over owned markdown. The cross-meeting relationship graph is temporarily unavailable while its privacy-safe bounded rebuild is completed (roadmap issue #513); compatibility-only derived insight and annotation reads fail explicitly until their source provenance can be revalidated.
+• Diarized speaker labels, structured action items and decisions, and policy-safe search over owned markdown. Cross-meeting relationship answers are rebuilt from bounded live policy-authorized snapshots; compatibility-only derived insight and annotation reads still fail explicitly until their source provenance can be revalidated.
 
 ## Choose your surface
 
@@ -44,7 +44,7 @@ What you get:
   - When: User wants a menu bar app with one-click recording, Recall, and artifact drafting.
   - Install: `brew install --cask silverstein/tap/minutes`
   - Best for: Best for first recording, live capture, and post-meeting artifact work.
-  - Notes: Tauri v2, macOS only today. Includes command palette, dictation hotkey, live mode toggle, and auto-updates from GitHub Releases.
+  - Notes: Tauri v2, macOS only today. Includes command palette, dictation hotkey, and live mode toggle. Updates remain manual until a hosted manifest and rollback UX exist.
 
 ## Canonical entry points
 
@@ -79,7 +79,7 @@ What you get:
 - `start_dictation` — Start dictation mode — speech to clipboard and daily notes Docs: https://useminutes.app/docs/mcp/tools#tool-start-dictation
 - `stop_dictation` — Stop dictation mode Docs: https://useminutes.app/docs/mcp/tools#tool-stop-dictation
 - `track_commitments` — List open and stale commitments, optionally filtered by person Docs: https://useminutes.app/docs/mcp/tools#tool-track-commitments
-- `relationship_map` — Temporarily unavailable while the privacy-safe relationship graph is rebuilt; see roadmap issue #513 Docs: https://useminutes.app/docs/mcp/tools#tool-relationship-map
+- `relationship_map` — Rank relationships from the bounded process-private policy-safe graph projection Docs: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 - `list_voices` — List enrolled voice profiles for speaker identification Docs: https://useminutes.app/docs/mcp/tools#tool-list-voices
 - `confirm_speaker` — Compatibility name only: agent-controlled speaker mutation is unavailable; use the Minutes app or human CLI Docs: https://useminutes.app/docs/mcp/tools#tool-confirm-speaker
 - `get_meeting_insights` — Compatibility name only: unavailable until derived insight records carry live-verifiable canonical source policy provenance Docs: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
@@ -163,8 +163,8 @@ Workflow-level skills that wrap MCP tools into operator motions. Install in Clau
 
 ### Intelligence
 
-- `/minutes-graph` — Build a bounded person profile or research a topic; report graph-only requests unavailable with roadmap issue 513.
-  - Description: Bounded person profiles and topic research; graph rankings and commitments are temporarily unavailable.
+- `/minutes-graph` — Rank relationships, inspect commitments, confirm aliases, build a person profile, or research a topic.
+  - Description: Bounded policy-safe relationship intelligence from owned meeting history.
   - Example: `/minutes-graph profile Alex from my normal meeting history`
   - Docs: https://useminutes.app/for-agents#minutes-graph
 

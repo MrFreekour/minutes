@@ -37,7 +37,7 @@ Do not route Coach through the transcript JSONL, change final-event production, 
 
 `CopilotRequest::trusted_system_prompt` and `StrategyRequest::system_prompt` contain policy only. Goals, transcript strings, battle-card history, and strategy state are encoded into delimited JSON user messages. Keep this role split when adding a provider. Provider request types intentionally have no tools field and `CopilotModel` has no tool-execution method.
 
-`BattleCard::assemble` rebuilds the graph before use and relies on the default restricted-history exclusion for graph, structured intent/decision, and FTS sources. It fails closed rather than reading a stale graph. Never add an `include_restricted` control to Coach.
+`BattleCard::assemble` materializes people and commitments together from one bounded, process-private graph projection, then reads the other policy-authorized sources. It fails closed rather than reading a stale durable graph. Never add an `include_restricted` control to Coach.
 
 The HUD consumes only the versioned `Nudge`; it must not receive a request, battle card, or strategy snapshot. Native Coach windows request screen-share content protection. macOS and Windows can honor it; Linux must show the warning returned by `evaluate_copilot_window_contract` because the compositor owns the final guarantee.
 

@@ -92,7 +92,7 @@ If no conflicts and no stale commitments, say: "No decision conflicts or stale c
 
 - If there are decision conflicts: suggest running `/minutes-debrief` on the most recent conflicting meeting, or `/minutes-search "{topic}"` to review the full decision history
 - If there are stale commitments: suggest the user update the action item status in the meeting file, or bring it up in the next meeting with that person
-- Relationship-graph commitments are temporarily unavailable; link [issue #513](https://github.com/silverstein/minutes/issues/513) instead of suggesting `minutes commitments`
+- Relationship-graph commitments come from `minutes commitments --json`; treat a nonzero exit as unavailable, never empty
 
 ## Gotchas
 

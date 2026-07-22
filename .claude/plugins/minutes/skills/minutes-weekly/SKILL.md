@@ -6,7 +6,9 @@ user_invocable: true
 
 # /minutes-weekly
 
-Synthesize an entire week of meetings and voice memos into a forward-looking brief — themes, decision arcs, stale commitments, and what deserves attention Monday.
+Synthesize a week of policy-authorized normal meetings and voice memos into a
+forward-looking brief — themes, decision arcs, stale commitments, and what
+deserves attention Monday. Restricted history is excluded by default.
 
 ## How it works
 
@@ -63,7 +65,7 @@ Present as:
 
 ### Phase 3: Decision evolution arcs
 
-For every decision made this week, search for prior decisions on the same topic in the last 30 days:
+For every decision found in the authorized normal sources this week, search for prior normal-source decisions on the same topic in the last 30 days:
 
 ```bash
 minutes search "<topic>" --since <30-days-ago> --limit 20
@@ -116,7 +118,7 @@ Flag overdue items prominently:
 
 ### Phase 4b: Relationship intelligence
 
-Skip the relationship-graph phase while its privacy-safe bounded rebuild is in progress. `minutes people` and `minutes commitments` fail explicitly; that means unavailable, never “no relationships” or “no commitments.” Track the rebuild in [issue #513](https://github.com/silverstein/minutes/issues/513). Continue using source-backed actions and consistency results from the surrounding phases.
+Run `minutes people --json` and `minutes commitments --json` for bounded relationship intelligence. Require exit status 0 from each; a projection failure means unavailable, never “no relationships” or “no commitments.” Continue using source-backed actions and consistency results from the surrounding phases.
 
 ### Phase 5: Unresolved preps
 

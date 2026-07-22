@@ -4,7 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/silverstein/minutes/blob/main/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/silverstein/minutes?style=social)](https://github.com/silverstein/minutes)
 
-**Open-source conversation memory for AI assistants.** Record meetings, capture voice memos, search everything — your AI remembers every conversation you've had.
+**Open-source conversation memory for AI assistants.** Record meetings, capture
+voice memos, and search policy-authorized history while keeping restricted
+conversations out of agent results by default.
 
 [Website](https://useminutes.app) | [GitHub](https://github.com/silverstein/minutes) | [MCP Server](https://www.npmjs.com/package/minutes-mcp) | [Desktop App](https://github.com/silverstein/minutes/releases)
 
@@ -36,8 +38,8 @@ minutes actions               # Open action items
 - **Transcribe** locally with whisper.cpp (Apple Silicon optimized)
 - **Diarize** speakers with pyannote-rs (native Rust, no Python)
 - **Extract** action items, decisions, and people into structured YAML frontmatter
-- **Search** across all conversations by keyword, person, or topic
-- **Track** commitments and relationships across meetings
+- **Search** normal conversations by keyword, person, or topic; restricted access requires an explicit audited override
+- **Build** bounded process-private relationship rankings, commitments, person profiles, aliases, and topic research
 - **Sync** voice memos from your phone via iCloud/Dropbox/any folder sync
 - **Integrate** with Claude, Cursor, Windsurf, Obsidian via MCP
 
@@ -50,8 +52,8 @@ minutes actions               # Open action items
 | `minutes process <file>` | Transcribe an audio file |
 | `minutes search <query>` | Full-text search across meetings |
 | `minutes actions` | List open action items |
-| `minutes people` | Relationship intelligence |
-| `minutes commitments` | Track what you promised who |
+| `minutes people` | Rank relationships and surface losing-touch signals from an ephemeral policy-safe projection |
+| `minutes commitments` | Query commitments from an ephemeral policy-safe projection |
 | `minutes watch` | Auto-process voice memos from a folder |
 | `minutes dictate` | Speak-to-text (clipboard + daily note) |
 | `minutes health` | System diagnostics |

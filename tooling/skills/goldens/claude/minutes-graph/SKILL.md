@@ -1,12 +1,12 @@
 ---
 name: minutes-graph
-description: Policy-safe relationship intelligence across normal meeting history. Use for top contacts, relationship summaries, commitments, losing-touch signals, person profiles, topic research, or questions about people across meetings. Always use Minutes' native CLI projections; never build or read a durable graph cache.
+description: Policy-safe relationship rankings, commitments, aliases, person profiles, and topic research. Always use Minutes' bounded native CLI surfaces; never build or read a durable graph cache.
 user_invocable: true
 ---
 
 # /minutes-graph
 
-Use Minutes' native, process-private relationship projection. It rebuilds from stable live Markdown, excludes restricted or policy-uncertain meetings, and revalidates the corpus before returning an answer. It does not retain a graph database or JSON index.
+Minutes builds relationship rankings and graph commitments from a bounded, process-private SQLite projection of stable policy-authorized Markdown. Person profiles and topic research use the separately bounded live-source search boundary. Both paths re-attest policy before returning facts. Do not fall back to a retired durable index or read meeting files directly.
 
 ## Privacy boundary
 
@@ -14,37 +14,31 @@ Use Minutes' native, process-private relationship projection. It rebuilds from s
 - Never run `graph_build.py` or read `~/.minutes/graph/index.json`; those are retired legacy surfaces.
 - Never create a replacement graph cache, spreadsheet, JSON file, or database.
 - Never pass `--include-restricted`. Restricted meetings are intentionally absent from this agent-facing skill.
-- Treat an unavailable or resource-budget error as a hard stop. Do not fall back to filesystem reads.
+- Treat any authorization, resource-budget, correction-race, or projection error as a hard stop. Do not fall back to filesystem reads.
 
-## Choose the native command
+## Available commands
 
-| User intent | Command |
-|---|---|
-| Top contacts, relationship scores, losing-touch signals, top topics | `minutes people --json --limit 50` |
-| One person's profile and recent history | `minutes person "<name>"` |
-| Open or stale commitments | `minutes commitments --json` |
-| Commitments for one person | `minutes commitments --person "<name>" --json` |
-| Topic or question across normal meetings | `minutes research "<query>"` |
-| Topic scoped to one attendee | `minutes research "<query>" --attendee "<name>"` |
-
-Run the narrowest command that answers the question. Parse its stdout as the returned JSON where applicable; do not inspect stderr for meeting content.
+- `minutes people --json` — bounded relationship rankings and losing-touch signals.
+- `minutes commitments --json` — bounded graph commitments.
+- `minutes people merge <canonical> <alias...>` — confirm an identity correction in the local vocabulary; uncertain names are never merged automatically.
+- `minutes person "<name>"` — bounded person profile.
+- `minutes research "<topic>"` — bounded topic research.
 
 ## Workflow
 
-1. Restate the scope in one short phrase when ambiguity matters, such as “normal meetings only.”
-2. Run one native command from the table.
-3. Rank or filter the returned objects in memory for this response only.
-4. Cite the meeting titles/dates supplied by the command. Do not open the source paths.
-5. If the native command cannot answer a cross-entity/co-occurrence question, say that the safe graph surface does not currently expose that relationship. Offer the nearest supported `people`, `person`, `commitments`, or `research` view; do not synthesize a durable index.
+1. Classify the request and use the narrowest command above.
+2. Require exit status 0. Use only the bounded native result and never substitute filesystem reads.
+3. For a proposed alias, show the suggestion and ask for confirmation before running `minutes people merge`; a wrong merge is worse than no merge.
+4. Do not imply that restricted history or a relationship fact is absent when any command fails.
 
 ## Output
 
-Prefer a compact table for ranked people or commitments. Explain signals such as `losing_touch`, `meeting_count`, `top_topics`, and `open_commitments` in plain language. Do not imply that omitted restricted meetings do not exist; say the result covers the normal meeting corpus available to the agent.
+Return only the bounded native result. Never invent rankings, commitments, or relationship signals from raw files.
 
 ## Gotchas
 
-- A missing person may be absent, named differently, or present only in restricted history. Report “not available in the normal meeting graph,” not “never met.”
-- Relationship and commitment answers are live projections, so a later sensitivity change can intentionally remove prior results.
-- Name-merge suggestions are suggestions only. Never rewrite or merge identities without the user's explicit confirmation.
-- Company/product deep extraction is not available through this skill because it would require reading and retaining raw corpus content outside the native policy boundary.
+- A failed person profile cannot be interpreted as “never met.” Report the source unavailable.
+- Do not imply that a later sensitivity change proves a historical fact absent; report only the current authorized projection.
+- Alias suggestions are evidence, not permission to rewrite identity. Require explicit confirmation before merging.
+- Use `minutes research "<topic>"` for bounded company, product, or topic research. If it fails, report the source unavailable; never fall back to raw corpus reads.
 

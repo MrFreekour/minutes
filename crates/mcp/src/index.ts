@@ -19,7 +19,7 @@
  *   - consistency_report: Flag conflicting decisions and stale commitments
  *   - get_person_profile: Policy-authorized live profile for a person
  *   - track_commitments: Live open/stale action and intent commitments
- *   - relationship_map: Temporarily unavailable pending privacy-safe graph rebuild (#513)
+ *   - relationship_map: bounded process-private policy-fresh core projection
  *   - research_topic: Cross-meeting topic research
  *   - list_voices: List enrolled voice profiles for speaker identification
  *   - confirm_speaker: Compatibility registration; directs humans to the app/CLI
@@ -208,8 +208,8 @@ export const MCP_INTENT_RESULT_MAX = 50;
 export const MCP_PERSON_PROFILE_MEETING_MAX = 50;
 export const MCP_PERSON_PROFILE_OPEN_ACTION_MAX = 50;
 export const MCP_PERSON_PROFILE_TOPIC_MAX = 50;
+export const MCP_PERSON_PROFILE_DECISION_MAX = 50;
 export const MCP_RELATIONSHIP_RESULT_MAX = 50;
-export const MCP_RELATIONSHIP_CANDIDATE_MAX = 5_000;
 export const MCP_PROCESSING_JOB_RESULT_MAX = 50;
 export const MCP_RESEARCH_MEETING_RESULT_MAX = 20;
 export const MCP_RESEARCH_DECISION_RESULT_MAX = 50;
@@ -1233,13 +1233,34 @@ function meetingMatchesPerson(meeting: PolicyVerifiedMeeting, person?: string): 
   return people.some((entry) => entry.trim().toLowerCase().includes(needle));
 }
 
+function normalizedPersonSelector(value?: string): string {
+  return (value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function personSelectorSlug(value?: string): string {
+  return normalizedPersonSelector(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function ownerMatchesExactSelector(owner: string | undefined, selector: string | undefined): boolean {
+  const normalizedSelector = normalizedPersonSelector(selector);
+  if (!normalizedSelector) return true;
+  const normalizedOwner = normalizedPersonSelector(owner);
+  return normalizedOwner === normalizedSelector
+    || personSelectorSlug(owner) === personSelectorSlug(selector);
+}
+
 export function policyIntentResults(
   meetings: PolicyVerifiedMeeting[],
   query: string,
   intentKind?: string,
   owner?: string,
   limit: number = MCP_INTENT_RESULT_MAX,
-  statuses?: ReadonlySet<string>
+  statuses?: ReadonlySet<string>,
+  includeMeetingTitleInQuery = true
 ): PolicyIntentResult[] {
   const boundedLimit = normalizeMcpResultLimit(
     limit,
@@ -1260,8 +1281,11 @@ export function policyIntentResults(
   ): boolean => {
     if (intentKind && kind !== intentKind) return false;
     if (statuses && !statuses.has(status)) return false;
-    if (needle && ![what, who || "", meeting.frontmatter.title].some((value) => value.toLowerCase().includes(needle))) return false;
-    if (ownerNeedle && !(who || "").toLowerCase().includes(ownerNeedle)) return false;
+    const queryFields = includeMeetingTitleInQuery
+      ? [what, who || "", meeting.frontmatter.title]
+      : [what, who || ""];
+    if (needle && !queryFields.some((value) => value.toLowerCase().includes(needle))) return false;
+    if (ownerNeedle && !ownerMatchesExactSelector(who, ownerNeedle)) return false;
     results.push(boundedPolicyIntentResult({
       date: meeting.frontmatter.date,
       title: meeting.frontmatter.title,
@@ -1289,6 +1313,94 @@ export function policyIntentResults(
       if (push(meeting, intent.kind, intent.what, intent.status, intent.who, intent.by_date)) {
         return results;
       }
+    }
+  }
+  return results;
+}
+
+function normalizedCommitmentKeyField(value?: string): string {
+  return (value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function commitmentStatus(status: string, byDate: string | undefined, nowMs: number): "open" | "stale" | null {
+  if (status !== "open" && status !== "stale") return null;
+  if (status === "stale") return "stale";
+  if (!byDate) return "open";
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(byDate);
+  if (dateOnly) {
+    const dueEndMs = new Date(
+      Number(dateOnly[1]),
+      Number(dateOnly[2]) - 1,
+      Number(dateOnly[3]) + 1,
+    ).getTime();
+    return Number.isFinite(dueEndMs) && nowMs >= dueEndMs ? "stale" : "open";
+  }
+  const dueMs = Date.parse(byDate);
+  return Number.isFinite(dueMs) && dueMs < nowMs ? "stale" : "open";
+}
+
+/** Build one deduplicated, bounded live commitment projection. */
+export function policyCommitmentResults(
+  meetings: PolicyVerifiedMeeting[],
+  owner?: string,
+  limit: number = MCP_INTENT_RESULT_MAX,
+  nowMs: number = Date.now()
+): PolicyIntentResult[] {
+  const boundedLimit = normalizeMcpResultLimit(
+    limit,
+    MCP_INTENT_RESULT_MAX,
+    "commitment result"
+  );
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("commitment clock must be finite");
+  }
+  const ownerNeedle = owner?.trim().toLowerCase();
+  const results: PolicyIntentResult[] = [];
+  const resultIndexByKey = new Map<string, number>();
+
+  const push = (
+    meeting: PolicyVerifiedMeeting,
+    kind: "action-item" | "commitment",
+    what: string,
+    status: string,
+    who?: string,
+    byDate?: string
+  ): void => {
+    const projectedStatus = commitmentStatus(status, byDate, nowMs);
+    if (!projectedStatus) return;
+    if (ownerNeedle && !ownerMatchesExactSelector(who, ownerNeedle)) return;
+    const key = [meeting.path, what, who, byDate]
+      .map(normalizedCommitmentKeyField)
+      .join("\u0000");
+    const existingIndex = resultIndexByKey.get(key);
+    if (existingIndex !== undefined) {
+      if (projectedStatus === "stale") {
+        results[existingIndex].status = "stale";
+      }
+      return;
+    }
+    if (results.length >= boundedLimit) return;
+    resultIndexByKey.set(key, results.length);
+    results.push(boundedPolicyIntentResult({
+      date: meeting.frontmatter.date,
+      title: meeting.frontmatter.title,
+      content_type: meeting.frontmatter.type,
+      path: meeting.path,
+      kind,
+      what,
+      who,
+      by_date: byDate,
+      status: projectedStatus,
+    }));
+  };
+
+  for (const meeting of meetings) {
+    for (const item of meeting.frontmatter.action_items) {
+      push(meeting, "action-item", item.task, item.status, item.assignee, item.due);
+    }
+    for (const intent of meeting.frontmatter.intents) {
+      if (intent.kind !== "commitment" && intent.kind !== "action-item") continue;
+      push(meeting, intent.kind, intent.what, intent.status, intent.who, intent.by_date);
     }
   }
   return results;
@@ -1408,6 +1520,107 @@ export type McpPersonProfileLimits = {
   topicLimit?: number;
 };
 
+type PolicyPersonIdentity = {
+  canonical: string;
+  selectors: Set<string>;
+};
+
+function parsePolicyRawAttendees(raw?: string): string[] {
+  if (!raw) return [];
+  return raw.split(",").flatMap((token) => {
+    const trimmed = token.trim();
+    if (!trimmed || trimmed.toLowerCase() === "none") return [];
+    const parenthesized = trimmed.match(/^(.*?)\s*\([^)]*\)$/)?.[1];
+    const angled = trimmed.match(/^(.*?)\s*<[^>]*>$/)?.[1];
+    const display = (parenthesized || angled || trimmed).trim();
+    return display ? [display] : [];
+  });
+}
+
+function policyPersonIdentities(
+  meeting: PolicyVerifiedMeeting,
+  participationOnly: boolean = false
+): PolicyPersonIdentity[] {
+  const frontmatter = meeting.frontmatter as any;
+  const entities = Array.isArray(frontmatter?.entities?.people)
+    ? frontmatter.entities.people
+    : [];
+  const entityIdentities: PolicyPersonIdentity[] = entities.flatMap((entity: any) => {
+    const label = typeof entity?.label === "string" ? entity.label : "";
+    const slug = typeof entity?.slug === "string" ? entity.slug : personSelectorSlug(label);
+    if (!slug || !label) return [];
+    const aliases = Array.isArray(entity.aliases)
+      ? entity.aliases.filter((alias: unknown): alias is string => typeof alias === "string")
+      : [];
+    return [{
+      canonical: slug,
+      selectors: new Set([label, slug, ...aliases].flatMap((value) => [
+        normalizedPersonSelector(value),
+        personSelectorSlug(value),
+      ]).filter(Boolean)),
+    }];
+  });
+
+  const participantNames = [
+    ...meeting.frontmatter.attendees,
+    ...parsePolicyRawAttendees(meeting.frontmatter.attendees_raw),
+  ];
+  const mentionedNames = [
+    ...meeting.frontmatter.people,
+    ...meeting.frontmatter.action_items
+      .filter((item) => item.status === "open" || item.status === "stale")
+      .map((item) => item.assignee),
+    ...meeting.frontmatter.intents
+      .filter((intent) =>
+        (intent.kind === "action-item" || intent.kind === "commitment") &&
+        (intent.status === "open" || intent.status === "stale")
+      )
+      .flatMap((intent) => intent.who ? [intent.who] : []),
+  ];
+  const rawNames = participationOnly
+    ? participantNames
+    : [...participantNames, ...mentionedNames];
+  const speakerMap = Array.isArray(frontmatter?.speaker_map) ? frontmatter.speaker_map : [];
+  for (const speaker of speakerMap) {
+    if (
+      speaker?.confidence === "high" &&
+      typeof speaker?.name === "string"
+    ) rawNames.push(speaker.name);
+  }
+
+  const identities = participationOnly ? [] : [...entityIdentities];
+  for (const raw of rawNames) {
+    const name = raw.trim();
+    if (!name) continue;
+    const normalized = normalizedPersonSelector(name);
+    const slug = personSelectorSlug(name);
+    const entity = entityIdentities.find(
+      (candidate) => candidate.selectors.has(normalized) || candidate.selectors.has(slug)
+    );
+    if (entity) {
+      if (
+        participationOnly &&
+        !identities.some((candidate) => candidate.canonical === entity.canonical)
+      ) identities.push(entity);
+      continue;
+    }
+    identities.push({
+      canonical: slug,
+      selectors: new Set([normalized, slug].filter(Boolean)),
+    });
+  }
+  const merged = new Map<string, PolicyPersonIdentity>();
+  for (const identity of identities) {
+    const existing = merged.get(identity.canonical);
+    if (existing) {
+      for (const selector of identity.selectors) existing.selectors.add(selector);
+    } else {
+      merged.set(identity.canonical, identity);
+    }
+  }
+  return [...merged.values()];
+}
+
 export function personProfileFromMeetings(
   meetings: PolicyVerifiedMeeting[],
   name: string,
@@ -1415,8 +1628,16 @@ export function personProfileFromMeetings(
 ): {
   name: string;
   meetings: Array<{ title: string; date: string; path: string }>;
-  openActions: Array<PolicyVerifiedMeeting["frontmatter"]["action_items"][number]>;
+  openActions: PolicyIntentResult[];
   topics: string[];
+  topicCounts: Array<{ topic: string; count: number }>;
+  recentDecisions: Array<{
+    path: string;
+    title: string;
+    date: string;
+    what: string;
+    authority?: string;
+  }>;
 } {
   const meetingLimit = normalizeMcpResultLimit(
     limits.meetingLimit ?? MCP_PERSON_PROFILE_MEETING_MAX,
@@ -1433,71 +1654,188 @@ export function personProfileFromMeetings(
     MCP_PERSON_PROFILE_TOPIC_MAX,
     "person profile topic"
   );
-  const needle = name.toLowerCase();
+  const normalizedSelector = normalizedPersonSelector(name);
+  const slugSelector = personSelectorSlug(name);
+  if (!normalizedSelector) throw new Error("person selector is empty");
   const profileMeetings: Array<{ title: string; date: string; path: string }> = [];
-  const topics = new Set<string>();
-  const openActions: Array<
-    PolicyVerifiedMeeting["frontmatter"]["action_items"][number]
-  > = [];
+  const topicCounts = new Map<string, number>();
+  const openActions: PolicyIntentResult[] = [];
+  const recentDecisions: Array<{
+    path: string;
+    title: string;
+    date: string;
+    what: string;
+    authority?: string;
+  }> = [];
+  const seenCommitments = new Set<string>();
+  const matchedCanonicalPeople = new Set<string>();
   for (const meeting of meetings) {
-    let matched =
-      meeting.frontmatter.attendees.some((entry) =>
-        entry.toLowerCase().includes(needle)
-      ) ||
-      meeting.frontmatter.people.some((entry) =>
-        entry.toLowerCase().includes(needle)
-      ) ||
-      meeting.body.toLowerCase().includes(needle);
-    if (!matched) {
-      for (const entry of (meeting.frontmatter.attendees_raw || "").matchAll(/[^,;\n]+/g)) {
-        if (entry[0].trim().toLowerCase().includes(needle)) {
-          matched = true;
-          break;
-        }
-      }
+    const matchingIdentities = policyPersonIdentities(meeting).filter(
+      (identity) => identity.selectors.has(normalizedSelector) || identity.selectors.has(slugSelector)
+    );
+    const participatingIdentities = policyPersonIdentities(meeting, true).filter(
+      (identity) => identity.selectors.has(normalizedSelector) || identity.selectors.has(slugSelector)
+    );
+    for (const identity of matchingIdentities) matchedCanonicalPeople.add(identity.canonical);
+    if (matchedCanonicalPeople.size > 1) {
+      throw new Error("person selector is ambiguous across policy-authorized meetings");
     }
-    if (!matched) continue;
+    if (matchingIdentities.length === 0) continue;
 
-    if (profileMeetings.length < meetingLimit) {
+    if (participatingIdentities.length > 0 && profileMeetings.length < meetingLimit) {
       profileMeetings.push({
         title: boundedMcpField(meeting.frontmatter.title) ?? "",
         date: boundedMcpField(meeting.frontmatter.date) ?? "",
         path: boundedMcpField(meeting.path) ?? "",
       });
     }
-    if (topics.size < topicLimit) {
+    if (participatingIdentities.length > 0) {
       for (const rawTag of meeting.frontmatter.tags) {
         const tag = boundedMcpField(rawTag) ?? "";
-        if (!tag || topics.has(tag)) continue;
-        topics.add(tag);
-        if (topics.size >= topicLimit) break;
+        if (!tag) continue;
+        const existing = topicCounts.get(tag);
+        if (existing !== undefined) topicCounts.set(tag, existing + 1);
+        else if (topicCounts.size < topicLimit) topicCounts.set(tag, 1);
+      }
+      for (const decision of meeting.frontmatter.decisions) {
+        if (recentDecisions.length >= MCP_PERSON_PROFILE_DECISION_MAX) break;
+        const what = boundedMcpField(decision.text) ?? "";
+        if (!what) continue;
+        recentDecisions.push({
+          path: boundedMcpField(meeting.path) ?? "",
+          title: boundedMcpField(meeting.frontmatter.title) ?? "",
+          date: boundedMcpField(meeting.frontmatter.date) ?? "",
+          what,
+          authority: boundedMcpField((decision as any).authority),
+        });
       }
     }
     if (openActions.length < openActionLimit) {
-      for (const item of meeting.frontmatter.action_items) {
-        if (
-          item.status !== "open" ||
-          !item.assignee.toLowerCase().includes(needle)
-        ) {
-          continue;
-        }
-        openActions.push(boundedActionItem(item));
+      for (const commitment of policyCommitmentResults(
+        [meeting],
+        undefined,
+        MCP_INTENT_RESULT_MAX
+      )) {
+        const ownerMatches = matchingIdentities.some((identity) =>
+          identity.selectors.has(normalizedPersonSelector(commitment.who)) ||
+          identity.selectors.has(personSelectorSlug(commitment.who))
+        );
+        if (!ownerMatches) continue;
+        const key = [commitment.path, commitment.what, commitment.who, commitment.by_date]
+          .map((value) => normalizedCommitmentKeyField(value))
+          .join("\0");
+        if (seenCommitments.has(key)) continue;
+        seenCommitments.add(key);
+        openActions.push(commitment);
         if (openActions.length >= openActionLimit) break;
       }
     }
-    if (
-      profileMeetings.length >= meetingLimit &&
-      openActions.length >= openActionLimit &&
-      topics.size >= topicLimit
-    ) {
-      break;
-    }
   }
+  const rankedTopics = [...topicCounts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([topic, count]) => ({ topic, count }));
   return {
     name: boundedMcpField(name) ?? "",
     meetings: profileMeetings,
     openActions,
-    topics: [...topics],
+    topics: rankedTopics.map((entry) => entry.topic),
+    topicCounts: rankedTopics,
+    recentDecisions,
+  };
+}
+
+export function boundedCorePersonProfile(raw: unknown): {
+  name: string;
+  meetings: Array<{ title: string; date: string; path: string }>;
+  openIntents: PolicyIntentResult[];
+  recentDecisions: Array<{
+    title: string;
+    date: string;
+    path: string;
+    what: string;
+    authority: string | null;
+  }>;
+  topicCounts: Array<{ topic: string; count: number }>;
+} {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Minutes returned an invalid person profile");
+  }
+  const profile = raw as Record<string, unknown>;
+  const meetingsRaw = Array.isArray(profile.recent_meetings) ? profile.recent_meetings : null;
+  const intentsRaw = Array.isArray(profile.open_intents) ? profile.open_intents : null;
+  const decisionsRaw = Array.isArray(profile.recent_decisions) ? profile.recent_decisions : null;
+  const topicsRaw = Array.isArray(profile.top_topics) ? profile.top_topics : null;
+  if (
+    !meetingsRaw || meetingsRaw.length > MCP_PERSON_PROFILE_MEETING_MAX ||
+    !intentsRaw || intentsRaw.length > MCP_PERSON_PROFILE_OPEN_ACTION_MAX ||
+    !decisionsRaw || decisionsRaw.length > MCP_PERSON_PROFILE_DECISION_MAX ||
+    !topicsRaw || topicsRaw.length > MCP_PERSON_PROFILE_TOPIC_MAX
+  ) {
+    throw new Error("Minutes returned an invalid bounded person profile");
+  }
+  const field = (value: unknown, label: string): string => {
+    if (typeof value !== "string") throw new Error(`Minutes returned an invalid profile ${label}`);
+    return boundedMcpField(value) ?? "";
+  };
+  const meetings = meetingsRaw.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Minutes returned an invalid profile meeting");
+    }
+    const row = value as Record<string, unknown>;
+    return {
+      title: field(row.title, "meeting title"),
+      date: field(row.date, "meeting date"),
+      path: field(row.path, "meeting path"),
+    };
+  });
+  const openIntents = intentsRaw.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Minutes returned an invalid profile commitment");
+    }
+    const row = value as Record<string, unknown>;
+    return boundedPolicyIntentResult({
+      date: field(row.date, "commitment date"),
+      title: field(row.title, "commitment title"),
+      content_type: field(row.content_type, "commitment content type"),
+      path: field(row.path, "commitment path"),
+      kind: field(row.kind, "commitment kind"),
+      what: field(row.what, "commitment text"),
+      who: typeof row.who === "string" ? row.who : undefined,
+      by_date: typeof row.by_date === "string" ? row.by_date : undefined,
+      status: field(row.status, "commitment status"),
+    });
+  });
+  const topicCounts = topicsRaw.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Minutes returned an invalid profile topic");
+    }
+    const row = value as Record<string, unknown>;
+    if (!Number.isSafeInteger(row.count) || (row.count as number) < 0) {
+      throw new Error("Minutes returned an invalid profile topic count");
+    }
+    return { topic: field(row.topic, "topic"), count: row.count as number };
+  });
+  const recentDecisions = decisionsRaw.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Minutes returned an invalid profile decision");
+    }
+    const row = value as Record<string, unknown>;
+    return {
+      title: field(row.title, "decision title"),
+      date: field(row.date, "decision date"),
+      path: field(row.path, "decision path"),
+      what: field(row.what, "decision text"),
+      authority: row.authority === null || row.authority === undefined
+        ? null
+        : field(row.authority, "decision authority"),
+    };
+  });
+  return {
+    name: field(profile.name, "name"),
+    meetings,
+    openIntents,
+    recentDecisions,
+    topicCounts,
   };
 }
 
@@ -1515,9 +1853,18 @@ export function researchTopicProjection(
   query: string
 ): McpResearchTopicProjection {
   const meetings = sourceMeetings.slice(0, MCP_RESEARCH_MEETING_RESULT_MAX);
+  const needle = query.trim().toLowerCase();
   const decisions: string[] = [];
   for (const meeting of meetings) {
     for (const decision of meeting.frontmatter.decisions) {
+      if (
+        !needle ||
+        ![decision.text, decision.topic || ""].some((value) =>
+          value.toLowerCase().includes(needle)
+        )
+      ) {
+        continue;
+      }
       const line = `- ${boundedMcpField(meeting.frontmatter.date) ?? ""} — ${boundedMcpField(decision.text) ?? ""} (${boundedMcpField(meeting.frontmatter.title) ?? ""})`;
       decisions.push(boundedMcpField(line) ?? "");
       if (decisions.length >= MCP_RESEARCH_DECISION_RESULT_MAX) break;
@@ -1527,15 +1874,17 @@ export function researchTopicProjection(
 
   const openIntents = policyIntentResults(
     meetings,
-    "",
+    query,
     undefined,
     undefined,
     MCP_INTENT_RESULT_MAX,
-    new Set(["open"])
+    new Set(["open"]),
+    false
   );
   const topicCounts = new Map<string, number>();
   for (const meeting of meetings) {
     for (const rawTag of meeting.frontmatter.tags) {
+      if (!needle || !rawTag.toLowerCase().includes(needle)) continue;
       const topic = boundedMcpField(rawTag) ?? "";
       if (!topic) continue;
       const current = topicCounts.get(topic);
@@ -1591,98 +1940,6 @@ export function researchTopicProjection(
     meetings: meetingResults,
     text: boundedMcpText(text),
   };
-}
-
-export type LiveRelationship = {
-  name: string;
-  meeting_count: number;
-  days_since: number;
-  losing_touch: boolean;
-  open_commitments: number;
-  score: number;
-};
-
-export function relationshipMapFromMeetings(
-  meetings: PolicyVerifiedMeeting[],
-  limit: number = MCP_RELATIONSHIP_RESULT_MAX,
-  candidateLimit: number = MCP_RELATIONSHIP_CANDIDATE_MAX
-): LiveRelationship[] {
-  const boundedLimit = normalizeMcpResultLimit(
-    limit,
-    MCP_RELATIONSHIP_RESULT_MAX,
-    "relationship"
-  );
-  const boundedCandidateLimit = normalizeMcpResultLimit(
-    candidateLimit,
-    MCP_RELATIONSHIP_CANDIDATE_MAX,
-    "relationship candidate"
-  );
-  const people = new Map<
-    string,
-    { name: string; meetingCount: number; latest: number; open: number }
-  >();
-  for (const meeting of meetings) {
-    const names = new Map<string, string>();
-    const addName = (rawName: string) => {
-      const name = (boundedMcpField(rawName.trim()) ?? "").trim();
-      const key = name.toLowerCase();
-      if (!key || names.has(key)) return;
-      if (names.size >= boundedCandidateLimit && !people.has(key)) return;
-      names.set(key, name);
-    };
-    for (const name of meeting.frontmatter.attendees) addName(name);
-    for (const name of meeting.frontmatter.people) addName(name);
-    for (const match of (meeting.frontmatter.attendees_raw || "").matchAll(/[^,;\n]+/g)) {
-      addName(match[0]);
-    }
-    const timestamp = Date.parse(meeting.frontmatter.date);
-    for (const [key, name] of names) {
-      let record = people.get(key);
-      if (!record) {
-        if (people.size >= boundedCandidateLimit) continue;
-        record = {
-          name,
-          meetingCount: 0,
-          latest: 0,
-          open: 0,
-        };
-        people.set(key, record);
-      }
-      record.meetingCount += 1;
-      if (Number.isFinite(timestamp)) {
-        record.latest = Math.max(record.latest, timestamp);
-      }
-      for (const item of meeting.frontmatter.action_items) {
-        if (
-          item.status === "open" &&
-          item.assignee.trim().toLowerCase().includes(key)
-        ) {
-          record.open += 1;
-        }
-      }
-    }
-  }
-  const now = Date.now();
-  const results: LiveRelationship[] = [];
-  for (const person of people.values()) {
-    const daysSince = person.latest > 0
-      ? Math.max(0, (now - person.latest) / 86_400_000)
-      : 0;
-    results.push({
-      name: person.name,
-      meeting_count: person.meetingCount,
-      days_since: daysSince,
-      losing_touch: person.meetingCount > 0 && daysSince >= 60,
-      open_commitments: person.open,
-      score: person.meetingCount / (1 + daysSince / 30),
-    });
-  }
-  return results
-    .sort(
-      (left, right) =>
-        right.score - left.score || left.name.localeCompare(right.name)
-    )
-    .slice(0, boundedLimit);
 }
 
 // ── Live-snapshot enrichment for policy-filtered search indexes ─────
@@ -1894,6 +2151,31 @@ export function parseKnowledgeConfig(configContent: string): KnowledgeConfigStat
 // non-technical users don't hit a "binary not found" dead end.
 
 let installAttempted = false;
+const MAX_CAPABILITY_REPAIR_ATTEMPTS = 2;
+
+export function createCapabilityRepairCoordinator(
+  repair: () => Promise<boolean>,
+  maximumAttempts: number = MAX_CAPABILITY_REPAIR_ATTEMPTS
+): () => Promise<boolean> {
+  let attempts = 0;
+  let inFlight: Promise<boolean> | null = null;
+  return async () => {
+    if (inFlight) return inFlight;
+    if (attempts >= maximumAttempts) return false;
+    attempts += 1;
+    const attempt = repair();
+    inFlight = attempt;
+    try {
+      return await attempt;
+    } finally {
+      inFlight = null;
+    }
+  };
+}
+
+const runCapabilityRepair = createCapabilityRepairCoordinator(
+  () => tryAutoInstallAttempt(true)
+);
 
 function getReleaseBinaryName(): string | null {
   const platform = process.platform;
@@ -1913,11 +2195,17 @@ function getInstallDir(): string {
   return localBin;
 }
 
-async function tryAutoInstall(): Promise<boolean> {
-  if (installAttempted) return false;
-  installAttempted = true;
+async function tryAutoInstallAttempt(capabilityRepair: boolean = false): Promise<boolean> {
+  if (!capabilityRepair) {
+    if (installAttempted) return false;
+    installAttempted = true;
+  }
 
-  console.error("[Minutes] CLI not found — attempting automatic install...");
+  console.error(
+    capabilityRepair
+      ? "[Minutes] CLI is missing required trust capabilities — attempting a verified update..."
+      : "[Minutes] CLI not found — attempting automatic install..."
+  );
 
   // Strategy 1: Download pre-built binary from GitHub release (fastest, no deps)
   const binaryName = getReleaseBinaryName();
@@ -2101,6 +2389,43 @@ async function isCliAvailable(): Promise<boolean> {
     );
   }
   return cliAvailable;
+}
+
+async function tryAutoInstall(capabilityRepair: boolean = false): Promise<boolean> {
+  if (!capabilityRepair) return tryAutoInstallAttempt(false);
+  return runCapabilityRepair();
+}
+
+export async function repairCliCapabilities(
+  required: readonly string[],
+  capabilities: CapabilityProbeResult,
+  repair: () => Promise<boolean>,
+  reprobe: () => CapabilityProbeResult
+): Promise<CapabilityProbeResult> {
+  if (
+    capabilities.kind === "report" &&
+    required.every((feature) => hasFeature(capabilities, feature))
+  ) {
+    return capabilities;
+  }
+  if (await repair()) {
+    return reprobe();
+  }
+  return capabilities;
+}
+
+async function ensureCliCapabilities(
+  required: readonly string[]
+): Promise<CapabilityProbeResult> {
+  if (!(await isCliAvailable())) {
+    return { kind: "missing-cli" };
+  }
+  return repairCliCapabilities(
+    required,
+    probeCapabilitiesSync(MINUTES_BIN),
+    () => tryAutoInstall(true),
+    () => probeCapabilitiesSync(MINUTES_BIN)
+  );
 }
 
 type DesktopAppStatus = {
@@ -2768,13 +3093,14 @@ export function selectCopilotNudges(
 async function runMinutes(
   args: string[],
   timeoutMs: number = 30000,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  extraEnv: Record<string, string> = {}
 ): Promise<{ stdout: string; stderr: string }> {
   try {
     const { stdout, stderr } = await execFileAsync(MINUTES_BIN, args, {
       timeout: timeoutMs,
       signal,
-      env: mcpCliChildEnv({ RUST_LOG: "info" }),
+      env: mcpCliChildEnv({ RUST_LOG: "info", ...extraEnv }),
     });
     return { stdout: stdout.trim(), stderr: stderr.trim() };
   } catch (error: any) {
@@ -2785,6 +3111,15 @@ async function runMinutes(
     const stdout = error.stdout?.trim() || "";
     throw new Error(stderr || stdout || error.message);
   }
+}
+
+async function runPolicyGraphMinutes(
+  args: string[]
+): Promise<{ stdout: string; stderr: string }> {
+  const corpusRoot = await getEffectiveMeetingsDir();
+  return runMinutes(args, 30000, undefined, {
+    MINUTES_POLICY_GRAPH_CORPUS_ROOT: corpusRoot,
+  });
 }
 
 type MinutesRunner = (
@@ -4928,7 +5263,7 @@ registerDocsAppTool(
   {
     description: "Get a relationship profile derived from live, policy-authorized meeting snapshots within the supported corpus bounds. Restricted meetings are excluded unless an operator launch grant plus include_restricted=true is durably audited.",
     inputSchema: {
-      name: z.string().max(MCP_QUERY_MAX_CHARS).describe("Person / attendee name to profile"),
+      name: z.string().trim().min(1).max(MCP_QUERY_MAX_CHARS).describe("Person / attendee name to profile"),
       include_restricted: z
         .boolean()
         .optional()
@@ -4939,6 +5274,53 @@ registerDocsAppTool(
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ name, include_restricted }) => {
+    if (!include_restricted) {
+      const capabilities = await ensureCliCapabilities([
+        "person_profile_policy_fresh_v1",
+        "policy_projection_worker_v1",
+      ]);
+      if (
+        capabilities.kind !== "report" ||
+        !hasFeature(capabilities, "person_profile_policy_fresh_v1") ||
+        !hasFeature(capabilities, "policy_projection_worker_v1")
+      ) {
+        throw new Error(
+          "Person profiles require a Minutes CLI with policy-fresh correction-aware identity resolution. Update Minutes, then try again."
+        );
+      }
+      const { stdout } = await runPolicyGraphMinutes(["person", name]);
+      const profile = boundedCorePersonProfile(parseJsonOutput(stdout));
+      const sections = [];
+      if (profile.topicCounts.length > 0) {
+        sections.push(
+          "Topics: " + profile.topicCounts.map((topic) => `${topic.topic} (${topic.count})`).join(", ")
+        );
+      }
+      if (profile.meetings.length > 0) {
+        sections.push("Meetings:\n" + profile.meetings.map((meeting) => `- ${meeting.date} — ${meeting.title}`).join("\n"));
+      }
+      if (profile.openIntents.length > 0) {
+        sections.push("Open commitments:\n" + profile.openIntents.map((intent) => `- ${intent.what} (${intent.status})`).join("\n"));
+      }
+      if (profile.recentDecisions.length > 0) {
+        sections.push("Recent decisions:\n" + profile.recentDecisions.map((decision) => `- ${decision.what} (${decision.date})`).join("\n"));
+      }
+      const text = sections.length > 0
+        ? sections.join("\n\n")
+        : `No profile data found for ${profile.name}.`;
+      return {
+        content: [{ type: "text" as const, text: boundedMcpText(text) }],
+        structuredContent: {
+          name: profile.name,
+          top_topics: profile.topicCounts,
+          open_intents: profile.openIntents,
+          recent_decisions: profile.recentDecisions,
+          recent_meetings: profile.meetings,
+          view: "person",
+        },
+        _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "person" },
+      };
+    }
     // Profile every field from strict live snapshots. Cached graph and legacy
     // CLI profile output remain operator conveniences, not authorization
     // sources for an agent-facing response.
@@ -4952,11 +5334,12 @@ registerDocsAppTool(
     const sections = [];
     if (profile.topics.length > 0) sections.push("Topics: " + profile.topics.join(", "));
     if (profile.meetings.length > 0) sections.push("Meetings:\n" + profile.meetings.map((m) => `- ${m.date} — ${m.title}`).join("\n"));
-    if (profile.openActions.length > 0) sections.push("Open actions:\n" + profile.openActions.map((a) => `- ${a.task} (${a.status})`).join("\n"));
+    if (profile.openActions.length > 0) sections.push("Open commitments:\n" + profile.openActions.map((a) => `- ${a.what} (${a.status})`).join("\n"));
+    if (profile.recentDecisions.length > 0) sections.push("Recent decisions:\n" + profile.recentDecisions.map((decision) => `- ${decision.what} (${decision.date})`).join("\n"));
     const text = sections.length > 0 ? sections.join("\n\n") : `No profile data found for ${profile.name}.`;
     return {
       content: [{ type: "text" as const, text: boundedMcpText(text) }],
-      structuredContent: { name: profile.name, top_topics: profile.topics.map((t) => ({ topic: t, count: 1 })), open_intents: profile.openActions, recent_meetings: profile.meetings, view: "person" },
+      structuredContent: { name: profile.name, top_topics: profile.topicCounts, open_intents: profile.openActions, recent_decisions: profile.recentDecisions, recent_meetings: profile.meetings, view: "person" },
       _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "person" },
     };
   }
@@ -5675,117 +6058,6 @@ function killProcessAudioGroup(child: ReturnType<typeof spawn>): void {
   }
 }
 
-/**
- * Spawn the CLI with exactly one inherited source capability at fd 3.
- * Child output is bounded and never reflected into thrown errors.
- */
-export async function runMcpProcessAudioCli(
-  input: AuthorizedMcpProcessAudioInput,
-  contentType: "meeting" | "memo",
-  language?: string,
-  options: McpProcessAudioCliOptions = {}
-): Promise<{ stdout: string; stderr: string }> {
-  if (process.platform !== "linux" && process.platform !== "darwin") {
-    throw new Error("process_audio inherited descriptors are unavailable");
-  }
-  const timeoutMs = boundedProcessAudioLimit(
-    options.timeoutMs,
-    MCP_PROCESS_AUDIO_CLI_TIMEOUT_MS
-  );
-  const maxStdoutBytes = boundedProcessAudioLimit(
-    options.maxStdoutBytes,
-    MCP_PROCESS_AUDIO_MAX_STDOUT_BYTES
-  );
-  const maxStderrBytes = boundedProcessAudioLimit(
-    options.maxStderrBytes,
-    MCP_PROCESS_AUDIO_MAX_STDERR_BYTES
-  );
-  validateAuthorizedProcessAudioInput(input);
-  const args = buildMcpProcessAudioArgs(input, contentType, language);
-  const safeExtraEnv = { ...(options.extraEnv ?? {}) };
-  delete safeExtraEnv.MINUTES_MCP_OUTER_PROCESS_GROUP;
-
-  return new Promise((resolveRun, rejectRun) => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(options.binary ?? MINUTES_BIN, args, {
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe", input.fd],
-        env: mcpCliChildEnv({
-          RUST_LOG: "info",
-          ...safeExtraEnv,
-        }),
-      });
-    } catch {
-      rejectRun(new Error("process_audio CLI could not be started safely"));
-      return;
-    }
-
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    let failure: string | undefined;
-    let settled = false;
-    const timer = setTimeout(() => {
-      failure = "process_audio CLI exceeded its time budget";
-      killProcessAudioGroup(child);
-    }, timeoutMs);
-
-    const requestFailure = (message: string): void => {
-      if (failure === undefined) failure = message;
-      killProcessAudioGroup(child);
-    };
-    child.stdout?.on("data", (value: Buffer | string) => {
-      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      stdoutBytes += bytes.byteLength;
-      if (stdoutBytes > maxStdoutBytes) {
-        requestFailure("process_audio CLI stdout exceeded its byte budget");
-        return;
-      }
-      stdoutChunks.push(bytes);
-    });
-    child.stderr?.on("data", (value: Buffer | string) => {
-      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      stderrBytes += bytes.byteLength;
-      if (stderrBytes > maxStderrBytes) {
-        requestFailure("process_audio CLI stderr exceeded its byte budget");
-        return;
-      }
-      stderrChunks.push(bytes);
-    });
-
-    child.once("error", () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      killProcessAudioGroup(child);
-      rejectRun(new Error("process_audio CLI could not be started safely"));
-    });
-    child.once("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      // Retire descendants even after a successful leader exit. A decoder may
-      // have forked after closing its pipes; the outer group remains killable
-      // after its original leader has exited.
-      killProcessAudioGroup(child);
-      if (failure !== undefined) {
-        rejectRun(new Error(failure));
-        return;
-      }
-      if (code !== 0) {
-        rejectRun(new Error("process_audio CLI failed safely"));
-        return;
-      }
-      resolveRun({
-        stdout: Buffer.concat(stdoutChunks).toString("utf8").trim(),
-        stderr: Buffer.concat(stderrChunks).toString("utf8").trim(),
-      });
-    });
-  });
-}
-
 function processAudioHelperInvocation(): { binary: string; args: string[] } {
   const currentModule = fileURLToPath(import.meta.url);
   const sourceMode = extname(currentModule) === ".ts";
@@ -6253,32 +6525,86 @@ registerTool(
 
 // ── Tool: track_commitments ─────────────────────────────────
 
+export function historicalCommitmentRows(commitments: readonly PolicyIntentResult[]) {
+  return commitments.map((commitment) => ({
+    text: commitment.what,
+    status: commitment.status,
+    due_date: commitment.by_date ?? null,
+    created_at: commitment.date,
+    commitment_type: commitment.kind === "action-item" ? "action_item" : "intent",
+    meeting_title: commitment.title,
+    meeting_date: commitment.date,
+    person_name: commitment.who ?? null,
+  }));
+}
+
+export function relationshipMapStructuredContent<T>(people: readonly T[]) {
+  return { people: [...people], view: "relationship_map" as const };
+}
+
 registerDocsAppTool(
   server,
   "track_commitments",
   {
     description: "List open and stale action items and explicit intent commitments from live meeting frontmatter. Optionally filter by person. Answers: 'What did I promise Sarah?' or 'What's overdue?' Meetings designated `sensitivity: restricted` never enter this live-source view.",
     inputSchema: {
-      person: z.string().max(MCP_QUERY_MAX_CHARS).optional().describe("Filter by person name or slug (optional — omit for all commitments)"),
+      person: z.string().trim().min(1).max(MCP_QUERY_MAX_CHARS).optional().describe("Filter by person name or slug (optional — omit for all commitments)"),
     },
     annotations: { title: "Track Commitments", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
   async ({ person }) => {
-    const meetingsDir = await getEffectiveMeetingsDir();
-    const meetings = await policyListMeetings(
-      meetingsDir,
-      MCP_POLICY_MEETING_RESULT_MAX,
-      false
-    );
-    const commitments = policyIntentResults(
-      meetings,
-      "",
-      undefined,
-      person,
-      MCP_INTENT_RESULT_MAX,
-      new Set(["open", "stale"])
-    );
+    const capabilities = await ensureCliCapabilities([
+      "track_commitments",
+      "policy_projection_worker_v1",
+    ]);
+    if (
+      capabilities.kind !== "report" ||
+      !hasFeature(capabilities, "track_commitments") ||
+      !hasFeature(capabilities, "policy_projection_worker_v1")
+    ) {
+      throw new Error(
+        "Commitment tracking requires a Minutes CLI with the supervised policy-projection boundary. Update Minutes, then try again."
+      );
+    }
+    const args = ["commitments", "--json", "--limit", String(MCP_INTENT_RESULT_MAX)];
+    if (person) args.push("--person", person);
+    const { stdout } = await runPolicyGraphMinutes(args);
+    const parsed = parseJsonOutput(stdout);
+    if (!Array.isArray(parsed) || parsed.length > MCP_INTENT_RESULT_MAX) {
+      throw new Error("Minutes returned an invalid bounded commitment projection");
+    }
+    const commitments = parsed.map((value: unknown) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Minutes returned an invalid commitment row");
+      }
+      const row = value as Record<string, unknown>;
+      const field = (raw: unknown, label: string, optional = false): string | null => {
+        if (raw === null && optional) return null;
+        if (typeof raw !== "string") {
+          throw new Error(`Minutes returned an invalid commitment ${label}`);
+        }
+        return boundedMcpField(raw) ?? "";
+      };
+      const status = field(row.status, "status") as string;
+      if (status !== "open" && status !== "stale") {
+        throw new Error("Minutes returned an invalid commitment status");
+      }
+      const commitmentType = field(row.commitment_type, "type") as string;
+      if (commitmentType !== "action_item" && commitmentType !== "intent") {
+        throw new Error("Minutes returned an invalid commitment type");
+      }
+      return {
+        text: field(row.text, "text") as string,
+        status,
+        due_date: field(row.due_date, "due date", true),
+        created_at: field(row.created_at, "created at") as string,
+        commitment_type: commitmentType,
+        meeting_title: field(row.meeting_title, "meeting title") as string,
+        meeting_date: field(row.meeting_date, "meeting date") as string,
+        person_name: field(row.person_name, "person name", true),
+      };
+    });
     const boundedPerson = boundedMcpField(person) || null;
 
     if (commitments.length === 0) {
@@ -6293,21 +6619,22 @@ registerDocsAppTool(
     // Group by status
     const stale = commitments.filter((commitment) => commitment.status === "stale");
     const open = commitments.filter((commitment) => commitment.status === "open");
+    const structuredCommitments = commitments;
 
     const lines: string[] = [];
     if (stale.length > 0) {
       lines.push(`STALE (${stale.length} overdue):`);
       for (const c of stale) {
-        const who = c.who || "unassigned";
-        lines.push(`  ⚠ ${c.what} (${who}; due: ${c.by_date || "no date"}; from: ${c.title})`);
+        const who = c.person_name || "unassigned";
+        lines.push(`  ⚠ ${c.text} (${who}; due: ${c.due_date || "no date"}; from: ${c.meeting_title})`);
       }
     }
     if (open.length > 0) {
       if (stale.length > 0) lines.push("");
       lines.push(`OPEN (${open.length}):`);
       for (const c of open) {
-        const who = c.who || "unassigned";
-        lines.push(`  · ${c.what} (${who}; from: ${c.title})`);
+        const who = c.person_name || "unassigned";
+        lines.push(`  · ${c.text} (${who}; from: ${c.meeting_title})`);
       }
     }
 
@@ -6315,7 +6642,7 @@ registerDocsAppTool(
 
     return {
       content: [{ type: "text" as const, text: boundedMcpText(text) }],
-      structuredContent: { commitments, person: boundedPerson, stale_count: stale.length, open_count: open.length, view: "commitments" },
+      structuredContent: { commitments: structuredCommitments, person: boundedPerson, stale_count: stale.length, open_count: open.length, view: "commitments" },
       _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "commitments" },
     };
   }
@@ -6327,7 +6654,7 @@ registerDocsAppTool(
   server,
   "relationship_map",
   {
-    description: "Temporarily unavailable while the bounded privacy-safe relationship graph is rebuilt; see roadmap issue #513.",
+    description: "Show contacts with relationship scores, meeting frequency, and losing-touch alerts from the bounded process-private graph projection. Restricted meetings never enter the projection.",
     inputSchema: {
       limit: z
         .number()
@@ -6341,10 +6668,105 @@ registerDocsAppTool(
     annotations: { title: "Relationship Map", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_RESOURCE_URI } },
   },
-  async () => {
-    throw new Error(
-      "Cross-meeting relationship graph is temporarily unavailable while its privacy-safe bounded rebuild is completed; see roadmap issue #513"
-    );
+  async ({ limit }) => {
+    const graphCapabilities = await ensureCliCapabilities([
+      "relationship_map_policy_fresh_v1",
+      "policy_projection_worker_v1",
+    ]);
+    if (
+      graphCapabilities.kind !== "report" ||
+      !hasFeature(graphCapabilities, "relationship_map_policy_fresh_v1") ||
+      !hasFeature(graphCapabilities, "policy_projection_worker_v1")
+    ) {
+      throw new Error(
+        "Relationship Map requires a Minutes CLI with the policy-fresh process-private graph boundary. Update Minutes, then try again."
+      );
+    }
+    const { stdout } = await runPolicyGraphMinutes([
+      "people",
+      "--json",
+      "--limit",
+      String(limit),
+    ]);
+    const parsed = parseJsonOutput(stdout);
+    if (!Array.isArray(parsed) || parsed.length > limit) {
+      throw new Error("Minutes returned an invalid bounded relationship projection");
+    }
+    const people = parsed.map((raw: unknown) => {
+      const finiteNumber = (
+        value: unknown,
+        field: string,
+        integer: boolean = false
+      ): number => {
+        if (
+          typeof value !== "number" ||
+          !Number.isFinite(value) ||
+          value < 0 ||
+          (integer && !Number.isSafeInteger(value))
+        ) {
+          throw new Error(`Minutes returned an invalid relationship ${field}`);
+        }
+        return value;
+      };
+      const boundedString = (value: unknown, field: string): string => {
+        if (typeof value !== "string") {
+          throw new Error(`Minutes returned an invalid relationship ${field}`);
+        }
+        return boundedMcpField(value) ?? "";
+      };
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error("Minutes returned an invalid relationship row");
+      }
+      const row = raw as Record<string, unknown>;
+      if (!Array.isArray(row.top_topics) || typeof row.losing_touch !== "boolean") {
+        throw new Error("Minutes returned an invalid relationship row");
+      }
+      const topTopics = row.top_topics
+        .slice(0, 3)
+        .map((topic: unknown) => boundedString(topic, "topic"));
+      return {
+        slug: boundedString(row.slug, "slug"),
+        name: boundedString(row.name, "name"),
+        meeting_count: finiteNumber(row.meeting_count, "meeting count", true),
+        last_seen: boundedString(row.last_seen, "last seen"),
+        days_since: finiteNumber(row.days_since, "days since"),
+        open_commitments: finiteNumber(row.open_commitments, "open commitments", true),
+        top_topics: topTopics,
+        score: finiteNumber(row.score, "score"),
+        losing_touch: row.losing_touch,
+      };
+    });
+    if (people.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: "No relationship data found in policy-authorized meetings." }],
+        structuredContent: relationshipMapStructuredContent([]),
+        _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "relationship_map" },
+      };
+    }
+    const lines: string[] = [];
+    const losingTouch: string[] = [];
+    for (const person of people) {
+      const daysSince = Math.round(person.days_since);
+      const last = daysSince < 1 ? "today" : daysSince < 2 ? "yesterday" : `${daysSince}d ago`;
+      const status = person.losing_touch
+        ? "⚠ losing touch"
+        : person.open_commitments > 0
+          ? `${person.open_commitments} open commitment${person.open_commitments === 1 ? "" : "s"}`
+          : "✓ all clear";
+      lines.push(`${person.name} — ${person.meeting_count} meetings, last: ${last}, ${status} (score: ${person.score.toFixed(1)})`);
+      if (person.losing_touch) {
+        losingTouch.push(`${person.name} — ${person.meeting_count} meetings total, last seen ${daysSince}d ago`);
+      }
+    }
+    let text = `Relationship Map (${people.length} contacts):\n\n${lines.join("\n")}`;
+    if (losingTouch.length > 0) {
+      text += `\n\nLosing Touch:\n${losingTouch.join("\n")}`;
+    }
+    return {
+      content: [{ type: "text" as const, text: boundedMcpText(text) }],
+      structuredContent: relationshipMapStructuredContent(people),
+      _meta: { ui: { resourceUri: UI_RESOURCE_URI }, view: "relationship_map" },
+    };
   }
 );
 
@@ -6620,7 +7042,7 @@ registerTool(
     try {
       await execFileAsync(MINUTES_BIN, ["dictate", "--preflight"], {
         timeout: 5000,
-        env: augmentedEnv(),
+        env: mcpCliChildEnv(),
       });
     } catch (error: any) {
       const stderr = typeof error?.stderr === "string" ? error.stderr : "";

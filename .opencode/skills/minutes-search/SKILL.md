@@ -74,7 +74,7 @@ Suggest search strategies based on what the user is looking for:
 ## Tips for good searches
 
 - Search for **what people said**, not document titles: `"we should postpone the launch"` not `"launch delay meeting"`
-- Search for **names** to find everything someone discussed: `"Alex"` or `"Case"`
+- Search for **names** to find the policy-authorized normal history involving someone: `"Alex"` or `"Case"`
 - Search for **decisions**: `"decided"`, `"agreed"`, `"committed to"`
 - Reauthorize a selected result with `minutes get "<exact path>" --json` before loading full context
 

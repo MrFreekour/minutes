@@ -3058,6 +3058,19 @@ pub(crate) fn acquire_private_projection_lease(
     Ok(lease)
 }
 
+/// Acquire the one graph/search heap reservation for a canonical corpus.
+/// Keeping derivation here prevents configurable correction roots from
+/// splitting what must be a single cross-process memory boundary.
+pub(crate) fn acquire_private_corpus_projection_lease(
+    canonical_corpus_root: &Path,
+    wait_for_test_peer: bool,
+) -> std::io::Result<BoundRecoveryLeaseFile> {
+    acquire_private_projection_lease(
+        &canonical_corpus_root.join(".minutes-private-projection"),
+        wait_for_test_peer,
+    )
+}
+
 fn retire_legacy_policy_caches_at(state_root: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(state_root) {
         Ok(_) => {}

@@ -403,22 +403,15 @@ impl SearchIndex {
                 "retire legacy durable policy caches before search: {error}"
             ))
         })?;
-        #[cfg(not(test))]
-        let projection_state = crate::overlays::correction_state_dir();
-        #[cfg(test)]
-        let projection_state = config
-            .output_dir
-            .join("failed")
-            .join(".minutes-search-projection-test");
+        let corpus_root = canonical_corpus_root(&config.output_dir)?;
         let projection_lease =
-            crate::policy_fs::acquire_private_projection_lease(&projection_state, cfg!(test))
+            crate::policy_fs::acquire_private_corpus_projection_lease(&corpus_root, cfg!(test))
                 .map_err(|error| {
                     SearchIndexError::Io(format!(
                         "private search projection capacity unavailable: {error}"
                     ))
                 })?;
         let mut conn = open_private_memory_connection()?;
-        let corpus_root = canonical_corpus_root(&config.output_dir)?;
         schema::ensure_schema(&mut conn)?;
 
         Ok(SearchIndex {

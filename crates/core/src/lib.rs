@@ -5,6 +5,15 @@ pub mod apple_speech;
 pub(crate) mod audio_budget;
 pub mod autoresearch;
 pub(crate) mod bounded_child;
+
+/// Activate a previously validated MCP process-audio outer process group.
+/// The CLI must also hold the helper's live supervisor capability; the core
+/// repeats the Unix parent/group topology checks before changing child-launch
+/// behavior.
+#[cfg(unix)]
+pub fn install_validated_outer_process_group(process_group: i32) -> std::io::Result<()> {
+    bounded_child::install_validated_outer_process_group(process_group)
+}
 #[cfg(any(test, all(feature = "streaming", feature = "whisper")))]
 pub(crate) mod bounded_inference;
 pub mod calendar;
@@ -22,7 +31,6 @@ pub mod dictation_memory;
 pub(crate) mod engine_process;
 /// Person entity-resolution clustering (issue #385, class 3): suggestion-only
 /// grouping of name-variant fragments. Never merges.
-#[cfg(test)]
 pub(crate) mod entity_cluster;
 /// Entity-resolution evaluation harness (cluster-level). Test-only; the
 /// measurement contract for the entity-clustering lever (issue #385 / #371).
@@ -32,6 +40,7 @@ pub mod error;
 pub mod events;
 pub mod ffmpeg;
 pub mod graph;
+pub mod graph_worker;
 pub mod health;
 pub mod jobs;
 pub mod knowledge;

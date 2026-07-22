@@ -803,7 +803,51 @@ pub fn speaker_mapping_model_hint(config: &Config) -> String {
 /// does not change for users who already have another CLI installed — #520).
 /// Returns the resolved path if found and executable, None otherwise.
 pub fn detect_agent_cli() -> Option<String> {
-    for cmd in &["claude", "codex", "gemini", "opencode", "agent"] {
+    detect_agent_cli_from_candidates(&["claude", "codex", "gemini", "opencode", "agent"])
+}
+
+/// Detect only the CLI whose no-tools/no-MCP/no-settings contract is verified
+/// for Native Recall. General summarization retains the broader agent list.
+pub fn detect_recall_chat_cli() -> Option<String> {
+    let resolved = resolve_agent_path("claude");
+    if resolved == "claude" && !std::path::Path::new(&resolved).exists() {
+        return None;
+    }
+    let output = crate::engine_process::command(&resolved)
+        .arg("--version")
+        .env_clear()
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() || !recall_claude_version_is_known(&output.stdout) {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// Accept the stable native Claude Code version contract and nothing else.
+/// Native Recall repeats this probe through its held executable capability;
+/// this discovery-time check is only an early fail-closed filter.
+pub fn recall_claude_version_is_known(stdout: &[u8]) -> bool {
+    let Ok(version) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    let mut fields = version.split_whitespace();
+    let Some(number) = fields.next() else {
+        return false;
+    };
+    let numeric = number.split('.').collect::<Vec<_>>();
+    numeric.len() >= 3
+        && numeric
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && version.trim_end().ends_with("(Claude Code)")
+}
+
+fn detect_agent_cli_from_candidates(candidates: &[&str]) -> Option<String> {
+    for cmd in candidates {
         let resolved = resolve_agent_path(cmd);
         // resolve_agent_path returns the bare name if not found — check if we got a real path
         if (resolved != *cmd || std::path::Path::new(&resolved).exists())
@@ -919,8 +963,9 @@ pub struct ChatInvocation {
 
 /// Build a [`ChatInvocation`] for the given agent CLI and prompt.
 ///
-/// Non-claude agents get the same `lean = true` argument conventions as the
-/// summarization path (see `prepare_agent_invocation`). claude gets its own
+/// Native Recall currently accepts only Claude because its installed CLI has
+/// a verified, tested no-tools/no-MCP/no-settings mode. Other agent CLIs fail
+/// closed until an equivalent launch contract is proven. Claude gets its own
 /// arg-building path — [`prepare_claude_chat_invocation`] — which is
 /// deliberately *not* the shared `lean = true` claude branch because chat has
 /// different streaming arguments. It now shares that branch's security
@@ -938,12 +983,14 @@ pub fn build_chat_invocation(
     prompt: &str,
     stream_json: bool,
 ) -> Result<ChatInvocation, Box<dyn std::error::Error>> {
-    let inner = if matches_agent_binary(agent_cmd, "claude") {
-        prepare_claude_chat_invocation(agent_cmd, prompt)
-    } else {
-        // Chat has no screenshots to deliver; #421 added the screen_files param.
-        prepare_agent_invocation(agent_cmd, prompt, &[], true)?
-    };
+    if !matches_agent_binary(agent_cmd, "claude") {
+        return Err(format!(
+            "Native Recall cannot safely launch {}; only Claude has a verified no-tools mode",
+            agent_label(agent_cmd)
+        )
+        .into());
+    }
+    let inner = prepare_claude_chat_invocation(agent_cmd, prompt);
     let mut args = inner.args;
     if stream_json && matches_agent_binary(agent_cmd, "claude") {
         if let Some(pos) = args.iter().position(|a| a == "--output-format") {
@@ -3652,13 +3699,13 @@ PARTICIPANTS:
     }
 
     #[test]
-    fn build_chat_invocation_non_claude_ignores_stream_flag() {
-        // codex has no stream-json path here; the flag must not perturb its args.
-        let streamed = build_chat_invocation("codex", "hola", true).unwrap();
-        let plain = build_chat_invocation("codex", "hola", false).unwrap();
-        assert_eq!(streamed.args, plain.args);
-        assert!(!streamed.args.iter().any(|a| a == "stream-json"));
-        assert_eq!(streamed.cmd, "codex");
+    fn build_chat_invocation_rejects_unverified_agent_clis() {
+        for agent in ["codex", "gemini", "opencode", "pi"] {
+            let error = build_chat_invocation(agent, "hola", false)
+                .err()
+                .expect("unverified Recall CLI must fail closed");
+            assert!(error.to_string().contains("verified no-tools mode"));
+        }
     }
 
     #[test]

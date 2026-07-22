@@ -51,7 +51,7 @@ const toolGroups = [
     label: "People and relationships",
     tools: [
       ["get_person_profile", "Build a profile from policy-authorized meetings within supported corpus bounds."],
-      ["relationship_map", "Temporarily unavailable during the privacy-safe bounded rebuild; see roadmap issue #513."],
+      ["relationship_map", "Rank relationships from the bounded process-private policy-safe graph projection."],
       ["track_commitments", "Open and stale commitments, optionally filtered by person."],
       ["consistency_report", "Flag contradicting decisions and stale commitments."],
     ],
@@ -174,7 +174,7 @@ const tasks = [
     steps: [
       "Call get_person_profile with the person's name.",
       "For deeper context, call track_commitments filtered to that person.",
-      "If the user asks for graph rankings or a broader relationship map, report that surface temporarily unavailable and link roadmap issue #513.",
+      "For broader relationship rankings, call relationship_map and require a successful policy-authorized response.",
     ],
   },
   {
@@ -203,7 +203,7 @@ export default function ForAgentsPage() {
     "@type": "ItemList",
     name: "Minutes skill catalog",
     description:
-      "Workflow-level skills that turn Minutes MCP tools into operator motions like meeting prep, debrief, bounded person/topic research, and honest graph deferrals.",
+      "Workflow-level skills that turn Minutes MCP tools into operator motions like meeting prep, debrief, bounded person/topic research, and policy-safe relationship intelligence.",
     numberOfItems: skillsCatalog.length,
     itemListElement: skillsCatalog.map((skill, index) => ({
       "@type": "ListItem",
@@ -500,9 +500,10 @@ export default function ForAgentsPage() {
             </table>
           </div>
           <p className="mt-4 text-[12px] leading-6 text-[var(--text-secondary)]">
-            Every agent reads the same{" "}
+            Every agent uses the same policy-aware local tools over your{" "}
             <code className="font-mono text-[12px] text-[var(--text)]">~/meetings/</code>{" "}
-            folder. Switch hosts without migrating data. The portable skill pack
+            folder. Switch hosts without migrating data or bypassing the corpus
+            sensitivity boundary. The portable skill pack
             also includes artifact workflows like{" "}
             <code className="font-mono text-[12px] text-[var(--text)]">/minutes-video-review</code>{" "}
             for Loom, ScreenPal, and local walkthrough videos.

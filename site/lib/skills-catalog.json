@@ -195,9 +195,9 @@
     "name": "minutes-graph",
     "displayName": "Minutes Graph",
     "category": "Intelligence",
-    "shortDescription": "Bounded person profiles and topic research; graph rankings and commitments are temporarily unavailable.",
-    "description": "Policy-safe live-source person profiles and topic research, with honest fail-closed handling for deferred graph rankings, commitments, aliases, and losing-touch signals. Always use Minutes' bounded native CLI surfaces; never build or read a durable graph cache.",
-    "bestFor": "Build a bounded person profile or research a topic; report graph-only requests unavailable with roadmap issue 513.",
+    "shortDescription": "Bounded policy-safe relationship intelligence from owned meeting history.",
+    "description": "Policy-safe relationship rankings, commitments, aliases, person profiles, and topic research. Always use Minutes' bounded native CLI surfaces; never build or read a durable graph cache.",
+    "bestFor": "Rank relationships, inspect commitments, confirm aliases, build a person profile, or research a topic.",
     "example": "/minutes-graph profile Alex from my normal meeting history",
     "triggers": [
       "who do I meet with most",

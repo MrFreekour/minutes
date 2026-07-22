@@ -6,8 +6,8 @@
 
 This is the generated public catalog of stable Minutes core errors. It intentionally favors actionable, user-facing errors over generic wrapper variants.
 
-- Visible actionable errors: 60
-- Hidden low-signal wrappers: 14
+- Visible actionable errors: 61
+- Hidden low-signal wrappers: 16
 
 # CaptureError
 
@@ -753,17 +753,17 @@ Reference URL: https://useminutes.app/docs/errors#error-templateerror-invalidver
 
 # GraphError
 
-<a id="error-grapherror-temporarilyunavailable"></a>
+<a id="error-grapherror-dirnotfound"></a>
 
-## `GraphError::TemporarilyUnavailable`
+## `GraphError::DirNotFound`
 
 Exact message:
 
-> cross-meeting graph is temporarily unavailable while its privacy-safe bounded rebuild is completed; see roadmap issue #513
+> meetings directory does not exist: {0}
 
 Source: `crates/core/src/graph.rs`
 
-Reference URL: https://useminutes.app/docs/errors#error-grapherror-temporarilyunavailable
+Reference URL: https://useminutes.app/docs/errors#error-grapherror-dirnotfound
 
 # VoiceError
 

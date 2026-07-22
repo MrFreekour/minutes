@@ -40,13 +40,19 @@ pub struct SpeakerConfirmation {
 #[derive(Debug, Clone)]
 pub(crate) struct StableSpeakerOverlaySnapshot {
     by_meeting: HashMap<String, Vec<SpeakerConfirmation>>,
+    revision: String,
 }
 
 impl StableSpeakerOverlaySnapshot {
     pub(crate) fn empty() -> Self {
         Self {
             by_meeting: HashMap::new(),
+            revision: empty_overlay_revision(),
         }
+    }
+
+    pub(crate) fn revision(&self) -> &str {
+        &self.revision
     }
 
     pub(crate) fn confirmations_for_meeting(&self, meeting_path: &Path) -> &[SpeakerConfirmation] {
@@ -54,6 +60,10 @@ impl StableSpeakerOverlaySnapshot {
             .get(&meeting_key(meeting_path))
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn confirmations(&self) -> impl Iterator<Item = &SpeakerConfirmation> {
+        self.by_meeting.values().flat_map(|items| items.iter())
     }
 
     pub(crate) fn confirmations_for_source(
@@ -72,6 +82,33 @@ impl StableSpeakerOverlaySnapshot {
             .collect()
     }
 }
+
+fn hash_field(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn finish_revision(hasher: Sha256) -> String {
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn empty_overlay_revision() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(OVERLAY_REVISION_DOMAIN);
+    finish_revision(hasher)
+}
+
+const OVERLAY_REVISION_DOMAIN: &[u8] = b"minutes.speaker-overlays.v1\0";
 
 /// The one state root used by correction readers and writers. `MINUTES_HOME`
 /// is an explicit override of the complete `.minutes` directory; otherwise
@@ -997,6 +1034,8 @@ pub(crate) fn stable_speaker_overlay_snapshot_at_until(
         ))
     })?;
 
+    let mut hasher = Sha256::new();
+    hasher.update(OVERLAY_REVISION_DOMAIN);
     let mut by_meeting: HashMap<String, Vec<SpeakerConfirmation>> = HashMap::new();
     for row in rows {
         check_deadline()?;
@@ -1035,6 +1074,19 @@ pub(crate) fn stable_speaker_overlay_snapshot_at_until(
             .into());
         }
 
+        for value in [
+            Some(entity_key.as_str()),
+            Some(name.as_str()),
+            Some(confidence.as_str()),
+            Some(source.as_str()),
+            reversible_to.as_deref(),
+            note.as_deref(),
+            Some(created_at.as_str()),
+            source_sha256.as_deref(),
+        ] {
+            hash_field(&mut hasher, value);
+        }
+
         by_meeting
             .entry(meeting_key.to_string())
             .or_default()
@@ -1055,7 +1107,10 @@ pub(crate) fn stable_speaker_overlay_snapshot_at_until(
     conn.execute_batch("COMMIT")?;
     drop(conn);
     secure_sidecars(&canonical_db_path)?;
-    Ok(StableSpeakerOverlaySnapshot { by_meeting })
+    Ok(StableSpeakerOverlaySnapshot {
+        by_meeting,
+        revision: finish_revision(hasher),
+    })
 }
 
 pub fn load_speaker_confirmations_for_meeting_at(

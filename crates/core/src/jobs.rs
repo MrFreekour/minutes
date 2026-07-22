@@ -1550,9 +1550,8 @@ fn process_pending_jobs_with_transcriber(
                 &recording_duration(&review_job),
             ));
             maybe_mark_context_session_complete(&review_job, artifact.write_result.content_type);
-            if let Err(error) = crate::graph::rebuild_index(config) {
-                tracing::warn!(error = %error, "graph index rebuild failed after queued job");
-            }
+            // Graph answers are disposable, policy-fresh projections of the
+            // current Markdown corpus; there is no durable index to refresh.
             refresh_qmd_collection(config);
             sync_processing_status();
             on_job_update(&review_job);
@@ -1637,9 +1636,7 @@ fn process_pending_jobs_with_transcriber(
                     &result,
                     &recording_duration(&completed_job),
                 ));
-                if let Err(error) = crate::graph::rebuild_index(config) {
-                    tracing::warn!(error = %error, "graph index rebuild failed after queued job");
-                }
+                // Graph consumers project the newly written Markdown on use.
                 refresh_qmd_collection(config);
                 // Run post_record hook (async, non-blocking)
                 pipeline::run_post_record_hook(config, &result.path);

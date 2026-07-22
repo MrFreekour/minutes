@@ -163,6 +163,22 @@ export interface RestrictedMeetingStub {
 
 export type ExactMeetingResult = MeetingFile | RestrictedMeetingStub;
 
+/** Normalize only Rust/Node's equivalent Windows canonical wire prefixes. */
+export function normalizeCanonicalPathWire(path: string): string {
+  const extendedUnc = /^\\\\\?\\UNC\\([^\\]+)\\([^\\]+)(.*)$/i.exec(path);
+  if (extendedUnc) {
+    return `\\\\${extendedUnc[1]}\\${extendedUnc[2]}${extendedUnc[3]}`;
+  }
+  if (/^\\\\\?\\[A-Za-z]:\\/.test(path)) {
+    return path.slice(4);
+  }
+  return path;
+}
+
+export function canonicalPathWireEquals(left: string, right: string): boolean {
+  return normalizeCanonicalPathWire(left) === normalizeCanonicalPathWire(right);
+}
+
 function parseRawAttendees(raw?: string): string[] {
   if (!raw) return [];
 
@@ -918,9 +934,10 @@ export async function getMeetingWithOverlays(
   if (fallback.restricted_stub) return fallback;
 
   const expected = meetingSnapshotContent.get(fallback);
+  const expectedPath = fallback.path;
   const reauthorizeSource = async () => {
     const current = await getMeetingAtCanonicalRoot(
-      filePath,
+      expectedPath,
       options,
       canonicalRoot
     );
@@ -930,6 +947,7 @@ export async function getMeetingWithOverlays(
         expected !== undefined &&
         current !== null &&
         !current.restricted_stub &&
+        current.path === expectedPath &&
         meetingSnapshotContent.get(current) === expected,
     };
   };
@@ -954,7 +972,7 @@ export async function getMeetingWithOverlays(
     try {
       execFile(
         bin,
-        ["get", filePath, "--json", "--compact-json"],
+        ["get", expectedPath, "--json", "--compact-json"],
         { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 },
         (err, out) => {
           if (err) resolve(null);
@@ -986,6 +1004,9 @@ export async function getMeetingWithOverlays(
     if (
       !Array.isArray(overlaidMap) ||
       payload?.overlay_applied !== true ||
+      typeof payload?.path !== "string" ||
+      !canonicalPathWireEquals(payload.path, expectedPath) ||
+      !canonicalPathWireEquals(authorization.current.path, expectedPath) ||
       payload?.overlay_source_sha256 !== sha256(expected)
     ) {
       return authorization.current;

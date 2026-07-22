@@ -6,11 +6,18 @@
 
 **Open-source conversation memory.** &nbsp; [useminutes.app](https://useminutes.app)
 
-**Your AI remembers every conversation — and no one can take it from you.**
+**Your AI remembers the conversations you authorize — and no one can take them from you.**
 
 Agents have run logs. Humans have conversations. **minutes** captures the human side — the decisions, the intent, the context that agents need but can't observe — and makes it queryable. Record a meeting. Capture a voice memo on a walk. Dictate a thought at your cursor. Ask Claude *"what did I promise Sarah?"* — and get an answer.
 
-Everything is transcribed **on your machine** and written to `~/meetings/` as plain markdown, which every AI you use (Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi) reads directly. Nothing is uploaded. When a cloud memory app gets acquired or subpoenaed, your recordings aren't theirs to hand over — they never left your disk.
+Everything is transcribed **on your machine** and written to `~/meetings/` as
+plain markdown. Policy-aware local tools expose normal sources to the AI clients
+you choose (Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi) while
+restricted meetings stay excluded by default. Minutes never uploads your audio;
+meeting text leaves your device only when you explicitly send policy-authorized
+context to a connected cloud agent or summarizer. When a cloud memory app gets
+acquired or subpoenaed, your recordings aren't theirs to hand over — they never
+left your disk.
 
 > **The private, owned conversation-memory layer.** Not another AI notetaker — that category ships free inside Zoom and Meet now. Minutes is audio capture, transcripts, decisions, commitments, people, and provenance as plain files, CLI commands, MCP tools, and live transcript streams. No SDK. No API key. No vendor to outlive. Ten years from now, `grep` still works on your corpus. &nbsp;[**For agents →**](https://useminutes.app/for-agents) &nbsp;·&nbsp; [**Frontmatter schema →**](docs/architecture/frontmatter-schema.md)
 
@@ -95,7 +102,7 @@ Audio → Transcribe → Diarize → Summarize → Structured Markdown → Polic
         Parakeet → Whisper)      Mistral/OpenAI
 ```
 
-Everything runs locally. Your audio never leaves your machine (unless you opt into cloud LLM summarization). Speakers are identified via native diarization. The relationship graph is temporarily unavailable while its bounded privacy-safe rebuild is completed; see roadmap issue #513. Policy-safe search remains available.
+Everything runs locally. Your audio never leaves your machine (unless you opt into cloud LLM summarization). Speakers are identified via native diarization. Relationship answers are rebuilt in a bounded process-private projection from current policy-authorized Markdown and discarded after use.
 
 ## Features
 
@@ -166,7 +173,7 @@ minutes process ~/.minutes/native-captures/2026-05-19-120148-call.voice.wav --ty
 minutes watch                                     # Auto-process new files in inbox
 ```
 
-### Search everything
+### Search your authorized memory
 ```bash
 minutes search "pricing"                          # Full-text search
 minutes search "onboarding" -t memo               # Filter by type
@@ -177,7 +184,7 @@ minutes list                                      # Recent recordings
 
 ### Relationship intelligence
 
-Bounded live-source person profiles and topic research remain available through `minutes person` and `minutes research`. Graph-backed rankings, commitments, alias merging, and losing-touch alerts are temporarily unavailable while their privacy-safe projection is rebuilt. Those graph commands fail closed rather than reading the retired durable index or reporting empty relationship facts. Follow [roadmap issue #513](https://github.com/silverstein/minutes/issues/513) for restoration work.
+`minutes people` and `minutes commitments` derive bounded relationship intelligence through a process-private projection of current policy-authorized Markdown. `minutes person` and `minutes research` use bounded live-source search instead. Both paths re-attest policy before results are returned; no durable graph cache is trusted.
 
 ### Cross-meeting intelligence
 ```bash
@@ -231,7 +238,10 @@ minutes demo                                     # Run a pipeline test (bundled 
 
 ## Switching from Granola?
 
-Import your meeting history into Minutes' conversation memory. Once imported, your meetings become searchable context for AI agents and surface action items and decision patterns across months of conversations. Cross-meeting relationship projections are temporarily unavailable while the privacy-safe rebuild tracked in issue #513 is completed.
+Import your meeting history into Minutes' conversation memory. Once imported,
+normal meetings become searchable context for AI agents and surface action items,
+decision patterns, and bounded relationship intelligence across months of
+conversations. Restricted meetings stay excluded from agent results by default.
 
 ```bash
 minutes import granola --dry-run    # Preview what will be imported
@@ -492,7 +502,7 @@ Canonical MCP reference now lives at:
 
 The MCP surface currently includes recording control, meeting search/retrieval, policy-bound person profiles, structured insights, live transcript reading, dictation, QMD integration, and an interactive dashboard resource. Tool names, resource URIs, and prompt templates are generated from the live product surface instead of hand-maintained in this README.
 
-**Interactive dashboard (Claude Desktop):** tools render an inline interactive UI via [MCP Apps](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/apps) — meeting list with filter/search, detail view with fullscreen + "Send to Claude" context injection, and consistency reports. The graph-backed People tab currently reports the privacy-safe rebuild tracked in [issue #513](https://github.com/silverstein/minutes/issues/513) as unavailable; bounded person profiles remain available through `get_person_profile`. Text-only clients see the same data as plain text.
+**Interactive dashboard (Claude Desktop):** tools render an inline interactive UI via [MCP Apps](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/apps) — meeting list with filter/search, detail view with fullscreen + "Send to Claude" context injection, bounded relationship maps, and consistency reports. Text-only clients see the same data as plain text.
 
 ### OpenCode CLI
 
@@ -573,7 +583,7 @@ command = "npx"
 args = ["minutes-mcp"]
 ```
 
-All 36 tools are available in Vibe as `minutes_*` (e.g. `minutes_start_recording`, `minutes_search_meetings`).
+Minutes tools are available in Vibe as `minutes_*` (e.g. `minutes_start_recording`, `minutes_search_meetings`).
 
 ### Claude Code (Plugin)
 
@@ -641,7 +651,7 @@ same local meeting artifacts. It runs as a singleton assistant session:
 - `AI Assistant` opens or focuses the persistent assistant window
 - `Discuss with AI` reuses that same assistant and switches its active meeting focus
 - Recall writes matching `CLAUDE.md` and `AGENTS.md` instructions into its assistant workspace so Claude-style and AGENTS.md-aware terminal agents get the same meeting context
-- Auto-updates from GitHub Releases with signed artifacts, never interrupting a recording
+- Updates remain manual until a hosted release manifest and rollback UX exist; auto-update stays off
 
 ### Cowork / Dispatch
 The currently verified path for Cowork is plugin-oriented, not “raw MCP automatically appears everywhere.” Minutes ships a Cowork extension scaffold under `integrations/claude-cowork-extension/` and a local bundle build script at `scripts/build_cowork_extension.sh`. On this machine, the bundle build is verified; actual in-Cowork install/use remains a proof-of-life workflow, not a guaranteed default path. Treat Dispatch-triggered recording and other mobile workflows as experimental until the plugin-native path is installed and checked end to end.
@@ -740,7 +750,10 @@ engine = "none"        # "none" = structured YAML only (safest), "agent" = LLM e
 min_confidence = "strong"
 ```
 
-After each meeting, structured facts (decisions, action items, commitments) flow into person profiles automatically. Every fact carries provenance back to its source meeting.
+After each policy-authorized normal meeting, structured facts (decisions,
+action items, commitments) can flow into person profiles automatically.
+Restricted meetings are skipped. Every emitted fact carries provenance back to
+its source meeting.
 
 ```bash
 minutes ingest --dry-run --all   # Preview what would be extracted
