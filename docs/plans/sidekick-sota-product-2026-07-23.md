@@ -332,6 +332,25 @@ remains only a partial completion of step 2: native audio/live ASR, mixed
 room-mic speaker clustering or identity, native permission adapters,
 signed-WebView behavior, and real-provider behavior are explicit exclusions.
 
+### 2026-07-24 real-provider quality and reliability milestone
+
+The first broad real-Codex pass is documented in
+[`sidekick-real-provider-checkpoint-2026-07-24.md`](sidekick-real-provider-checkpoint-2026-07-24.md).
+Across two full-corpus runs and one targeted rerun, every completed scenario
+passed its mechanical and semantic quality gates. The targeted rerun recovered
+all five initial failures with 19/19 required insights and 4.805-6.224-second
+total responses. The second full run found 21/21 required insights across six
+graded scenarios, while independently reproducing a 60-second provider
+session-start timeout and a 10.834-second latency-tail miss.
+
+The evaluator now distinguishes graded quality from coverage, provider
+capacity/timeouts, scenario-execution errors, and latency failures. It remains
+fail-closed: perfect quality on completed work cannot bless an incomplete or
+slow corpus. The provisional generalized SOTA grade does not move yet because
+provider-neutral automatic recovery, the 30-scenario corpus, repeated-tail
+reliability, signed-app evidence, and blind baseline preference are still
+missing.
+
 ## Current Baseline
 
 The branch has a strong deterministic integration foundation and an excellent

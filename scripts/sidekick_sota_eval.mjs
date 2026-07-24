@@ -100,6 +100,17 @@ export function sidekickSotaExitCode(aggregate, { allowPartial = false } = {}) {
   return 1;
 }
 
+function executionErrorCategory(error) {
+  const message = String(error ?? "");
+  if (/\bcapacity\b|\boverloaded\b|rate.?limit|\b429\b|\b503\b/i.test(message)) {
+    return "provider_capacity";
+  }
+  if (/\btimed out\b|\btimeout\b/i.test(message)) {
+    return "provider_timeout";
+  }
+  return "scenario_execution";
+}
+
 function percentile(values, quantile) {
   if (values.length === 0) return null;
   const sorted = [...values].sort((left, right) => left - right);
@@ -174,6 +185,149 @@ export function buildSidekickSotaEvalPlan(
       runnable: runnable.length,
       skipped: skipped.length,
     },
+  };
+}
+
+export function summarizeSidekickSotaResults({
+  results,
+  planCounts,
+  skipped = [],
+}) {
+  const executionFailures = results
+    .filter((result) => result.error)
+    .map((result) => ({
+      fixture_id: result.fixture_id,
+      category: executionErrorCategory(result.error),
+    }));
+  const gradedResults = results.filter(
+    (result) => !result.error && typeof result.quality_passed === "boolean",
+  );
+  const qualityFailures = gradedResults
+    .filter((result) => !result.quality_passed)
+    .map((result) => result.fixture_id);
+  const latencyFailures = gradedResults
+    .filter((result) => result.latency?.passed !== true)
+    .map((result) => result.fixture_id);
+  const insightCoverageComplete =
+    gradedResults.length > 0 &&
+    gradedResults.every(
+      (result) =>
+        Number.isFinite(result.semantic?.insights?.passed) &&
+        Number.isFinite(result.semantic?.insights?.total) &&
+        result.semantic.insights.total > 0 &&
+        result.semantic.insights.passed <= result.semantic.insights.total,
+    );
+  const insightPassed = gradedResults.reduce(
+    (total, result) => total + (result.semantic?.insights?.passed ?? 0),
+    0,
+  );
+  const insightTotal = gradedResults.reduce(
+    (total, result) => total + (result.semantic?.insights?.total ?? 0),
+    0,
+  );
+  const requiredInsightRate = insightTotal > 0 ? insightPassed / insightTotal : 0;
+  const gradedQualityPassed = gradedResults.filter(
+    (result) => result.quality_passed,
+  ).length;
+  const qualityCoverageComplete =
+    gradedResults.length === results.length && results.length > 0;
+  const qualityPassed =
+    qualityCoverageComplete &&
+    insightCoverageComplete &&
+    gradedQualityPassed === gradedResults.length &&
+    requiredInsightRate >= 0.9;
+  const latencyPassed =
+    qualityCoverageComplete &&
+    latencyFailures.length === 0;
+  const behavioralPathAllPassed =
+    qualityPassed &&
+    latencyPassed &&
+    results.every((result) => result.passed);
+  const fullCorpusPassed =
+    planCounts.matched === planCounts.total &&
+    skipped.length === 0 &&
+    results.length === planCounts.matched &&
+    behavioralPathAllPassed;
+  const providerCapacityFailures = executionFailures.filter(
+    ({ category }) => category === "provider_capacity",
+  );
+  const providerFailures = executionFailures.filter(({ category }) =>
+    category.startsWith("provider_"),
+  );
+
+  return {
+    attempted: results.length,
+    passed: results.filter((result) => result.passed).length,
+    failed: results.filter((result) => !result.passed).length,
+    deferred: skipped.length,
+    graded: gradedResults.length,
+    graded_quality_passed: gradedQualityPassed,
+    graded_quality_pass_rate:
+      gradedResults.length > 0 ? gradedQualityPassed / gradedResults.length : 0,
+    quality_coverage_complete: qualityCoverageComplete,
+    insight_coverage_complete: insightCoverageComplete,
+    quality_passed: qualityPassed,
+    quality_failure_count: qualityFailures.length,
+    quality_failure_scenarios: qualityFailures,
+    latency_passed: latencyPassed,
+    latency_failure_count: latencyFailures.length,
+    latency_failure_scenarios: latencyFailures,
+    scenario_execution_error_count: executionFailures.length,
+    scenario_execution_errors: executionFailures,
+    provider_error_count: providerFailures.length,
+    provider_capacity_error_count: providerCapacityFailures.length,
+    provider_error_scenarios: providerFailures,
+    required_insights_found: insightPassed,
+    required_insights_total: insightTotal,
+    required_insight_rate: requiredInsightRate,
+    first_token_p95_ms: percentile(
+      gradedResults
+        .flatMap((result) => result.latency?.checks ?? [])
+        .map(({ first_token_ms }) => first_token_ms)
+        .filter(Number.isFinite),
+      0.95,
+    ),
+    total_p95_ms: percentile(
+      gradedResults
+        .flatMap((result) => result.latency?.checks ?? [])
+        .map(({ total_ms }) => total_ms)
+        .filter(Number.isFinite),
+      0.95,
+    ),
+    behavioral_path_all_passed: behavioralPathAllPassed,
+    full_corpus_passed: fullCorpusPassed,
+    release_ready: false,
+    release_blockers: [
+      "capture and diarization are not exercised by this behavioral replay",
+      ...(executionFailures.length > 0
+        ? [
+            `${executionFailures.length} scenario(s) failed before quality grading because the scenario execution lane errored`,
+          ]
+        : []),
+      ...(providerCapacityFailures.length > 0
+        ? [
+            `${providerCapacityFailures.length} provider execution error(s) were capacity or overload failures`,
+          ]
+        : []),
+      ...(!qualityCoverageComplete
+        ? ["quality grading did not cover every attempted scenario"]
+        : []),
+      ...(!insightCoverageComplete
+        ? ["insight grading was missing or malformed for a graded scenario"]
+        : []),
+      ...(qualityFailures.length > 0
+        ? [`${qualityFailures.length} graded scenario(s) failed quality checks`]
+        : []),
+      ...(latencyFailures.length > 0
+        ? [`${latencyFailures.length} graded scenario(s) missed the latency budget`]
+        : []),
+      ...(requiredInsightRate < 0.9
+        ? ["fewer than 90% of rubric insights were found"]
+        : []),
+      ...(skipped.length > 0
+        ? ["projection scenarios remain deferred until their product evidence lanes exist"]
+        : []),
+    ],
   };
 }
 
@@ -411,28 +565,13 @@ export async function main(argv = process.argv) {
   if (!sidekickProviderAttestationMatches(providerExecutableAfter, providerExecutable)) {
     throw new Error("Codex provider executable changed during Sidekick SOTA evaluation");
   }
-  const insightPassed = results.reduce(
-    (total, result) => total + (result.semantic?.insights?.passed ?? 0),
-    0,
-  );
-  const insightTotal = results.reduce(
-    (total, result) => total + (result.semantic?.insights?.total ?? 0),
-    0,
-  );
-  const requiredInsightRate = insightTotal > 0 ? insightPassed / insightTotal : 0;
-  const qualityPassed =
-    results.length > 0 &&
-    results.every((result) => result.quality_passed) &&
-    requiredInsightRate >= 0.9;
-  const latencyPassed =
-    results.length > 0 && results.every((result) => result.latency?.passed);
-  const behavioralPathAllPassed =
-    qualityPassed &&
-    latencyPassed &&
-    results.length > 0 &&
-    results.every((result) => result.passed);
+  const aggregate = summarizeSidekickSotaResults({
+    results,
+    planCounts: plan.counts,
+    skipped: plan.skipped,
+  });
   const report = {
-    schema_version: 1,
+    schema_version: 2,
     benchmark: "sidekick-sota-adversarial-corpus",
     provider_executable: providerExecutableAfter,
     requested_model: options.model,
@@ -446,46 +585,8 @@ export async function main(argv = process.argv) {
     skipped: plan.skipped,
     results,
     aggregate: {
-      attempted: results.length,
-      passed: results.filter((result) => result.passed).length,
-      failed: results.filter((result) => !result.passed).length,
-      deferred: plan.skipped.length,
-      quality_passed: qualityPassed,
-      latency_passed: latencyPassed,
-      required_insights_found: insightPassed,
-      required_insights_total: insightTotal,
-      required_insight_rate: requiredInsightRate,
-      first_token_p95_ms: percentile(
-        results
-          .flatMap((result) => result.latency?.checks ?? [])
-          .map(({ first_token_ms }) => first_token_ms)
-          .filter(Number.isFinite),
-        0.95,
-      ),
-      total_p95_ms: percentile(
-        results
-          .flatMap((result) => result.latency?.checks ?? [])
-          .map(({ total_ms }) => total_ms)
-          .filter(Number.isFinite),
-        0.95,
-      ),
-      behavioral_path_all_passed: behavioralPathAllPassed,
-      full_corpus_passed:
-        plan.counts.matched === plan.counts.total &&
-        plan.skipped.length === 0 &&
-        results.length === plan.counts.matched &&
-        behavioralPathAllPassed,
-      release_ready: false,
+      ...aggregate,
       partial_success_allowed: options.allowPartial,
-      release_blockers: [
-        "capture and diarization are not exercised by this behavioral replay",
-        ...(requiredInsightRate < 0.9
-          ? ["fewer than 90% of rubric insights were found"]
-          : []),
-        ...(plan.skipped.length > 0
-          ? ["projection scenarios remain deferred until their product evidence lanes exist"]
-          : []),
-      ],
     },
   };
   const serialized = `${JSON.stringify(report, null, 2)}\n`;

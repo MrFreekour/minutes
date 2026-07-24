@@ -5,6 +5,7 @@ import {
   buildSidekickSotaEvalPlan,
   scoreSidekickSotaLatency,
   sidekickSotaExitCode,
+  summarizeSidekickSotaResults,
 } from "../sidekick_sota_eval.mjs";
 import {
   loadSidekickSotaFixtures,
@@ -107,4 +108,111 @@ test("foreground latency is a fail-closed part of the SOTA result", async () => 
 
   const missing = scoreSidekickSotaLatency({ fixture, latencies: {} });
   assert.equal(missing.passed, false);
+});
+
+test("aggregate reporting distinguishes quality coverage, provider capacity, and latency tails", () => {
+  const aggregate = summarizeSidekickSotaResults({
+    results: [
+      {
+        fixture_id: "fast-quality-pass",
+        passed: true,
+        quality_passed: true,
+        latency: {
+          passed: true,
+          checks: [{ first_token_ms: 2_000, total_ms: 4_000 }],
+        },
+        semantic: { insights: { passed: 3, total: 3 } },
+      },
+      {
+        fixture_id: "slow-quality-pass",
+        passed: false,
+        quality_passed: true,
+        latency: {
+          passed: false,
+          checks: [{ first_token_ms: 2_500, total_ms: 12_000 }],
+        },
+        semantic: { insights: { passed: 2, total: 2 } },
+      },
+      {
+        fixture_id: "missing-measurements",
+        passed: false,
+        quality_passed: true,
+      },
+      {
+        fixture_id: "capacity-error",
+        passed: false,
+        error: "Selected model is at capacity. Please try a different model.",
+      },
+      {
+        fixture_id: "timeout-error",
+        passed: false,
+        error: "thread/start timed out after 60000 ms",
+      },
+      {
+        fixture_id: "harness-error",
+        passed: false,
+        error: "fixture parser exploded",
+      },
+    ],
+    planCounts: { matched: 6, total: 6 },
+  });
+
+  assert.equal(aggregate.graded, 3);
+  assert.equal(aggregate.graded_quality_passed, 3);
+  assert.equal(aggregate.graded_quality_pass_rate, 1);
+  assert.equal(aggregate.quality_coverage_complete, false);
+  assert.equal(aggregate.insight_coverage_complete, false);
+  assert.equal(aggregate.quality_passed, false);
+  assert.equal(aggregate.latency_passed, false);
+  assert.deepEqual(aggregate.latency_failure_scenarios, [
+    "slow-quality-pass",
+    "missing-measurements",
+  ]);
+  assert.equal(aggregate.scenario_execution_error_count, 3);
+  assert.deepEqual(aggregate.scenario_execution_errors, [
+    { fixture_id: "capacity-error", category: "provider_capacity" },
+    { fixture_id: "timeout-error", category: "provider_timeout" },
+    { fixture_id: "harness-error", category: "scenario_execution" },
+  ]);
+  assert.equal(aggregate.provider_error_count, 2);
+  assert.equal(aggregate.provider_capacity_error_count, 1);
+  assert.deepEqual(aggregate.provider_error_scenarios, [
+    { fixture_id: "capacity-error", category: "provider_capacity" },
+    { fixture_id: "timeout-error", category: "provider_timeout" },
+  ]);
+  assert.equal(aggregate.required_insight_rate, 1);
+  assert.equal(aggregate.behavioral_path_all_passed, false);
+  assert.equal(aggregate.full_corpus_passed, false);
+  assert.match(aggregate.release_blockers.join("\n"), /scenario execution lane/);
+  assert.match(aggregate.release_blockers.join("\n"), /latency budget/);
+  assert.match(aggregate.release_blockers.join("\n"), /did not cover every/);
+  assert.match(aggregate.release_blockers.join("\n"), /missing or malformed/);
+});
+
+test("aggregate reporting passes only a fully graded, full-corpus behavioral path", () => {
+  const aggregate = summarizeSidekickSotaResults({
+    results: [
+      {
+        fixture_id: "quality-pass",
+        passed: true,
+        quality_passed: true,
+        latency: {
+          passed: true,
+          checks: [{ first_token_ms: 2_000, total_ms: 4_000 }],
+        },
+        semantic: { insights: { passed: 3, total: 3 } },
+      },
+    ],
+    planCounts: { matched: 1, total: 1 },
+  });
+
+  assert.equal(aggregate.quality_coverage_complete, true);
+  assert.equal(aggregate.insight_coverage_complete, true);
+  assert.equal(aggregate.quality_passed, true);
+  assert.equal(aggregate.latency_passed, true);
+  assert.equal(aggregate.behavioral_path_all_passed, true);
+  assert.equal(aggregate.full_corpus_passed, true);
+  assert.deepEqual(aggregate.release_blockers, [
+    "capture and diarization are not exercised by this behavioral replay",
+  ]);
 });
