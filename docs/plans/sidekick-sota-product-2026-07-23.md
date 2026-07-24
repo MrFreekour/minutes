@@ -347,9 +347,19 @@ The evaluator now distinguishes graded quality from coverage, provider
 capacity/timeouts, scenario-execution errors, and latency failures. It remains
 fail-closed: perfect quality on completed work cannot bless an incomplete or
 slow corpus. The provisional generalized SOTA grade does not move yet because
-provider-neutral automatic recovery, the 30-scenario corpus, repeated-tail
+complete attach-and-verifier recovery, the 30-scenario corpus, repeated-tail
 reliability, signed-app evidence, and blind baseline preference are still
 missing.
+
+The first recovery slice is now implemented below the provider boundary.
+Retryable overload, timeout, and unavailable failures during a foreground
+generation get one exact-window replay without asking the user to retype.
+Attempt identity is Minutes-owned, so a late completion from a replaced
+provider session cannot publish even if that provider reuses its local turn
+ID. Attempt and recovery time remain in the first-useful-token and total
+latency receipts. This closes the ordinary foreground-generation gap only;
+initial attach, independent-verifier failure, signed recovery UX, and
+statistically meaningful reliability tails remain red.
 
 ## Current Baseline
 

@@ -297,6 +297,7 @@ struct NativeSidekickCandidateEvidenceReceipt {
     context_evidence_ids: Vec<String>,
     visual_evidence_ids: Vec<String>,
     claims_visual_observation: bool,
+    provider_attempts: u8,
     first_token_ms: Option<u64>,
     total_ms: u64,
     candidate_sha256: String,
@@ -17282,6 +17283,7 @@ fn wait_for_native_sidekick_diagnostic_turn(
                     "verdict": publication.evidence_verification.verdict,
                     "verifier_session_correlation": verifier_session_correlation,
                 },
+                "provider_attempts": publication.provider_attempts,
                 "first_token_ms": publication.first_token_ms,
                 "total_ms": publication.total_ms,
                 "publication_ready_ms": Instant::now()
@@ -21564,6 +21566,7 @@ fn run_native_sidekick(
                             .map(|id| id.as_str().to_string())
                             .collect(),
                         claims_visual_observation: publication.candidate.claims_visual_observation,
+                        provider_attempts: publication.provider_attempts,
                         first_token_ms: publication.first_token_ms,
                         total_ms: publication.total_ms,
                         candidate_digest_verified: candidate_sha256

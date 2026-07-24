@@ -18,6 +18,7 @@ const VERIFIER_DEVELOPER_INSTRUCTIONS: &str =
     include_str!("../../../../resources/live_sidekick/verifier_developer_instructions.txt");
 const STRATEGIST_WARMUP_INSTRUCTION: &str = "MINUTES SESSION WARMUP\nNo meeting evidence or user request is present. Return a silent Sidekick decision with no text, evidence IDs, visual claim, or factual claim. Treat this synthetic warmup as lifecycle traffic, not meeting history.";
 const SESSION_WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_FOREGROUND_PROVIDER_RETRIES: u8 = 1;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -348,6 +349,10 @@ pub struct SidekickPublication {
     pub work: SidekickWork,
     pub candidate: InterventionCandidate,
     pub evidence_verification: EvidenceVerificationReceipt,
+    /// Total provider generation attempts behind this visible publication.
+    /// This is one on the ordinary path and two after the single bounded
+    /// provider-neutral overload/timeout/unavailable recovery.
+    pub provider_attempts: u8,
     pub first_token_ms: Option<u64>,
     pub total_ms: u64,
 }
@@ -381,9 +386,9 @@ pub struct ForegroundEvidenceReceipt {
     pub visual_evidence_ids: Vec<EvidenceId>,
 }
 
-/// Terminal lifecycle signal for every provider turn that matched the active
-/// invocation. UI runtimes can settle loading state even when Minutes elects
-/// not to publish model output.
+/// Lifecycle signal for every provider turn that matched the active
+/// invocation. Retry events are nonterminal; publication, suppression, and
+/// failure let UI runtimes settle loading state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidekickLifecycleEvent {
     pub work: SidekickWork,
@@ -394,6 +399,13 @@ pub struct SidekickLifecycleEvent {
 pub enum SidekickLifecycleOutcome {
     Published,
     Suppressed(CandidateSuppressionReason),
+    Retrying {
+        error: ReasoningError,
+        attempt: u8,
+        elapsed_ms: u64,
+        recovery_ms: u64,
+        session_restarted: bool,
+    },
     Failed(ReasoningError),
 }
 
@@ -402,7 +414,10 @@ pub enum SidekickLifecycleOutcome {
 /// session can never impersonate the active verifier, even when both providers
 /// reuse the same opaque turn ID.
 enum EngineReasoningEvent {
-    Strategist(ReasoningStreamEvent),
+    Strategist {
+        attempt: u64,
+        event: ReasoningStreamEvent,
+    },
     Verifier {
         attempt: u64,
         event: ReasoningStreamEvent,
@@ -431,13 +446,16 @@ struct ActiveReasoning {
     freshness_retries: u8,
     completeness_retries: u8,
     verification_retries: u8,
+    provider_retries: u8,
     carried_total_ms: u64,
     initial_first_token_ms: Option<u64>,
+    attempt_started_at: Instant,
 }
 
 enum ActiveReasoningStage {
     Generating {
         turn_id: ReasoningTurnId,
+        strategist_attempt: u64,
     },
     Verifying {
         turn_id: ReasoningTurnId,
@@ -458,6 +476,7 @@ struct TurnRetryState {
     freshness_retries: u8,
     completeness_retries: u8,
     verification_retries: u8,
+    provider_retries: u8,
     carried_total_ms: u64,
     initial_first_token_ms: Option<u64>,
 }
@@ -465,7 +484,7 @@ struct TurnRetryState {
 impl ActiveReasoningStage {
     fn turn_id(&self) -> &ReasoningTurnId {
         match self {
-            Self::Generating { turn_id } | Self::Verifying { turn_id, .. } => turn_id,
+            Self::Generating { turn_id, .. } | Self::Verifying { turn_id, .. } => turn_id,
         }
     }
 }
@@ -502,6 +521,7 @@ pub struct LiveSidekickEngine {
     next_run: u64,
     next_turn: u64,
     next_user_event: u64,
+    next_strategist_attempt: u64,
     next_verifier_attempt: u64,
 }
 
@@ -578,6 +598,7 @@ impl LiveSidekickEngine {
             next_run: 1,
             next_turn: 1,
             next_user_event: 1,
+            next_strategist_attempt: 1,
             next_verifier_attempt: 1,
         })
     }
@@ -907,6 +928,7 @@ impl LiveSidekickEngine {
             if let (Some(active), Some(provider)) = (&self.active, self.backend_session.as_mut()) {
                 if let ActiveReasoningStage::Generating {
                     turn_id: active_turn_id,
+                    strategist_attempt,
                 } = &active.stage
                 {
                     if provider.steer_turn(active_turn_id, request.clone()).is_ok() {
@@ -915,6 +937,7 @@ impl LiveSidekickEngine {
                         self.active = Some(ActiveReasoning {
                             stage: ActiveReasoningStage::Generating {
                                 turn_id: active_turn_id.clone(),
+                                strategist_attempt: *strategist_attempt,
                             },
                             work,
                             policy_feedback: request.policy_feedback.clone(),
@@ -930,8 +953,10 @@ impl LiveSidekickEngine {
                             freshness_retries: 0,
                             completeness_retries: 0,
                             verification_retries: 0,
+                            provider_retries: 0,
                             carried_total_ms: 0,
                             initial_first_token_ms: None,
+                            attempt_started_at: Instant::now(),
                         });
                         self.remember_user_message(text);
                         return Ok(turn_id);
@@ -997,11 +1022,11 @@ impl LiveSidekickEngine {
     pub fn pump(&mut self) {
         while let Ok(event) = self.event_receiver.try_recv() {
             match event {
-                EngineReasoningEvent::Strategist(event) => {
-                    self.handle_provider_event(event, None);
+                EngineReasoningEvent::Strategist { attempt, event } => {
+                    self.handle_provider_event(event, Some(attempt), None);
                 }
                 EngineReasoningEvent::Verifier { attempt, event } => {
-                    self.handle_provider_event(event, Some(attempt));
+                    self.handle_provider_event(event, None, Some(attempt));
                 }
             }
         }
@@ -1010,6 +1035,7 @@ impl LiveSidekickEngine {
     fn handle_provider_event(
         &mut self,
         event: ReasoningStreamEvent,
+        strategist_attempt: Option<u64>,
         verifier_attempt: Option<u64>,
     ) {
         match event {
@@ -1018,12 +1044,24 @@ impl LiveSidekickEngine {
                 turn_id,
                 invocation,
                 result,
-            } => self.complete(turn_id, invocation, result, verifier_attempt),
+            } => self.complete(
+                turn_id,
+                invocation,
+                result,
+                strategist_attempt,
+                verifier_attempt,
+            ),
             ReasoningStreamEvent::Failed {
                 turn_id,
                 invocation,
                 error,
-            } => self.failed(turn_id, invocation, error, verifier_attempt),
+            } => self.failed(
+                turn_id,
+                invocation,
+                error,
+                strategist_attempt,
+                verifier_attempt,
+            ),
         }
     }
 
@@ -1043,7 +1081,7 @@ impl LiveSidekickEngine {
         self.active.is_some()
     }
 
-    /// Drain terminal turn outcomes, including intentional suppression.
+    /// Drain provider retry and terminal turn outcomes.
     pub fn take_lifecycle_events(&mut self) -> Vec<SidekickLifecycleEvent> {
         self.pump();
         self.lifecycle_events.drain(..).collect()
@@ -1106,7 +1144,7 @@ impl LiveSidekickEngine {
         &mut self,
         work: SidekickWork,
         prepared_request: Option<ReasoningTurnRequest>,
-        retry_state: TurnRetryState,
+        mut retry_state: TurnRetryState,
     ) -> Result<(), ReasoningError> {
         let request = match prepared_request {
             Some(request) => request,
@@ -1115,24 +1153,69 @@ impl LiveSidekickEngine {
         self.ensure_context_sources_current()?;
         let sender = self.event_sender.clone();
         let (allowed_evidence_ids, allowed_visual_ids) = Self::allowed_provenance(&request);
-        let turn_id = self
-            .backend_session
-            .as_mut()
-            .ok_or_else(|| {
-                ReasoningError::new(
-                    ReasoningErrorKind::Unavailable,
-                    "reasoning backend is not attached",
-                    true,
-                )
-            })?
-            .start_turn(
+        let Some(next_strategist_attempt) = self.next_strategist_attempt.checked_add(1) else {
+            return Err(ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "Sidekick exhausted strategist attempt identities",
+                false,
+            ));
+        };
+        let strategist_attempt = self.next_strategist_attempt;
+        self.next_strategist_attempt = next_strategist_attempt;
+        let attempt_started_at = Instant::now();
+        let start_result = match self.backend_session.as_mut() {
+            Some(session) => session.start_turn(
                 request.clone(),
                 Arc::new(move |event| {
-                    let _ = sender.send(EngineReasoningEvent::Strategist(event));
+                    let _ = sender.send(EngineReasoningEvent::Strategist {
+                        attempt: strategist_attempt,
+                        event,
+                    });
                 }),
-            )?;
+            ),
+            None => Err(ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "reasoning backend is not attached",
+                true,
+            )),
+        };
+        let turn_id = match start_result {
+            Ok(turn_id) => turn_id,
+            Err(error)
+                if Self::can_retry_provider_generation(
+                    &work,
+                    &error,
+                    retry_state.provider_retries,
+                ) =>
+            {
+                let elapsed_ms = Self::elapsed_ms(attempt_started_at);
+                retry_state.provider_retries = retry_state.provider_retries.saturating_add(1);
+                retry_state.carried_total_ms =
+                    retry_state.carried_total_ms.saturating_add(elapsed_ms);
+                let recovery_started_at = Instant::now();
+                let session_restarted = self.recover_session_for_provider_retry(&error)?;
+                let recovery_ms = Self::elapsed_ms(recovery_started_at);
+                retry_state.carried_total_ms =
+                    retry_state.carried_total_ms.saturating_add(recovery_ms);
+                self.lifecycle_events.push_back(SidekickLifecycleEvent {
+                    work: work.clone(),
+                    outcome: SidekickLifecycleOutcome::Retrying {
+                        error,
+                        attempt: retry_state.provider_retries.saturating_add(1),
+                        elapsed_ms,
+                        recovery_ms,
+                        session_restarted,
+                    },
+                });
+                return self.start_turn_with_retry(work, Some(request), retry_state);
+            }
+            Err(error) => return Err(error),
+        };
         self.active = Some(ActiveReasoning {
-            stage: ActiveReasoningStage::Generating { turn_id },
+            stage: ActiveReasoningStage::Generating {
+                turn_id,
+                strategist_attempt,
+            },
             work,
             policy_feedback: request.policy_feedback.clone(),
             request,
@@ -1147,10 +1230,51 @@ impl LiveSidekickEngine {
             freshness_retries: retry_state.freshness_retries,
             completeness_retries: retry_state.completeness_retries,
             verification_retries: retry_state.verification_retries,
+            provider_retries: retry_state.provider_retries,
             carried_total_ms: retry_state.carried_total_ms,
             initial_first_token_ms: retry_state.initial_first_token_ms,
+            attempt_started_at,
         });
         Ok(())
+    }
+
+    fn can_retry_provider_generation(
+        work: &SidekickWork,
+        error: &ReasoningError,
+        provider_retries: u8,
+    ) -> bool {
+        matches!(work, SidekickWork::Foreground { .. })
+            && provider_retries < MAX_FOREGROUND_PROVIDER_RETRIES
+            && error.retryable
+            && matches!(
+                error.kind,
+                ReasoningErrorKind::Overloaded
+                    | ReasoningErrorKind::Timeout
+                    | ReasoningErrorKind::Unavailable
+            )
+    }
+
+    fn recover_session_for_provider_retry(
+        &mut self,
+        error: &ReasoningError,
+    ) -> Result<bool, ReasoningError> {
+        if error.kind == ReasoningErrorKind::Overloaded {
+            return Ok(false);
+        }
+        self.restart_backend().map(|()| true).map_err(|recovery| {
+            ReasoningError::new(
+                recovery.kind,
+                format!(
+                    "reasoning provider recovery after {:?} failed: {}",
+                    error.kind, recovery.message
+                ),
+                recovery.retryable,
+            )
+        })
+    }
+
+    fn elapsed_ms(started_at: Instant) -> u64 {
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
 
     fn request_for(
@@ -1238,6 +1362,7 @@ impl LiveSidekickEngine {
         turn_id: ReasoningTurnId,
         invocation: InvocationIdentity,
         result: ReasoningTurnResult,
+        strategist_attempt: Option<u64>,
         verifier_attempt: Option<u64>,
     ) {
         let Some(active) = self.active.as_ref() else {
@@ -1247,7 +1372,10 @@ impl LiveSidekickEngine {
             return;
         }
         match &active.stage {
-            ActiveReasoningStage::Generating { .. } if verifier_attempt.is_none() => {
+            ActiveReasoningStage::Generating {
+                strategist_attempt: active_attempt,
+                ..
+            } if strategist_attempt == Some(*active_attempt) && verifier_attempt.is_none() => {
                 self.complete_generation(result);
             }
             ActiveReasoningStage::Verifying {
@@ -1262,7 +1390,15 @@ impl LiveSidekickEngine {
 
     fn complete_generation(&mut self, mut result: ReasoningTurnResult) {
         let active = self.active.take().expect("generation completion is active");
-        result.first_token_ms = active.initial_first_token_ms.or(result.first_token_ms);
+        result.first_token_ms = active.initial_first_token_ms.or_else(|| {
+            result.first_token_ms.map(|first_token_ms| {
+                if active.provider_retries > 0 {
+                    active.carried_total_ms.saturating_add(first_token_ms)
+                } else {
+                    first_token_ms
+                }
+            })
+        });
         result.total_ms = active.carried_total_ms.saturating_add(result.total_ms);
         let allowed_evidence_ids = active.allowed_evidence_ids.clone();
         let allowed_visual_ids = active.allowed_visual_ids.clone();
@@ -1326,6 +1462,7 @@ impl LiveSidekickEngine {
                 result,
                 None,
                 processed_evidence_revision,
+                active.provider_retries.saturating_add(1),
             );
             return;
         }
@@ -1619,6 +1756,7 @@ impl LiveSidekickEngine {
                 verifier_session_id,
             }),
             active.evidence_revision,
+            active.provider_retries.saturating_add(1),
         );
     }
 
@@ -1629,6 +1767,7 @@ impl LiveSidekickEngine {
         result: ReasoningTurnResult,
         evidence_verification: Option<EvidenceVerificationReceipt>,
         processed_evidence_revision: u64,
+        provider_attempts: u8,
     ) {
         if let Err(error) = self.ensure_context_sources_current() {
             self.record_failure(work, error);
@@ -1677,6 +1816,7 @@ impl LiveSidekickEngine {
                 work: work.clone(),
                 candidate,
                 evidence_verification,
+                provider_attempts,
                 first_token_ms: result.first_token_ms,
                 total_ms: result.total_ms,
             });
@@ -1709,6 +1849,7 @@ impl LiveSidekickEngine {
         turn_id: ReasoningTurnId,
         invocation: InvocationIdentity,
         error: ReasoningError,
+        strategist_attempt: Option<u64>,
         verifier_attempt: Option<u64>,
     ) {
         let Some(active) = self.active.as_ref() else {
@@ -1718,7 +1859,10 @@ impl LiveSidekickEngine {
             return;
         }
         match &active.stage {
-            ActiveReasoningStage::Generating { .. } if verifier_attempt.is_none() => {}
+            ActiveReasoningStage::Generating {
+                strategist_attempt: active_attempt,
+                ..
+            } if strategist_attempt == Some(*active_attempt) && verifier_attempt.is_none() => {}
             ActiveReasoningStage::Verifying {
                 verifier_attempt: active_attempt,
                 ..
@@ -1726,7 +1870,47 @@ impl LiveSidekickEngine {
             _ => return,
         }
         let active = self.active.take().expect("active checked");
-        if matches!(active.stage, ActiveReasoningStage::Verifying { .. }) {
+        if matches!(&active.stage, ActiveReasoningStage::Generating { .. })
+            && Self::can_retry_provider_generation(&active.work, &error, active.provider_retries)
+        {
+            let elapsed_ms = Self::elapsed_ms(active.attempt_started_at);
+            let mut retry_state = TurnRetryState {
+                freshness_retries: active.freshness_retries,
+                completeness_retries: active.completeness_retries,
+                verification_retries: active.verification_retries,
+                provider_retries: active.provider_retries.saturating_add(1),
+                carried_total_ms: active.carried_total_ms.saturating_add(elapsed_ms),
+                initial_first_token_ms: active.initial_first_token_ms,
+            };
+            let recovery_started_at = Instant::now();
+            let session_restarted = match self.recover_session_for_provider_retry(&error) {
+                Ok(restarted) => restarted,
+                Err(recovery_error) => {
+                    self.record_failure(active.work, recovery_error);
+                    return;
+                }
+            };
+            let recovery_ms = Self::elapsed_ms(recovery_started_at);
+            retry_state.carried_total_ms = retry_state.carried_total_ms.saturating_add(recovery_ms);
+            self.lifecycle_events.push_back(SidekickLifecycleEvent {
+                work: active.work.clone(),
+                outcome: SidekickLifecycleOutcome::Retrying {
+                    error,
+                    attempt: retry_state.provider_retries.saturating_add(1),
+                    elapsed_ms,
+                    recovery_ms,
+                    session_restarted,
+                },
+            });
+            let work = active.work;
+            if let Err(retry_error) =
+                self.start_turn_with_retry(work.clone(), Some(active.request), retry_state)
+            {
+                self.record_failure(work, retry_error);
+            }
+            return;
+        }
+        if matches!(&active.stage, ActiveReasoningStage::Verifying { .. }) {
             if let Some(mut verifier) = self.active_verifier_session.take() {
                 verifier.close();
             }
@@ -1791,6 +1975,7 @@ impl LiveSidekickEngine {
                 freshness_retries: active.freshness_retries.saturating_add(1),
                 completeness_retries: active.completeness_retries,
                 verification_retries: active.verification_retries,
+                provider_retries: active.provider_retries,
                 carried_total_ms,
                 initial_first_token_ms,
             },
@@ -1838,6 +2023,7 @@ impl LiveSidekickEngine {
                 verification_retries: active.verification_retries.saturating_add(u8::from(
                     matches!(retry_kind, SemanticRetryKind::Verification),
                 )),
+                provider_retries: active.provider_retries,
                 carried_total_ms: generation_result
                     .total_ms
                     .saturating_add(verification_total_ms),
@@ -2522,6 +2708,8 @@ mod tests {
         closed_sessions: Vec<String>,
         steer_fails: bool,
         defer_verification: bool,
+        strategist_start_errors: VecDeque<ReasoningError>,
+        reuse_strategist_turn_ids: bool,
         reuse_verifier_turn_ids: bool,
         verification_verdicts: VecDeque<EvidenceVerificationVerdict>,
     }
@@ -2558,6 +2746,16 @@ mod tests {
                     first_token_ms: Some(50),
                     total_ms: 100,
                 },
+            });
+        }
+
+        fn fail(&self, index: usize, error: ReasoningError) {
+            let state = lock(&self.state);
+            let turn = &state.turns[index];
+            turn.sink.on_event(ReasoningStreamEvent::Failed {
+                turn_id: turn.id.clone(),
+                invocation: turn.request.invocation,
+                error,
             });
         }
     }
@@ -2680,7 +2878,14 @@ mod tests {
                 });
                 return Ok(id);
             }
-            let id = ReasoningTurnId::new(format!("fake-turn-{}", state.turns.len() + 1));
+            if let Some(error) = state.strategist_start_errors.pop_front() {
+                return Err(error);
+            }
+            let id = if state.reuse_strategist_turn_ids {
+                ReasoningTurnId::new("provider-local-strategist-turn-1")
+            } else {
+                ReasoningTurnId::new(format!("fake-turn-{}", state.turns.len() + 1))
+            };
             state.turns.push(FakeTurn {
                 id: id.clone(),
                 request,
@@ -4073,6 +4278,197 @@ mod tests {
             publications[0].candidate.text.as_deref(),
             Some("Stop; approval was withdrawn.")
         );
+    }
+
+    #[test]
+    fn synchronous_foreground_start_failure_recovers_without_retyping() {
+        let backend = FakeBackend::default();
+        lock(&backend.state)
+            .strategist_start_errors
+            .push_back(ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "synthetic start failure",
+                true,
+            ));
+        let mut engine = engine(backend.clone());
+        observe(&mut engine, "decision", "The decision is still open.");
+
+        let turn_id = engine.send_user("What should I protect?").unwrap();
+        assert_eq!(
+            engine
+                .foreground_evidence_receipt(&turn_id)
+                .unwrap()
+                .transcript_evidence_ids,
+            vec![EvidenceId::new("decision")]
+        );
+        assert!(engine.take_lifecycle_events().iter().any(|event| {
+            matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    attempt: 2,
+                    session_restarted: true,
+                    ..
+                }
+            )
+        }));
+        backend.complete(
+            0,
+            speak(&["decision"], "Protect the reversible decision path."),
+        );
+        let publications = engine.take_publications();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].provider_attempts, 2);
+        assert!(engine.take_failures().is_empty());
+    }
+
+    #[test]
+    fn retryable_foreground_failure_replays_once_and_rejects_old_session_events() {
+        let backend = FakeBackend::default();
+        lock(&backend.state).reuse_strategist_turn_ids = true;
+        let mut engine = engine(backend.clone());
+        observe(&mut engine, "approval", "The launch is approved.");
+        engine.send_user("Should we proceed?").unwrap();
+        engine
+            .active
+            .as_mut()
+            .expect("foreground turn is active")
+            .attempt_started_at = Instant::now() - Duration::from_millis(1_000);
+
+        backend.fail(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "synthetic transport loss",
+                true,
+            ),
+        );
+        let retry_events = engine.take_lifecycle_events();
+        assert!(retry_events.iter().any(|event| {
+            matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    error,
+                    attempt: 2,
+                    session_restarted: true,
+                    ..
+                } if error.kind == ReasoningErrorKind::Unavailable
+            )
+        }));
+        {
+            let state = lock(&backend.state);
+            assert_eq!(state.turns.len(), 2);
+            assert_eq!(state.turns[0].id, state.turns[1].id);
+            assert_eq!(
+                state.turns[0].request.typed_user_message,
+                state.turns[1].request.typed_user_message
+            );
+            assert_eq!(state.turns[0].request.window, state.turns[1].request.window);
+            assert_eq!(
+                state.turns[0].request.invocation,
+                state.turns[1].request.invocation
+            );
+        }
+
+        // The failed provider session reuses the exact local turn ID and
+        // invocation after restart. Its late completion must still be stale.
+        backend.complete(0, speak(&["approval"], "Ignore this stale answer."));
+        assert!(engine.take_publications().is_empty());
+        assert!(engine.has_active_turn());
+
+        backend.complete(1, speak(&["approval"], "Proceed with the approved launch."));
+        let publications = engine.take_publications();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].provider_attempts, 2);
+        assert!(
+            publications[0].first_token_ms >= Some(1_250),
+            "first token must include the failed attempt"
+        );
+        assert!(
+            publications[0].total_ms >= 1_600,
+            "total latency must include the failed attempt and verifier"
+        );
+        assert_eq!(
+            publications[0].candidate.text.as_deref(),
+            Some("Proceed with the approved launch.")
+        );
+        assert!(engine.take_failures().is_empty());
+    }
+
+    #[test]
+    fn foreground_provider_retry_exhaustion_fails_closed_without_a_third_attempt() {
+        let backend = FakeBackend::default();
+        let mut engine = engine(backend.clone());
+        observe(&mut engine, "decision", "The decision is still open.");
+        engine.send_user("What should I protect?").unwrap();
+
+        backend.fail(
+            0,
+            ReasoningError::new(ReasoningErrorKind::Overloaded, "busy once", true),
+        );
+        assert!(engine.has_active_turn());
+        backend.fail(
+            1,
+            ReasoningError::new(ReasoningErrorKind::Overloaded, "busy twice", true),
+        );
+
+        let failures = engine.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].error.kind, ReasoningErrorKind::Overloaded);
+        assert_eq!(lock(&backend.state).turns.len(), 2);
+        assert!(engine.take_publications().is_empty());
+        let retry_events = engine.take_lifecycle_events();
+        assert_eq!(
+            retry_events
+                .iter()
+                .filter(|event| {
+                    matches!(&event.outcome, SidekickLifecycleOutcome::Retrying { .. })
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_retry_scope_excludes_background_and_nonretryable_failures() {
+        let background_backend = FakeBackend::default();
+        let mut background_engine = engine(background_backend.clone());
+        observe(
+            &mut background_engine,
+            "decision",
+            "The decision is still open.",
+        );
+        background_engine.evaluate_background().unwrap();
+        background_backend.fail(
+            0,
+            ReasoningError::new(ReasoningErrorKind::Overloaded, "background busy", true),
+        );
+        let background_failures = background_engine.take_failures();
+        assert_eq!(background_failures.len(), 1);
+        assert_eq!(lock(&background_backend.state).turns.len(), 1);
+        assert!(background_engine
+            .take_lifecycle_events()
+            .iter()
+            .all(|event| !matches!(&event.outcome, SidekickLifecycleOutcome::Retrying { .. })));
+
+        let auth_backend = FakeBackend::default();
+        let mut auth_engine = engine(auth_backend.clone());
+        observe(&mut auth_engine, "decision", "The decision is still open.");
+        auth_engine.send_user("What should I protect?").unwrap();
+        auth_backend.fail(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Authentication,
+                "authentication required",
+                false,
+            ),
+        );
+        let auth_failures = auth_engine.take_failures();
+        assert_eq!(auth_failures.len(), 1);
+        assert_eq!(lock(&auth_backend.state).turns.len(), 1);
+        assert!(auth_engine
+            .take_lifecycle_events()
+            .iter()
+            .all(|event| !matches!(&event.outcome, SidekickLifecycleOutcome::Retrying { .. })));
     }
 
     #[test]

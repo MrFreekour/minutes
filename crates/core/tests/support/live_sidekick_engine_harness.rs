@@ -963,16 +963,25 @@ fn provider_failure_and_recovery() -> EvalScenario {
                 true,
             ),
         )?;
+        let lifecycle = fixture.engine.take_lifecycle_events();
         let failures = fixture.engine.take_failures();
         let capture_survived = fixture.engine.session.phase == AssistancePhase::Ready;
-        fixture
-            .engine
-            .recover_backend()
-            .map_err(|error| error.to_string())?;
-        fixture
-            .engine
-            .send_user("Retry with the current evidence.")
-            .map_err(|error| error.to_string())?;
+        let requests = fixture.strategist.requests();
+        let exact_request_replayed = requests.len() == 2
+            && requests[0].typed_user_message == requests[1].typed_user_message
+            && requests[0].window == requests[1].window
+            && requests[0].invocation == requests[1].invocation;
+        let bounded_retry_recorded = lifecycle.iter().any(|event| {
+            matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    error,
+                    attempt: 2,
+                    session_restarted: true,
+                    ..
+                } if error.kind == ReasoningErrorKind::Unavailable && error.retryable
+            )
+        });
         fixture.strategist.complete_candidate(
             1,
             candidate(
@@ -992,11 +1001,12 @@ fn provider_failure_and_recovery() -> EvalScenario {
             .map_err(|error| error.to_string())?;
         Ok(vec![
             assertion(
-                "provider_failure_is_classified",
-                failures.len() == 1
-                    && failures[0].error.kind == ReasoningErrorKind::Unavailable
-                    && failures[0].error.retryable,
-                format!("failures={}", failures.len()),
+                "retryable_provider_failure_is_recovered_once",
+                failures.is_empty() && bounded_retry_recorded,
+                format!(
+                    "failures={} retry_recorded={bounded_retry_recorded}",
+                    failures.len()
+                ),
             ),
             assertion(
                 "capture_survives_provider_failure",
@@ -1009,9 +1019,20 @@ fn provider_failure_and_recovery() -> EvalScenario {
                 "sessions=2+2",
             ),
             assertion(
-                "recovered_turn_publishes",
-                publications.len() == 1,
-                format!("publications={}", publications.len()),
+                "recovery_replays_the_exact_user_and_evidence_window",
+                exact_request_replayed,
+                format!("requests={}", requests.len()),
+            ),
+            assertion(
+                "recovered_turn_publishes_with_attempt_receipt",
+                publications.len() == 1 && publications[0].provider_attempts == 2,
+                format!(
+                    "publications={} attempts={}",
+                    publications.len(),
+                    publications
+                        .first()
+                        .map_or(0, |publication| publication.provider_attempts)
+                ),
             ),
         ])
     })

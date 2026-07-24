@@ -105,8 +105,11 @@ It does not prove:
   meaningful repeated corpus; or
 - blind preference against the production terminal-Codex baseline.
 
-The immediate product blocker is provider-neutral recovery: fail quickly on a
-stalled provider start, retry a retryable overload/timeout once without losing
-the user turn or evidence window, preserve both attempts in telemetry and
-latency, and surface an inline recovery action if the bounded retry fails.
-
+The foreground generation recovery identified by this checkpoint is now
+implemented in Minutes' provider-neutral engine: one retry preserves the exact
+user turn and evidence window, both attempts in latency and telemetry, and a
+Minutes-owned attempt identity that rejects late events from a replaced
+provider session. Remaining reliability blockers are fast failure and bounded
+recovery during initial attach, equivalent provider-failure handling in the
+independent verifier lane, and an inline recovery action if the bounded turn
+retry fails.

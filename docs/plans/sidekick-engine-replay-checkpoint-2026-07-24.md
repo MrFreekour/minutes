@@ -39,7 +39,7 @@ The checkpoint executes each scenario twice through the public production
 | Exact screen publication | Exact selected PNG bytes, evidence receipt, independent verifier, publication gate |
 | Exact-session screen store | Production context database/session links select one session's PNG, exclude another session, and deliver the selected bytes to Sidekick |
 | Correction during verification | Moving transcript window, refreshed verification, contradiction rejection, fresh regeneration |
-| Provider failure and recovery | Retryable network-class failure, capture isolation, provider epoch replacement, successful retry |
+| Provider failure and recovery | Retryable network-class failure, automatic bounded retry, exact-window replay, provider epoch replacement, attempt receipt, successful publication |
 | Screen unavailable | Missing image bytes rejected, fabricated visual provenance blocked, transcript-only recovery |
 | Foreground preemption | Typed user turn interrupts background work; late background completion is ignored |
 | Provider steering | Active persistent turn is steered into foreground work without a second generation |
@@ -53,9 +53,9 @@ Result at this checkpoint:
 
 ```text
 12/12 scenarios
-47/47 assertions
+48/48 assertions
 reproducible=true
-digest=e48a0d1c27ef8d898ac0b185ac1a138ca50cded0a01820b05faca1a2cc8a8e48
+digest=3d794c88ff72e8b51b76508c8b22c24fdaf40b63c1320aaef0d68b12a870fb91
 ```
 
 The second lane then transcribes the committed 10.6-second spoken-meeting WAV
@@ -145,3 +145,14 @@ The artifact also labels every provider duration as simulated and sets
 `release_ready_from_this_report_alone=false`. A future change cannot turn this
 gate green into a claim about native microphone capture, live ASR,
 diarization, permissions, cloud latency, or signed-app UX.
+
+The provider-recovery scenario now reflects the production behavior instead
+of requiring a synthetic user to retype the message. A retryable foreground
+generation overload, timeout, or unavailable error gets one Minutes-owned
+retry. Timeout/unavailable recovery replaces the provider session; overload
+retries the still-valid persistent session. The retry carries forward the
+exact typed message, bounded evidence window, first-useful-token clock, and
+total latency. A Minutes-owned strategist-attempt identity prevents a delayed
+event from the replaced session from impersonating the retry even if both
+provider sessions reuse the same local turn ID and invocation. Authentication,
+protocol, background, and second failures still fail closed.
