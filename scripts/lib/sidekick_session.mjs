@@ -277,7 +277,7 @@ export class SidekickSession {
         throw new Error("Sidekick warmup must resolve as an empty silent decision");
       }
     } catch (error) {
-      this.backend.close();
+      await Promise.resolve(this.backend.close()).catch(() => {});
       throw error;
     }
     this.backendSessionId = result.sessionId;
@@ -431,7 +431,7 @@ export class SidekickSession {
     }
     // Close immediately so a wedged protocol request cannot hold shutdown open
     // for the full provider timeout. Any in-flight interruption is best effort.
-    this.backend.close();
+    const closing = Promise.resolve(this.backend.close()).catch(() => {});
     if (interruption) {
       let deadline;
       await Promise.race([
@@ -442,6 +442,7 @@ export class SidekickSession {
       ]);
       clearTimeout(deadline);
     }
+    await closing;
     this.#record("session_stopped", {});
   }
 

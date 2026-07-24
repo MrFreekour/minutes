@@ -129,8 +129,10 @@ export class BackendEvidenceVerifier {
     this.closed = false;
     this.cwd = null;
     this.readyPromise = null;
+    this.closePromise = null;
     this.activeBackend = null;
     this.preparingBackend = null;
+    this.closingBackends = new Set();
     this.sessionsStarted = 0;
     this.verificationReceipts = [];
   }
@@ -139,6 +141,7 @@ export class BackendEvidenceVerifier {
     if (this.started) throw new Error("evidence verifier already started");
     this.cwd = cwd;
     this.closed = false;
+    this.closePromise = null;
     this.readyPromise = this.#beginPreparingSlot();
     const slot = await this.#takePreparedSlot();
     this.started = true;
@@ -162,7 +165,7 @@ export class BackendEvidenceVerifier {
     const backend = assertReasoningBackend(await this.backendFactory());
     this.preparingBackend = backend;
     if (this.closed) {
-      backend.close();
+      await this.#closeBackend(backend);
       if (this.preparingBackend === backend) this.preparingBackend = null;
       throw new Error("evidence verifier is closed");
     }
@@ -195,7 +198,7 @@ export class BackendEvidenceVerifier {
       if (this.preparingBackend === backend) this.preparingBackend = null;
       return { backend, session };
     } catch (error) {
-      backend.close();
+      await this.#closeBackend(backend);
       if (this.preparingBackend === backend) this.preparingBackend = null;
       throw error;
     }
@@ -213,7 +216,7 @@ export class BackendEvidenceVerifier {
     if (this.activeBackend) throw new Error("evidence verifier already has an active candidate");
     const slot = await this.#takePreparedSlot();
     if (this.closed) {
-      slot.backend.close();
+      await this.#closeBackend(slot.backend);
       throw new Error("evidence verifier is closed");
     }
     this.activeBackend = slot.backend;
@@ -250,9 +253,21 @@ export class BackendEvidenceVerifier {
       });
       return verdict;
     } finally {
-      slot.backend.close();
+      this.#closeBackend(slot.backend);
       if (this.activeBackend === slot.backend) this.activeBackend = null;
     }
+  }
+
+  #closeBackend(backend) {
+    let closing;
+    try {
+      closing = Promise.resolve(backend?.close()).catch(() => {});
+    } catch {
+      closing = Promise.resolve();
+    }
+    this.closingBackends.add(closing);
+    closing.finally(() => this.closingBackends.delete(closing));
+    return closing;
   }
 
   async #verifyWithBackend(backend, {
@@ -292,24 +307,39 @@ export class BackendEvidenceVerifier {
     return parseVerdict(result);
   }
 
-  async close() {
-    if (this.closed) return;
+  close() {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.#close();
+    return this.closePromise;
+  }
+
+  async #close() {
     this.closed = true;
     this.started = false;
-    this.activeBackend?.close();
+    const closing = [];
+    if (this.activeBackend) {
+      closing.push(this.#closeBackend(this.activeBackend));
+    }
     this.activeBackend = null;
-    this.preparingBackend?.close();
+    if (this.preparingBackend) {
+      closing.push(this.#closeBackend(this.preparingBackend));
+    }
     this.preparingBackend = null;
-    let deadline;
-    await Promise.race([
-      this.#takePreparedSlot()
-        .then((slot) => slot?.backend?.close())
-        .catch(() => {}),
-      new Promise((resolve) => {
-        deadline = setTimeout(resolve, this.shutdownGraceMs);
-      }),
-    ]);
-    clearTimeout(deadline);
+    let preparationDeadline;
+    closing.push(
+      Promise.race([
+        this.#takePreparedSlot()
+          .then((slot) => this.#closeBackend(slot?.backend))
+          .catch(() => {}),
+        new Promise((resolve) => {
+          preparationDeadline = setTimeout(resolve, this.shutdownGraceMs);
+        }),
+      ]).finally(() => clearTimeout(preparationDeadline)),
+    );
+    await Promise.allSettled(closing);
+    while (this.closingBackends.size > 0) {
+      await Promise.allSettled([...this.closingBackends]);
+    }
     this.readyPromise = null;
   }
 }

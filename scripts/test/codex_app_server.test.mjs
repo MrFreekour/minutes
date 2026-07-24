@@ -139,7 +139,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   await client.start();
   const child = client.child;
   const exited = once(child, "exit");
-  client.close();
+  const closeResult = client.close();
+  assert.equal(client.close(), closeResult);
   let deadline;
   const [, signal] = await Promise.race([
     exited,
@@ -151,6 +152,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     }),
   ]);
   clearTimeout(deadline);
+  await closeResult;
+  assert.notEqual(child.exitCode ?? child.signalCode, null);
   assert.equal(signal, "SIGKILL");
   assert.equal(child.stdin.destroyed, true);
   assert.equal(child.stdout.destroyed, true);

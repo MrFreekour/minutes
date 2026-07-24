@@ -238,6 +238,6 @@ export class SidekickSotaJudge {
   close() {
     this.started = false;
     this.sessionId = null;
-    this.backend.close();
+    return this.backend.close();
   }
 }

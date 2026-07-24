@@ -116,3 +116,45 @@ retry on a fresh verifier session, replaying the exact candidate and evidence
 seal without rerunning the strategist. Remaining reliability blockers are
 repeated real-provider tail evidence and an inline recovery action if bounded
 recovery is exhausted.
+
+## Post-recovery repeated corpus
+
+Four additional full-corpus runs exercised the three recovery layers and the
+real provider lifecycle. The first passed cleanly. The second exposed a
+harness-owned teardown defect: a scenario could start while a verifier, judge,
+or strategist process from the prior scenario was still exiting, causing three
+Codex state-runtime initialization failures. It also captured one genuine
+25.525-second foreground latency tail.
+
+The client shutdown contract now resolves only after the provider child exits,
+escalates a wedged child from `SIGTERM` to `SIGKILL`, and is idempotent across
+competing owners. Sidekick session, judge, provider, and verifier teardown all
+propagate that completion. The verifier tracks consumed and speculative
+backends until each has exited, while retaining a bounded shutdown for a
+non-cooperative preparation promise. A regression deliberately withholds
+backend exit and proves verifier shutdown cannot report completion early.
+
+After that correction, two baseline runs had no provider or state errors and no
+Sidekick-owned provider process survived the corpus:
+
+| Run | End-to-end | Quality | Insights | First-token p95 | Total p95 | Provider errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| post-recovery 3 | 5/7 | 7/7 | 25/25 | 3.323s | 14.849s | 0 |
+| post-recovery 4 | 7/7 | 7/7 | 25/25 | 3.415s | 6.222s | 0 |
+
+Run 3 failed only the unchanged latency bar. One first draft correctly failed
+independent verification and the repaired answer arrived in 14.849 seconds;
+one otherwise clean answer arrived in 9.043 seconds. Run 4 passed every
+behavioral and latency gate. This is evidence that teardown-induced state
+contention is fixed, not statistical proof that the total-response tail is
+ready.
+
+An adversarial A/B lowered verifier reasoning from `low` to `none` without
+changing any rubric or threshold. It regressed to 4/7 end-to-end, 6/7 quality,
+and a 16.378-second total p95. The product default therefore remains `low`.
+Faster verification must earn promotion through repeated safety and quality
+evidence; the latency budget will not be weakened to accommodate it.
+
+The complete Sidekick JavaScript bank at this checkpoint is 162/162, including
+normal exit, forced exit, idempotent close, state-error classification, and
+verifier lifecycle ownership.

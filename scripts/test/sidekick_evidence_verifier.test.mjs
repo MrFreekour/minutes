@@ -38,6 +38,26 @@ class FakeBackend {
   close() { this.closed = true; }
 }
 
+class DeferredCloseBackend extends FakeBackend {
+  constructor(options) {
+    super(options);
+    this.closeStarted = false;
+    this.closeFinished = false;
+    this.closePromise = new Promise((resolve) => {
+      this.finishClose = () => {
+        this.closed = true;
+        this.closeFinished = true;
+        resolve();
+      };
+    });
+  }
+
+  close() {
+    this.closeStarted = true;
+    return this.closePromise;
+  }
+}
+
 function verifierFactory(configure = () => [supported, supported]) {
   const backends = [];
   return {
@@ -223,4 +243,38 @@ test("close bounds a wedged verifier preparation after closing its backend", asy
   assert.equal(backend.closed, true);
   resolveStart({ sessionId: "late-session" });
   await assert.rejects(starting, /closed/);
+});
+
+test("close waits for every verifier backend process to finish exiting", async () => {
+  const backends = [];
+  const verifier = new BackendEvidenceVerifier({
+    backendFactory: () => {
+      const backend = new DeferredCloseBackend({
+        id: backends.length + 1,
+        verdicts: [supported, supported],
+      });
+      backends.push(backend);
+      return backend;
+    },
+  });
+  await verifier.start();
+  await verifier.verify({
+    candidate: { text: "Four thousand times $200 is $800K." },
+    transcriptEvidence: [{ id: "math", text: "Four thousand wrong at $200 each." }],
+    screenEvidence: null,
+  });
+  assert.equal(backends[0].closeStarted, true);
+  assert.equal(backends[0].closeFinished, false);
+
+  let closeFinished = false;
+  const closeResult = verifier.close();
+  assert.equal(verifier.close(), closeResult);
+  const closing = closeResult.then(() => {
+    closeFinished = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeFinished, false);
+  for (const backend of backends) backend.finishClose();
+  await closing;
+  assert.equal(backends.every((backend) => backend.closeFinished), true);
 });

@@ -368,6 +368,16 @@ close the ordinary foreground-generation, initial-attach, and verifier
 transport gaps only; signed recovery UX and statistically meaningful
 reliability tails remain red.
 
+The subsequent repeated-provider pass also found and closed a harness-owned
+process-lifecycle false failure: evaluator shutdown previously initiated
+provider termination but could begin the next scenario before the old child
+actually exited. Two post-fix full corpora reached all seven graders with zero
+provider/state errors and 25/25 required insights in each. One corpus passed
+the 5s/8s latency bar at 3.415s/6.222s p95; the other retained two honest tail
+misses at 9.043s and 14.849s. A lighter-verifier experiment made both quality
+and latency worse, so it was rejected. This raises confidence in lifecycle
+correctness while leaving repeated-tail reliability red.
+
 ## Current Baseline
 
 The branch has a strong deterministic integration foundation and an excellent

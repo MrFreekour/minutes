@@ -142,7 +142,7 @@ export class CodexAppServerBackend {
   }
 
   close() {
-    this.client.close();
+    return this.client.close();
   }
 
   #assertStarted() {

@@ -153,8 +153,14 @@ test("aggregate reporting distinguishes quality coverage, provider capacity, and
         passed: false,
         error: "fixture parser exploded",
       },
+      {
+        fixture_id: "state-error",
+        passed: false,
+        error:
+          "failed to initialize sqlite state runtime: failed to initialize state runtime",
+      },
     ],
-    planCounts: { matched: 6, total: 6 },
+    planCounts: { matched: 7, total: 7 },
   });
 
   assert.equal(aggregate.graded, 3);
@@ -168,17 +174,19 @@ test("aggregate reporting distinguishes quality coverage, provider capacity, and
     "slow-quality-pass",
     "missing-measurements",
   ]);
-  assert.equal(aggregate.scenario_execution_error_count, 3);
+  assert.equal(aggregate.scenario_execution_error_count, 4);
   assert.deepEqual(aggregate.scenario_execution_errors, [
     { fixture_id: "capacity-error", category: "provider_capacity" },
     { fixture_id: "timeout-error", category: "provider_timeout" },
     { fixture_id: "harness-error", category: "scenario_execution" },
+    { fixture_id: "state-error", category: "provider_state" },
   ]);
-  assert.equal(aggregate.provider_error_count, 2);
+  assert.equal(aggregate.provider_error_count, 3);
   assert.equal(aggregate.provider_capacity_error_count, 1);
   assert.deepEqual(aggregate.provider_error_scenarios, [
     { fixture_id: "capacity-error", category: "provider_capacity" },
     { fixture_id: "timeout-error", category: "provider_timeout" },
+    { fixture_id: "state-error", category: "provider_state" },
   ]);
   assert.equal(aggregate.required_insight_rate, 1);
   assert.equal(aggregate.behavioral_path_all_passed, false);

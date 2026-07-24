@@ -78,10 +78,12 @@ export class CodexAppServerClient extends EventEmitter {
     this.pendingRequests = new Map();
     this.turns = new Map();
     this.stderrTail = "";
+    this.closePromise = null;
   }
 
   async start() {
     if (this.child) throw new Error("Codex app-server is already running");
+    this.closePromise = null;
 
     const child = spawn(this.command, this.args, {
       cwd: this.cwd,
@@ -188,20 +190,27 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   close() {
-    if (!this.child) return;
+    if (this.closePromise) return this.closePromise;
+    if (!this.child) return Promise.resolve();
     const child = this.child;
+    this.closePromise = new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve({ code: child.exitCode, signal: child.signalCode });
+        return;
+      }
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
     child.kill("SIGTERM");
     const forceKill = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
       }
     }, this.closeGraceMs);
-    forceKill.unref();
     child.once("exit", () => clearTimeout(forceKill));
     child.stdin?.end();
     child.stdout?.destroy();
     child.stderr?.destroy();
-    child.unref();
+    return this.closePromise;
   }
 
   #turn(turnId) {

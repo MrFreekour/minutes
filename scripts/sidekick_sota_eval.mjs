@@ -108,6 +108,9 @@ function executionErrorCategory(error) {
   if (/\btimed out\b|\btimeout\b/i.test(message)) {
     return "provider_timeout";
   }
+  if (/failed to initialize (?:sqlite )?state runtime/i.test(message)) {
+    return "provider_state";
+  }
   return "scenario_execution";
 }
 
@@ -497,9 +500,11 @@ async function runScenario({ fixture, providerExecutable, options, mcpDisableArg
       trace: session.trace,
     };
   } finally {
-    judge.close();
-    await evidenceVerifier.close();
-    await session.stop();
+    await Promise.allSettled([
+      Promise.resolve(judge.close()),
+      evidenceVerifier.close(),
+      session.stop(),
+    ]);
     await fs.rm(cwd, { recursive: true, force: true });
   }
 }
