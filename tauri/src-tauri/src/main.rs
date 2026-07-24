@@ -553,10 +553,20 @@ fn native_sidekick_diagnostic_operationally_passed(
         else {
             return false;
         };
-        if payload
+        let Some(reasoning_sessions_started) = payload
             .pointer("/reasoning_sessions_started")
             .and_then(serde_json::Value::as_u64)
-            != Some(1)
+        else {
+            return false;
+        };
+        let Some(reasoning_ready_attempts) = payload
+            .pointer("/reasoning_ready_attempts")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|attempts| (1..=2).contains(attempts))
+        else {
+            return false;
+        };
+        if reasoning_sessions_started == 0 || reasoning_sessions_started > reasoning_ready_attempts
         {
             return false;
         }
@@ -852,6 +862,7 @@ mod native_sidekick_cli_tests {
             "context_session_id": "sidekick-diagnostic-synthetic-42-1",
             "reasoning_session_correlation": "session-a",
             "reasoning_sessions_started": 1,
+            "reasoning_ready_attempts": 1,
             "fixture_turns": [
                 {
                     "id": "vendor_strategy",
@@ -870,6 +881,13 @@ mod native_sidekick_cli_tests {
 
         assert!(native_sidekick_diagnostic_operationally_passed(
             &payload, &cli
+        ));
+        let mut recovered_attach = payload.clone();
+        recovered_attach["reasoning_sessions_started"] = serde_json::json!(2);
+        recovered_attach["reasoning_ready_attempts"] = serde_json::json!(2);
+        assert!(native_sidekick_diagnostic_operationally_passed(
+            &recovered_attach,
+            &cli
         ));
         let mut wrong_source = payload;
         wrong_source["transcript_source"] = serde_json::json!("active_transcript");
@@ -898,6 +916,7 @@ mod native_sidekick_cli_tests {
             "context_session_id": "sidekick-diagnostic-synthetic-42-1",
             "reasoning_session_correlation": "session-a",
             "reasoning_sessions_started": 1,
+            "reasoning_ready_attempts": 1,
             "fixture_turns": []
         });
 

@@ -357,7 +357,10 @@ pub(crate) struct NativeSidekickAcceptanceRuntime {
     provider_descriptor: Option<minutes_core::live_sidekick::ReasoningBackendDescriptor>,
     verifier_provider_descriptor: Option<minutes_core::live_sidekick::ReasoningBackendDescriptor>,
     reasoning_session_correlation: Option<String>,
+    reasoning_session_correlation_at_ready: Option<String>,
     reasoning_sessions_started: u64,
+    reasoning_sessions_started_at_ready: Option<u64>,
+    reasoning_ready_attempts: u8,
     verifier_sessions_started: u64,
 }
 
@@ -16146,7 +16149,10 @@ fn configure_native_sidekick_acceptance(
         provider_descriptor: None,
         verifier_provider_descriptor: None,
         reasoning_session_correlation: None,
+        reasoning_session_correlation_at_ready: None,
         reasoning_sessions_started: 0,
+        reasoning_sessions_started_at_ready: None,
+        reasoning_ready_attempts: 0,
         verifier_sessions_started: 0,
     });
     Ok(())
@@ -16499,8 +16505,15 @@ fn record_native_sidekick_acceptance_reasoning_session(
         .unwrap_or_else(|error| error.into_inner())
         .as_mut()
     {
+        if runtime.reasoning_session_correlation_at_ready.is_none() {
+            runtime.reasoning_session_correlation_at_ready = correlation.clone();
+        }
+        if runtime.reasoning_sessions_started_at_ready.is_none() {
+            runtime.reasoning_sessions_started_at_ready = Some(sessions_started);
+        }
         runtime.reasoning_session_correlation = correlation;
         runtime.reasoning_sessions_started = sessions_started;
+        runtime.reasoning_ready_attempts = engine.reasoning_ready_attempts();
         runtime.verifier_sessions_started = verifier_sessions_started;
         runtime.provider_descriptor = Some(engine.descriptor().clone());
         runtime.verifier_provider_descriptor = Some(engine.verifier_descriptor());
@@ -17733,6 +17746,7 @@ pub fn run_native_sidekick_diagnostic(
         .map_err(|error| error.to_string())?;
     let initial_reasoning_session_correlation =
         native_sidekick_diagnostic_session_correlation(&engine)?;
+    let initial_reasoning_sessions_started = engine.reasoning_sessions_started();
 
     let transcript_items = if let Some(fixture) = fixture.as_ref() {
         let mut accepted = 0;
@@ -17780,7 +17794,7 @@ pub fn run_native_sidekick_diagnostic(
     let mut fixture_turns = Vec::new();
     if let Some(fixture) = fixture.as_ref() {
         for turn in &fixture.fixture.turns {
-            if engine.reasoning_sessions_started() != 1
+            if engine.reasoning_sessions_started() != initial_reasoning_sessions_started
                 || native_sidekick_diagnostic_session_correlation(&engine)?
                     != initial_reasoning_session_correlation
             {
@@ -17799,7 +17813,7 @@ pub fn run_native_sidekick_diagnostic(
                 requested_at,
             )?;
             let turn_session_correlation = native_sidekick_diagnostic_session_correlation(&engine)?;
-            if engine.reasoning_sessions_started() != 1
+            if engine.reasoning_sessions_started() != initial_reasoning_sessions_started
                 || turn_session_correlation != initial_reasoning_session_correlation
             {
                 return Err(
@@ -17852,6 +17866,7 @@ pub fn run_native_sidekick_diagnostic(
     let reasoning_sessions_started = engine.reasoning_sessions_started();
     let verifier_sessions_started = engine.verifier_sessions_started();
     let reasoning_ready_ms = engine.reasoning_ready_ms();
+    let reasoning_ready_attempts = engine.reasoning_ready_attempts();
     let _ = engine.stop_capture();
     let provider_identity_after = native_sidekick_provider_identity(&codex_path)?;
     if provider_identity_after != provider_identity {
@@ -17894,6 +17909,7 @@ pub fn run_native_sidekick_diagnostic(
         "reasoning_sessions_started": reasoning_sessions_started,
         "verifier_sessions_started": verifier_sessions_started,
         "reasoning_ready_ms": reasoning_ready_ms,
+        "reasoning_ready_attempts": reasoning_ready_attempts,
         "proactive": proactive,
         "foreground": foreground,
         "fixture_turns": fixture_turns,
@@ -20007,7 +20023,10 @@ fn run_native_sidekick_ui_acceptance(
     }
     let (
         reasoning_session_correlation,
+        reasoning_session_correlation_at_ready,
         reasoning_sessions_started,
+        reasoning_sessions_started_at_ready,
+        reasoning_ready_attempts,
         verifier_sessions_started,
         main_launch_claimed,
         main_launch_completed,
@@ -20025,7 +20044,10 @@ fn run_native_sidekick_ui_acceptance(
         })?;
         (
             runtime.reasoning_session_correlation.clone(),
+            runtime.reasoning_session_correlation_at_ready.clone(),
             runtime.reasoning_sessions_started,
+            runtime.reasoning_sessions_started_at_ready,
+            runtime.reasoning_ready_attempts,
             runtime.verifier_sessions_started,
             runtime.main_launch_claimed,
             runtime.main_launch_completed,
@@ -20106,7 +20128,10 @@ fn run_native_sidekick_ui_acceptance(
             "main_launch_completed": main_launch_completed,
             "interactable_targets": interactable_targets,
             "reasoning_session_correlation": reasoning_session_correlation,
+            "reasoning_session_correlation_at_ready": reasoning_session_correlation_at_ready,
             "reasoning_sessions_started": reasoning_sessions_started,
+            "reasoning_sessions_started_at_ready": reasoning_sessions_started_at_ready,
+            "reasoning_ready_attempts": reasoning_ready_attempts,
             "verifier_sessions_started": verifier_sessions_started,
             "provider_executable_path": provider_executable_path,
             "provider_executable_sha256": provider_executable_sha256,
@@ -20115,7 +20140,8 @@ fn run_native_sidekick_ui_acceptance(
             "provider_requested_contract": provider_descriptor.clone(),
             "verifier_requested_contract": verifier_provider_descriptor,
             "provider_capabilities_exercised": {
-                "persistent_sequential_turns": reasoning_sessions_started == 1,
+                "persistent_sequential_turns": reasoning_sessions_started_at_ready == Some(reasoning_sessions_started)
+                    && reasoning_session_correlation_at_ready == reasoning_session_correlation,
                 "streaming_delta_observed": streaming_delta_observed,
                 "steering": false,
                 "interruption": false,

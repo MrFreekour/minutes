@@ -18,6 +18,7 @@ const VERIFIER_DEVELOPER_INSTRUCTIONS: &str =
     include_str!("../../../../resources/live_sidekick/verifier_developer_instructions.txt");
 const STRATEGIST_WARMUP_INSTRUCTION: &str = "MINUTES SESSION WARMUP\nNo meeting evidence or user request is present. Return a silent Sidekick decision with no text, evidence IDs, visual claim, or factual claim. Treat this synthetic warmup as lifecycle traffic, not meeting history.";
 const SESSION_WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_ATTACH_PROVIDER_ATTEMPTS: u8 = 2;
 const MAX_FOREGROUND_PROVIDER_RETRIES: u8 = 1;
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -499,6 +500,7 @@ pub struct LiveSidekickEngine {
     backend_sessions_started: u64,
     verifier_sessions_started: u64,
     reasoning_ready_ms: Option<u64>,
+    reasoning_ready_attempts: u8,
     descriptor: ReasoningBackendDescriptor,
     config: LiveSidekickEngineConfig,
     /// Local-only source receipts for the active historical context. Provider
@@ -578,6 +580,7 @@ impl LiveSidekickEngine {
             backend_sessions_started: 0,
             verifier_sessions_started: 0,
             reasoning_ready_ms: None,
+            reasoning_ready_attempts: 0,
             descriptor,
             config,
             context_card: None,
@@ -639,6 +642,12 @@ impl LiveSidekickEngine {
         self.reasoning_ready_ms
     }
 
+    /// Number of provider attach attempts used when this capture first became
+    /// ready. A value of two proves the one bounded startup recovery was used.
+    pub fn reasoning_ready_attempts(&self) -> u8 {
+        self.reasoning_ready_attempts
+    }
+
     pub fn start_capture(
         &mut self,
         capture_session_id: CaptureSessionId,
@@ -655,7 +664,18 @@ impl LiveSidekickEngine {
                 reduction.rejection
             )));
         }
-        self.restart_backend()?;
+        let started_at = Instant::now();
+        self.reasoning_ready_attempts = 1;
+        if let Err(error) = self.restart_backend() {
+            if !Self::is_retryable_provider_transport_error(&error)
+                || self.reasoning_ready_attempts >= MAX_ATTACH_PROVIDER_ATTEMPTS
+            {
+                return Err(error);
+            }
+            self.reasoning_ready_attempts = self.reasoning_ready_attempts.saturating_add(1);
+            self.restart_backend()?;
+        }
+        self.reasoning_ready_ms = Some(Self::elapsed_ms(started_at));
         Ok(reduction)
     }
 
@@ -1245,7 +1265,11 @@ impl LiveSidekickEngine {
     ) -> bool {
         matches!(work, SidekickWork::Foreground { .. })
             && provider_retries < MAX_FOREGROUND_PROVIDER_RETRIES
-            && error.retryable
+            && Self::is_retryable_provider_transport_error(error)
+    }
+
+    fn is_retryable_provider_transport_error(error: &ReasoningError) -> bool {
+        error.retryable
             && matches!(
                 error.kind,
                 ReasoningErrorKind::Overloaded
@@ -2699,6 +2723,7 @@ mod tests {
     #[derive(Default)]
     struct FakeState {
         sessions_started: usize,
+        session_start_errors: VecDeque<ReasoningError>,
         strategist_warmups: Vec<ReasoningTurnRequest>,
         verifier_warmups: Vec<ReasoningTurnRequest>,
         turns: Vec<FakeTurn>,
@@ -2779,6 +2804,9 @@ mod tests {
         ) -> Result<Box<dyn PersistentReasoningSession>, ReasoningError> {
             config.validate()?;
             let mut state = lock(&self.state);
+            if let Some(error) = state.session_start_errors.pop_front() {
+                return Err(error);
+            }
             state.sessions_started += 1;
             let session_number = state.sessions_started;
             drop(state);
@@ -2927,8 +2955,8 @@ mod tests {
         }
     }
 
-    fn engine(backend: FakeBackend) -> LiveSidekickEngine {
-        let mut engine = LiveSidekickEngine::new(
+    fn unstarted_engine(backend: FakeBackend) -> LiveSidekickEngine {
+        LiveSidekickEngine::new(
             "assist".into(),
             AssistanceSurface::NativeRecall,
             UserRole::DecisionMaker,
@@ -2942,7 +2970,11 @@ mod tests {
                 max_transcript_items: 4,
             },
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn engine(backend: FakeBackend) -> LiveSidekickEngine {
+        let mut engine = unstarted_engine(backend);
         engine
             .start_capture("capture".into(), CaptureMode::Recording)
             .unwrap();
@@ -3298,6 +3330,7 @@ mod tests {
         assert_eq!(engine.reasoning_sessions_started(), 1);
         assert_eq!(engine.verifier_sessions_started(), 1);
         assert!(engine.reasoning_ready_ms().is_some());
+        assert_eq!(engine.reasoning_ready_attempts(), 1);
         assert_eq!(
             engine
                 .reasoning_session_id()
@@ -3334,6 +3367,114 @@ mod tests {
         let state = lock(&backend.state);
         assert_eq!(state.sessions_started, 4);
         assert_eq!(state.strategist_warmups.len(), 2);
+    }
+
+    #[test]
+    fn initial_attach_recovers_once_from_retryable_provider_transport_failure() {
+        let backend = FakeBackend::default();
+        lock(&backend.state)
+            .session_start_errors
+            .push_back(ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "synthetic startup transport loss",
+                true,
+            ));
+
+        let mut engine = unstarted_engine(backend.clone());
+        let reduction = engine
+            .start_capture("capture".into(), CaptureMode::Recording)
+            .unwrap();
+
+        assert!(reduction.accepted);
+        assert_eq!(engine.reasoning_ready_attempts(), 2);
+        assert_eq!(engine.reasoning_sessions_started(), 1);
+        assert_eq!(engine.verifier_sessions_started(), 1);
+        assert!(engine.reasoning_ready_ms().is_some());
+        assert_eq!(
+            engine
+                .reasoning_session_id()
+                .map(ReasoningSessionId::as_str),
+            Some("fake-session-1")
+        );
+        let state = lock(&backend.state);
+        assert_eq!(state.sessions_started, 2);
+        assert_eq!(state.strategist_warmups.len(), 1);
+        assert_eq!(state.verifier_warmups.len(), 1);
+    }
+
+    #[test]
+    fn initial_attach_does_not_retry_authentication_failure() {
+        let backend = FakeBackend::default();
+        lock(&backend.state)
+            .session_start_errors
+            .push_back(ReasoningError::new(
+                ReasoningErrorKind::Authentication,
+                "synthetic invalid credentials",
+                false,
+            ));
+        let mut engine = unstarted_engine(backend.clone());
+
+        let error = engine
+            .start_capture("capture".into(), CaptureMode::Recording)
+            .unwrap_err();
+
+        assert_eq!(error.kind, ReasoningErrorKind::Authentication);
+        assert_eq!(engine.reasoning_ready_attempts(), 1);
+        assert_eq!(engine.reasoning_sessions_started(), 0);
+        assert_eq!(engine.verifier_sessions_started(), 0);
+        assert!(engine.reasoning_ready_ms().is_none());
+        assert_eq!(lock(&backend.state).sessions_started, 0);
+    }
+
+    #[test]
+    fn initial_attach_does_not_retry_non_transport_failure_marked_retryable() {
+        let backend = FakeBackend::default();
+        lock(&backend.state)
+            .session_start_errors
+            .push_back(ReasoningError::new(
+                ReasoningErrorKind::Protocol,
+                "synthetic malformed provider response",
+                true,
+            ));
+        let mut engine = unstarted_engine(backend.clone());
+
+        let error = engine
+            .start_capture("capture".into(), CaptureMode::Recording)
+            .unwrap_err();
+
+        assert_eq!(error.kind, ReasoningErrorKind::Protocol);
+        assert_eq!(engine.reasoning_ready_attempts(), 1);
+        assert!(engine.reasoning_ready_ms().is_none());
+        assert_eq!(lock(&backend.state).sessions_started, 0);
+    }
+
+    #[test]
+    fn initial_attach_stops_after_second_retryable_provider_failure() {
+        let backend = FakeBackend::default();
+        lock(&backend.state).session_start_errors.extend([
+            ReasoningError::new(
+                ReasoningErrorKind::Timeout,
+                "synthetic startup timeout",
+                true,
+            ),
+            ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "synthetic startup transport loss",
+                true,
+            ),
+        ]);
+        let mut engine = unstarted_engine(backend.clone());
+
+        let error = engine
+            .start_capture("capture".into(), CaptureMode::Recording)
+            .unwrap_err();
+
+        assert_eq!(error.kind, ReasoningErrorKind::Unavailable);
+        assert_eq!(engine.reasoning_ready_attempts(), 2);
+        assert_eq!(engine.reasoning_sessions_started(), 0);
+        assert_eq!(engine.verifier_sessions_started(), 0);
+        assert!(engine.reasoning_ready_ms().is_none());
+        assert_eq!(lock(&backend.state).sessions_started, 0);
     }
 
     #[test]
@@ -4466,6 +4607,30 @@ mod tests {
         assert_eq!(auth_failures.len(), 1);
         assert_eq!(lock(&auth_backend.state).turns.len(), 1);
         assert!(auth_engine
+            .take_lifecycle_events()
+            .iter()
+            .all(|event| !matches!(&event.outcome, SidekickLifecycleOutcome::Retrying { .. })));
+
+        let protocol_backend = FakeBackend::default();
+        let mut protocol_engine = engine(protocol_backend.clone());
+        observe(
+            &mut protocol_engine,
+            "decision",
+            "The decision is still open.",
+        );
+        protocol_engine.send_user("What should I protect?").unwrap();
+        protocol_backend.fail(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Protocol,
+                "malformed provider response",
+                true,
+            ),
+        );
+        let protocol_failures = protocol_engine.take_failures();
+        assert_eq!(protocol_failures.len(), 1);
+        assert_eq!(lock(&protocol_backend.state).turns.len(), 1);
+        assert!(protocol_engine
             .take_lifecycle_events()
             .iter()
             .all(|event| !matches!(&event.outcome, SidekickLifecycleOutcome::Retrying { .. })));

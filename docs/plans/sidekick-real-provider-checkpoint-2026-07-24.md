@@ -105,11 +105,13 @@ It does not prove:
   meaningful repeated corpus; or
 - blind preference against the production terminal-Codex baseline.
 
-The foreground generation recovery identified by this checkpoint is now
-implemented in Minutes' provider-neutral engine: one retry preserves the exact
-user turn and evidence window, both attempts in latency and telemetry, and a
-Minutes-owned attempt identity that rejects late events from a replaced
-provider session. Remaining reliability blockers are fast failure and bounded
-recovery during initial attach, equivalent provider-failure handling in the
-independent verifier lane, and an inline recovery action if the bounded turn
-retry fails.
+The foreground generation and initial-attach recovery identified by this
+checkpoint are now implemented in Minutes' provider-neutral engine. Foreground
+recovery preserves the exact user turn and evidence window, both attempts in
+latency and telemetry, and a Minutes-owned attempt identity that rejects late
+events from a replaced provider session. Initial attach gets one bounded retry
+for overload, timeout, or unavailable failures and records the full ready time
+and attempt count. Remaining reliability blockers are equivalent
+provider-failure handling in the independent verifier lane, repeated
+real-provider tail evidence, and an inline recovery action if bounded recovery
+is exhausted.

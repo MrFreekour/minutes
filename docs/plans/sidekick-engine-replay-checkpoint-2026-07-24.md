@@ -90,7 +90,7 @@ false-green tests headlessly:
 ```text
 69/69 VM UI contract tests
 0 failed, skipped, cancelled, or todo
-source_sha256=6120f8384244668d19e2a96918212ae642db9750ae2d173abac3dd854f6e72e6
+source_sha256=e36e3bdab9a20c32dda9454a5b7aad4d1b0b2dc108ff747345715cb99090b1c5
 ```
 
 That lane catches the prior missing-listener `ReferenceError` class and

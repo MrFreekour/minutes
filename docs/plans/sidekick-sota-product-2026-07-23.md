@@ -319,7 +319,7 @@ never degrade recording or WAV preservation.
 The first no-human orchestration and fault-injection gate is implemented and
 documented in
 [`sidekick-engine-replay-checkpoint-2026-07-24.md`](sidekick-engine-replay-checkpoint-2026-07-24.md).
-Its 12 scenarios and 47 assertions pass reproducibly through the production
+Its 12 scenarios and 48 assertions pass reproducibly through the production
 transcript JSONL adapter, project/prepared-context assembler, engine, reducer,
 evidence window, independent verification, publication, recovery, and teardown
 paths. The populated participant-archive lane now proves that bounded prior
@@ -351,14 +351,17 @@ complete attach-and-verifier recovery, the 30-scenario corpus, repeated-tail
 reliability, signed-app evidence, and blind baseline preference are still
 missing.
 
-The first recovery slice is now implemented below the provider boundary.
+The first two recovery slices are now implemented below the provider boundary.
 Retryable overload, timeout, and unavailable failures during a foreground
 generation get one exact-window replay without asking the user to retype.
 Attempt identity is Minutes-owned, so a late completion from a replaced
 provider session cannot publish even if that provider reuses its local turn
 ID. Attempt and recovery time remain in the first-useful-token and total
-latency receipts. This closes the ordinary foreground-generation gap only;
-initial attach, independent-verifier failure, signed recovery UX, and
+latency receipts. Initial provider attachment also gets one bounded retry for
+the same transport classes, while authentication and protocol failures still
+fail immediately. Its ready receipt includes both attempts and the complete
+attach latency. These close the ordinary foreground-generation and initial
+attach gaps only; independent-verifier failure, signed recovery UX, and
 statistically meaningful reliability tails remain red.
 
 ## Current Baseline
