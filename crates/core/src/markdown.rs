@@ -85,6 +85,10 @@ pub(crate) const ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES: u64 = 80 * 1024 * 1024;
 pub(crate) const ACTIVE_CORPUS_MAX_RETAINED_PATH_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS: usize = 2;
 pub(crate) const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE: Duration = Duration::from_secs(15);
+/// One materialization can read each pre-authorized source during index
+/// construction, before the transactional write, after the write, and once
+/// more when converting a result into user-visible bytes.
+pub(crate) const ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES: usize = 4;
 
 #[derive(Debug, Default)]
 struct ActiveCorpusReadUsage {
@@ -121,6 +125,45 @@ impl ActiveCorpusReadBudget {
             max_authorized_bytes: ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES,
             max_retained_path_bytes: ACTIVE_CORPUS_MAX_RETAINED_PATH_BYTES,
             deadline,
+            usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
+        }
+    }
+
+    /// Start one separately bounded corpus pass under this operation's same
+    /// absolute deadline.
+    ///
+    /// A search operation has several mandatory full-corpus passes
+    /// (pre-snapshot, ephemeral index materialization, and post-snapshot).
+    /// Sharing one usage counter made a corpus that fit the documented
+    /// per-pass ceiling fail merely because it was safely reread. A fresh pass
+    /// resets only the counters; it cannot extend the deadline or raise any
+    /// individual-pass ceiling.
+    pub(crate) fn fresh_pass(&self) -> Self {
+        Self {
+            max_file_count: self.max_file_count,
+            max_directory_count: self.max_directory_count,
+            max_authorized_bytes: self.max_authorized_bytes,
+            max_retained_path_bytes: self.max_retained_path_bytes,
+            deadline: self.deadline,
+            usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
+        }
+    }
+
+    /// Start the bounded materialization phase after a regular pre-snapshot
+    /// has already proved that the corpus itself fits the base ceiling.
+    ///
+    /// This phase may perform up to four mandatory reads of each allowlisted
+    /// source, but it keeps the same absolute deadline and a finite aggregate
+    /// envelope. The pre- and post-snapshot passes continue to enforce the
+    /// unmultiplied corpus ceiling.
+    pub(crate) fn fresh_materialization_pass(&self) -> Self {
+        let multiplier = ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES;
+        Self {
+            max_file_count: self.max_file_count.saturating_mul(multiplier),
+            max_directory_count: self.max_directory_count.saturating_mul(multiplier),
+            max_authorized_bytes: self.max_authorized_bytes.saturating_mul(multiplier as u64),
+            max_retained_path_bytes: self.max_retained_path_bytes.saturating_mul(multiplier),
+            deadline: self.deadline,
             usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
         }
     }
@@ -238,6 +281,11 @@ struct StableMarkdownAttestation {
 impl StableActiveCorpusRevision {
     pub(crate) fn budget(&self) -> ActiveCorpusReadBudget {
         self.budget.clone()
+    }
+
+    pub(crate) fn with_read_budget(mut self, budget: ActiveCorpusReadBudget) -> Self {
+        self.budget = budget;
+        self
     }
 
     pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
@@ -2398,6 +2446,40 @@ mod tests {
         stable_active_corpus_revision_with_budget(&root, shared.clone()).unwrap();
         assert_eq!(
             stable_active_corpus_revision_with_budget(&root, shared).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+    }
+
+    #[test]
+    fn active_corpus_fresh_pass_resets_usage_but_not_the_deadline_or_limits() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("meeting.md"), "12").unwrap();
+        let operation = ActiveCorpusReadBudget::for_test(1, 1, 2, Duration::from_secs(60));
+
+        stable_active_corpus_revision_with_budget(&root, operation.fresh_pass()).unwrap();
+        stable_active_corpus_revision_with_budget(&root, operation.fresh_pass()).unwrap();
+
+        let expired = ActiveCorpusReadBudget::for_test(1, 1, 2, Duration::ZERO).fresh_pass();
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, expired).unwrap_err(),
+            ActiveCorpusRevisionError::Deadline
+        );
+    }
+
+    #[test]
+    fn materialization_pass_is_bounded_to_four_authorized_reads() {
+        let operation = ActiveCorpusReadBudget::for_test(1, 1, 2, Duration::from_secs(60));
+        let materialization = operation.fresh_materialization_pass();
+
+        materialization.consume(4, 4, 8).unwrap();
+        assert_eq!(
+            materialization.consume(1, 0, 0).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+        assert_eq!(
+            materialization.consume(0, 0, 1).unwrap_err(),
             ActiveCorpusRevisionError::Budget
         );
     }

@@ -74,6 +74,19 @@ fn run_policy_minutes(root: &std::path::Path, corpus: &std::path::Path, args: &[
         .unwrap()
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn dedicated_macos_xpc_worker_refuses_direct_stream_execution() {
+    let output = Command::new(env!("CARGO_BIN_EXE_minutes-graph-worker"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "direct execution must not expose the removed stdin/stdout worker protocol"
+    );
+}
+
 #[test]
 fn graph_worker_projects_map_profile_and_commitments_from_one_policy_boundary() {
     let nonce = SystemTime::now()

@@ -76,6 +76,8 @@ echo "=== Staging CLI as Tauri sidecar ==="
 HOST_TARGET="$(rustc -Vv | awk '/host:/ {print $2}')"
 mkdir -p tauri/src-tauri/bin
 cp -f target/release/minutes "tauri/src-tauri/bin/minutes-${HOST_TARGET}"
+cp -f target/release/minutes-graph-worker \
+    "tauri/src-tauri/bin/minutes-graph-worker-${HOST_TARGET}"
 
 echo "=== Building Tauri app ==="
 # The calendar-events Swift helper is compiled and staged into
@@ -111,22 +113,25 @@ if [[ -f "$SIDECAR" ]]; then
         --sign "$SIGN_ID" \
         "$SIDECAR"
     echo "  Signed sidecar with identity: $SIGN_ID"
-    # Re-signing nested code after the bundle was sealed invalidates the
-    # outer seal (#311): copied/downloaded apps then fail Gatekeeper as
-    # "damaged". Re-seal the outer bundle (no --deep, preserving the
-    # sidecar's entitlements) and verify strictly.
-    if [[ "$SIGN_ID" == "-" ]]; then
-        codesign --force --sign - "$APP_BUNDLE"
-    else
-        codesign --force --options runtime --timestamp \
-            --entitlements tauri/src-tauri/entitlements.plist \
-            --sign "$SIGN_ID" \
-            "$APP_BUNDLE"
-    fi
-    codesign --verify --deep --strict "$APP_BUNDLE" && echo "  Bundle seal OK"
 else
     echo "  WARNING: expected sidecar not found at $SIDECAR — skipping re-sign."
 fi
+./scripts/package-graph-xpc.sh \
+    "$APP_BUNDLE" \
+    "$SIGN_ID" \
+    tauri/src-tauri/minutes-graph-worker.entitlements
+echo "  Signed embedded graph XPC service with identity: $SIGN_ID"
+# Re-signing nested code after the bundle was sealed invalidates the outer
+# seal (#311). Re-seal once, without --deep, preserving nested entitlements.
+if [[ "$SIGN_ID" == "-" ]]; then
+    codesign --force --sign - "$APP_BUNDLE"
+else
+    codesign --force --options runtime --timestamp \
+        --entitlements tauri/src-tauri/entitlements.plist \
+        --sign "$SIGN_ID" \
+        "$APP_BUNDLE"
+fi
+codesign --verify --deep --strict "$APP_BUNDLE" && echo "  Bundle seal OK"
 
 APP_VERSION="$(python3 - <<'PY'
 import json

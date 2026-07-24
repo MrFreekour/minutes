@@ -118,6 +118,12 @@ override. An explicitly named restricted meeting passed to `minutes ingest`
 is refused; batch ingest skips restricted meetings and reports the count.
 Core graph rows exist only in a bounded process-private projection, are bound to
 the current corpus and correction revisions, and are discarded after the answer.
+The signed macOS desktop bundle additionally runs that projection in a
+dedicated App-Sandboxed helper whose exact CodeDirectory hash is sealed into
+the enclosing app. On older macOS, standalone, source-built, and ad-hoc
+channels supervise an exact second instance of the already-running executable;
+the parent verifies the live child's kernel CodeDirectory hash before sending
+any source bytes, and the child installs the same hard resource ceilings.
 Derived annotation, insight, and live-event tools remain
 absent from Native Recall until their records have live sensitivity provenance
 or mandatory invalidation.

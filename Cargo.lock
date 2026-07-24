@@ -3528,6 +3528,7 @@ name = "minutes-core"
 version = "0.23.0"
 dependencies = [
  "base64 0.22.1",
+ "block2",
  "cap-std",
  "chacha20poly1305",
  "chrono",
@@ -3543,6 +3544,7 @@ dependencies = [
  "interprocess",
  "knf-rs",
  "libc",
+ "mach2 0.6.0",
  "ndarray",
  "nnnoiseless",
  "notify",

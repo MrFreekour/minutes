@@ -23,6 +23,7 @@ pub(crate) struct BoundExecutable {
     /// exact source handle on Windows. Worker execution never trusts a later
     /// reopen of the caller-provided source bytes.
     file: std::fs::File,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     source_path: PathBuf,
     #[cfg(windows)]
     bytes: u64,
@@ -93,6 +94,7 @@ impl BoundExecutable {
         ))
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn launch_path(&self) -> PathBuf {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         use std::os::fd::AsRawFd;
@@ -104,10 +106,12 @@ impl BoundExecutable {
         return self.source_path.clone();
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn bind(path: &Path) -> std::io::Result<Self> {
         bind_executable(path, false)
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn current() -> std::io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -122,6 +126,7 @@ impl BoundExecutable {
         }
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
         Ok(Self {
             file: self.file.try_clone()?,
@@ -436,11 +441,12 @@ impl BoundedCommand {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     pub(crate) fn new_bound_executable(path: &Path) -> std::io::Result<Self> {
         Self::from_bound_executable(BoundExecutable::bind(path)?)
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn from_bound_executable(authority: BoundExecutable) -> std::io::Result<Self> {
         authority.verify()?;
         let launch_path = authority.launch_path();
@@ -512,6 +518,7 @@ impl BoundedCommand {
     /// resuming the initially suspended process. This is the hard boundary
     /// used for adversarial graph inputs; SQLite limits alone do not bound all
     /// transient allocations.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn address_space_limit(&mut self, bytes: u64) -> &mut Self {
         self.address_space_limit = Some(bytes);
         self
@@ -522,6 +529,7 @@ impl BoundedCommand {
     /// installs a Job active-process limit of one before the suspended worker
     /// is resumed. Unix callers pair this flag with an exact bound executable;
     /// RLIMIT_NPROC is deliberately not used because it counts pthreads too.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn single_process(&mut self) -> &mut Self {
         self.single_process = true;
         self
@@ -533,6 +541,7 @@ impl BoundedCommand {
     /// need this boundary must additionally retire inherited HANDLEs inside an
     /// immutable trusted worker before reading any authority; graph_worker does
     /// so as its first operation.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn close_extra_descriptors(&mut self) -> &mut Self {
         self.close_extra_descriptors = true;
         self
@@ -2150,7 +2159,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn bound_executable_runs_the_retained_identity_after_path_replacement() {
         use std::os::unix::fs::PermissionsExt;
@@ -2175,7 +2184,7 @@ mod tests {
         assert!(run.output.status.success());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn bound_executable_runs_immutable_snapshot_after_in_place_source_rewrite() {
         use std::os::unix::fs::PermissionsExt;

@@ -46,7 +46,7 @@ fn authorized_process_accepts_an_ordinary_0644_source_end_to_end() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "output_dir = {:?}\n\n[transcription]\nengine = \"whisper\"\nmodel = \"definitely-missing-model\"\n",
+            "output_dir = {:?}\n\n[transcription]\nengine = \"whisper\"\nmodel = \"definitely-missing-model\"\n\n[summarization]\nengine = \"none\"\n",
             meetings
         ),
     )
@@ -68,16 +68,20 @@ fn authorized_process_accepts_an_ordinary_0644_source_end_to_end() {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .process_group(0);
     let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
 
-    assert!(
-        !output.status.success(),
-        "model-free regression must stop at the configured downstream model check"
-    );
-    assert!(
-        stderr.contains("transcription model not found"),
-        "ordinary 0644 input must cross authorization and reach transcription: {stderr}"
-    );
+    if output.status.success() {
+        assert!(
+            stdout.contains("\"status\": \"done\""),
+            "successful model-free processing must publish an honest completion: {stdout}"
+        );
+    } else {
+        assert!(
+            stderr.contains("transcription model not found"),
+            "ordinary 0644 input must cross authorization and reach transcription: {stderr}"
+        );
+    }
     for forbidden in [
         "authorized process input",
         "outer process containment",

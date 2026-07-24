@@ -36,38 +36,43 @@ fn with_stable_active_corpus_with_hooks<T>(
     mut after_precheck: impl FnMut(),
     mut before_postcheck: impl FnMut(),
 ) -> Result<T, SearchError> {
-    let budget = ActiveCorpusReadBudget::new();
+    let envelope = ActiveCorpusReadBudget::new();
     for _ in 0..ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS {
-        budget.check_deadline().map_err(|_| {
+        envelope.check_deadline().map_err(|_| {
             SearchError::Io(std::io::Error::other(
                 "meeting corpus could not be verified safely",
             ))
         })?;
-        let before =
-            stable_active_corpus_revision_with_budget(dir, budget.clone()).map_err(|_| {
+        // Every mandatory corpus pass keeps the documented per-pass envelope,
+        // while all passes share one absolute operation deadline. This keeps
+        // safe rereads from making an otherwise supported corpus unavailable.
+        let before = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
+            .map_err(|_| {
                 SearchError::Io(std::io::Error::other(
                     "meeting corpus could not be verified safely",
                 ))
-            })?;
+            })?
+            .with_read_budget(envelope.fresh_materialization_pass());
         after_precheck();
-        budget.check_deadline().map_err(|_| {
+        envelope.check_deadline().map_err(|_| {
             SearchError::Io(std::io::Error::other(
                 "meeting corpus authorization deadline elapsed",
             ))
         })?;
         let value = operation(&before)?;
-        budget.check_deadline().map_err(|_| {
+        envelope.check_deadline().map_err(|_| {
             SearchError::Io(std::io::Error::other(
                 "meeting corpus authorization deadline elapsed",
             ))
         })?;
         before_postcheck();
-        let after =
-            stable_active_corpus_revision_with_budget(dir, budget.clone()).map_err(|_| {
+        let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass()).map_err(
+            |_| {
                 SearchError::Io(std::io::Error::other(
                     "meeting corpus could not be reverified safely",
                 ))
-            })?;
+            },
+        )?;
         if before == after {
             return Ok(value);
         }
@@ -1849,7 +1854,7 @@ fn search_with_mode_and_vocabulary_once(
         return Err(SearchError::DirNotFound(dir.display().to_string()));
     }
     let index = crate::search_index::SearchIndex::open(config)?;
-    let stats = index.sync_for_active_corpus(config, mode, revision.budget())?;
+    let stats = index.sync_for_active_corpus(config, mode, revision)?;
     if stats.indexed + stats.updated + stats.removed + stats.errored > 0 {
         tracing::info!(
             indexed = stats.indexed,
@@ -1865,11 +1870,8 @@ fn search_with_mode_and_vocabulary_once(
     if expansions.len() <= 1 {
         let mut results = index.search(query, filters, None)?;
         if filters.include_restricted {
-            results.extend(index.search_restricted_live_for_active_corpus(
-                query,
-                filters,
-                revision.budget(),
-            )?);
+            results
+                .extend(index.search_restricted_live_for_active_corpus(query, filters, revision)?);
         }
         // Normal and explicit-override restricted candidates pass through one
         // identical live-snapshot, filter, and exact-FTS authorization gate.
@@ -1887,7 +1889,7 @@ fn search_with_mode_and_vocabulary_once(
         // the first matching vocabulary expansion from the already-bound
         // revision rather than rewalking the entire corpus for every alias.
         for mut result in
-            index.search_restricted_live_for_active_corpus(query, filters, revision.budget())?
+            index.search_restricted_live_for_active_corpus(query, filters, revision)?
         {
             let snapshot = revision_snapshot(revision, &result.path)?;
             let (frontmatter_text, body) = split_frontmatter(&snapshot.content);
@@ -3951,6 +3953,39 @@ mod tests {
     }
 
     #[test]
+    fn default_budget_supports_realistic_1500_meeting_multi_pass_list() {
+        let dir = TempDir::new().unwrap();
+        let filler = ".".repeat(25_800);
+        let meeting = format!(
+            "---\ntitle: Corpus Scale Meeting\ntype: meeting\ndate: 2026-07-23T12:00:00Z\nduration: 30m\nstatus: complete\nattendees: []\npeople: []\naction_items: []\ndecisions: []\nintents: []\n---\n\n## Transcript\n\n{filler}\n"
+        );
+        let aggregate_bytes = meeting.len() * 1_500;
+        assert!(
+            (38_000_000..=40_000_000).contains(&aggregate_bytes),
+            "fixture should stay representative of the 1,399-file / 39 MB corpus"
+        );
+        for index in 0..1_500 {
+            create_test_file(
+                dir.path(),
+                &format!("2026-07-23-corpus-scale-{index:04}.md"),
+                &meeting,
+            );
+        }
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let results =
+            search_with_mode("", &config, &SearchFilters::default(), SyncMode::Skip).unwrap();
+
+        assert_eq!(results.len(), 1_500);
+        assert!(results
+            .iter()
+            .all(|result| result.title == "Corpus Scale Meeting"));
+    }
+
+    #[test]
     fn slug_scope_and_exact_path_share_restricted_read_policy() {
         let dir = TempDir::new().unwrap();
         let restricted = NORMAL_MEETING.replace(
@@ -3992,7 +4027,10 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        assert_eq!(resolve_slug(exact.to_str().unwrap(), &config), Some(exact));
+        assert_eq!(
+            resolve_slug(exact.to_str().unwrap(), &config),
+            Some(exact.canonicalize().unwrap())
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 

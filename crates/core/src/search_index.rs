@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::error::SearchError;
 use crate::markdown::{
     extract_field, read_stable_active_markdown, split_frontmatter, ActiveCorpusReadBudget,
-    ContentType, Frontmatter, Sensitivity, StableMarkdownSnapshot,
+    ContentType, Frontmatter, Sensitivity, StableActiveCorpusRevision, StableMarkdownSnapshot,
 };
 use crate::search::{SearchFilters, SearchResult};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -424,26 +424,27 @@ impl SearchIndex {
     /// Sync filesystem state into the index per the requested mode.
     #[cfg(test)]
     pub fn sync(&self, config: &Config, mode: SyncMode) -> Result<SyncStats, SearchIndexError> {
-        self.sync_with_active_corpus_budget(config, mode, None)
+        self.sync_with_active_corpus_revision(config, mode, None)
     }
 
     pub(crate) fn sync_for_active_corpus(
         &self,
         config: &Config,
         mode: SyncMode,
-        budget: ActiveCorpusReadBudget,
+        revision: &StableActiveCorpusRevision,
     ) -> Result<SyncStats, SearchIndexError> {
-        self.sync_with_active_corpus_budget(config, mode, Some(budget))
+        self.sync_with_active_corpus_revision(config, mode, Some(revision))
     }
 
-    fn sync_with_active_corpus_budget(
+    fn sync_with_active_corpus_revision(
         &self,
         config: &Config,
         mode: SyncMode,
-        budget: Option<ActiveCorpusReadBudget>,
+        revision: Option<&StableActiveCorpusRevision>,
     ) -> Result<SyncStats, SearchIndexError> {
         let start = std::time::Instant::now();
         let mut stats = SyncStats::default();
+        let budget = revision.map(StableActiveCorpusRevision::budget);
         let check_deadline = || -> Result<(), SearchIndexError> {
             if budget
                 .as_ref()
@@ -505,53 +506,69 @@ impl SearchIndex {
             }
         };
 
-        for entry in walkdir::WalkDir::new(&self.corpus_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                if e.file_type().is_dir() {
-                    !is_excluded_path(e.path(), &self.corpus_root)
-                } else {
-                    true
-                }
-            })
-        {
+        let entries: Box<dyn Iterator<Item = Result<(PathBuf, bool), SearchIndexError>> + '_> =
+            if let Some(revision) = revision {
+                Box::new(revision.paths().map(|path| Ok((path.to_path_buf(), false))))
+            } else {
+                Box::new(
+                    walkdir::WalkDir::new(&self.corpus_root)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_entry(|entry| {
+                            !entry.file_type().is_dir()
+                                || !is_excluded_path(entry.path(), &self.corpus_root)
+                        })
+                        .map(|entry| {
+                            entry
+                                .map(|entry| {
+                                    (entry.path().to_path_buf(), entry.file_type().is_dir())
+                                })
+                                .map_err(|_| {
+                                    SearchIndexError::Io(
+                                        "meeting corpus traversal could not be verified".into(),
+                                    )
+                                })
+                        }),
+                )
+            };
+
+        for entry in entries {
             check_deadline()?;
-            let entry = entry.map_err(|_| {
-                SearchIndexError::Io("meeting corpus traversal could not be verified".into())
-            })?;
-            consume_path(entry.path())?;
-            if entry.file_type().is_dir() {
-                if !is_excluded_path(entry.path(), &self.corpus_root) {
+            let (path, is_directory) = entry?;
+            if revision.is_none() {
+                consume_path(&path)?;
+            }
+            if is_directory {
+                if !is_excluded_path(&path, &self.corpus_root) {
                     consume(0, 1, 0)?;
                 }
                 continue;
             }
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
-                || is_excluded_path(entry.path(), &self.corpus_root)
+            if path.extension().and_then(|s| s.to_str()) != Some("md")
+                || is_excluded_path(&path, &self.corpus_root)
             {
                 continue;
             }
-            consume(1, 0, 0)?;
-            let path = entry.path().to_path_buf();
+            if revision.is_none() {
+                consume(1, 0, 0)?;
+            }
             // Authorization intentionally precedes the mtime fast path. A
             // normal file can be reclassified as restricted without changing
             // the metadata values cached in an older index.
-            let snapshot = match budget.as_ref() {
-                Some(budget) => crate::markdown::read_stable_active_markdown_with_budget(
-                    &path,
-                    &self.corpus_root,
-                    budget,
-                ),
+            let snapshot = match revision {
+                Some(revision) => revision.read_snapshot(&path),
                 None => read_stable_active_markdown(&path, &self.corpus_root),
             };
             let Some(snapshot) = snapshot else {
+                if revision.is_some() {
+                    return Err(SearchIndexError::Io(
+                        "meeting changed while building the authorized search projection".into(),
+                    ));
+                }
                 let _ = self.delete_file_inner(&path);
                 stats.errored += 1;
                 continue;
             };
-            consume(0, 0, snapshot.content.len() as u64)?;
             let document = match self.indexable_document_from_snapshot(snapshot) {
                 Ok(Some(document)) => document,
                 Ok(None) => {
@@ -570,7 +587,9 @@ impl SearchIndex {
                 }
             };
             let path = document.path.clone();
-            consume_path(&path)?;
+            if revision.is_none() {
+                consume_path(&path)?;
+            }
             seen_paths.insert(path.clone());
 
             let needs_index = {
@@ -596,7 +615,12 @@ impl SearchIndex {
                 continue;
             }
 
-            match self.upsert_document(document, budget.as_ref()) {
+            let upsert = if revision.is_some() {
+                self.upsert_pre_attested_document(document)
+            } else {
+                self.upsert_document(document, None)
+            };
+            match upsert {
                 Ok(true) => stats.indexed += 1,
                 Ok(false) => stats.updated += 1,
                 Err(_) => {
@@ -740,16 +764,36 @@ impl SearchIndex {
         document: IndexableDocument,
         budget: Option<&ActiveCorpusReadBudget>,
     ) -> Result<bool, SearchIndexError> {
-        self.upsert_document_with_hook(document, budget, |_| {})
+        self.upsert_document_inner(document, budget, true, |_| {})
     }
 
+    fn upsert_pre_attested_document(
+        &self,
+        document: IndexableDocument,
+    ) -> Result<bool, SearchIndexError> {
+        self.upsert_document_inner(document, None, false, |_| {})
+    }
+
+    #[cfg(test)]
     fn upsert_document_with_hook(
         &self,
         document: IndexableDocument,
         budget: Option<&ActiveCorpusReadBudget>,
         mut after_write_before_reauthorize: impl FnMut(&Path),
     ) -> Result<bool, SearchIndexError> {
-        if !self.document_still_authorized(&document, budget) {
+        self.upsert_document_inner(document, budget, true, |path| {
+            after_write_before_reauthorize(path)
+        })
+    }
+
+    fn upsert_document_inner(
+        &self,
+        document: IndexableDocument,
+        budget: Option<&ActiveCorpusReadBudget>,
+        reauthorize: bool,
+        mut after_write_before_reauthorize: impl FnMut(&Path),
+    ) -> Result<bool, SearchIndexError> {
+        if reauthorize && !self.document_still_authorized(&document, budget) {
             return Err(SearchIndexError::Io(
                 "meeting changed before search projection update".into(),
             ));
@@ -838,13 +882,16 @@ impl SearchIndex {
             return Err(error.into());
         }
 
-        after_write_before_reauthorize(&path);
-        let reauthorized = self.source_path_has_normal_policy(&path, Some(&source_sha256), budget);
-        if !reauthorized {
-            txn.rollback()?;
-            return Err(SearchIndexError::Io(
-                "meeting changed during search projection update".into(),
-            ));
+        if reauthorize {
+            after_write_before_reauthorize(&path);
+            let reauthorized =
+                self.source_path_has_normal_policy(&path, Some(&source_sha256), budget);
+            if !reauthorized {
+                txn.rollback()?;
+                return Err(SearchIndexError::Io(
+                    "meeting changed during search projection update".into(),
+                ));
+            }
         }
         txn.commit()?;
         Ok(!existed)
@@ -1000,11 +1047,32 @@ impl SearchIndex {
         &self,
         query: &str,
         filters: &SearchFilters,
-        budget: ActiveCorpusReadBudget,
+        revision: &StableActiveCorpusRevision,
     ) -> Result<Vec<SearchResult>, SearchIndexError> {
-        self.search_restricted_live_with_budget(query, filters, Some(budget))
+        let _ = query;
+        if !filters.include_restricted {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::new();
+        // Iterate only the exact paths admitted by the pre-operation revision.
+        // A file created after that snapshot cannot spend this pass's budget;
+        // the outer post-snapshot still rejects publication when membership
+        // changed.
+        for path in revision.paths() {
+            let snapshot = revision.read_snapshot(path).ok_or_else(|| {
+                SearchIndexError::Io(
+                    "meeting changed while building the authorized restricted projection".into(),
+                )
+            })?;
+            if let Some(result) = restricted_live_result(snapshot, filters) {
+                results.push(result);
+            }
+        }
+        results.sort_by(|left, right| right.date.cmp(&left.date));
+        Ok(results)
     }
 
+    #[cfg(test)]
     fn search_restricted_live_with_budget(
         &self,
         _query: &str,
@@ -1084,62 +1152,9 @@ impl SearchIndex {
                 continue;
             };
             consume(0, 0, snapshot.content.len() as u64)?;
-            let (frontmatter_text, _) = split_frontmatter(&snapshot.content);
-            let Ok(frontmatter) = serde_yaml::from_str::<Frontmatter>(frontmatter_text) else {
-                continue;
-            };
-            if frontmatter.sensitivity != Some(Sensitivity::Restricted) {
-                continue;
+            if let Some(result) = restricted_live_result(snapshot, filters) {
+                results.push(result);
             }
-            let content_type = match frontmatter.r#type {
-                ContentType::Meeting => "meeting",
-                ContentType::Memo => "memo",
-                ContentType::Dictation => "dictation",
-            };
-            if filters
-                .content_type
-                .as_deref()
-                .is_some_and(|expected| expected != content_type)
-            {
-                continue;
-            }
-            let date = frontmatter.date.to_rfc3339();
-            if filters
-                .since
-                .as_deref()
-                .is_some_and(|since| date.as_str() < since)
-            {
-                continue;
-            }
-            if let Some(attendee) = filters.attendee.as_deref() {
-                let needle = attendee.to_lowercase();
-                if !frontmatter
-                    .attendees
-                    .iter()
-                    .any(|value| value.to_lowercase().contains(&needle))
-                {
-                    continue;
-                }
-            }
-            if let Some(recorded_by) = filters.recorded_by.as_deref() {
-                let needle = recorded_by.to_lowercase();
-                if !frontmatter
-                    .recorded_by
-                    .as_deref()
-                    .is_some_and(|value| value.to_lowercase().contains(&needle))
-                {
-                    continue;
-                }
-            }
-
-            results.push(SearchResult {
-                path: snapshot.path,
-                title: frontmatter.title,
-                date,
-                content_type: content_type.into(),
-                snippet: String::new(),
-                matched_via_alias: None,
-            });
         }
 
         if budget
@@ -1153,6 +1168,65 @@ impl SearchIndex {
         results.sort_by(|left, right| right.date.cmp(&left.date));
         Ok(results)
     }
+}
+
+fn restricted_live_result(
+    snapshot: StableMarkdownSnapshot,
+    filters: &SearchFilters,
+) -> Option<SearchResult> {
+    let (frontmatter_text, _) = split_frontmatter(&snapshot.content);
+    let frontmatter = serde_yaml::from_str::<Frontmatter>(frontmatter_text).ok()?;
+    if frontmatter.sensitivity != Some(Sensitivity::Restricted) {
+        return None;
+    }
+    let content_type = match frontmatter.r#type {
+        ContentType::Meeting => "meeting",
+        ContentType::Memo => "memo",
+        ContentType::Dictation => "dictation",
+    };
+    if filters
+        .content_type
+        .as_deref()
+        .is_some_and(|expected| expected != content_type)
+    {
+        return None;
+    }
+    let date = frontmatter.date.to_rfc3339();
+    if filters
+        .since
+        .as_deref()
+        .is_some_and(|since| date.as_str() < since)
+    {
+        return None;
+    }
+    if let Some(attendee) = filters.attendee.as_deref() {
+        let needle = attendee.to_lowercase();
+        if !frontmatter
+            .attendees
+            .iter()
+            .any(|value| value.to_lowercase().contains(&needle))
+        {
+            return None;
+        }
+    }
+    if let Some(recorded_by) = filters.recorded_by.as_deref() {
+        let needle = recorded_by.to_lowercase();
+        if !frontmatter
+            .recorded_by
+            .as_deref()
+            .is_some_and(|value| value.to_lowercase().contains(&needle))
+        {
+            return None;
+        }
+    }
+    Some(SearchResult {
+        path: snapshot.path,
+        title: frontmatter.title,
+        date,
+        content_type: content_type.into(),
+        snippet: String::new(),
+        matched_via_alias: None,
+    })
 }
 
 /// Empty-query path: no MATCH, just B-tree filtered list ordered by date.
@@ -1608,6 +1682,39 @@ mod tests {
         assert_eq!(authorized.len(), 1);
         assert_eq!(authorized[0].title, "Restricted");
         assert_eq!(raw_counts(&idx, "RESTRICTEDINGESTCANARY"), (0, 0));
+    }
+
+    #[test]
+    fn restricted_projection_iterates_only_the_prebound_revision() {
+        let (dir, config) = temp_config();
+        std::fs::write(
+            config.output_dir.join("bound.md"),
+            "---\ntitle: Bound Restricted\ndate: 2026-07-15\ntype: meeting\nsensitivity: restricted\n---\n\nBOUND",
+        )
+        .unwrap();
+        let revision = crate::markdown::stable_active_corpus_revision(&config.output_dir).unwrap();
+        let materialization_budget = revision.budget().fresh_pass();
+        let revision = revision.with_read_budget(materialization_budget);
+        std::fs::write(
+            config.output_dir.join("late.md"),
+            "---\ntitle: Late Restricted\ndate: 2026-07-16\ntype: meeting\nsensitivity: restricted\n---\n\nLATE",
+        )
+        .unwrap();
+        let idx = make_index(&dir, &config);
+
+        let results = idx
+            .search_restricted_live_for_active_corpus(
+                "",
+                &SearchFilters {
+                    include_restricted: true,
+                    ..Default::default()
+                },
+                &revision,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Bound Restricted");
     }
 
     #[test]

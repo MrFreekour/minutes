@@ -8,18 +8,20 @@ use crate::markdown::{
 use crate::overlays;
 use crate::person_identity::PersonCanonicalizer;
 use chrono::Local;
-#[cfg(not(windows))]
-use notify::{
-    Config as NotifyConfig, EventKind as NotifyEventKind, RecommendedWatcher, RecursiveMode,
-    Watcher,
-};
+#[cfg(all(not(windows), not(target_os = "macos")))]
+use notify::{Config as NotifyConfig, RecommendedWatcher, Watcher};
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+use notify::{EventKind as NotifyEventKind, RecursiveMode};
 use rusqlite::{limits::Limit, params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex, MutexGuard};
+#[cfg(not(target_os = "macos"))]
+use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 use walkdir::WalkDir;
 
@@ -54,8 +56,11 @@ const MAX_GRAPH_SQLITE_VARIABLES: i32 = 64;
 // active-corpus envelope avoids shrinking the supported corpus to one third,
 // while this operation envelope still bounds cumulative work.
 const MAX_GRAPH_OPERATION_PASSES: usize = 18;
+#[cfg(any(test, not(target_os = "macos")))]
 const GRAPH_SNAPSHOT_FENCE_DIRECTORY: &str = ".minutes-graph-snapshot-fences";
+#[cfg(not(target_os = "macos"))]
 const GRAPH_SNAPSHOT_FENCE_BYTES: &[u8] = b"minutes-graph-snapshot-fence-v1";
+#[cfg(not(target_os = "macos"))]
 const GRAPH_SNAPSHOT_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 static GRAPH_PROJECTION_ADMISSION: Mutex<()> = Mutex::new(());
 
@@ -826,14 +831,21 @@ impl GraphCorrectionPaths {
 /// two namespaces between reads. This journal establishes one ordering
 /// boundary before materialization and retains it until the answer has been
 /// serialized by the supervised worker.
+#[cfg(any(not(target_os = "macos"), test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 enum GraphJournalEvent {
     Paths(Vec<PathBuf>),
     Overflow,
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 struct GraphNativeWatchers {
     _watcher: RecommendedWatcher,
+}
+
+#[cfg(target_os = "macos")]
+struct GraphNativeWatchers {
+    journal: macos_graph_journal::MacGraphJournal,
 }
 
 #[cfg(windows)]
@@ -843,12 +855,19 @@ struct GraphNativeWatchers {
 
 struct GraphSnapshotJournal {
     _watchers: GraphNativeWatchers,
+    #[cfg(not(target_os = "macos"))]
     events: mpsc::Receiver<GraphJournalEvent>,
+    #[cfg(not(target_os = "macos"))]
     fence_directories: Vec<crate::policy_fs::BoundRecoveryDirectory>,
+    #[cfg(not(target_os = "macos"))]
     corpus_root: PathBuf,
+    #[cfg(not(target_os = "macos"))]
     correction_root: PathBuf,
+    #[cfg(not(target_os = "macos"))]
     vocabulary_path: PathBuf,
+    #[cfg(not(target_os = "macos"))]
     overlays_path: PathBuf,
+    #[cfg(not(target_os = "macos"))]
     dirty: bool,
     deadline: std::time::Instant,
 }
@@ -874,33 +893,53 @@ impl GraphSnapshotJournal {
                 "graph correction namespace could not be bound privately",
             ))
         })?;
-        let corpus_fence_root = corpus_root
-            .join(".minutes-private-projection")
-            .join(GRAPH_SNAPSHOT_FENCE_DIRECTORY);
-        let correction_fence_root = correction_root.join(GRAPH_SNAPSHOT_FENCE_DIRECTORY);
-        let mut fence_directories = Vec::with_capacity(2);
-        for fence_root in [&corpus_fence_root, &correction_fence_root] {
-            fence_directories.push(
-                crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(fence_root)
-                    .map_err(|_| {
-                        GraphError::Io(std::io::Error::other(
-                            "graph snapshot fence namespace could not be prepared",
-                        ))
-                    })?,
-            );
-        }
+        #[cfg(not(target_os = "macos"))]
+        let fence_directories = {
+            let corpus_fence_root = corpus_root
+                .join(".minutes-private-projection")
+                .join(GRAPH_SNAPSHOT_FENCE_DIRECTORY);
+            let correction_fence_root = correction_root.join(GRAPH_SNAPSHOT_FENCE_DIRECTORY);
+            let mut directories = Vec::with_capacity(2);
+            for fence_root in [&corpus_fence_root, &correction_fence_root] {
+                directories.push(
+                    crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(fence_root)
+                        .map_err(|_| {
+                            GraphError::Io(std::io::Error::other(
+                                "graph snapshot fence namespace could not be prepared",
+                            ))
+                        })?,
+                );
+            }
+            directories
+        };
 
+        #[cfg(not(target_os = "macos"))]
         let (event_tx, events) = mpsc::channel();
+        #[cfg(not(target_os = "macos"))]
         let watchers = install_graph_snapshot_watches(event_tx, corpus_root, &correction_root)?;
+        #[cfg(target_os = "macos")]
+        let watchers = install_graph_snapshot_watches(
+            corpus_root,
+            &correction_root,
+            &corrections.vocabulary,
+            &corrections.overlays,
+        )?;
 
         let mut journal = Self {
             _watchers: watchers,
+            #[cfg(not(target_os = "macos"))]
             events,
+            #[cfg(not(target_os = "macos"))]
             fence_directories,
+            #[cfg(not(target_os = "macos"))]
             corpus_root: lexical_absolute_path(corpus_root),
+            #[cfg(not(target_os = "macos"))]
             correction_root: lexical_absolute_path(&correction_root),
+            #[cfg(not(target_os = "macos"))]
             vocabulary_path: lexical_absolute_path(&corrections.vocabulary),
+            #[cfg(not(target_os = "macos"))]
             overlays_path: lexical_absolute_path(&corrections.overlays),
+            #[cfg(not(target_os = "macos"))]
             dirty: false,
             deadline,
         };
@@ -912,77 +951,94 @@ impl GraphSnapshotJournal {
     /// capability-backed fence. Rescan/overflow and any corpus/correction
     /// mutation fail closed; the worker may retry from a brand-new journal.
     fn checkpoint(&mut self, label: &str) -> Result<(), GraphError> {
-        if std::time::Instant::now() >= self.deadline {
-            return Err(graph_corpus_budget_error());
-        }
-        let mut fences = Vec::with_capacity(self.fence_directories.len());
-        for (domain, directory) in self.fence_directories.iter().enumerate() {
-            let fence = directory
-                .create_random_private_control_file(
-                    &format!("graph-{domain}-{label}-{}", std::process::id()),
-                    GRAPH_SNAPSHOT_FENCE_BYTES,
-                )
-                .map_err(|_| {
-                    GraphError::Io(std::io::Error::other(
-                        "graph snapshot fence could not be published",
-                    ))
-                })?;
-            let path = lexical_absolute_path(fence.display_path());
-            fences.push((directory, fence, path));
-        }
-        let wait_deadline = self
-            .deadline
-            .min(std::time::Instant::now() + GRAPH_SNAPSHOT_FENCE_TIMEOUT);
-        let mut observed = vec![false; fences.len()];
-        while observed.iter().any(|seen| !seen) {
-            let remaining = wait_deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                self.dirty = true;
-                break;
+        #[cfg(target_os = "macos")]
+        {
+            if std::time::Instant::now() >= self.deadline {
+                return Err(graph_corpus_budget_error());
             }
-            match self.events.recv_timeout(remaining) {
-                Ok(GraphJournalEvent::Paths(paths)) => {
-                    for path in &paths {
-                        let path = lexical_absolute_path(path);
-                        for (index, (_, _, fence_path)) in fences.iter().enumerate() {
-                            if path == *fence_path {
-                                observed[index] = true;
-                            }
-                        }
-                    }
-                    if graph_snapshot_event_affects_inputs(
-                        &paths,
-                        &self.corpus_root,
-                        &self.correction_root,
-                        &self.vocabulary_path,
-                        &self.overlays_path,
-                        &self
-                            .fence_directories
-                            .iter()
-                            .map(|directory| directory.display_path())
-                            .collect::<Vec<_>>(),
-                    ) {
-                        self.dirty = true;
-                    }
-                }
-                Ok(GraphJournalEvent::Overflow) | Err(_) => {
+            if self._watchers.journal.changed().map_err(GraphError::Io)? {
+                return Err(GraphError::Io(std::io::Error::other(
+                    "graph corpus or corrections changed during one ordered snapshot",
+                )));
+            }
+            let _ = label;
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if std::time::Instant::now() >= self.deadline {
+                return Err(graph_corpus_budget_error());
+            }
+            let mut fences = Vec::with_capacity(self.fence_directories.len());
+            for (domain, directory) in self.fence_directories.iter().enumerate() {
+                let fence = directory
+                    .create_random_private_control_file(
+                        &format!("graph-{domain}-{label}-{}", std::process::id()),
+                        GRAPH_SNAPSHOT_FENCE_BYTES,
+                    )
+                    .map_err(|_| {
+                        GraphError::Io(std::io::Error::other(
+                            "graph snapshot fence could not be published",
+                        ))
+                    })?;
+                let path = lexical_absolute_path(fence.display_path());
+                fences.push((directory, fence, path));
+            }
+            let wait_deadline = self
+                .deadline
+                .min(std::time::Instant::now() + GRAPH_SNAPSHOT_FENCE_TIMEOUT);
+            let mut observed = vec![false; fences.len()];
+            while observed.iter().any(|seen| !seen) {
+                let remaining = wait_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
                     self.dirty = true;
                     break;
                 }
+                match self.events.recv_timeout(remaining) {
+                    Ok(GraphJournalEvent::Paths(paths)) => {
+                        for path in &paths {
+                            let path = lexical_absolute_path(path);
+                            for (index, (_, _, fence_path)) in fences.iter().enumerate() {
+                                if path == *fence_path {
+                                    observed[index] = true;
+                                }
+                            }
+                        }
+                        if graph_snapshot_event_affects_inputs(
+                            &paths,
+                            &self.corpus_root,
+                            &self.correction_root,
+                            &self.vocabulary_path,
+                            &self.overlays_path,
+                            &self
+                                .fence_directories
+                                .iter()
+                                .map(|directory| directory.display_path())
+                                .collect::<Vec<_>>(),
+                        ) {
+                            self.dirty = true;
+                        }
+                    }
+                    Ok(GraphJournalEvent::Overflow) | Err(_) => {
+                        self.dirty = true;
+                        break;
+                    }
+                }
             }
+            let retired = fences
+                .iter()
+                .all(|(directory, fence, _)| directory.remove_owned_private_file(fence).is_ok());
+            if observed.iter().any(|seen| !seen) || !retired || self.dirty {
+                return Err(GraphError::Io(std::io::Error::other(
+                    "graph corpus or corrections changed during one ordered snapshot",
+                )));
+            }
+            Ok(())
         }
-        let retired = fences
-            .iter()
-            .all(|(directory, fence, _)| directory.remove_owned_private_file(fence).is_ok());
-        if observed.iter().any(|seen| !seen) || !retired || self.dirty {
-            return Err(GraphError::Io(std::io::Error::other(
-                "graph corpus or corrections changed during one ordered snapshot",
-            )));
-        }
-        Ok(())
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn lexical_absolute_path(path: &Path) -> PathBuf {
     use std::path::Component;
 
@@ -1008,10 +1064,12 @@ fn lexical_absolute_path(path: &Path) -> PathBuf {
     normalized
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn path_touches_namespace(path: &Path, namespace: &Path) -> bool {
     path == namespace || path.starts_with(namespace) || namespace.starts_with(path)
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn graph_snapshot_event_affects_inputs(
     paths: &[PathBuf],
     corpus_root: &Path,
@@ -1039,6 +1097,7 @@ fn graph_snapshot_event_affects_inputs(
     })
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn path_touches_sqlite_correction(path: &Path, database: &Path) -> bool {
     if path_touches_namespace(path, database) {
         return true;
@@ -1058,7 +1117,7 @@ fn path_touches_sqlite_correction(path: &Path, database: &Path) -> bool {
             })
 }
 
-#[cfg(not(windows))]
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
 fn classify_graph_notify_event(event: notify::Result<notify::Event>) -> Option<GraphJournalEvent> {
     match event {
         Ok(event) if event.need_rescan() => Some(GraphJournalEvent::Overflow),
@@ -1076,7 +1135,7 @@ fn classify_graph_notify_event(event: notify::Result<notify::Event>) -> Option<G
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
 fn non_windows_graph_watch_specs(
     corpus_root: &Path,
     correction_root: &Path,
@@ -1095,7 +1154,7 @@ fn non_windows_graph_watch_specs(
     watches
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn install_graph_snapshot_watches(
     event_tx: mpsc::Sender<GraphJournalEvent>,
     corpus_root: &Path,
@@ -1135,6 +1194,27 @@ fn install_graph_snapshot_watches(
     }
     Ok(GraphNativeWatchers { _watcher: watcher })
 }
+
+#[cfg(target_os = "macos")]
+fn install_graph_snapshot_watches(
+    corpus_root: &Path,
+    correction_root: &Path,
+    vocabulary_path: &Path,
+    overlays_path: &Path,
+) -> Result<GraphNativeWatchers, GraphError> {
+    let journal = macos_graph_journal::MacGraphJournal::start(
+        corpus_root,
+        correction_root,
+        vocabulary_path,
+        overlays_path,
+    )
+    .map_err(GraphError::Io)?;
+    Ok(GraphNativeWatchers { journal })
+}
+
+#[cfg(target_os = "macos")]
+#[path = "graph/macos_kqueue.rs"]
+mod macos_graph_journal;
 
 #[cfg(windows)]
 fn install_graph_snapshot_watches(
@@ -1437,6 +1517,41 @@ struct GraphCorrectionSnapshot {
     revision: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PolicyGraphSpeakerCorrection {
+    pub(crate) speaker_label: String,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PolicyGraphStreamSource {
+    /// Request-local opaque path. The parent maps this back to the exact
+    /// authorized live path only after the final ordered-snapshot fence.
+    pub(crate) opaque_path: PathBuf,
+    pub(crate) content: String,
+    pub(crate) content_sha256: [u8; 32],
+    pub(crate) speaker_corrections: Vec<PolicyGraphSpeakerCorrection>,
+}
+
+pub(crate) struct PolicyGraphSnapshotPayload {
+    pub(crate) sources: Vec<PolicyGraphStreamSource>,
+    pub(crate) vocabulary_people: Vec<EntityRef>,
+    pub(crate) correction_revision: String,
+    pub(crate) opaque_to_live_paths: HashMap<PathBuf, PathBuf>,
+}
+
+pub(crate) struct PolicyGraphSnapshotAuthority {
+    _admission: GraphProjectionAdmission,
+    journal: GraphSnapshotJournal,
+    canonical_root: PathBuf,
+    correction_paths: GraphCorrectionPaths,
+    corpus_revision: String,
+    correction_revision: String,
+    operation: GraphOperationBudget,
+    derived: GraphDerivedBudget,
+    deadline: std::time::Instant,
+}
+
 fn hash_revision_field(hasher: &mut Sha256, value: &str) {
     hasher.update((value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
@@ -1649,6 +1764,164 @@ fn graph_inputs_still_attested(
             .is_ok_and(|snapshot| snapshot.revision == expected_corrections))
 }
 
+pub(crate) fn capture_policy_graph_snapshot(
+    config: &Config,
+) -> Result<(PolicyGraphSnapshotPayload, PolicyGraphSnapshotAuthority), GraphError> {
+    let deadline = graph_operation_deadline();
+    let canonical_root = config
+        .output_dir
+        .canonicalize()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                GraphError::DirNotFound(config.output_dir.display().to_string())
+            }
+            _ => GraphError::Io(error),
+        })?;
+    let admission = graph_projection_admission(&canonical_root)?;
+    let correction_paths = GraphCorrectionPaths::production();
+    let mut operation = GraphOperationBudget::new(deadline);
+    let mut derived = GraphDerivedBudget::default();
+
+    for attempt in 0..3 {
+        let mut journal =
+            match GraphSnapshotJournal::begin(&canonical_root, &correction_paths, deadline) {
+                Ok(journal) => journal,
+                Err(_) if attempt < 2 => continue,
+                Err(error) => return Err(error),
+            };
+        let correction_budget = operation.next_pass()?;
+        let corrections = match graph_correction_snapshot(
+            &correction_paths,
+            &correction_budget,
+            &mut derived,
+            deadline,
+        ) {
+            Ok(corrections) => corrections,
+            Err(_) if attempt < 2 => continue,
+            Err(error) => return Err(error),
+        };
+        let source_budget = operation.next_pass()?;
+        let mut sources = match collect_policy_graph_sources(
+            &config.output_dir,
+            &canonical_root,
+            &corrections,
+            &source_budget,
+            &mut derived,
+            &mut |_| {},
+        ) {
+            Ok(sources) => sources,
+            Err(_) if attempt < 2 => continue,
+            Err(error) => return Err(error),
+        };
+
+        let mut revision_entries = sources
+            .iter()
+            .map(|source| (source.opaque_path.clone(), source.content_sha256))
+            .collect::<Vec<_>>();
+        let corpus_revision = graph_revision_from_entries(&mut revision_entries);
+        if journal.checkpoint("captured").is_err() {
+            if attempt < 2 {
+                continue;
+            }
+            return Err(GraphError::Io(std::io::Error::other(
+                "graph sources or corrections changed during capture",
+            )));
+        }
+
+        let mut request_nonce = [0_u8; 16];
+        getrandom::fill(&mut request_nonce)
+            .map_err(|error| GraphError::Io(std::io::Error::other(error.to_string())))?;
+        let request_prefix = request_nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut opaque_to_live_paths = HashMap::with_capacity(sources.len());
+        for (index, source) in sources.iter_mut().enumerate() {
+            let live_path = source.opaque_path.clone();
+            let opaque_path = PathBuf::from(format!(
+                "/__minutes_graph_source/{request_prefix}/{index:08}.md"
+            ));
+            source.opaque_path = opaque_path.clone();
+            opaque_to_live_paths.insert(opaque_path, live_path);
+        }
+
+        let correction_revision = corrections.revision.clone();
+        let payload = PolicyGraphSnapshotPayload {
+            sources,
+            vocabulary_people: corrections.vocabulary_people,
+            correction_revision: correction_revision.clone(),
+            opaque_to_live_paths,
+        };
+        let authority = PolicyGraphSnapshotAuthority {
+            _admission: admission,
+            journal,
+            canonical_root,
+            correction_paths,
+            corpus_revision,
+            correction_revision,
+            operation,
+            derived,
+            deadline,
+        };
+        return Ok((payload, authority));
+    }
+
+    Err(GraphError::Io(std::io::Error::other(
+        "graph sources or corrections could not be captured",
+    )))
+}
+
+impl PolicyGraphSnapshotAuthority {
+    pub(crate) fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    pub(crate) fn finalize(mut self) -> Result<(), GraphError> {
+        if !graph_inputs_still_attested(
+            &self.canonical_root,
+            &self.correction_paths,
+            &self.corpus_revision,
+            &self.correction_revision,
+            &mut self.operation,
+            &mut self.derived,
+            self.deadline,
+        )? {
+            return Err(GraphError::Io(std::io::Error::other(
+                "graph sources or corrections changed before publication",
+            )));
+        }
+        self.journal.checkpoint("published")
+    }
+}
+
+pub(crate) fn rehydrate_policy_projection_paths(
+    response: &mut PolicyProjectionResponse,
+    opaque_to_live_paths: &HashMap<PathBuf, PathBuf>,
+) -> Result<(), GraphError> {
+    let rehydrate = |path: &mut PathBuf| {
+        let live = opaque_to_live_paths.get(path).ok_or_else(|| {
+            GraphError::Io(std::io::Error::other(
+                "graph worker returned an unknown source identifier",
+            ))
+        })?;
+        *path = live.clone();
+        Ok::<(), GraphError>(())
+    };
+    if let PolicyProjectionResponse::PersonProfile(profile) = response {
+        for meeting in &mut profile.recent_meetings {
+            rehydrate(&mut meeting.path)?;
+        }
+        for intent in &mut profile.open_intents {
+            rehydrate(&mut intent.path)?;
+        }
+        for decision in &mut profile.recent_decisions {
+            rehydrate(&mut decision.path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Read one source as an immutable policy snapshot. The returned bytes and
 /// revision come from the same descriptor, and the live pathname must still
 /// identify that descriptor after the read. Invalid, unreadable, symlinked,
@@ -1765,6 +2038,7 @@ fn graph_corpus_revision(
     graph_corpus_revision_with_budget_and_hook(canonical_root, budget, derived, &mut |_| {})
 }
 
+#[cfg(test)]
 fn graph_metadata_value(conn: &Connection, key: &str) -> Result<Option<String>, GraphError> {
     match conn.query_row(
         "SELECT value FROM graph_metadata WHERE key = ?1",
@@ -1782,6 +2056,7 @@ fn graph_metadata_value(conn: &Connection, key: &str) -> Result<Option<String>, 
 /// snapshot prevents a stale cache read; the post-query snapshot prevents a
 /// normal-to-restricted flip during SQL materialization from escaping. No raw
 /// `Connection` leaves this boundary.
+#[cfg(test)]
 fn query_policy_fresh_graph_at_with_publication<T>(
     config: &Config,
     path: &Path,
@@ -1925,6 +2200,8 @@ fn query_policy_fresh_graph_at<T>(
 /// pipe flush. The parent never exposes those bytes unless the worker exits
 /// successfully, so a mutation during serialization/publication discards the
 /// whole answer rather than leaking a stale projection.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn write_policy_projection_response(
     config: &Config,
     request: &PolicyProjectionRequest,
@@ -2070,6 +2347,108 @@ pub(crate) fn write_policy_projection_response(
         },
     )?;
     Ok(())
+}
+
+pub(crate) fn policy_projection_response_from_stream(
+    sources: Vec<PolicyGraphStreamSource>,
+    vocabulary_people: Vec<EntityRef>,
+    correction_revision: String,
+    request: &PolicyProjectionRequest,
+) -> Result<PolicyProjectionResponse, GraphError> {
+    let requested_limit = match request {
+        PolicyProjectionRequest::People { limit, .. }
+        | PolicyProjectionRequest::RelationshipMap { limit }
+        | PolicyProjectionRequest::RelationshipContext { limit }
+        | PolicyProjectionRequest::Commitments { limit, .. }
+        | PolicyProjectionRequest::LosingTouch { limit }
+        | PolicyProjectionRequest::ParakeetBoostPhrases { limit } => Some(*limit),
+        PolicyProjectionRequest::RebuildStats | PolicyProjectionRequest::PersonProfile { .. } => {
+            None
+        }
+    };
+    if requested_limit.is_some_and(|limit| limit > MAX_GRAPH_QUERY_ROWS) {
+        return Err(GraphError::Io(std::io::Error::other(
+            "graph projection result limit exceeded",
+        )));
+    }
+    match request {
+        PolicyProjectionRequest::PersonProfile { selector }
+        | PolicyProjectionRequest::Commitments {
+            selector: Some(selector),
+            ..
+        } => ensure_graph_entity_field(selector)?,
+        _ => {}
+    }
+
+    let include_alias_analysis = matches!(
+        request,
+        PolicyProjectionRequest::RebuildStats
+            | PolicyProjectionRequest::People {
+                include_stats: true,
+                ..
+            }
+    );
+    let (conn, stats) = populate_policy_projection_from_stream(
+        sources,
+        vocabulary_people,
+        correction_revision,
+        include_alias_analysis,
+    )?;
+    let query_deadline = graph_operation_deadline();
+    match request {
+        PolicyProjectionRequest::RebuildStats => Ok(PolicyProjectionResponse::RebuildStats(stats)),
+        PolicyProjectionRequest::People {
+            limit,
+            include_commitments,
+            include_stats,
+        } => Ok(PolicyProjectionResponse::People(
+            people_projection_from_connection(
+                &conn,
+                *limit,
+                *include_commitments,
+                include_stats.then_some(stats),
+                query_deadline,
+            )?,
+        )),
+        PolicyProjectionRequest::RelationshipMap { limit } => {
+            Ok(PolicyProjectionResponse::RelationshipMap(
+                relationship_map_from_connection(&conn, query_deadline, false, Some(*limit))?,
+            ))
+        }
+        PolicyProjectionRequest::RelationshipContext { limit } => {
+            let projection =
+                people_projection_from_connection(&conn, *limit, true, None, query_deadline)?;
+            Ok(PolicyProjectionResponse::RelationshipContext(
+                RelationshipContext {
+                    people: projection.people,
+                    commitments: projection.commitments,
+                },
+            ))
+        }
+        PolicyProjectionRequest::PersonProfile { selector } => {
+            Ok(PolicyProjectionResponse::PersonProfile(
+                policy_person_profile_from_connection(&conn, selector, query_deadline)?,
+            ))
+        }
+        PolicyProjectionRequest::Commitments { selector, limit } => Ok(
+            PolicyProjectionResponse::Commitments(query_commitments_from_connection(
+                &conn,
+                selector.as_deref(),
+                *limit,
+                query_deadline,
+            )?),
+        ),
+        PolicyProjectionRequest::LosingTouch { limit } => {
+            Ok(PolicyProjectionResponse::LosingTouch(
+                relationship_map_from_connection(&conn, query_deadline, true, Some(*limit))?,
+            ))
+        }
+        PolicyProjectionRequest::ParakeetBoostPhrases { limit } => {
+            Ok(PolicyProjectionResponse::ParakeetBoostPhrases(
+                parakeet_boost_phrases_from_connection(&conn, *limit, query_deadline)?,
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2237,6 +2616,7 @@ pub(crate) fn rebuild_index(config: &Config) -> Result<GraphStats, GraphError> {
     rebuild_index_with_publication(config, |_, _, _| Ok(()))
 }
 
+#[cfg(test)]
 fn rebuild_index_with_publication(
     config: &Config,
     mut publish_while_attested: impl FnMut(
@@ -2410,6 +2790,7 @@ fn rebuild_projection_with_hook(
     Ok(stats)
 }
 
+#[cfg(test)]
 fn rebuild_in_memory_projection_with_hook(
     config: &Config,
     corrections: &GraphCorrectionSnapshot,
@@ -2435,6 +2816,7 @@ fn rebuild_in_memory_projection_with_hook(
     )
 }
 
+#[cfg(test)]
 fn populate_projection_with_hook(
     config: &Config,
     conn: Connection,
@@ -2444,36 +2826,38 @@ fn populate_projection_with_hook(
     mut after_source_snapshot: impl FnMut(&Path),
     include_alias_analysis: bool,
 ) -> Result<(Connection, GraphStats), GraphError> {
-    let start = std::time::Instant::now();
-    let projection_now = Local::now();
     let dir = &config.output_dir;
     if !dir.exists() {
         return Err(GraphError::DirNotFound(dir.display().to_string()));
     }
     let canonical_root = dir.canonicalize()?;
-
-    // Wrap the private in-memory projection in one transaction so a failed
-    // rebuild cannot expose a partially materialized answer.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-
-    // Clear existing data for full rebuild
-    conn.execute_batch(
-        "DELETE FROM meeting_topics;
-         DELETE FROM people_meetings;
-         DELETE FROM commitments;
-         DELETE FROM decisions;
-         DELETE FROM meetings;
-         DELETE FROM topics;
-         DELETE FROM people;
-         DELETE FROM graph_metadata;",
+    let sources = collect_policy_graph_sources(
+        dir,
+        &canonical_root,
+        corrections,
+        budget,
+        derived_budget,
+        &mut after_source_snapshot,
     )?;
+    populate_projection_from_sources(
+        conn,
+        corrections,
+        budget,
+        derived_budget,
+        sources,
+        include_alias_analysis,
+    )
+}
 
-    // Walk all markdown files
-    let mut people_map: HashMap<String, (String, Vec<String>)> = HashMap::new(); // slug -> (stable name, aliases)
-    let mut meeting_count = 0usize;
-    let mut commitment_count = 0usize;
-    let mut topic_set: HashMap<String, i64> = HashMap::new(); // name -> id
-    let mut source_revision_entries: Vec<(PathBuf, [u8; 32])> = Vec::new();
+fn collect_policy_graph_sources(
+    dir: &Path,
+    canonical_root: &Path,
+    corrections: &GraphCorrectionSnapshot,
+    budget: &ActiveCorpusReadBudget,
+    derived_budget: &mut GraphDerivedBudget,
+    after_source_snapshot: &mut impl FnMut(&Path),
+) -> Result<Vec<PolicyGraphStreamSource>, GraphError> {
+    let mut sources = Vec::new();
     let walker = WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
@@ -2503,7 +2887,7 @@ fn populate_projection_with_hook(
         {
             continue;
         }
-        let source = read_policy_graph_source(entry.path(), &canonical_root, budget);
+        let source = read_policy_graph_source(entry.path(), canonical_root, budget);
         budget
             .check_deadline()
             .map_err(|_| graph_corpus_budget_error())?;
@@ -2513,7 +2897,93 @@ fn populate_projection_with_hook(
         };
         consume_graph_corpus(budget, 0, 0, source.content.len() as u64)?;
         derived_budget.consume(1, budget)?;
-        let file_path = source.path;
+        let speaker_corrections = corrections
+            .speaker_overlays
+            .confirmations_for_source(&source.path, &source.content_sha256)
+            .into_iter()
+            .map(|confirmation| PolicyGraphSpeakerCorrection {
+                speaker_label: confirmation.speaker_label,
+                name: confirmation.name,
+            })
+            .collect();
+        after_source_snapshot(&source.path);
+        sources.push(PolicyGraphStreamSource {
+            opaque_path: source.path,
+            content: source.content,
+            content_sha256: source.content_sha256,
+            speaker_corrections,
+        });
+    }
+    Ok(sources)
+}
+
+pub(crate) fn populate_policy_projection_from_stream(
+    sources: Vec<PolicyGraphStreamSource>,
+    vocabulary_people: Vec<EntityRef>,
+    correction_revision: String,
+    include_alias_analysis: bool,
+) -> Result<(Connection, GraphStats), GraphError> {
+    let conn = open_memory_db()?;
+    let budget = ActiveCorpusReadBudget::new();
+    let progress_budget = budget.clone();
+    conn.progress_handler(
+        1_000,
+        Some(move || progress_budget.check_deadline().is_err()),
+    );
+    let corrections = GraphCorrectionSnapshot {
+        vocabulary_people,
+        speaker_overlays: overlays::StableSpeakerOverlaySnapshot::empty(),
+        revision: correction_revision,
+    };
+    let mut derived = GraphDerivedBudget::default();
+    populate_projection_from_sources(
+        conn,
+        &corrections,
+        &budget,
+        &mut derived,
+        sources,
+        include_alias_analysis,
+    )
+}
+
+fn populate_projection_from_sources(
+    conn: Connection,
+    corrections: &GraphCorrectionSnapshot,
+    budget: &ActiveCorpusReadBudget,
+    derived_budget: &mut GraphDerivedBudget,
+    sources: Vec<PolicyGraphStreamSource>,
+    include_alias_analysis: bool,
+) -> Result<(Connection, GraphStats), GraphError> {
+    let start = std::time::Instant::now();
+    let projection_now = Local::now();
+
+    // Wrap the private in-memory projection in one transaction so a failed
+    // rebuild cannot expose a partially materialized answer.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    // Clear existing data for full rebuild
+    conn.execute_batch(
+        "DELETE FROM meeting_topics;
+         DELETE FROM people_meetings;
+         DELETE FROM commitments;
+         DELETE FROM decisions;
+         DELETE FROM meetings;
+         DELETE FROM topics;
+         DELETE FROM people;
+         DELETE FROM graph_metadata;",
+    )?;
+
+    // Walk all markdown files
+    let mut people_map: HashMap<String, (String, Vec<String>)> = HashMap::new(); // slug -> (stable name, aliases)
+    let mut meeting_count = 0usize;
+    let mut commitment_count = 0usize;
+    let mut topic_set: HashMap<String, i64> = HashMap::new(); // name -> id
+    let mut source_revision_entries: Vec<(PathBuf, [u8; 32])> = Vec::new();
+    for source in sources {
+        budget
+            .check_deadline()
+            .map_err(|_| graph_corpus_budget_error())?;
+        let file_path = source.opaque_path;
         let (fm_str, body) = split_frontmatter(&source.content);
         let Some(frontmatter) = parse_graph_frontmatter(fm_str) else {
             continue;
@@ -2547,7 +3017,6 @@ fn populate_projection_with_hook(
             }
         }
         source_revision_entries.push((file_path.clone(), source.content_sha256));
-        after_source_snapshot(&file_path);
 
         let content_type_str = match frontmatter.r#type {
             ContentType::Meeting => "meeting",
@@ -2559,11 +3028,9 @@ fn populate_projection_with_hook(
         let speakers = extract_speakers_from_transcript(body, budget, derived_budget)?;
         // Correction rows are enrichments only: lookup happens after this
         // exact source descriptor has parsed as normal-authorized.
-        let speaker_map = speaker_map_with_overlays(
+        let speaker_map = speaker_map_with_confirmations(
             &frontmatter.speaker_map,
-            &corrections.speaker_overlays,
-            &file_path,
-            &source.content_sha256,
+            &source.speaker_corrections,
             &speakers,
         );
         derived_budget.consume(
@@ -3008,10 +3475,7 @@ fn populate_projection_with_hook(
     let corpus_revision = graph_revision_from_entries(&mut source_revision_entries);
     conn.execute(
         "INSERT INTO graph_metadata (key, value) VALUES (?1, ?2)",
-        params![
-            GRAPH_CORPUS_ROOT_KEY,
-            canonical_root.to_string_lossy().as_ref()
-        ],
+        params![GRAPH_CORPUS_ROOT_KEY, "/__minutes_graph_source"],
     )?;
     conn.execute(
         "INSERT INTO graph_metadata (key, value) VALUES (?1, ?2)",
@@ -3048,15 +3512,12 @@ fn populate_projection_with_hook(
     Ok((conn, stats))
 }
 
-fn speaker_map_with_overlays(
+fn speaker_map_with_confirmations(
     speaker_map: &[SpeakerAttribution],
-    overlays: &overlays::StableSpeakerOverlaySnapshot,
-    meeting_path: &Path,
-    source_sha256: &[u8; 32],
+    confirmations: &[PolicyGraphSpeakerCorrection],
     transcript_speakers: &[String],
 ) -> Vec<SpeakerAttribution> {
     let mut combined = speaker_map.to_vec();
-    let confirmations = overlays.confirmations_for_source(meeting_path, source_sha256);
     for confirmation in confirmations {
         // A bound row enriches an attribution already evidenced by these exact
         // source bytes. It can never append a person to unrelated content.
@@ -3064,7 +3525,7 @@ fn speaker_map_with_overlays(
             .iter_mut()
             .find(|attr| attr.speaker_label == confirmation.speaker_label)
         {
-            existing.name = confirmation.name;
+            existing.name = confirmation.name.clone();
             existing.confidence = crate::diarize::Confidence::High;
             existing.source = crate::diarize::AttributionSource::Manual;
         } else if transcript_speakers
@@ -3072,8 +3533,8 @@ fn speaker_map_with_overlays(
             .any(|speaker| speaker.eq_ignore_ascii_case(&confirmation.speaker_label))
         {
             combined.push(SpeakerAttribution {
-                speaker_label: confirmation.speaker_label,
-                name: confirmation.name,
+                speaker_label: confirmation.speaker_label.clone(),
+                name: confirmation.name.clone(),
                 confidence: crate::diarize::Confidence::High,
                 source: crate::diarize::AttributionSource::Manual,
             });
@@ -4407,6 +4868,75 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn path_bearing_profile(path: PathBuf) -> PolicyProjectionResponse {
+        PolicyProjectionResponse::PersonProfile(PolicyPersonProfile {
+            name: "Synthetic Person".into(),
+            recent_meetings: vec![PolicyMeetingReference {
+                path: path.clone(),
+                title: "Synthetic Meeting".into(),
+                date: "2026-01-01".into(),
+                content_type: "meeting".into(),
+            }],
+            open_intents: vec![PolicyIntentReference {
+                path: path.clone(),
+                title: "Synthetic Meeting".into(),
+                date: "2026-01-01".into(),
+                content_type: "meeting".into(),
+                kind: IntentKind::Commitment,
+                what: "Synthetic follow-up".into(),
+                who: None,
+                who_original: None,
+                who_provenance: None,
+                status: "open".into(),
+                by_date: None,
+            }],
+            recent_decisions: vec![PolicyDecisionReference {
+                path,
+                title: "Synthetic Meeting".into(),
+                date: "2026-01-01".into(),
+                what: "Synthetic decision".into(),
+                who: None,
+                who_original: None,
+                who_provenance: None,
+                by_date: None,
+                authority: None,
+            }],
+            top_topics: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn profile_rehydration_rejects_unknown_or_replayed_source_ids_in_every_collection() {
+        let opaque = PathBuf::from("/__minutes_graph_source/current/00000001.md");
+        let replayed = PathBuf::from("/__minutes_graph_source/prior/00000001.md");
+        let live = PathBuf::from("/live/synthetic.md");
+        let allow = HashMap::from([(opaque.clone(), live.clone())]);
+
+        let mut valid = path_bearing_profile(opaque.clone());
+        rehydrate_policy_projection_paths(&mut valid, &allow).unwrap();
+        let PolicyProjectionResponse::PersonProfile(valid) = valid else {
+            unreachable!();
+        };
+        assert_eq!(valid.recent_meetings[0].path, live);
+        assert_eq!(valid.open_intents[0].path, live);
+        assert_eq!(valid.recent_decisions[0].path, live);
+
+        for collection in 0..3 {
+            let mut response = path_bearing_profile(opaque.clone());
+            let PolicyProjectionResponse::PersonProfile(profile) = &mut response else {
+                unreachable!();
+            };
+            match collection {
+                0 => profile.recent_meetings[0].path = replayed.clone(),
+                1 => profile.open_intents[0].path = replayed.clone(),
+                2 => profile.recent_decisions[0].path = replayed.clone(),
+                _ => unreachable!(),
+            }
+            let error = rehydrate_policy_projection_paths(&mut response, &allow).unwrap_err();
+            assert!(error.to_string().contains("unknown source identifier"));
+        }
+    }
+
     #[test]
     fn private_graph_connections_force_memory_only_temporary_storage() {
         let conn = open_memory_db().unwrap();
@@ -4848,6 +5378,74 @@ Skip the wizard. Drop users into a pre-populated demo workspace.
             GraphSnapshotJournal::begin(&meetings, &corrections, deadline).unwrap();
         fs::write(meetings.join("new.md"), b"---\ntitle: Changed\n---\n").unwrap();
         assert!(corpus_journal.checkpoint("corpus-mutated").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ordered_snapshot_kqueue_rejects_transient_write_and_rename_aba() {
+        let tmp = TempDir::new().unwrap();
+        let meetings = tmp.path().join("meetings");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&meetings).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let meeting = meetings.join("meeting.md");
+        let original = b"---\ntitle: Original\n---\n";
+        fs::write(&meeting, original).unwrap();
+        let corrections = GraphCorrectionPaths {
+            vocabulary: state.join("vocabulary.toml"),
+            overlays: state.join("overlays.db"),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        let mut write_aba = GraphSnapshotJournal::begin(&meetings, &corrections, deadline).unwrap();
+        fs::write(&meeting, b"---\ntitle: Transient\n---\n").unwrap();
+        fs::write(&meeting, original).unwrap();
+        assert!(write_aba.checkpoint("write-aba").is_err());
+
+        let mut rename_aba =
+            GraphSnapshotJournal::begin(&meetings, &corrections, deadline).unwrap();
+        let displaced = meetings.join("displaced.md");
+        fs::rename(&meeting, &displaced).unwrap();
+        fs::rename(&displaced, &meeting).unwrap();
+        assert!(rename_aba.checkpoint("rename-aba").is_err());
+
+        let vocabulary_original = b"version = 1\n";
+        fs::write(&corrections.vocabulary, vocabulary_original).unwrap();
+        let mut correction_write_aba =
+            GraphSnapshotJournal::begin(&meetings, &corrections, deadline).unwrap();
+        fs::write(&corrections.vocabulary, b"version = 2\n").unwrap();
+        fs::write(&corrections.vocabulary, vocabulary_original).unwrap();
+        assert!(correction_write_aba
+            .checkpoint("correction-write-aba")
+            .is_err());
+
+        let mut correction_rename_aba =
+            GraphSnapshotJournal::begin(&meetings, &corrections, deadline).unwrap();
+        let displaced_vocabulary = state.join("vocabulary-displaced.toml");
+        fs::rename(&corrections.vocabulary, &displaced_vocabulary).unwrap();
+        fs::rename(&displaced_vocabulary, &corrections.vocabulary).unwrap();
+        assert!(correction_rename_aba
+            .checkpoint("correction-rename-aba")
+            .is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ordered_snapshot_kqueue_ignores_unrelated_ancestor_sibling_activity() {
+        let tmp = TempDir::new().unwrap();
+        let meetings = tmp.path().join("meetings");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&meetings).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let corrections = GraphCorrectionPaths {
+            vocabulary: state.join("vocabulary.toml"),
+            overlays: state.join("overlays.db"),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut journal = GraphSnapshotJournal::begin(&meetings, &corrections, deadline).unwrap();
+
+        fs::write(tmp.path().join("unrelated.txt"), b"unrelated").unwrap();
+        journal.checkpoint("unrelated-ancestor-sibling").unwrap();
     }
 
     #[test]

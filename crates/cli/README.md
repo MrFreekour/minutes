@@ -23,6 +23,15 @@ Or via Homebrew on macOS:
 brew tap silverstein/tap && brew install minutes
 ```
 
+On macOS, the signed desktop app runs relationship projections in its bundled,
+App-Sandboxed helper. Standalone, Cargo, source-built, and ad-hoc installs run
+an exact second instance of the already-running Minutes executable. On every
+supported macOS version, the parent starts the worker suspended in an isolated
+process group, verifies the live child's kernel CodeDirectory hash before it
+can execute or receive source bytes, and retires the whole group before reaping
+its leader. The child enforces the same no-descendants, memory, descriptor, and
+wall-clock ceilings. Restricted conversations remain excluded in every channel.
+
 ## Quick start
 
 ```bash

@@ -1432,8 +1432,16 @@ fn main() {
     #[cfg(target_os = "macos")]
     if let Some(sidecar) = std::env::current_exe()
         .ok()
-        .and_then(|executable| executable.parent().map(|parent| parent.join("minutes")))
-        .filter(|candidate| candidate.is_file())
+        .and_then(|executable| {
+            executable.parent().and_then(|macos| {
+                macos.parent().map(|contents| {
+                    contents
+                        .join("XPCServices")
+                        .join("com.useminutes.graph-worker.xpc")
+                })
+            })
+        })
+        .filter(|candidate| candidate.is_dir())
     {
         let _ = minutes_core::graph_worker::install_policy_projection_worker_executable(sidecar);
     }

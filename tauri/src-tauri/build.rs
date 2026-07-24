@@ -6,7 +6,7 @@ fn main() {
     compile_mic_check_helper();
     compile_system_audio_helper();
     compile_calendar_helper();
-    stage_minutes_cli_sidecar();
+    stage_rust_sidecars();
     stage_assistant_skill_bundle();
     tauri_build::build()
 }
@@ -56,7 +56,7 @@ const MIN_REAL_CLI_SIDECAR_BYTES: u64 = 1_000_000;
 /// left by an earlier check/clippy run (issue #324: the release workflow
 /// called `cargo tauri build` without building the CLI first, and every
 /// CI-built macOS bundle since v0.16.2 shipped the stub).
-fn stage_minutes_cli_sidecar() {
+fn stage_rust_sidecars() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "macos" {
         return;
@@ -65,17 +65,20 @@ fn stage_minutes_cli_sidecar() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set"),
     );
-    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".into());
-    let bin_dir = manifest_dir.join("bin");
-    let staged = bin_dir.join(format!("minutes-{}", target));
-
-    println!("cargo:rerun-if-changed={}", staged.display());
     println!("cargo:rerun-if-env-changed=MINUTES_REQUIRE_REAL_CLI_SIDECAR");
-
     let require_real = std::env::var("MINUTES_REQUIRE_REAL_CLI_SIDECAR")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
+    for name in ["minutes", "minutes-graph-worker"] {
+        stage_rust_sidecar(&manifest_dir, name, require_real);
+    }
+}
 
+fn stage_rust_sidecar(manifest_dir: &Path, name: &str, require_real: bool) {
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".into());
+    let bin_dir = manifest_dir.join("bin");
+    let staged = bin_dir.join(format!("{name}-{target}"));
+    println!("cargo:rerun-if-changed={}", staged.display());
     if staged.exists() {
         let staged_len = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
         if !require_real || staged_len >= MIN_REAL_CLI_SIDECAR_BYTES {
@@ -95,34 +98,34 @@ fn stage_minutes_cli_sidecar() {
         repo_root
             .join("target")
             .join(&target)
-            .join("release/minutes"),
-        repo_root.join("target/release/minutes"),
+            .join("release")
+            .join(name),
+        repo_root.join("target/release").join(name),
     ];
     for candidate in candidate_paths.iter() {
         if candidate.exists() {
-            fs::copy(candidate, &staged).expect("failed to copy CLI sidecar");
+            fs::copy(candidate, &staged).expect("failed to copy Rust sidecar");
             return;
         }
     }
 
     if require_real {
         panic!(
-            "MINUTES_REQUIRE_REAL_CLI_SIDECAR is set but no release CLI binary was found \
-             (looked at {:?}). Run `cargo build --release -p minutes-cli` before \
-             `cargo tauri build` so the bundle ships a working CLI instead of a placeholder.",
-            candidate_paths
+            "MINUTES_REQUIRE_REAL_CLI_SIDECAR is set but no release {name} binary was found \
+             (looked at {candidate_paths:?}). Run `cargo build --release -p minutes-cli` before \
+             `cargo tauri build` so the bundle ships a working sidecar instead of a placeholder."
         );
     }
 
     // Placeholder for check/clippy only. Distributable builds set
     // MINUTES_REQUIRE_REAL_CLI_SIDECAR and hard-fail above instead.
     println!(
-        "cargo:warning=No minutes CLI release binary found; writing placeholder sidecar at {}. Run `cargo build --release -p minutes-cli` (or `scripts/build.sh`) before `cargo tauri build`.",
+        "cargo:warning=No {name} release binary found; writing placeholder sidecar at {}. Run `cargo build --release -p minutes-cli` (or `scripts/build.sh`) before `cargo tauri build`.",
         staged.display()
     );
     fs::write(
         &staged,
-        b"#!/bin/sh\necho 'minutes CLI placeholder' >&2\nexit 1\n",
+        format!("#!/bin/sh\necho '{name} placeholder' >&2\nexit 1\n"),
     )
     .expect("failed to write placeholder sidecar");
     #[cfg(unix)]

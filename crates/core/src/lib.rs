@@ -5,6 +5,8 @@ pub mod apple_speech;
 pub(crate) mod audio_budget;
 pub mod autoresearch;
 pub(crate) mod bounded_child;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_graph_xpc;
 
 /// Activate a previously validated MCP process-audio outer process group.
 /// The CLI must also hold the helper's live supervisor capability; the core

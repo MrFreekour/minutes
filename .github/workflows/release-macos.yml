@@ -26,13 +26,23 @@ jobs:
     name: Release readiness
     runs-on: ubuntu-latest
     steps:
+      - name: Validate exact release tag input
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "ERROR: release input must be an exact version tag" >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+
       - name: Check out release ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ format('refs/tags/{0}', env.RELEASE_TAG) }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
 
@@ -45,16 +55,28 @@ jobs:
     runs-on: macos-latest
 
     steps:
+      - name: Validate exact release tag input
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "ERROR: release input must be an exact version tag" >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ format('refs/tags/{0}', env.RELEASE_TAG) }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify checked out release ref
         run: |
-          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          tag_ref="refs/tags/$RELEASE_TAG"
+          git show-ref --verify --quiet "$tag_ref"
+          tag_commit="$(git rev-parse "${tag_ref}^{commit}")"
           head_commit="$(git rev-parse HEAD)"
           if [ "$head_commit" != "$tag_commit" ]; then
             echo "ERROR: checkout HEAD ($head_commit) does not match ${RELEASE_TAG} ($tag_commit)" >&2
@@ -65,7 +87,7 @@ jobs:
         run: echo "CXXFLAGS=-I$(xcrun --show-sdk-path)/usr/include/c++/v1" >> "$GITHUB_ENV"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
 
       - name: Resolve runner image for cache scope
         id: runner-image
@@ -73,7 +95,7 @@ jobs:
         run: echo "scope=${ImageOS:-noimage}-${ImageVersion:-noversion}" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry
@@ -128,29 +150,67 @@ jobs:
           chmod 600 "$key_path"
           echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
+      - name: Import Developer ID identity into an ephemeral keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/minutes-release.keychain-db"
+          certificate="$RUNNER_TEMP/minutes-release.p12"
+          keychain_password="$(openssl rand -hex 24)"
+          python3 - "$certificate" <<'PY'
+          import base64
+          import os
+          import pathlib
+          import sys
+
+          pathlib.Path(sys.argv[1]).write_bytes(
+              base64.b64decode(os.environ["APPLE_CERTIFICATE"], validate=True)
+          )
+          PY
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" \
+            | grep -Fq "$APPLE_SIGNING_IDENTITY"
+          echo "MINUTES_RELEASE_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
       # The bundle ships the CLI as a sidecar (in-app "Set up CLI" symlinks to
       # it). build.rs stages it from target/release/minutes, so the CLI must be
       # built first or the bundle ships a placeholder stub (#324).
       - name: Build release CLI for bundling
         run: cargo build --release -p minutes-cli --features parakeet,metal
 
-      - name: Build signed + notarized bundle (with updater artifacts)
+      - name: Build signed bundle (helper identity is repaired before notarization)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           MINUTES_REQUIRE_REAL_CLI_SIDECAR: "1"
         run: cargo tauri build --features parakeet,metal --bundles app
 
-      - name: Verify bundled CLI sidecar is real
+      - name: Sign graph helper inside-out and notarize the final exact app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
+          set -euo pipefail
+          app="target/release/bundle/macos/Minutes.app"
           sidecar="target/release/bundle/macos/Minutes.app/Contents/MacOS/minutes"
+          staged_graph_worker="$app/Contents/MacOS/minutes-graph-worker"
           test -f "$sidecar" || { echo "ERROR: bundled CLI sidecar missing" >&2; exit 1; }
+          test -f "$staged_graph_worker" || { echo "ERROR: bundled graph worker missing" >&2; exit 1; }
           size=$(stat -f%z "$sidecar")
           echo "bundled CLI sidecar size: $size bytes"
           if [ "$size" -lt 10000000 ]; then
@@ -158,31 +218,109 @@ jobs:
             exit 1
           fi
           file "$sidecar" | grep -q "Mach-O" || { echo "ERROR: bundled CLI sidecar is not a Mach-O binary" >&2; exit 1; }
+          file "$staged_graph_worker" | grep -q "Mach-O" || { echo "ERROR: bundled graph worker is not a Mach-O binary" >&2; exit 1; }
 
-      - name: Refresh release helper scripts for manual reruns
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          git fetch origin main
-          git show origin/main:scripts/create-branded-dmg.sh > scripts/create-branded-dmg.sh
-          chmod +x scripts/create-branded-dmg.sh
+          codesign --force --options runtime --timestamp \
+            --entitlements tauri/src-tauri/minutes-cli.entitlements \
+            --sign "$APPLE_SIGNING_IDENTITY" "$sidecar"
+          ./scripts/package-graph-xpc.sh \
+            "$app" \
+            "$APPLE_SIGNING_IDENTITY" \
+            tauri/src-tauri/minutes-graph-worker.entitlements
+          graph_worker_bundle="$app/Contents/XPCServices/com.useminutes.graph-worker.xpc"
+          graph_worker="$graph_worker_bundle/Contents/MacOS/minutes-graph-worker"
+          test ! -e "$staged_graph_worker"
+          test -f "$graph_worker"
+
+          codesign --force --options runtime --timestamp \
+            --entitlements tauri/src-tauri/entitlements.plist \
+            --sign "$APPLE_SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=4 "$app"
+          codesign --verify --strict --verbose=4 "$graph_worker_bundle"
+
+          codesign -d --entitlements :- "$graph_worker" \
+            > "$RUNNER_TEMP/graph-worker-entitlements.plist" 2>/dev/null
+          python3 - "$RUNNER_TEMP/graph-worker-entitlements.plist" <<'PY'
+          import plistlib
+          import sys
+
+          with open(sys.argv[1], "rb") as source:
+              actual = plistlib.load(source)
+          expected = {"com.apple.security.app-sandbox": True}
+          if actual != expected:
+              raise SystemExit(
+                  f"graph worker entitlement allowlist mismatch: {actual!r}"
+              )
+          PY
+          codesign -dv --verbose=4 "$graph_worker" \
+            > "$RUNNER_TEMP/graph-worker-identity.txt" 2>&1
+          grep -Fq "Identifier=com.useminutes.graph-worker" \
+            "$RUNNER_TEMP/graph-worker-identity.txt"
+          grep -Fq "TeamIdentifier=63TMLKT8HN" \
+            "$RUNNER_TEMP/graph-worker-identity.txt"
+
+          notary_zip="$RUNNER_TEMP/Minutes-final.zip"
+          ditto -c -k --keepParent "$app" "$notary_zip"
+          xcrun notarytool submit "$notary_zip" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          codesign --verify --deep --strict --verbose=4 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+
+          updater="target/release/bundle/macos/Minutes.app.tar.gz"
+          rm -f "$updater" "$updater.sig"
+          tar -C "target/release/bundle/macos" -czf "$updater" "Minutes.app"
+          cargo tauri signer sign "$updater"
+          test -s "$updater.sig"
 
       - name: Create DMG
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
+          set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
+          dmg="target/release/bundle/dmg/Minutes_${VERSION}_aarch64.dmg"
           ./scripts/create-branded-dmg.sh \
             --app target/release/bundle/macos/Minutes.app \
             --version "$VERSION" \
-            --output "target/release/bundle/dmg/Minutes_${VERSION}_aarch64.dmg"
+            --output "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=4 "$dmg"
+
+      - name: Remove ephemeral release signing material
+        if: always()
+        run: |
+          if [ -n "${MINUTES_RELEASE_KEYCHAIN:-}" ]; then
+            security delete-keychain "$MINUTES_RELEASE_KEYCHAIN" || true
+          fi
+          rm -f \
+            "${APPLE_API_KEY_PATH:-}" \
+            "$RUNNER_TEMP/minutes-release.p12" \
+            "$RUNNER_TEMP/Minutes-final.zip" \
+            "$RUNNER_TEMP/graph-worker-entitlements.plist" \
+            "$RUNNER_TEMP/graph-worker-identity.txt"
 
       - name: Upload signed app bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: minutes-macos-app
           path: target/release/bundle/macos/Minutes.app
           if-no-files-found: error
 
       - name: Upload signed dmg
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: minutes-macos-dmg
           path: target/release/bundle/dmg/*.dmg

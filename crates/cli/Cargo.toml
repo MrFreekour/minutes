@@ -10,10 +10,15 @@ description = "CLI for minutes — record, transcribe, and search conversation m
 keywords = ["meeting", "transcription", "whisper", "ai", "memory"]
 categories = ["multimedia::audio", "command-line-utilities"]
 readme = "README.md"
+default-run = "minutes"
 
 [[bin]]
 name = "minutes"
 path = "src/main.rs"
+
+[[bin]]
+name = "minutes-graph-worker"
+path = "src/bin/minutes-graph-worker.rs"
 
 [features]
 default = ["whisper", "diarize"]
