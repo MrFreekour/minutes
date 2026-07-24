@@ -1864,6 +1864,11 @@ fn main() -> Result<()> {
     if let Some(code) = minutes_core::graph_worker::maybe_run_policy_projection_worker() {
         std::process::exit(code);
     }
+    // Must stay ahead of argument parsing: a decode child is re-executed with
+    // this binary and must never run a user command line.
+    if let Some(code) = minutes_core::audio_decode_worker::maybe_run_audio_decode_worker() {
+        std::process::exit(code);
+    }
     let mut cli = Cli::parse();
     let verbose = cli.verbose;
     // This must remain the first action after parsing. In particular, do not

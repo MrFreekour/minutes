@@ -736,7 +736,8 @@ fn transcribe_meeting_with_hints_inner(
 ) -> Result<TranscribeResult, TranscribeError> {
     const MIN_MEETING_CHUNKS: usize = 2;
 
-    let samples = load_audio_samples_with_format(audio_path, hints.audio_format_extension())?;
+    let samples =
+        load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
     let audio_duration_secs = samples.len() as f64 / 16000.0;
     let vad_chunks = detect_meeting_vad_chunks(&samples);
 
@@ -781,7 +782,8 @@ fn transcribe_whisper_dispatch(
     hints: &DecodeHints,
 ) -> Result<TranscribeResult, TranscribeError> {
     // Step 1: Load audio as 16kHz mono f32 PCM samples
-    let samples = load_audio_samples_with_format(audio_path, hints.audio_format_extension())?;
+    let samples =
+        load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
 
     // Step 3: Transcribe
     #[cfg(feature = "whisper")]
@@ -855,7 +857,8 @@ fn transcribe_parakeet_dispatch(
                 crate::config::VALID_PARAKEET_MODELS.join(", ")
             )));
         }
-        let samples = load_audio_samples_with_format(audio_path, hints.audio_format_extension())?;
+        let samples =
+            load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
         let audio_duration_secs = samples.len() as f64 / 16000.0;
         let native_vad_path = resolve_parakeet_native_vad_path(config);
         let chunk_ranges = crate::pipeline::parakeet_private_audio_transport_supported()
@@ -914,7 +917,8 @@ fn transcribe_sherpa_dispatch(
     {
         // Decode-hint biasing for sherpa is a future follow-up.
         let _ = hints;
-        let samples = load_audio_samples_with_format(audio_path, hints.audio_format_extension())?;
+        let samples =
+            load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
         if samples.is_empty() {
             return Err(TranscribeError::EmptyAudio);
         }
@@ -1438,6 +1442,7 @@ fn transcribe_with_whisper(
 fn load_audio_samples_with_format(
     path: &Path,
     format_extension: Option<&str>,
+    config: &Config,
 ) -> Result<Vec<f32>, TranscribeError> {
     let ext = format_extension
         .map(str::to_string)
@@ -1484,7 +1489,7 @@ fn load_audio_samples_with_format(
                 "decode.start",
                 serde_json::json!({"decoder": "ffmpeg"}),
             );
-            let samples = decode_with_ffmpeg(path)?;
+            let samples = decode_with_ffmpeg(path, config)?;
             crate::process_trace::update_audio(samples.len());
             crate::process_trace::stage_with_extra(
                 "decode.done",
@@ -1705,21 +1710,72 @@ fn push_pcm_s16le_sample(
 /// This matches exactly what whisper-cli does and produces samples that
 /// whisper transcribes correctly across all languages.
 ///
-/// Returns an error if ffmpeg is not installed or the conversion fails. There
-/// is deliberately no in-process compressed-container fallback: Symphonia
-/// 0.5.5 can allocate attacker-declared tables before resource limits run.
-fn decode_with_ffmpeg(path: &Path) -> Result<Vec<f32>, TranscribeError> {
-    let ffmpeg = crate::ffmpeg::resolve_ffmpeg().map_err(|error| {
-        TranscribeError::CompressedDecoderUnavailable(format!(
-            "ffmpeg is required for compressed audio but is not available: {error}"
-        ))
+/// Returns an error if ffmpeg is not installed and the bounded decode worker is
+/// disabled or also fails. There is still deliberately no *in-process*
+/// compressed-container fallback: Symphonia 0.5.5 can allocate
+/// attacker-declared tables before resource limits run. The fallback below runs
+/// Symphonia only in a child whose `RLIMIT_AS` is installed in `pre_exec`, so
+/// the ceiling binds before the decoder probes the container.
+fn decode_with_ffmpeg(path: &Path, config: &Config) -> Result<Vec<f32>, TranscribeError> {
+    let unavailable = match crate::ffmpeg::resolve_ffmpeg() {
+        Ok(ffmpeg) => {
+            return decode_with_ffmpeg_binary(
+                path,
+                &ffmpeg,
+                crate::audio_budget::MAX_CANONICAL_SAMPLES,
+                crate::audio_budget::AUDIO_DECODE_DEADLINE,
+            );
+        }
+        Err(error) => error,
+    };
+    if !crate::audio_decode_worker::bounded_decode_fallback_enabled(config) {
+        return Err(TranscribeError::CompressedDecoderUnavailable(format!(
+            "ffmpeg is required for compressed audio but is not available: {unavailable}"
+        )));
+    }
+    tracing::warn!(
+        source = %crate::pipeline::private_audio_diagnostic_label(path),
+        "ffmpeg is unavailable; decoding this compressed import in the bounded worker. \
+         Install ffmpeg for the higher-fidelity decode (issue #21)"
+    );
+    decode_with_bounded_worker(path)
+}
+
+/// Decode a compressed import in the bounded Symphonia worker.
+///
+/// Mirrors [`decode_with_ffmpeg_binary`]'s contract exactly: the child emits
+/// 16 kHz mono `s16le` PCM into a private file that never has a pathname the
+/// child can reach, and the same reader converts it.
+fn decode_with_bounded_worker(path: &Path) -> Result<Vec<f32>, TranscribeError> {
+    let mut tmp_pcm = crate::pipeline::PrivateAudioTempFile::new("minutes-decode-", ".s16le")
+        .map_err(TranscribeError::Io)?;
+    let authorized_input = crate::pipeline::authorized_audio_stdin(path).map_err(|error| {
+        TranscribeError::TranscriptionFailed(format!("authorized audio input unavailable: {error}"))
     })?;
-    decode_with_ffmpeg_binary(
+    if authorized_input.is_some() {
+        return Err(TranscribeError::TranscriptionFailed(
+            "private audio requires an in-process decoder".into(),
+        ));
+    }
+    crate::audio_decode_worker::decode_to_private_pcm(
         path,
-        &ffmpeg,
-        crate::audio_budget::MAX_CANONICAL_SAMPLES,
+        &mut tmp_pcm,
+        crate::audio_budget::AudioWorkBudget::max_pcm_s16le_bytes(),
         crate::audio_budget::AUDIO_DECODE_DEADLINE,
     )
+    .map_err(TranscribeError::CompressedDecoderUnavailable)?;
+    tracing::info!(
+        source = %crate::pipeline::private_audio_diagnostic_label(path),
+        "decoded audio with the bounded decode worker (16kHz mono s16le PCM)"
+    );
+    let budget = crate::audio_budget::AudioWorkBudget::new();
+    let mut samples = load_pcm_s16le_stream_with_limit(
+        tmp_pcm.try_clone_reader().map_err(TranscribeError::Io)?,
+        crate::audio_budget::MAX_CANONICAL_SAMPLES,
+        budget,
+    )?;
+    crate::audio_budget::normalize_in_place(&mut samples);
+    Ok(samples)
 }
 
 fn ffmpeg_decode_command(ffmpeg: &Path, path: &Path) -> crate::bounded_child::BoundedCommand {
@@ -2297,7 +2353,8 @@ fn transcribe_with_parakeet(
     }
 
     // Step 1: Load audio and convert to 16kHz mono (reuse existing pipeline)
-    let samples = load_audio_samples_with_format(audio_path, hints.audio_format_extension())?;
+    let samples =
+        load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
     stats.audio_duration_secs = samples.len() as f64 / 16000.0;
     if samples.is_empty() {
         return Err(TranscribeError::EmptyAudio);
@@ -3661,7 +3718,7 @@ pub fn transcribe_parakeet_batch(
 
     let mut stats_per_file = Vec::with_capacity(audio_paths.len());
     for audio_path in audio_paths {
-        let samples = load_audio_samples_with_format(audio_path, None)?;
+        let samples = load_audio_samples_with_format(audio_path, None, config)?;
         if samples.is_empty() {
             stats_per_file.push(Err(TranscribeError::EmptyAudio));
             continue;
@@ -4045,7 +4102,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let decoded = decode_with_ffmpeg(&encoded).unwrap();
+        let decoded = decode_with_ffmpeg(&encoded, &Config::default()).unwrap();
         assert!((15_000..=17_000).contains(&decoded.len()));
         assert!(decoded.iter().all(|sample| sample.is_finite()));
         assert!(decoded.iter().any(|sample| sample.abs() > 0.1));
@@ -4390,8 +4447,9 @@ mod tests {
         write_wav_16k_mono_to_writer(audio.prepare_for_write().unwrap(), &source).unwrap();
         audio.finish_write().unwrap();
 
-        let error = load_audio_samples_with_format(audio.as_path(), Some("mp3"))
-            .expect_err("private non-WAV routing must fail before container probing");
+        let error =
+            load_audio_samples_with_format(audio.as_path(), Some("mp3"), &Config::default())
+                .expect_err("private non-WAV routing must fail before container probing");
         assert!(error.to_string().contains("bounded WAV input only"));
     }
 
@@ -4470,7 +4528,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test.xyz");
         std::fs::write(&path, "not audio").unwrap();
-        let error = load_audio_samples_with_format(&path, None).unwrap_err();
+        let error = load_audio_samples_with_format(&path, None, &Config::default()).unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -4506,7 +4564,9 @@ mod tests {
         };
         let descriptor_path = Path::new(base).join(retained.as_raw_fd().to_string());
         assert!(descriptor_path.extension().is_none());
-        let samples = load_audio_samples_with_format(&descriptor_path, Some("wav")).unwrap();
+        let samples =
+            load_audio_samples_with_format(&descriptor_path, Some("wav"), &Config::default())
+                .unwrap();
         assert_eq!(samples.len(), 160);
     }
 

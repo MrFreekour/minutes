@@ -251,6 +251,16 @@ pub struct TranscriptionConfig {
     /// Enable noise reduction via nnnoiseless (RNNoise) before transcription.
     /// Requires the `denoise` feature flag. Default: true.
     pub noise_reduction: bool,
+    /// Allow compressed imports (m4a/mp3/ogg and friends) to fall back to the
+    /// bounded Symphonia decode worker when ffmpeg is not installed.
+    ///
+    /// Default: true. ffmpeg stays preferred whenever it is available because
+    /// its AAC decoder avoids the non-English hallucination loops in issue #21.
+    /// This exists so a user who never installed ffmpeg keeps the behaviour
+    /// they had before the conversation-trust work, notably `minutes watch`
+    /// over iPhone voice memos, which are `.m4a`. Set false to refuse the
+    /// extra decoder and require ffmpeg.
+    pub compressed_decode_fallback: bool,
     /// Path or name of the parakeet.cpp binary (resolved via PATH if not absolute).
     pub parakeet_binary: String,
     /// Parakeet model type: "tdt-ctc-110m", "tdt-600m".
@@ -1305,6 +1315,7 @@ impl Default for TranscriptionConfig {
             vad_model: "silero-v6.2.0".into(),
             vad_engine: "ort-silero".into(),
             noise_reduction: true,
+            compressed_decode_fallback: true,
             parakeet_binary: "parakeet".into(),
             parakeet_model: "tdt-600m".into(),
             sherpa_model_dir: String::new(),
