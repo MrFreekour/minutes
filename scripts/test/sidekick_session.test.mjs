@@ -114,6 +114,10 @@ test("the harness sends the shared product instructions byte-for-byte", async ()
   assert.equal(backend.warmups.length, 1);
   assert.match(backend.warmups[0].input[0].text, /^MINUTES SESSION WARMUP/);
   assert.doesNotMatch(backend.warmups[0].input[0].text, /capture-a/);
+  assert.match(
+    backend.warmups[0].outputSchema.properties.evidence_ids.description,
+    /rationale named or dismissed as not decisive.*require their IDs/,
+  );
 });
 
 test("a warmup can never publish or smuggle evidence into the persistent session", async () => {
@@ -231,6 +235,10 @@ test("foreground completeness outranks the soft brevity target", async () => {
   );
   assert.match(
     instructions,
+    /Do not invert the reframe.*governing cannot also be the metric dismissed as not decisive/s,
+  );
+  assert.match(
+    instructions,
     /never offer a later escalation that discards the queued work, fallback, remedy, or other consequence/,
   );
   assert.match(
@@ -264,6 +272,18 @@ test("foreground completeness outranks the soft brevity target", async () => {
   assert.match(
     instructions,
     /rejects or overrides a live proposal must cite both that proposal and the evidence establishing the conflicting boundary/,
+  );
+  assert.match(
+    instructions,
+    /close the provenance set.*rationale named or dismissed.*include every exact evidence id/s,
+  );
+  assert.match(
+    instructions,
+    /rationale is not decisive still uses that rationale and requires its evidence id/,
+  );
+  assert.match(
+    verifierInstructions,
+    /I can seek approval.*I can request an exception.*proposes a next action.*does not claim that approval exists/s,
   );
   assert.match(
     instructions,

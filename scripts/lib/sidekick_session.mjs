@@ -25,7 +25,7 @@ export const SIDEKICK_OUTPUT_SCHEMA = {
       type: "array",
       items: { type: "string" },
       description:
-        "Exact transcript evidence IDs supporting every visible factual claim, number, remedy condition, and fallback control. Include all distinct items needed for a synthesis; do not cite an item merely because it is available. If recommending human reversion when the evidence contains a human-in-loop versus automation decision, cite that decision item as well as any contract-remedy item.",
+        "Exact transcript evidence IDs supporting every visible factual claim, number, remedy condition, and fallback control. A referenced or rejected proposal and a rationale named or dismissed as not decisive both count as evidence use and require their IDs. Include all distinct items needed for a synthesis; do not cite an item merely because it is available. If recommending human reversion when the evidence contains a human-in-loop versus automation decision, cite that decision item as well as any contract-remedy item.",
     },
     visual_evidence_ids: { type: "array", items: { type: "string" } },
     claims_visual_observation: {

@@ -158,3 +158,44 @@ evidence; the latency budget will not be weakened to accommodate it.
 The complete Sidekick JavaScript bank at this checkpoint is 162/162, including
 normal exit, forced exit, idempotent close, state-error classification, and
 verifier lifecycle ownership.
+
+## Provenance and decision-frame tail checkpoint
+
+A follow-on adversarial loop targeted two repeatable first-draft defects that
+caused expensive verifier retries:
+
+- a response could mention or dismiss a live rationale while omitting its
+  evidence receipt; and
+- a quantitative response could correctly compute the governing exposure but
+  then invert the reframe and call that same governing constraint
+  non-decisive.
+
+The evidence-ID obligation now lives in the structured output schema as well as
+the instructions: referenced or rejected proposals and rationales named or
+dismissed as non-decisive count as evidence use. The decision contract also
+forbids dismissing the consequence it just identified as governing. The
+negotiation fixture's mechanical minimum now requires only the prior boundary
+and the live buyer proposal; if an answer uses the separate internal "logo"
+rationale, its semantic forbidden-behavior rule still requires that exact
+receipt. This removes an unconditional benchmark false negative without
+weakening conditional provenance.
+
+Targeted real-provider results:
+
+```text
+margin/provenance: 3/3 quality+latency, no retries, 5.392-6.846s total
+runway/reframe:     3/3 quality+latency, no retries, 5.827-7.315s total
+```
+
+The final full corpus at the pause seam reached 7/7 graded quality, 25/25
+required insights, and zero provider/state errors. It passed 6/7 end to end:
+the independent verifier falsely classified a complete price-concession
+candidate as `incomplete_material_consequence`, triggering a repair and a
+12.833-second total. The semantic judge passed the published result. No further
+real-provider runs were started to preserve the user's Codex budget.
+
+The remaining next defect is therefore narrow and explicit: calibrate or
+deterministically adjudicate false verifier completeness rejections without
+bypassing unsupported-fact, contradiction, privacy, or provenance checks and
+without weakening the 5s/8s latency bar. See
+[`sidekick-quality-tail-handoff-2026-07-24.md`](sidekick-quality-tail-handoff-2026-07-24.md).

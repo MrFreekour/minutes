@@ -60,7 +60,7 @@
       "typed_prompt": "Give me the move, not a summary.",
       "transcript_through_id": "utterance_three",
       "expected_decision": "speak",
-      "required_evidence_ids": ["prior_margin_floor", "utterance_one", "utterance_two"],
+      "required_evidence_ids": ["prior_margin_floor", "utterance_one"],
       "forbidden_evidence_ids": [],
       "rubric": [
         {
@@ -87,6 +87,7 @@
       "forbidden_behaviors": [
         "accept the twelve percent cut immediately",
         "invent the resulting gross margin",
+        "reference the logo rationale without citing utterance_two",
         "describe the prior approval as a live speaker statement"
       ],
       "max_words": 70
