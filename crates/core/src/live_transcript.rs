@@ -1912,12 +1912,12 @@ fn transcribe_with_parakeet_for_live_sidecar(
         return Ok(None);
     }
 
-    let tmp_wav = tempfile::Builder::new()
-        .prefix("minutes-live-sidecar-utterance-")
-        .suffix(".wav")
-        .tempfile()
-        .map_err(TranscribeError::Io)?;
-    crate::transcribe::write_wav_16k_mono(tmp_wav.path(), samples)?;
+    let mut tmp_wav =
+        crate::pipeline::PrivateAudioTempFile::new("minutes-live-sidecar-utterance-", ".wav")
+            .map_err(TranscribeError::Io)?;
+    crate::transcribe::write_wav_16k_mono_to_writer(tmp_wav.prepare_for_write()?, samples)?;
+    tmp_wav.finish_write()?;
+    let processing_path = tmp_wav.processing_path();
 
     // The general dispatcher switches on `transcription.engine`. The live
     // backend can resolve to parakeet independently of the batch engine
@@ -1925,7 +1925,7 @@ fn transcribe_with_parakeet_for_live_sidecar(
     // so force the engine here or the sidecar would label itself parakeet
     // while actually running the batch engine (#395).
     let forced = forced_parakeet_config(config);
-    match crate::transcribe::transcribe(tmp_wav.path(), &forced) {
+    match crate::transcribe::transcribe(&processing_path, &forced) {
         Ok(result) => Ok(Some((result.text, samples.len() as f64 / 16000.0))),
         Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
         Err(error) => Err(error.into()),
@@ -1962,16 +1962,16 @@ where
         return Ok(None);
     }
 
-    let tmp_wav = tempfile::Builder::new()
-        .prefix("minutes-live-apple-speech-")
-        .suffix(".wav")
-        .tempfile()
-        .map_err(TranscribeError::Io)?;
-    crate::transcribe::write_wav_16k_mono(tmp_wav.path(), samples)?;
+    let mut tmp_wav =
+        crate::pipeline::PrivateAudioTempFile::new("minutes-live-apple-speech-", ".wav")
+            .map_err(TranscribeError::Io)?;
+    crate::transcribe::write_wav_16k_mono_to_writer(tmp_wav.prepare_for_write()?, samples)?;
+    tmp_wav.finish_write()?;
+    let processing_path = tmp_wav.processing_path();
 
     let locale = crate::apple_speech::live_locale_hint(config.transcription.language.as_deref());
     let result = transcribe_fn(
-        tmp_wav.path(),
+        &processing_path,
         locale.as_deref(),
         crate::apple_speech::AppleSpeechMode::Speech,
         true,

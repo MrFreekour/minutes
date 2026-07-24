@@ -267,7 +267,12 @@ pub fn transcribe_with_apple_speech(
     ensure_assets: bool,
 ) -> Result<AppleSpeechTranscriptionResult> {
     let helper = ensure_helper_installed()?;
-    run_helper_transcription(&helper, audio_path, locale, mode, ensure_assets)
+    match crate::pipeline::authorized_audio_stdin(audio_path)? {
+        Some(reader) => {
+            run_helper_transcription_private(&helper, reader, locale, mode, ensure_assets)
+        }
+        None => run_helper_transcription(&helper, audio_path, locale, mode, ensure_assets),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1044,6 +1049,59 @@ fn run_helper_transcription(
         return Err(MinutesError::Io(std::io::Error::other(format!(
             "apple speech helper failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+    Ok(parsed)
+}
+
+#[cfg(target_os = "macos")]
+fn run_helper_transcription_private(
+    helper: &Path,
+    audio: crate::pipeline::PrivateAudioReader,
+    locale: Option<&str>,
+    mode: AppleSpeechMode,
+    ensure_assets: bool,
+) -> Result<AppleSpeechTranscriptionResult> {
+    let mut arguments = vec![
+        "transcribe".to_string(),
+        "--mode".to_string(),
+        mode.as_helper_arg().to_string(),
+        "--audio-path".to_string(),
+        crate::macos_audio_child::DelayedAudioChild::audio_descriptor_path().to_string(),
+    ];
+    if let Some(locale) = locale {
+        arguments.extend(["--locale".to_string(), locale.to_string()]);
+    }
+    if ensure_assets {
+        arguments.push("--ensure-assets".to_string());
+    }
+    let output = crate::audio_worker::run_private_audio_child(
+        crate::audio_worker::PrivateAudioChildSpec {
+            executable: helper.to_path_buf(),
+            arguments,
+            attachments: Vec::new(),
+            wall_clock: HELPER_TRANSCRIBE_TIMEOUT,
+            max_stdout: 1024 * 1024,
+            max_stderr: 64 * 1024,
+        },
+        audio,
+    )
+    .map_err(|error| MinutesError::Io(std::io::Error::other(error)))?;
+    let parsed: AppleSpeechTranscriptionResult =
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            MinutesError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ))
+        })?;
+    if (output.timed_out || output.exit_code != Some(0)) && parsed.error.is_none() {
+        let reason = if output.timed_out {
+            "apple speech helper exceeded its wall-clock budget".to_string()
+        } else {
+            String::from_utf8_lossy(&output.stderr).to_string()
+        };
+        return Err(MinutesError::Io(std::io::Error::other(format!(
+            "apple speech helper failed: {reason}"
         ))));
     }
     Ok(parsed)
