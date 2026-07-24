@@ -1272,8 +1272,8 @@ pub const fn private_audio_processing_supported() -> bool {
 /// not expose the sealed ciphertext backing or key. Parakeet remains on the
 /// in-process Whisper fallback until it accepts bytes/stdin or participates in
 /// an acknowledged post-exec descriptor-isolation protocol.
-pub fn parakeet_private_audio_transport_supported() -> bool {
-    cfg!(target_os = "macos") && crate::audio_worker::secure_transport_available()
+pub const fn parakeet_private_audio_transport_supported() -> bool {
+    false
 }
 
 /// Whether the pathname-only Apple Speech helper can receive private audio
@@ -1282,8 +1282,8 @@ pub fn parakeet_private_audio_transport_supported() -> bool {
 /// It cannot today: the helper accepts only `--audio-path`. Keep retained
 /// Apple Speech preferences on the sealed in-process Whisper path until the
 /// helper has an exact byte/fd transport (minutes-hueo).
-pub fn apple_speech_private_audio_transport_supported() -> bool {
-    cfg!(target_os = "macos") && crate::audio_worker::secure_transport_available()
+pub const fn apple_speech_private_audio_transport_supported() -> bool {
+    false
 }
 
 pub const fn apple_speech_unavailable_reason() -> &'static str {

@@ -3,13 +3,8 @@
 pub mod apple_fm;
 pub mod apple_speech;
 pub(crate) mod audio_budget;
-pub mod audio_worker;
 pub mod autoresearch;
 pub(crate) mod bounded_child;
-#[cfg(target_os = "macos")]
-pub(crate) mod macos_audio_child;
-#[cfg(target_os = "macos")]
-pub(crate) mod macos_audio_xpc;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_graph_xpc;
 

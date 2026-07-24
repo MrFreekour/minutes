@@ -20,10 +20,6 @@ path = "src/main.rs"
 name = "minutes-graph-worker"
 path = "src/bin/minutes-graph-worker.rs"
 
-[[bin]]
-name = "minutes-audio-worker"
-path = "src/bin/minutes-audio-worker.rs"
-
 [features]
 default = ["whisper", "diarize"]
 whisper = ["minutes-core/whisper"]

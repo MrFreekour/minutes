@@ -824,16 +824,16 @@ fn transcribe_utterance_with_apple_speech(
         return Ok(None);
     }
 
-    let mut tmp_wav =
-        crate::pipeline::PrivateAudioTempFile::new("minutes-dictation-apple-speech-", ".wav")
-            .map_err(TranscribeError::Io)?;
-    crate::transcribe::write_wav_16k_mono_to_writer(tmp_wav.prepare_for_write()?, samples)?;
-    tmp_wav.finish_write()?;
-    let processing_path = tmp_wav.processing_path();
+    let tmp_wav = tempfile::Builder::new()
+        .prefix("minutes-dictation-apple-speech-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(TranscribeError::Io)?;
+    crate::transcribe::write_wav_16k_mono(tmp_wav.path(), samples)?;
 
     let locale = crate::apple_speech::live_locale_hint(config.transcription.language.as_deref());
     let result = crate::apple_speech::transcribe_with_apple_speech(
-        &processing_path,
+        tmp_wav.path(),
         locale.as_deref(),
         crate::apple_speech::AppleSpeechMode::Dictation,
         true,

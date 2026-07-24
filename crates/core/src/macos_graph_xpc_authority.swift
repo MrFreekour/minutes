@@ -21,27 +21,6 @@ private func codeDirectoryHash(_ code: SecStaticCode) throws -> Data {
     return hash
 }
 
-private func validatedCodeDirectoryHash(at path: String) throws -> Data {
-    var staticCode: SecStaticCode?
-    guard SecStaticCodeCreateWithPath(
-        URL(fileURLWithPath: path) as CFURL,
-        SecCSFlags(),
-        &staticCode
-    ) == errSecSuccess,
-    let staticCode else {
-        throw POSIXError(.EACCES)
-    }
-    let flags = SecCSFlags(
-        rawValue: kSecCSCheckAllArchitectures
-            | kSecCSStrictValidate
-            | kSecCSRestrictSymlinks
-    )
-    guard SecStaticCodeCheckValidity(staticCode, flags, nil) == errSecSuccess else {
-        throw POSIXError(.EACCES)
-    }
-    return try codeDirectoryHash(staticCode)
-}
-
 private func validateSealedAuthorityBundle(
     _ bundlePath: String,
     currentExecutablePath: String,
@@ -141,32 +120,6 @@ public func minutesValidateGraphAuthorityBundle(
                 currentExecutablePath: String(cString: currentExecutablePath),
                 runningParentCodeDirectoryHash: parentCodeDirectoryHash
             )
-            return 0
-        } catch let error as POSIXError {
-            return Int32(error.code.rawValue)
-        } catch {
-            return Int32(EACCES)
-        }
-    }
-}
-
-/// Return the exact CodeDirectory hash of a valid executable selected by the
-/// authenticated parent. The audio XPC service compares this value with
-/// `csops(CS_OPS_CDHASH)` for the suspended live child before the parent sends
-/// a single private-audio byte.
-@_cdecl("minutes_static_code_cdhash")
-public func minutesStaticCodeDirectoryHash(
-    _ executablePath: UnsafePointer<CChar>,
-    _ output: UnsafeMutablePointer<UInt8>,
-    _ outputLength: Int
-) -> Int32 {
-    return autoreleasepool {
-        do {
-            guard outputLength == 20 else {
-                throw POSIXError(.EINVAL)
-            }
-            let hash = try validatedCodeDirectoryHash(at: String(cString: executablePath))
-            hash.copyBytes(to: output, count: outputLength)
             return 0
         } catch let error as POSIXError {
             return Int32(error.code.rawValue)
