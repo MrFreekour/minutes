@@ -21,6 +21,7 @@ missing. It writes bounded JSON artifacts to:
 ```text
 target/sidekick-eval/live-sidekick-engine-eval.json
 target/sidekick-eval/live-sidekick-media-eval.json
+target/sidekick-eval/live-sidekick-vm-ui-eval.json
 ```
 
 The artifacts contain no meeting text, user text, image bytes, local paths, or
@@ -44,15 +45,16 @@ The checkpoint executes each scenario twice through the public production
 | Evidence bounds | Only the newest configured transcript items enter a request and the serialized envelope stays under budget |
 | Transcript JSONL adapter | Production cursor/parser ingress, torn-line tolerance, idempotence, and speaker-track anonymization |
 | Context mutation and recovery | Real prepared-brief/project assembly, restricted/ambient exclusion, stale-source rejection, and refresh |
+| Participant archive grounding | Exact-person retrieval from a populated prior-meeting archive, restricted/unrelated exclusion, source receipts, and live-plus-history publication |
 | Teardown | Active work and provider sessions close; a late completion has no visible effect |
 
 Result at this checkpoint:
 
 ```text
-10/10 scenarios
-37/37 assertions
+11/11 scenarios
+43/43 assertions
 reproducible=true
-digest=0689cac48091143fa7edcf74fa65cc1ce44520d3adfe9ce5e23b5e8d932e5a56
+digest=656c1aaf48205beefd6acb16456160f240b8da74d08cffb0a534f010c1e4ad4b
 ```
 
 The second lane then transcribes the committed 10.6-second spoken-meeting WAV
@@ -66,13 +68,28 @@ publication. On the 2026-07-24 VM run:
 28 recognized words
 3 timed segments
 WER=0.192 (tiny model, required bound <=0.50)
-ASR elapsed=776ms
+ASR elapsed=0.8-1.2s across checkpoint runs (non-gating)
 corrupt WAV rejected=true
 ```
 
 ASR timing and transcript hashes are machine-dependent and are intentionally
 not described as deterministic. The fixture, model, and transcript hashes are
 recorded as receipts; raw transcript content is not written into the artifact.
+
+The third VM lane binds the current production Sidekick/main-window markup,
+frontend handlers, and acceptance evaluators to one source digest, then runs
+the startup, event-order, paint, deduplication, reload-recovery, and
+false-green tests headlessly:
+
+```text
+69/69 VM UI contract tests
+0 failed, skipped, cancelled, or todo
+source_sha256=6120f8384244668d19e2a96918212ae642db9750ae2d173abac3dd854f6e72e6
+```
+
+That lane catches the prior missing-listener `ReferenceError` class and
+ordering failures without a person or Mac. It is not a signed WebView run and
+does not prove native visibility, focus, permissions, or accessibility.
 
 The deterministic backend lives only under the example/integration-test
 boundary. It implements the same persistent, streaming, steerable,
@@ -92,13 +109,12 @@ It does **not** yet exercise:
 - live/streaming speech recognition from a native recording;
 - two-speaker diarization;
 - the native macOS Screen Recording permission adapter;
-- participant-scoped historical search against a populated meeting archive;
 - real Codex, Claude-compatible, or local-model network behavior; or
-- signed-app UI event order.
+- signed-app/WebView UI event order and accessibility.
 
 Those remain required by `minutes-k1qp.2`. The existing signed-Mac checkpoint
-and real Codex SOTA suite complement this deterministic lane, but the three
-artifacts must not be collapsed into one inflated release claim.
+and real Codex SOTA suite complement these VM lanes, but their evidence must
+not be collapsed into one inflated release claim.
 
 ## Adversarial review outcome
 
@@ -109,12 +125,12 @@ The final shape keeps all deterministic provider state under
 leaves the shipped provider-neutral engine untouched.
 
 The deterministic transcript-adapter scenario begins with already-produced
-synthetic JSONL. The separate media lane now proves prerecorded speech
-recognition and real ASR-segment ingress, but it deliberately supplies no
-speaker labels and therefore proves nothing about diarization. The
-project-context scenario proves allowlisted repository root files plus a
-prepared brief; participant-scoped archive search with populated meeting
-history remains separate.
+synthetic JSONL. The separate media lane proves prerecorded speech recognition
+and real ASR-segment ingress, but it deliberately supplies no speaker labels
+and therefore proves nothing about diarization. Historical-context replay now
+uses a populated meeting archive and an explicit participant, while excluding
+unrelated and restricted files; it still does not prove calendar identity
+resolution or live diarization-to-person matching.
 
 The artifact also labels every provider duration as simulated and sets
 `release_ready_from_this_report_alone=false`. A future change cannot turn this

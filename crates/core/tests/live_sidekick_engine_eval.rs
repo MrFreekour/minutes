@@ -6,7 +6,7 @@ fn deterministic_engine_eval_passes_and_repeats() {
     let report = harness::run_live_sidekick_engine_eval();
     assert!(report.passed, "{report:#?}");
     assert!(report.reproducible);
-    assert_eq!(report.summary.scenarios_passed, 10);
+    assert_eq!(report.summary.scenarios_passed, 11);
     assert_eq!(
         report.summary.assertions_passed,
         report.summary.assertions_total

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub const LIVE_SIDEKICK_ENGINE_EVAL_VERSION: &str = "1";
+pub const LIVE_SIDEKICK_ENGINE_EVAL_VERSION: &str = "2";
 pub const LIVE_SIDEKICK_ENGINE_EVAL_SEED: u64 = 0x4d49_4e55_5445_5301;
 
 const MAX_WINDOW_CHARS: usize = 4_096;
@@ -55,6 +55,7 @@ pub struct EvalCoverage {
     pub production_reducer: bool,
     pub production_transcript_jsonl_adapter: bool,
     pub production_context_card_adapter: bool,
+    pub production_participant_archive_adapter: bool,
     pub production_evidence_window: bool,
     pub production_publication_gate: bool,
     pub production_verification_gate: bool,
@@ -1317,6 +1318,180 @@ fn context_card_mutation_and_recovery() -> EvalScenario {
     })
 }
 
+fn archive_meeting(title: &str, person: &str, fact: &str, restricted: bool) -> String {
+    let sensitivity = if restricted {
+        "sensitivity: restricted\n"
+    } else {
+        ""
+    };
+    format!(
+        "---\ntitle: {title}\ntype: meeting\ndate: 2026-07-18T12:00:00+00:00\nduration: 30m\nstatus: complete\n{sensitivity}attendees: [{person}]\npeople: [{person}]\naction_items: []\ndecisions:\n  - text: {fact}\n    topic: procurement\nintents:\n  - kind: commitment\n    what: {fact}\n    who: {person}\n    status: open\n---\n\n## Transcript\n\n{fact}\n"
+    )
+}
+
+fn participant_archive_grounding() -> EvalScenario {
+    scenario("participant_archive_grounding", 840, || {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let meetings = temp.path().join("meetings");
+        std::fs::create_dir_all(&meetings).map_err(|error| error.to_string())?;
+        std::fs::write(
+            meetings.join("sam-meridian.md"),
+            archive_meeting(
+                "Meridian Procurement Review",
+                "Sam Lee",
+                "Require procurement approval before broad automation",
+                false,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            meetings.join("unrelated.md"),
+            archive_meeting(
+                "Hiring Review",
+                "Taylor Ray",
+                "UNRELATED_ARCHIVE_SENTINEL",
+                false,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            meetings.join("restricted.md"),
+            archive_meeting(
+                "Private Meridian Board Review",
+                "Sam Lee",
+                "RESTRICTED_ARCHIVE_SENTINEL",
+                true,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let config = Config {
+            output_dir: meetings,
+            ..Config::default()
+        };
+        let mut request = ContextCardRequest::new("procurement automation");
+        request.participant_candidates = vec!["Sam Lee".into()];
+        request.max_chars = 4_000;
+        let card = ContextCard::assemble(&config, request).map_err(|error| error.to_string())?;
+        card.validate_sources_current()
+            .map_err(|error| error.to_string())?;
+        let card_json = serde_json::to_string(&card).map_err(|error| error.to_string())?;
+        let expected_fact_present =
+            card_json.contains("Require procurement approval before broad automation");
+        let unrelated_excluded =
+            !card_json.contains("UNRELATED_ARCHIVE_SENTINEL") && !card_json.contains("Taylor Ray");
+        let restricted_excluded = !card_json.contains("RESTRICTED_ARCHIVE_SENTINEL")
+            && !card_json.contains("Private Meridian Board Review");
+        let archive_ids = card
+            .evidence()
+            .iter()
+            .filter(|item| item.source_kind == EvidenceSourceKind::MeetingArtifact)
+            .map(|item| item.evidence_id.as_str().to_string())
+            .collect::<Vec<_>>();
+        let archive_is_receipted = !archive_ids.is_empty()
+            && card.evidence().len() == card.sources().len()
+            && card.evidence().iter().all(|item| {
+                item.evidence_only && item.evidence_id.as_str().starts_with("context-")
+            });
+
+        let mut fixture = fixture(true, 4)?;
+        fixture
+            .engine
+            .load_context_card(card.clone())
+            .map_err(|error| error.to_string())?;
+        observe(
+            &mut fixture.engine,
+            "transcript-current",
+            "Sam asks whether broad automation can ship today.",
+            None,
+        )?;
+        fixture
+            .engine
+            .send_user("What prior context should govern this decision?")
+            .map_err(|error| error.to_string())?;
+        let reasoning_request = fixture
+            .strategist
+            .requests()
+            .first()
+            .cloned()
+            .ok_or_else(|| "participant archive request missing".to_string())?;
+        let historical_id = card
+            .evidence()
+            .iter()
+            .find(|item| {
+                item.text
+                    .contains("Require procurement approval before broad automation")
+                    && matches!(item.context_class.as_str(), "decision" | "open_intent")
+            })
+            .map(|item| item.evidence_id.as_str().to_string())
+            .ok_or_else(|| "participant archive decision evidence missing".to_string())?;
+        let request_contains_exact_archive = reasoning_request.window.context.len()
+            == card.evidence().len()
+            && reasoning_request
+                .window
+                .context
+                .iter()
+                .any(|item| item.evidence_id.as_str() == historical_id)
+            && reasoning_request
+                .window
+                .context
+                .iter()
+                .all(|item| item.evidence_only);
+        fixture.strategist.complete_candidate(
+            0,
+            candidate(
+                "The current request conflicts with the prior procurement gate.",
+                &["transcript-current", historical_id.as_str()],
+                &[],
+            ),
+        )?;
+        fixture.engine.pump();
+        fixture.verifier.complete_verdict(0, allow_verdict())?;
+        let publications = fixture.engine.take_publications();
+        fixture
+            .engine
+            .stop_capture()
+            .map_err(|error| error.to_string())?;
+
+        Ok(vec![
+            assertion(
+                "explicit_participant_retrieves_prior_meeting",
+                expected_fact_present,
+                format!("archive_items={}", archive_ids.len()),
+            ),
+            assertion(
+                "unrelated_people_are_excluded",
+                unrelated_excluded,
+                format!("excluded={unrelated_excluded}"),
+            ),
+            assertion(
+                "restricted_history_is_excluded",
+                restricted_excluded,
+                format!("excluded={restricted_excluded}"),
+            ),
+            assertion(
+                "archive_evidence_is_exactly_receipted",
+                archive_is_receipted,
+                format!(
+                    "evidence={} receipts={}",
+                    card.evidence().len(),
+                    card.sources().len()
+                ),
+            ),
+            assertion(
+                "participant_history_reaches_bounded_reasoning_window",
+                request_contains_exact_archive,
+                format!("context_items={}", reasoning_request.window.context.len()),
+            ),
+            assertion(
+                "live_plus_historical_claim_passes_publication_gate",
+                publications.len() == 1,
+                format!("publications={}", publications.len()),
+            ),
+        ])
+    })
+}
+
 fn teardown_rejects_late_completion() -> EvalScenario {
     scenario("teardown_rejects_late_completion", 0, || {
         let mut fixture = fixture(true, 4)?;
@@ -1384,6 +1559,7 @@ fn run_once() -> Vec<EvalScenario> {
         evidence_bounds_are_enforced(),
         transcript_jsonl_adapter_replay(),
         context_card_mutation_and_recovery(),
+        participant_archive_grounding(),
         teardown_rejects_late_completion(),
     ]
 }
@@ -1431,6 +1607,7 @@ pub fn run_live_sidekick_engine_eval() -> LiveSidekickEngineEvalReport {
             production_reducer: true,
             production_transcript_jsonl_adapter: true,
             production_context_card_adapter: true,
+            production_participant_archive_adapter: true,
             production_evidence_window: true,
             production_publication_gate: true,
             production_verification_gate: true,
