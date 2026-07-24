@@ -319,7 +319,7 @@ never degrade recording or WAV preservation.
 The first no-human orchestration and fault-injection gate is implemented and
 documented in
 [`sidekick-engine-replay-checkpoint-2026-07-24.md`](sidekick-engine-replay-checkpoint-2026-07-24.md).
-Its 12 scenarios and 48 assertions pass reproducibly through the production
+Its 13 scenarios and 52 assertions pass reproducibly through the production
 transcript JSONL adapter, project/prepared-context assembler, engine, reducer,
 evidence window, independent verification, publication, recovery, and teardown
 paths. The populated participant-archive lane now proves that bounded prior
@@ -347,11 +347,11 @@ The evaluator now distinguishes graded quality from coverage, provider
 capacity/timeouts, scenario-execution errors, and latency failures. It remains
 fail-closed: perfect quality on completed work cannot bless an incomplete or
 slow corpus. The provisional generalized SOTA grade does not move yet because
-complete attach-and-verifier recovery, the 30-scenario corpus, repeated-tail
-reliability, signed-app evidence, and blind baseline preference are still
-missing.
+the 30-scenario corpus, repeated-tail reliability, signed-app recovery
+evidence, and blind baseline preference are still missing.
 
-The first two recovery slices are now implemented below the provider boundary.
+The three provider-transport recovery slices are now implemented below the
+provider boundary.
 Retryable overload, timeout, and unavailable failures during a foreground
 generation get one exact-window replay without asking the user to retype.
 Attempt identity is Minutes-owned, so a late completion from a replaced
@@ -360,9 +360,13 @@ ID. Attempt and recovery time remain in the first-useful-token and total
 latency receipts. Initial provider attachment also gets one bounded retry for
 the same transport classes, while authentication and protocol failures still
 fail immediately. Its ready receipt includes both attempts and the complete
-attach latency. These close the ordinary foreground-generation and initial
-attach gaps only; independent-verifier failure, signed recovery UX, and
-statistically meaningful reliability tails remain red.
+attach latency. The independent verifier has a separate one-retry foreground
+budget: it replaces only the verifier session and replays the exact candidate
+and evidence seal while the strategist stays stable. Evidence that changes
+during the outage still forces a fresh verification before publication. These
+close the ordinary foreground-generation, initial-attach, and verifier
+transport gaps only; signed recovery UX and statistically meaningful
+reliability tails remain red.
 
 ## Current Baseline
 

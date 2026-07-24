@@ -111,7 +111,8 @@ recovery preserves the exact user turn and evidence window, both attempts in
 latency and telemetry, and a Minutes-owned attempt identity that rejects late
 events from a replaced provider session. Initial attach gets one bounded retry
 for overload, timeout, or unavailable failures and records the full ready time
-and attempt count. Remaining reliability blockers are equivalent
-provider-failure handling in the independent verifier lane, repeated
-real-provider tail evidence, and an inline recovery action if bounded recovery
-is exhausted.
+and attempt count. The independent verifier also gets one foreground transport
+retry on a fresh verifier session, replaying the exact candidate and evidence
+seal without rerunning the strategist. Remaining reliability blockers are
+repeated real-provider tail evidence and an inline recovery action if bounded
+recovery is exhausted.

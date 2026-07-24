@@ -20,6 +20,7 @@ const STRATEGIST_WARMUP_INSTRUCTION: &str = "MINUTES SESSION WARMUP\nNo meeting 
 const SESSION_WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ATTACH_PROVIDER_ATTEMPTS: u8 = 2;
 const MAX_FOREGROUND_PROVIDER_RETRIES: u8 = 1;
+const MAX_FOREGROUND_VERIFIER_PROVIDER_RETRIES: u8 = 1;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -366,6 +367,9 @@ pub struct EvidenceVerificationReceipt {
     pub candidate_sha256: String,
     pub verdict: EvidenceVerificationVerdict,
     pub verifier_session_id: ReasoningSessionId,
+    /// Total transport attempts used by the independent verifier for this
+    /// foreground work. Semantic rechecks are governed separately.
+    pub provider_attempts: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,6 +405,7 @@ pub enum SidekickLifecycleOutcome {
     Published,
     Suppressed(CandidateSuppressionReason),
     Retrying {
+        lane: ReasoningRetryLane,
         error: ReasoningError,
         attempt: u8,
         elapsed_ms: u64,
@@ -408,6 +413,12 @@ pub enum SidekickLifecycleOutcome {
         session_restarted: bool,
     },
     Failed(ReasoningError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningRetryLane {
+    Strategist,
+    Verifier,
 }
 
 /// Provider-local turn IDs are only unique inside their own session. Wrap
@@ -448,6 +459,7 @@ struct ActiveReasoning {
     completeness_retries: u8,
     verification_retries: u8,
     provider_retries: u8,
+    verifier_provider_retries: u8,
     carried_total_ms: u64,
     initial_first_token_ms: Option<u64>,
     attempt_started_at: Instant,
@@ -478,6 +490,7 @@ struct TurnRetryState {
     completeness_retries: u8,
     verification_retries: u8,
     provider_retries: u8,
+    verifier_provider_retries: u8,
     carried_total_ms: u64,
     initial_first_token_ms: Option<u64>,
 }
@@ -974,6 +987,7 @@ impl LiveSidekickEngine {
                             completeness_retries: 0,
                             verification_retries: 0,
                             provider_retries: 0,
+                            verifier_provider_retries: 0,
                             carried_total_ms: 0,
                             initial_first_token_ms: None,
                             attempt_started_at: Instant::now(),
@@ -1220,6 +1234,7 @@ impl LiveSidekickEngine {
                 self.lifecycle_events.push_back(SidekickLifecycleEvent {
                     work: work.clone(),
                     outcome: SidekickLifecycleOutcome::Retrying {
+                        lane: ReasoningRetryLane::Strategist,
                         error,
                         attempt: retry_state.provider_retries.saturating_add(1),
                         elapsed_ms,
@@ -1251,6 +1266,7 @@ impl LiveSidekickEngine {
             completeness_retries: retry_state.completeness_retries,
             verification_retries: retry_state.verification_retries,
             provider_retries: retry_state.provider_retries,
+            verifier_provider_retries: retry_state.verifier_provider_retries,
             carried_total_ms: retry_state.carried_total_ms,
             initial_first_token_ms: retry_state.initial_first_token_ms,
             attempt_started_at,
@@ -1265,6 +1281,16 @@ impl LiveSidekickEngine {
     ) -> bool {
         matches!(work, SidekickWork::Foreground { .. })
             && provider_retries < MAX_FOREGROUND_PROVIDER_RETRIES
+            && Self::is_retryable_provider_transport_error(error)
+    }
+
+    fn can_retry_provider_verification(
+        work: &SidekickWork,
+        error: &ReasoningError,
+        provider_retries: u8,
+    ) -> bool {
+        matches!(work, SidekickWork::Foreground { .. })
+            && provider_retries < MAX_FOREGROUND_VERIFIER_PROVIDER_RETRIES
             && Self::is_retryable_provider_transport_error(error)
     }
 
@@ -1295,6 +1321,16 @@ impl LiveSidekickEngine {
                 recovery.retryable,
             )
         })
+    }
+
+    fn recover_verifier_session_for_provider_retry(&mut self) -> Result<(), ReasoningError> {
+        if let Some(mut verifier) = self.active_verifier_session.take() {
+            verifier.close();
+        }
+        if let Some(mut verifier) = self.ready_verifier_session.take() {
+            verifier.close();
+        }
+        self.replenish_ready_verifier()
     }
 
     fn elapsed_ms(started_at: Instant) -> u64 {
@@ -1566,6 +1602,23 @@ impl LiveSidekickEngine {
             self.record_failure(active.work, error);
             return;
         }
+        // Pin the revision seal before the first verifier attempt. A transport
+        // retry replays these exact bytes and must not relabel an older window
+        // as current if transcript or screen evidence moves meanwhile.
+        active.evidence_revision = self.evidence_revision;
+        active.transcript_revision = self.transcript_revision;
+        active.screen_revision = self.screen_revision;
+        self.start_verification_attempt(active, candidate, generation_result, verification_request);
+    }
+
+    fn start_verification_attempt(
+        &mut self,
+        mut active: ActiveReasoning,
+        candidate: InterventionCandidate,
+        generation_result: ReasoningTurnResult,
+        verification_request: ReasoningTurnRequest,
+    ) {
+        let attempt_started_at = Instant::now();
         let Some(next_verifier_attempt) = self.next_verifier_attempt.checked_add(1) else {
             self.record_failure(
                 active.work,
@@ -1582,7 +1635,14 @@ impl LiveSidekickEngine {
         let sender = self.event_sender.clone();
         if self.ready_verifier_session.is_none() {
             if let Err(error) = self.replenish_ready_verifier() {
-                self.record_failure(active.work, error);
+                self.handle_verifier_start_failure(
+                    active,
+                    candidate,
+                    generation_result,
+                    verification_request,
+                    error,
+                    attempt_started_at,
+                );
                 return;
             }
         }
@@ -1592,7 +1652,14 @@ impl LiveSidekickEngine {
             .expect("a ready verifier was ensured");
         if let Err(error) = self.ensure_context_sources_current() {
             verifier.close();
-            self.record_failure(active.work, error);
+            self.handle_verifier_start_failure(
+                active,
+                candidate,
+                generation_result,
+                verification_request,
+                error,
+                attempt_started_at,
+            );
             return;
         }
         let verification_turn_id = match verifier.start_turn(
@@ -1607,7 +1674,14 @@ impl LiveSidekickEngine {
             Ok(turn_id) => turn_id,
             Err(error) => {
                 verifier.close();
-                self.record_failure(active.work, error);
+                self.handle_verifier_start_failure(
+                    active,
+                    candidate,
+                    generation_result,
+                    verification_request,
+                    error,
+                    attempt_started_at,
+                );
                 return;
             }
         };
@@ -1619,14 +1693,53 @@ impl LiveSidekickEngine {
             generation_result,
         };
         active.request = verification_request;
-        active.evidence_revision = self.evidence_revision;
-        active.transcript_revision = self.transcript_revision;
-        active.screen_revision = self.screen_revision;
+        active.attempt_started_at = attempt_started_at;
         self.active = Some(active);
         // Do not synchronously create an unrelated future verifier here. A
         // provider handshake can take tens of seconds and would prevent pump()
         // from publishing the verifier result that is already in flight. The
         // next candidate lazily receives its own fresh session.
+    }
+
+    fn handle_verifier_start_failure(
+        &mut self,
+        mut active: ActiveReasoning,
+        candidate: InterventionCandidate,
+        mut generation_result: ReasoningTurnResult,
+        verification_request: ReasoningTurnRequest,
+        error: ReasoningError,
+        attempt_started_at: Instant,
+    ) {
+        if !Self::can_retry_provider_verification(
+            &active.work,
+            &error,
+            active.verifier_provider_retries,
+        ) {
+            self.record_failure(active.work, error);
+            return;
+        }
+        let elapsed_ms = Self::elapsed_ms(attempt_started_at);
+        active.verifier_provider_retries = active.verifier_provider_retries.saturating_add(1);
+        generation_result.total_ms = generation_result.total_ms.saturating_add(elapsed_ms);
+        let recovery_started_at = Instant::now();
+        if let Err(recovery_error) = self.recover_verifier_session_for_provider_retry() {
+            self.record_failure(active.work, recovery_error);
+            return;
+        }
+        let recovery_ms = Self::elapsed_ms(recovery_started_at);
+        generation_result.total_ms = generation_result.total_ms.saturating_add(recovery_ms);
+        self.lifecycle_events.push_back(SidekickLifecycleEvent {
+            work: active.work.clone(),
+            outcome: SidekickLifecycleOutcome::Retrying {
+                lane: ReasoningRetryLane::Verifier,
+                error,
+                attempt: active.verifier_provider_retries.saturating_add(1),
+                elapsed_ms,
+                recovery_ms,
+                session_restarted: true,
+            },
+        });
+        self.start_verification_attempt(active, candidate, generation_result, verification_request);
     }
 
     fn complete_verification(&mut self, result: ReasoningTurnResult) {
@@ -1778,6 +1891,7 @@ impl LiveSidekickEngine {
                 candidate_sha256,
                 verdict,
                 verifier_session_id,
+                provider_attempts: active.verifier_provider_retries.saturating_add(1),
             }),
             active.evidence_revision,
             active.provider_retries.saturating_add(1),
@@ -1903,6 +2017,7 @@ impl LiveSidekickEngine {
                 completeness_retries: active.completeness_retries,
                 verification_retries: active.verification_retries,
                 provider_retries: active.provider_retries.saturating_add(1),
+                verifier_provider_retries: active.verifier_provider_retries,
                 carried_total_ms: active.carried_total_ms.saturating_add(elapsed_ms),
                 initial_first_token_ms: active.initial_first_token_ms,
             };
@@ -1919,6 +2034,7 @@ impl LiveSidekickEngine {
             self.lifecycle_events.push_back(SidekickLifecycleEvent {
                 work: active.work.clone(),
                 outcome: SidekickLifecycleOutcome::Retrying {
+                    lane: ReasoningRetryLane::Strategist,
                     error,
                     attempt: retry_state.provider_retries.saturating_add(1),
                     elapsed_ms,
@@ -1932,6 +2048,55 @@ impl LiveSidekickEngine {
             {
                 self.record_failure(work, retry_error);
             }
+            return;
+        }
+        if matches!(&active.stage, ActiveReasoningStage::Verifying { .. })
+            && Self::can_retry_provider_verification(
+                &active.work,
+                &error,
+                active.verifier_provider_retries,
+            )
+        {
+            let elapsed_ms = Self::elapsed_ms(active.attempt_started_at);
+            let (candidate, mut generation_result) = match &active.stage {
+                ActiveReasoningStage::Verifying {
+                    candidate,
+                    generation_result,
+                    ..
+                } => (candidate.clone(), generation_result.clone()),
+                ActiveReasoningStage::Generating { .. } => unreachable!(),
+            };
+            if let Some(mut verifier) = self.active_verifier_session.take() {
+                verifier.close();
+            }
+            let mut active = active;
+            active.verifier_provider_retries = active.verifier_provider_retries.saturating_add(1);
+            generation_result.total_ms = generation_result.total_ms.saturating_add(elapsed_ms);
+            let recovery_started_at = Instant::now();
+            if let Err(recovery_error) = self.recover_verifier_session_for_provider_retry() {
+                self.record_failure(active.work, recovery_error);
+                return;
+            }
+            let recovery_ms = Self::elapsed_ms(recovery_started_at);
+            generation_result.total_ms = generation_result.total_ms.saturating_add(recovery_ms);
+            self.lifecycle_events.push_back(SidekickLifecycleEvent {
+                work: active.work.clone(),
+                outcome: SidekickLifecycleOutcome::Retrying {
+                    lane: ReasoningRetryLane::Verifier,
+                    error,
+                    attempt: active.verifier_provider_retries.saturating_add(1),
+                    elapsed_ms,
+                    recovery_ms,
+                    session_restarted: true,
+                },
+            });
+            let verification_request = active.request.clone();
+            self.start_verification_attempt(
+                active,
+                candidate,
+                generation_result,
+                verification_request,
+            );
             return;
         }
         if matches!(&active.stage, ActiveReasoningStage::Verifying { .. }) {
@@ -2000,6 +2165,7 @@ impl LiveSidekickEngine {
                 completeness_retries: active.completeness_retries,
                 verification_retries: active.verification_retries,
                 provider_retries: active.provider_retries,
+                verifier_provider_retries: active.verifier_provider_retries,
                 carried_total_ms,
                 initial_first_token_ms,
             },
@@ -2048,6 +2214,7 @@ impl LiveSidekickEngine {
                     matches!(retry_kind, SemanticRetryKind::Verification),
                 )),
                 provider_retries: active.provider_retries,
+                verifier_provider_retries: active.verifier_provider_retries,
                 carried_total_ms: generation_result
                     .total_ms
                     .saturating_add(verification_total_ms),
@@ -2734,6 +2901,7 @@ mod tests {
         steer_fails: bool,
         defer_verification: bool,
         strategist_start_errors: VecDeque<ReasoningError>,
+        verifier_start_errors: VecDeque<ReasoningError>,
         reuse_strategist_turn_ids: bool,
         reuse_verifier_turn_ids: bool,
         verification_verdicts: VecDeque<EvidenceVerificationVerdict>,
@@ -2777,6 +2945,16 @@ mod tests {
         fn fail(&self, index: usize, error: ReasoningError) {
             let state = lock(&self.state);
             let turn = &state.turns[index];
+            turn.sink.on_event(ReasoningStreamEvent::Failed {
+                turn_id: turn.id.clone(),
+                invocation: turn.request.invocation,
+                error,
+            });
+        }
+
+        fn fail_verification(&self, index: usize, error: ReasoningError) {
+            let state = lock(&self.state);
+            let turn = &state.verification_turns[index];
             turn.sink.on_event(ReasoningStreamEvent::Failed {
                 turn_id: turn.id.clone(),
                 invocation: turn.request.invocation,
@@ -2865,6 +3043,9 @@ mod tests {
                 if is_warmup {
                     state.verifier_warmups.push(request.clone());
                 } else {
+                    if let Some(error) = state.verifier_start_errors.pop_front() {
+                        return Err(error);
+                    }
                     state.verification_turns_started += 1;
                 }
                 let id = if state.reuse_verifier_turn_ids {
@@ -4567,6 +4748,300 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn retryable_foreground_verifier_failure_replays_exact_seal_and_rejects_old_events() {
+        let backend = FakeBackend::default();
+        {
+            let mut state = lock(&backend.state);
+            state.defer_verification = true;
+            state.reuse_verifier_turn_ids = true;
+        }
+        let mut engine = engine(backend.clone());
+        observe(&mut engine, "approval", "The launch is approved.");
+        engine.send_user("Should we proceed?").unwrap();
+        backend.complete(0, speak(&["approval"], "Proceed with the approved launch."));
+        assert!(engine.has_active_turn());
+        engine
+            .active
+            .as_mut()
+            .expect("verification is active")
+            .attempt_started_at = Instant::now() - Duration::from_millis(1_000);
+
+        backend.fail_verification(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "synthetic verifier transport loss",
+                true,
+            ),
+        );
+        let lifecycle = engine.take_lifecycle_events();
+        assert!(lifecycle.iter().any(|event| {
+            matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    lane: ReasoningRetryLane::Verifier,
+                    error,
+                    attempt: 2,
+                    session_restarted: true,
+                    ..
+                } if error.kind == ReasoningErrorKind::Unavailable
+            )
+        }));
+        {
+            let state = lock(&backend.state);
+            assert_eq!(state.verification_turns.len(), 2);
+            assert_eq!(
+                state.verification_turns[0].id,
+                state.verification_turns[1].id
+            );
+            assert_eq!(
+                state.verification_turns[0].request,
+                state.verification_turns[1].request
+            );
+        }
+
+        backend.complete_verification(
+            0,
+            EvidenceVerificationVerdict {
+                decision: EvidenceVerificationDecision::Allow,
+                reason_code: EvidenceVerificationReason::Supported,
+            },
+        );
+        engine.pump();
+        assert!(engine.take_publications().is_empty());
+        assert!(engine.has_active_turn());
+
+        backend.complete_verification(
+            1,
+            EvidenceVerificationVerdict {
+                decision: EvidenceVerificationDecision::Allow,
+                reason_code: EvidenceVerificationReason::Supported,
+            },
+        );
+        let publications = engine.take_publications();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].provider_attempts, 1);
+        assert_eq!(publications[0].evidence_verification.provider_attempts, 2);
+        assert!(publications[0].total_ms >= 1_600);
+        assert_eq!(engine.verifier_sessions_started(), 2);
+        assert!(engine.take_failures().is_empty());
+    }
+
+    #[test]
+    fn synchronous_foreground_verifier_start_failure_recovers_once() {
+        let backend = FakeBackend::default();
+        let mut engine = engine(backend.clone());
+        observe(&mut engine, "decision", "The decision is still open.");
+        engine.send_user("What should I protect?").unwrap();
+        lock(&backend.state)
+            .verifier_start_errors
+            .push_back(ReasoningError::new(
+                ReasoningErrorKind::Timeout,
+                "synthetic verifier start timeout",
+                true,
+            ));
+
+        backend.complete(
+            0,
+            speak(&["decision"], "Protect the reversible decision path."),
+        );
+        let publications = engine.take_publications();
+
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].evidence_verification.provider_attempts, 2);
+        assert!(engine.take_lifecycle_events().iter().any(|event| {
+            matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    lane: ReasoningRetryLane::Verifier,
+                    attempt: 2,
+                    session_restarted: true,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(engine.verifier_sessions_started(), 2);
+        assert!(engine.take_failures().is_empty());
+    }
+
+    #[test]
+    fn verifier_transport_retry_cannot_bless_evidence_that_changed_during_outage() {
+        let backend = FakeBackend::default();
+        lock(&backend.state).defer_verification = true;
+        let mut engine = engine(backend.clone());
+        observe(&mut engine, "approval", "The launch is approved.");
+        engine.send_user("Should we proceed?").unwrap();
+        backend.complete(0, speak(&["approval"], "Proceed with the approved launch."));
+        assert!(engine.has_active_turn());
+
+        backend.fail_verification(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "synthetic verifier transport loss",
+                true,
+            ),
+        );
+        assert!(engine.has_active_turn());
+        observe(
+            &mut engine,
+            "rescinded",
+            "The launch approval was rescinded.",
+        );
+
+        backend.complete_verification(
+            1,
+            EvidenceVerificationVerdict {
+                decision: EvidenceVerificationDecision::Allow,
+                reason_code: EvidenceVerificationReason::Supported,
+            },
+        );
+        assert!(engine.take_publications().is_empty());
+        assert!(engine.has_active_turn());
+        {
+            let state = lock(&backend.state);
+            assert_eq!(state.verification_turns.len(), 3);
+            assert_eq!(
+                state.verification_turns[0].request,
+                state.verification_turns[1].request
+            );
+            assert_ne!(
+                state.verification_turns[1].request.window,
+                state.verification_turns[2].request.window
+            );
+            assert!(state.verification_turns[2]
+                .request
+                .window
+                .transcript
+                .iter()
+                .any(|item| item.evidence_id.as_str() == "rescinded"));
+        }
+
+        backend.complete_verification(
+            2,
+            EvidenceVerificationVerdict {
+                decision: EvidenceVerificationDecision::Allow,
+                reason_code: EvidenceVerificationReason::Supported,
+            },
+        );
+        let publications = engine.take_publications();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].evidence_verification.provider_attempts, 2);
+    }
+
+    #[test]
+    fn foreground_verifier_retry_exhaustion_fails_closed_without_third_attempt() {
+        let backend = FakeBackend::default();
+        lock(&backend.state).defer_verification = true;
+        let mut engine = engine(backend.clone());
+        observe(&mut engine, "decision", "The decision is still open.");
+        engine.send_user("What should I protect?").unwrap();
+        backend.complete(0, speak(&["decision"], "Protect the decision path."));
+        assert!(engine.has_active_turn());
+
+        backend.fail_verification(
+            0,
+            ReasoningError::new(ReasoningErrorKind::Overloaded, "busy once", true),
+        );
+        assert!(engine.has_active_turn());
+        backend.fail_verification(
+            1,
+            ReasoningError::new(ReasoningErrorKind::Overloaded, "busy twice", true),
+        );
+
+        let failures = engine.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].error.kind, ReasoningErrorKind::Overloaded);
+        assert_eq!(lock(&backend.state).verification_turns.len(), 2);
+        assert!(engine.take_publications().is_empty());
+        assert_eq!(
+            engine
+                .take_lifecycle_events()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.outcome,
+                        SidekickLifecycleOutcome::Retrying {
+                            lane: ReasoningRetryLane::Verifier,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn verifier_provider_retry_scope_excludes_background_and_protocol_failures() {
+        let background_backend = FakeBackend::default();
+        lock(&background_backend.state).defer_verification = true;
+        let mut background_engine = engine(background_backend.clone());
+        observe(
+            &mut background_engine,
+            "decision",
+            "The decision is still open.",
+        );
+        background_engine.evaluate_background().unwrap();
+        background_backend.complete(0, speak(&["decision"], "Keep the decision open."));
+        assert!(background_engine.has_active_turn());
+        background_backend.fail_verification(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "background verifier unavailable",
+                true,
+            ),
+        );
+        assert_eq!(background_engine.take_failures().len(), 1);
+        assert_eq!(lock(&background_backend.state).verification_turns.len(), 1);
+        assert!(background_engine
+            .take_lifecycle_events()
+            .iter()
+            .all(|event| !matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    lane: ReasoningRetryLane::Verifier,
+                    ..
+                }
+            )));
+
+        let protocol_backend = FakeBackend::default();
+        lock(&protocol_backend.state).defer_verification = true;
+        let mut protocol_engine = engine(protocol_backend.clone());
+        observe(
+            &mut protocol_engine,
+            "decision",
+            "The decision is still open.",
+        );
+        protocol_engine.send_user("What should I protect?").unwrap();
+        protocol_backend.complete(0, speak(&["decision"], "Protect the decision path."));
+        assert!(protocol_engine.has_active_turn());
+        protocol_backend.fail_verification(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Protocol,
+                "malformed verifier response",
+                true,
+            ),
+        );
+        let failures = protocol_engine.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].error.kind, ReasoningErrorKind::Protocol);
+        assert_eq!(lock(&protocol_backend.state).verification_turns.len(), 1);
+        assert!(protocol_engine
+            .take_lifecycle_events()
+            .iter()
+            .all(|event| !matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    lane: ReasoningRetryLane::Verifier,
+                    ..
+                }
+            )));
     }
 
     #[test]

@@ -40,6 +40,7 @@ The checkpoint executes each scenario twice through the public production
 | Exact-session screen store | Production context database/session links select one session's PNG, exclude another session, and deliver the selected bytes to Sidekick |
 | Correction during verification | Moving transcript window, refreshed verification, contradiction rejection, fresh regeneration |
 | Provider failure and recovery | Retryable network-class failure, automatic bounded retry, exact-window replay, provider epoch replacement, attempt receipt, successful publication |
+| Verifier failure and recovery | Independent-verifier transport failure, fresh verifier session, exact candidate/evidence-seal replay, stable strategist session, attempt receipt |
 | Screen unavailable | Missing image bytes rejected, fabricated visual provenance blocked, transcript-only recovery |
 | Foreground preemption | Typed user turn interrupts background work; late background completion is ignored |
 | Provider steering | Active persistent turn is steered into foreground work without a second generation |
@@ -52,10 +53,10 @@ The checkpoint executes each scenario twice through the public production
 Result at this checkpoint:
 
 ```text
-12/12 scenarios
-48/48 assertions
+13/13 scenarios
+52/52 assertions
 reproducible=true
-digest=3d794c88ff72e8b51b76508c8b22c24fdaf40b63c1320aaef0d68b12a870fb91
+digest=05cf6cac524b63b12f88cce9b8f953dbd1fa9904622a4e1910d69001a653b45a
 ```
 
 The second lane then transcribes the committed 10.6-second spoken-meeting WAV
@@ -90,7 +91,7 @@ false-green tests headlessly:
 ```text
 69/69 VM UI contract tests
 0 failed, skipped, cancelled, or todo
-source_sha256=e36e3bdab9a20c32dda9454a5b7aad4d1b0b2dc108ff747345715cb99090b1c5
+source_sha256=b37af68744e964f7a7133494294ed6609b445689446b5ecfa53916509eea1697
 ```
 
 That lane catches the prior missing-listener `ReferenceError` class and
@@ -156,3 +157,11 @@ total latency. A Minutes-owned strategist-attempt identity prevents a delayed
 event from the replaced session from impersonating the retry even if both
 provider sessions reuse the same local turn ID and invocation. Authentication,
 protocol, background, and second failures still fail closed.
+
+The independent-verifier recovery scenario exercises a separate budget and
+session. A foreground verifier transport loss opens one fresh verifier and
+replays the byte-equivalent candidate and bounded evidence seal without
+replacing or rerunning the strategist. Late verifier events are rejected by a
+Minutes-owned attempt identity. If evidence changes during that outage, the
+replayed seal cannot publish as current; a fresh verification window is
+required first.

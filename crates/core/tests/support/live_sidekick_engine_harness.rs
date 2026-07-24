@@ -1038,6 +1038,98 @@ fn provider_failure_and_recovery() -> EvalScenario {
     })
 }
 
+fn verifier_failure_and_recovery() -> EvalScenario {
+    scenario("verifier_failure_and_recovery", 840, || {
+        let mut fixture = fixture(true, 4)?;
+        observe(
+            &mut fixture.engine,
+            "transcript-a",
+            "The synthetic decision remains open.",
+            None,
+        )?;
+        fixture
+            .engine
+            .send_user("Give me the current strategy.")
+            .map_err(|error| error.to_string())?;
+        fixture.strategist.complete_candidate(
+            0,
+            candidate(
+                "The current evidence supports keeping the decision open.",
+                &["transcript-a"],
+                &[],
+            ),
+        )?;
+        fixture.engine.pump();
+        fixture.verifier.fail(
+            0,
+            ReasoningError::new(
+                ReasoningErrorKind::Unavailable,
+                "synthetic verifier network unavailable",
+                true,
+            ),
+        )?;
+        let lifecycle = fixture.engine.take_lifecycle_events();
+        let failures = fixture.engine.take_failures();
+        let requests = fixture.verifier.requests();
+        let exact_seal_replayed = requests.len() == 2 && requests[0] == requests[1];
+        let bounded_retry_recorded = lifecycle.iter().any(|event| {
+            matches!(
+                &event.outcome,
+                SidekickLifecycleOutcome::Retrying {
+                    lane: minutes_core::live_sidekick::ReasoningRetryLane::Verifier,
+                    error,
+                    attempt: 2,
+                    session_restarted: true,
+                    ..
+                } if error.kind == ReasoningErrorKind::Unavailable && error.retryable
+            )
+        });
+        fixture.verifier.complete_verdict(1, allow_verdict())?;
+        let publications = fixture.engine.take_publications();
+        let receipt_attempts = publications.first().map_or(0, |publication| {
+            publication.evidence_verification.provider_attempts
+        });
+        let verifier_replaced =
+            fixture.strategist.sessions_started() == 1 && fixture.verifier.sessions_started() == 2;
+        fixture
+            .engine
+            .stop_capture()
+            .map_err(|error| error.to_string())?;
+        Ok(vec![
+            assertion(
+                "retryable_verifier_failure_is_recovered_once",
+                failures.is_empty() && bounded_retry_recorded,
+                format!(
+                    "failures={} retry_recorded={bounded_retry_recorded}",
+                    failures.len()
+                ),
+            ),
+            assertion(
+                "verifier_recovery_preserves_strategist_session",
+                verifier_replaced,
+                format!(
+                    "strategist_sessions={} verifier_sessions={}",
+                    fixture.strategist.sessions_started(),
+                    fixture.verifier.sessions_started()
+                ),
+            ),
+            assertion(
+                "verifier_recovery_replays_exact_candidate_and_evidence_seal",
+                exact_seal_replayed,
+                format!("requests={}", requests.len()),
+            ),
+            assertion(
+                "recovered_verifier_publishes_with_attempt_receipt",
+                publications.len() == 1 && receipt_attempts == 2,
+                format!(
+                    "publications={} verifier_attempts={receipt_attempts}",
+                    publications.len()
+                ),
+            ),
+        ])
+    })
+}
+
 fn unavailable_screen_fails_closed() -> EvalScenario {
     scenario("unavailable_screen_fails_closed", 720, || {
         let mut fixture = fixture(true, 4)?;
@@ -1784,6 +1876,7 @@ fn run_once() -> Vec<EvalScenario> {
         exact_session_screen_store_publication(),
         correction_during_verification(),
         provider_failure_and_recovery(),
+        verifier_failure_and_recovery(),
         unavailable_screen_fails_closed(),
         foreground_preempts_stale_background(),
         steerable_foreground_reuses_active_turn(),

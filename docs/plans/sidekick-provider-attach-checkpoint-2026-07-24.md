@@ -71,6 +71,6 @@ real turns.
 This checkpoint proves deterministic orchestration and fail-closed receipts on
 the VM. It does not establish the required 99% successful-start rate, a
 statistically meaningful startup-latency tail, native macOS behavior, or signed
-recovery UX. It also does not recover a provider transport failure inside the
-independent semantic-verifier lane; that is the next reliability slice.
-
+recovery UX. Independent semantic-verifier transport recovery was a separate
+gap at this checkpoint and is now documented in
+[`sidekick-verifier-recovery-checkpoint-2026-07-24.md`](sidekick-verifier-recovery-checkpoint-2026-07-24.md).
