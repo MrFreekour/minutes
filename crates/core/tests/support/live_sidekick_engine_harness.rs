@@ -11,10 +11,11 @@ use minutes_core::live_sidekick::*;
 use minutes_core::Config;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub const LIVE_SIDEKICK_ENGINE_EVAL_VERSION: &str = "2";
+pub const LIVE_SIDEKICK_ENGINE_EVAL_VERSION: &str = "3";
 pub const LIVE_SIDEKICK_ENGINE_EVAL_SEED: u64 = 0x4d49_4e55_5445_5301;
 
 const MAX_WINDOW_CHARS: usize = 4_096;
@@ -24,6 +25,42 @@ const FIXED_VERIFICATION_MS: u64 = 120;
 const MAX_DIAGNOSTIC_CHARS: usize = 240;
 const STRATEGIST_WARMUP_SEQUENCE: u64 = u64::MAX;
 const VERIFIER_WARMUP_SEQUENCE: u64 = u64::MAX - 1;
+
+struct HomeOverride {
+    home: Option<OsString>,
+    #[cfg(windows)]
+    user_profile: Option<OsString>,
+}
+
+impl HomeOverride {
+    fn set(path: &std::path::Path) -> Self {
+        let previous = Self {
+            home: std::env::var_os("HOME"),
+            #[cfg(windows)]
+            user_profile: std::env::var_os("USERPROFILE"),
+        };
+        std::env::set_var("HOME", path);
+        #[cfg(windows)]
+        std::env::set_var("USERPROFILE", path);
+        previous
+    }
+}
+
+impl Drop for HomeOverride {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take() {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        #[cfg(windows)]
+        if let Some(user_profile) = self.user_profile.take() {
+            std::env::set_var("USERPROFILE", user_profile);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
+    }
+}
 
 /// Bounded proof artifact emitted by the replay harness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,6 +93,7 @@ pub struct EvalCoverage {
     pub production_transcript_jsonl_adapter: bool,
     pub production_context_card_adapter: bool,
     pub production_participant_archive_adapter: bool,
+    pub production_context_store_screen_adapter: bool,
     pub production_evidence_window: bool,
     pub production_publication_gate: bool,
     pub production_verification_gate: bool,
@@ -110,6 +148,9 @@ pub struct LiveSidekickMediaEvalReport {
     pub production_batch_asr: bool,
     pub production_transcript_jsonl_adapter: bool,
     pub production_sidekick_engine: bool,
+    pub production_source_aware_diarization: bool,
+    pub source_aware_speakers: usize,
+    pub source_aware_segments: usize,
     pub native_microphone_capture: bool,
     pub native_live_asr: bool,
     pub native_diarization: bool,
@@ -631,6 +672,174 @@ fn exact_screen_publication() -> EvalScenario {
             assertion(
                 "independent_verifier_gated_publication",
                 publications.len() == 1 && verified,
+                format!("publications={}", publications.len()),
+            ),
+        ])
+    })
+}
+
+fn exact_session_screen_store_publication() -> EvalScenario {
+    scenario("exact_session_screen_store_publication", 720, || {
+        use chrono::{Duration, Local};
+        use minutes_core::context_store::{
+            cleanup_screen_context, get_screen_context, initialize_screen_context,
+            mark_screen_context_waiting, record_screen_capture_success, start_capture_session,
+        };
+        use minutes_core::pid::CaptureMode;
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let _home = HomeOverride::set(temp.path());
+        let screen_root = Config::minutes_dir().join("screens");
+        let selected_directory = screen_root.join("selected-session");
+        let other_directory = screen_root.join("other-session");
+        std::fs::create_dir_all(&selected_directory).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&other_directory).map_err(|error| error.to_string())?;
+
+        let started_at = Local::now();
+        let selected_session = start_capture_session(
+            CaptureMode::Meeting,
+            Some("Selected synthetic session".into()),
+            started_at,
+        )
+        .map_err(|error| error.to_string())?;
+        let other_session = start_capture_session(
+            CaptureMode::Meeting,
+            Some("Other synthetic session".into()),
+            started_at + Duration::seconds(1),
+        )
+        .map_err(|error| error.to_string())?;
+        initialize_screen_context(&selected_session.id, true, 30, false)
+            .map_err(|error| error.to_string())?;
+        initialize_screen_context(&other_session.id, true, 30, false)
+            .map_err(|error| error.to_string())?;
+        mark_screen_context_waiting(&selected_session.id, &selected_directory)
+            .map_err(|error| error.to_string())?;
+        mark_screen_context_waiting(&other_session.id, &other_directory)
+            .map_err(|error| error.to_string())?;
+
+        let selected_png = BASE64
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .map_err(|error| error.to_string())?;
+        let other_png = BASE64
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8zwAAAgEBAScY42YAAAAASUVORK5CYII=")
+            .map_err(|error| error.to_string())?;
+        let selected_path = selected_directory.join("screen-0000-0005s.png");
+        let other_path = other_directory.join("screen-0000-0005s.png");
+        std::fs::write(&selected_path, &selected_png).map_err(|error| error.to_string())?;
+        std::fs::write(&other_path, &other_png).map_err(|error| error.to_string())?;
+        record_screen_capture_success(
+            &selected_session.id,
+            &selected_path,
+            started_at + Duration::seconds(5),
+            0,
+            5,
+            selected_png.len() as u64,
+        )
+        .map_err(|error| error.to_string())?;
+        record_screen_capture_success(
+            &other_session.id,
+            &other_path,
+            started_at + Duration::seconds(6),
+            0,
+            5,
+            other_png.len() as u64,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let selected = get_screen_context(
+            &selected_session.id,
+            Some(started_at + Duration::seconds(5)),
+            1,
+        )
+        .map_err(|error| error.to_string())?;
+        let exact_image = selected
+            .images
+            .first()
+            .ok_or_else(|| "selected context store returned no image".to_string())?;
+        let exact_path = PathBuf::from(&exact_image.path);
+        let exact_bytes = std::fs::read(&exact_path).map_err(|error| error.to_string())?;
+        let exact_session_only = selected
+            .session
+            .as_ref()
+            .is_some_and(|session| session.id == selected_session.id)
+            && selected.images.len() == 1
+            && exact_path
+                == selected_path
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?
+            && exact_path
+                != other_path
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?;
+
+        let mut fixture = fixture(true, 4)?;
+        observe(
+            &mut fixture.engine,
+            "transcript-screen-store",
+            "The synthetic session is reviewing the current slide.",
+            None,
+        )?;
+        let reduction = fixture
+            .engine
+            .observe_screen_bytes(
+                "screen-store-selected".into(),
+                exact_path,
+                exact_bytes.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        fixture
+            .engine
+            .send_user("Use only the selected session screen.")
+            .map_err(|error| error.to_string())?;
+        let request = fixture
+            .strategist
+            .requests()
+            .first()
+            .cloned()
+            .ok_or_else(|| "screen-store reasoning request missing".to_string())?;
+        let exact_bytes_reached_provider =
+            request.window.latest_image.as_ref().is_some_and(|image| {
+                image.evidence_id.as_str() == "screen-store-selected"
+                    && image.png_bytes == selected_png
+                    && image.png_bytes != other_png
+            });
+        fixture.strategist.complete_candidate(
+            0,
+            candidate(
+                "The exact selected-session image supports the current review.",
+                &["transcript-screen-store"],
+                &["screen-store-selected"],
+            ),
+        )?;
+        fixture.engine.pump();
+        fixture.verifier.complete_verdict(0, allow_verdict())?;
+        let publications = fixture.engine.take_publications();
+        fixture
+            .engine
+            .stop_capture()
+            .map_err(|error| error.to_string())?;
+        cleanup_screen_context(&selected_session.id).map_err(|error| error.to_string())?;
+        cleanup_screen_context(&other_session.id).map_err(|error| error.to_string())?;
+
+        Ok(vec![
+            assertion(
+                "production_context_store_selects_exact_session",
+                exact_session_only,
+                format!("images={}", selected.images.len()),
+            ),
+            assertion(
+                "context_store_image_bytes_are_accepted",
+                reduction.accepted && exact_bytes == selected_png,
+                format!("accepted={}", reduction.accepted),
+            ),
+            assertion(
+                "exact_session_store_bytes_reach_provider",
+                exact_bytes_reached_provider,
+                "selected bytes only",
+            ),
+            assertion(
+                "store_grounded_visual_claim_passes_publication_gate",
+                publications.len() == 1,
                 format!("publications={}", publications.len()),
             ),
         ])
@@ -1551,6 +1760,7 @@ fn teardown_rejects_late_completion() -> EvalScenario {
 fn run_once() -> Vec<EvalScenario> {
     vec![
         exact_screen_publication(),
+        exact_session_screen_store_publication(),
         correction_during_verification(),
         provider_failure_and_recovery(),
         unavailable_screen_fails_closed(),
@@ -1608,6 +1818,7 @@ pub fn run_live_sidekick_engine_eval() -> LiveSidekickEngineEvalReport {
             production_transcript_jsonl_adapter: true,
             production_context_card_adapter: true,
             production_participant_archive_adapter: true,
+            production_context_store_screen_adapter: true,
             production_evidence_window: true,
             production_publication_gate: true,
             production_verification_gate: true,
@@ -1680,6 +1891,36 @@ fn sha256_file(path: &std::path::Path) -> Result<String, String> {
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(feature = "whisper")]
+fn write_source_stem(
+    path: &std::path::Path,
+    active_seconds: &[usize],
+    frequency_hz: f32,
+) -> Result<(), String> {
+    let sample_rate = 16_000_u32;
+    let seconds = 4_usize;
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).map_err(|error| error.to_string())?;
+    for sample_index in 0..seconds * sample_rate as usize {
+        let second = sample_index / sample_rate as usize;
+        let sample = if active_seconds.contains(&second) {
+            let time = sample_index as f32 / sample_rate as f32;
+            (time * frequency_hz * std::f32::consts::TAU).sin() * 8_000.0
+        } else {
+            0.0
+        };
+        writer
+            .write_sample(sample as i16)
+            .map_err(|error| error.to_string())?;
+    }
+    writer.finalize().map_err(|error| error.to_string())
 }
 
 /// Exercise a committed spoken-audio fixture through production batch ASR,
@@ -1810,6 +2051,36 @@ pub fn run_live_sidekick_media_eval(
     let corrupt_rejected =
         minutes_core::transcribe::transcribe_meeting(corrupt.path(), &config).is_err();
 
+    let source_stems = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let voice_stem = source_stems.path().join("synthetic.voice.wav");
+    let system_stem = source_stems.path().join("synthetic.system.wav");
+    write_source_stem(&voice_stem, &[0, 2], 220.0)?;
+    write_source_stem(&system_stem, &[1, 3], 330.0)?;
+    let source_aware = minutes_core::diarize::diarize_from_stems(
+        &minutes_core::diarize::StemPaths {
+            voice: voice_stem,
+            system: system_stem,
+        },
+        &Config::default(),
+    )
+    .ok_or_else(|| "production source-aware diarization returned no result".to_string())?;
+    let source_aware_labels = source_aware
+        .segments
+        .iter()
+        .map(|segment| segment.speaker.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let source_aware_sequence = source_aware
+        .segments
+        .iter()
+        .map(|segment| segment.speaker.as_str())
+        .collect::<Vec<_>>();
+    let source_aware_attribution = source_aware.num_speakers == 2
+        && source_aware.source_aware
+        && source_aware.from_stems
+        && source_aware_labels.contains("SPEAKER_0")
+        && source_aware_labels.contains("SPEAKER_1")
+        && source_aware_sequence == ["SPEAKER_0", "SPEAKER_1", "SPEAKER_0", "SPEAKER_1"];
+
     let assertions = vec![
         assertion(
             "committed_spoken_fixture_transcribed",
@@ -1841,6 +2112,15 @@ pub fn run_live_sidekick_media_eval(
             corrupt_rejected,
             format!("rejected={corrupt_rejected}"),
         ),
+        assertion(
+            "synthetic_source_stems_crossed_production_attributor",
+            source_aware_attribution,
+            format!(
+                "speakers={} segments={}",
+                source_aware.num_speakers,
+                source_aware.segments.len()
+            ),
+        ),
     ];
     let passed = assertions.iter().all(|assertion| assertion.passed);
 
@@ -1862,6 +2142,9 @@ pub fn run_live_sidekick_media_eval(
         production_batch_asr: true,
         production_transcript_jsonl_adapter: true,
         production_sidekick_engine: true,
+        production_source_aware_diarization: source_aware_attribution,
+        source_aware_speakers: source_aware.num_speakers,
+        source_aware_segments: source_aware.segments.len(),
         native_microphone_capture: false,
         native_live_asr: false,
         native_diarization: false,

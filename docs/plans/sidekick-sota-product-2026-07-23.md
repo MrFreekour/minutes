@@ -319,16 +319,18 @@ never degrade recording or WAV preservation.
 The first no-human orchestration and fault-injection gate is implemented and
 documented in
 [`sidekick-engine-replay-checkpoint-2026-07-24.md`](sidekick-engine-replay-checkpoint-2026-07-24.md).
-Its 11 scenarios and 43 assertions pass reproducibly through the production
+Its 12 scenarios and 47 assertions pass reproducibly through the production
 transcript JSONL adapter, project/prepared-context assembler, engine, reducer,
 evidence window, independent verification, publication, recovery, and teardown
 paths. The populated participant-archive lane now proves that bounded prior
 meeting evidence reaches Sidekick while unrelated and restricted history does
-not. A separate 69-test VM UI contract gate covers startup, event order,
-painting, deduplication, and reload recovery. This remains only a partial
-completion of step 2: native audio/live ASR/diarization, native permission
-adapters, signed-WebView behavior, and real-provider behavior are explicit
-exclusions.
+not. Exact-session context-store retrieval now selects one linked PNG and
+delivers only those bytes to the engine. A separate generated-stem lane proves
+production local/remote source attribution, and the 69-test VM UI contract gate
+covers startup, event order, painting, deduplication, and reload recovery. This
+remains only a partial completion of step 2: native audio/live ASR, mixed
+room-mic speaker clustering or identity, native permission adapters,
+signed-WebView behavior, and real-provider behavior are explicit exclusions.
 
 ## Current Baseline
 

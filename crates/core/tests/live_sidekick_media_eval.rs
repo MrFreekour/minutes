@@ -24,6 +24,8 @@ fn prerecorded_audio_crosses_asr_adapter_and_sidekick_engine() {
     .expect("media replay should complete");
     assert!(report.passed, "{report:#?}");
     assert!(report.production_batch_asr);
+    assert!(report.production_source_aware_diarization);
+    assert_eq!(report.source_aware_speakers, 2);
     assert!(!report.native_microphone_capture);
     assert!(!report.native_live_asr);
     assert!(!report.native_diarization);

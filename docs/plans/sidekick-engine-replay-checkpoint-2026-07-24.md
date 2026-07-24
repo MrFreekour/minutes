@@ -37,6 +37,7 @@ The checkpoint executes each scenario twice through the public production
 | Scenario | Production behavior exercised |
 | --- | --- |
 | Exact screen publication | Exact selected PNG bytes, evidence receipt, independent verifier, publication gate |
+| Exact-session screen store | Production context database/session links select one session's PNG, exclude another session, and deliver the selected bytes to Sidekick |
 | Correction during verification | Moving transcript window, refreshed verification, contradiction rejection, fresh regeneration |
 | Provider failure and recovery | Retryable network-class failure, capture isolation, provider epoch replacement, successful retry |
 | Screen unavailable | Missing image bytes rejected, fabricated visual provenance blocked, transcript-only recovery |
@@ -51,10 +52,10 @@ The checkpoint executes each scenario twice through the public production
 Result at this checkpoint:
 
 ```text
-11/11 scenarios
-43/43 assertions
+12/12 scenarios
+47/47 assertions
 reproducible=true
-digest=656c1aaf48205beefd6acb16456160f240b8da74d08cffb0a534f010c1e4ad4b
+digest=e48a0d1c27ef8d898ac0b185ac1a138ca50cded0a01820b05faca1a2cc8a8e48
 ```
 
 The second lane then transcribes the committed 10.6-second spoken-meeting WAV
@@ -64,17 +65,22 @@ through the real Sidekick engine, and requires independently verified
 publication. On the 2026-07-24 VM run:
 
 ```text
-6/6 media assertions
+7/7 media assertions
 28 recognized words
 3 timed segments
 WER=0.192 (tiny model, required bound <=0.50)
 ASR elapsed=0.8-1.2s across checkpoint runs (non-gating)
 corrupt WAV rejected=true
+source-aware attribution=2 speakers / 4 alternating segments
 ```
 
 ASR timing and transcript hashes are machine-dependent and are intentionally
 not described as deterministic. The fixture, model, and transcript hashes are
 recorded as receipts; raw transcript content is not written into the artifact.
+The source-aware check generates two separate, alternating synthetic audio
+stems at runtime and passes them through Minutes' production energy-based
+attributor. It proves local/remote source separation, not two-human room-mic
+voice clustering or identity.
 
 The third VM lane binds the current production Sidekick/main-window markup,
 frontend handlers, and acceptance evaluators to one source digest, then runs
@@ -98,8 +104,9 @@ backend; it is not compiled into the production Minutes engine.
 
 ## Honest coverage boundary
 
-This checkpoint uses the real Minutes batch meeting ASR, live-transcript JSONL
-cursor/parser adapter, historical/project `ContextCard` assembler, reducer,
+This checkpoint uses the real Minutes batch meeting ASR, source-aware stem
+attributor, live-transcript JSONL cursor/parser adapter, exact-session context
+store retrieval, historical/project `ContextCard` assembler, reducer,
 evidence-window assembler, provider contract, verification gate,
 suppression/publication decision, recovery, and teardown paths.
 
@@ -107,7 +114,7 @@ It does **not** yet exercise:
 
 - native microphone or system-audio capture;
 - live/streaming speech recognition from a native recording;
-- two-speaker diarization;
+- mixed room-mic voice clustering, named-speaker identity, or live diarization;
 - the native macOS Screen Recording permission adapter;
 - real Codex, Claude-compatible, or local-model network behavior; or
 - signed-app/WebView UI event order and accessibility.
@@ -127,10 +134,12 @@ leaves the shipped provider-neutral engine untouched.
 The deterministic transcript-adapter scenario begins with already-produced
 synthetic JSONL. The separate media lane proves prerecorded speech recognition
 and real ASR-segment ingress, but it deliberately supplies no speaker labels
-and therefore proves nothing about diarization. Historical-context replay now
-uses a populated meeting archive and an explicit participant, while excluding
-unrelated and restricted files; it still does not prove calendar identity
-resolution or live diarization-to-person matching.
+from its spoken fixture. Its separate generated-stem check proves the production
+local/remote attributor only; it does not turn synthetic tones into a
+two-person room-mic claim. Historical-context replay uses a populated meeting
+archive and an explicit participant, while excluding unrelated and restricted
+files; it still does not prove calendar identity resolution or live
+diarization-to-person matching.
 
 The artifact also labels every provider duration as simulated and sets
 `release_ready_from_this_report_alone=false`. A future change cannot turn this
