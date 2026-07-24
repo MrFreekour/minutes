@@ -14,7 +14,9 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,22 +50,7 @@ use std::time::{Duration, Instant};
 //   - Runs until explicit `minutes stop`
 // ──────────────────────────────────────────────────────────────
 
-/// A single line in the live transcript JSONL file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptLine {
-    /// Sequential line number (1-based).
-    pub line: usize,
-    /// Wall clock timestamp (ISO 8601).
-    pub ts: DateTime<Local>,
-    /// Milliseconds since session start.
-    pub offset_ms: u64,
-    /// Utterance duration in milliseconds.
-    pub duration_ms: u64,
-    /// Transcribed text.
-    pub text: String,
-    /// Speaker label (null for now, future diarization fills this).
-    pub speaker: Option<String>,
-}
+pub use crate::live_transcript_contract::TranscriptLine;
 
 /// How the live transcript is being produced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2628,12 +2615,7 @@ pub fn read_since_line_from_path(
     path: &Path,
     since_line: usize,
 ) -> Result<Vec<TranscriptLine>, MinutesError> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let file = File::open(path)?;
-    read_since_line_from_reader(BufReader::new(file), since_line)
+    crate::live_transcript_contract::read_since_line_from_path(path, since_line)
 }
 
 /// Parse transcript deltas from bytes already opened and verified by a host
@@ -2644,37 +2626,7 @@ pub fn read_since_line_from_bytes(
     bytes: &[u8],
     since_line: usize,
 ) -> Result<Vec<TranscriptLine>, MinutesError> {
-    read_since_line_from_reader(BufReader::new(bytes), since_line)
-}
-
-fn read_since_line_from_reader(
-    reader: impl BufRead,
-    since_line: usize,
-) -> Result<Vec<TranscriptLine>, MinutesError> {
-    let mut lines = Vec::new();
-
-    for line_result in reader.lines() {
-        let line_str = match line_result {
-            Ok(s) => s,
-            Err(e) => {
-                // Skip lines with invalid UTF-8 (e.g., crash-torn multibyte chars)
-                tracing::warn!("skipping unreadable JSONL line: {}", e);
-                continue;
-            }
-        };
-        if line_str.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<TranscriptLine>(&line_str) {
-            Ok(tl) if tl.line > since_line => lines.push(tl),
-            Ok(_) => {} // before cursor
-            Err(e) => {
-                tracing::warn!("skipping malformed JSONL line: {}", e);
-            }
-        }
-    }
-
-    Ok(lines)
+    crate::live_transcript_contract::read_since_line_from_bytes(bytes, since_line)
 }
 
 /// Read transcript lines from the last N milliseconds (wall clock time).

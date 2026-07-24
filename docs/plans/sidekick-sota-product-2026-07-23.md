@@ -287,7 +287,7 @@ answer variants.
 | Lane | Proves |
 | --- | --- |
 | Deterministic reducer replay | Session identity, evidence order, correction, cancellation, silence, and reproducibility |
-| Full-fidelity media/context replay | Real audio/transcript adapters, screen frames, historical retrieval, repository retrieval, and fault injection without a person |
+| Full-fidelity media/context replay | Real prerecorded ASR/transcript adapters, screen frames, historical retrieval, repository retrieval, and fault injection without a person |
 | Provider quality bake-off | Production prompts and adapters across Codex, Claude-compatible, and local backends with latency and cost receipts |
 | Signed Mac journey | Actual window state, focus, streaming, accessibility, recovery, teardown, and visual snapshots |
 
@@ -319,11 +319,12 @@ never degrade recording or WAV preservation.
 The first no-human orchestration and fault-injection gate is implemented and
 documented in
 [`sidekick-engine-replay-checkpoint-2026-07-24.md`](sidekick-engine-replay-checkpoint-2026-07-24.md).
-Its eight scenarios and 29 assertions pass reproducibly through the production
-engine, reducer, evidence window, independent verification, publication,
-recovery, and teardown paths. It intentionally remains only a partial
-completion of step 2: native audio/ASR/diarization, native permission adapters,
-retrieval adapters, and real-provider behavior are explicit exclusions.
+Its ten scenarios and 37 assertions pass reproducibly through the production
+transcript JSONL adapter, project/prepared-context assembler, engine, reducer,
+evidence window, independent verification, publication, recovery, and teardown
+paths. It intentionally remains only a partial completion of step 2: native
+audio/ASR/diarization, native permission adapters, populated-archive retrieval,
+and real-provider behavior are explicit exclusions.
 
 ## Current Baseline
 

@@ -4,10 +4,12 @@
 //! provider. It deliberately separates typed user authority from transcript,
 //! screen, and other meeting evidence.
 
+mod adapter;
 mod engine;
 mod provider;
 mod session;
 
+pub use adapter::*;
 pub use engine::*;
 pub use provider::*;
 pub use session::*;

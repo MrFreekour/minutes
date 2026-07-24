@@ -6,7 +6,9 @@
 //! controlled without a network, microphone, screen, or human operator.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use minutes_core::context_card::{ContextCard, ContextCardRequest};
 use minutes_core::live_sidekick::*;
+use minutes_core::Config;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -51,6 +53,8 @@ pub struct EvalSummary {
 pub struct EvalCoverage {
     pub production_engine: bool,
     pub production_reducer: bool,
+    pub production_transcript_jsonl_adapter: bool,
+    pub production_context_card_adapter: bool,
     pub production_evidence_window: bool,
     pub production_publication_gate: bool,
     pub production_verification_gate: bool,
@@ -78,6 +82,37 @@ pub struct EvalAssertion {
     pub passed: bool,
     /// Bounded, content-free diagnostic suitable for CI artifacts.
     pub observed: String,
+}
+
+/// Non-deterministic receipt for the production prerecorded-media lane.
+///
+/// Unlike [`LiveSidekickEngineEvalReport`], elapsed time and ASR output can
+/// vary by machine. The artifact therefore records hashes and quality bounds,
+/// not raw transcript content or a misleading reproducibility claim.
+#[cfg(feature = "whisper")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveSidekickMediaEvalReport {
+    pub schema_version: &'static str,
+    pub passed: bool,
+    pub fixture_sha256: String,
+    pub model_sha256: String,
+    pub transcript_sha256: String,
+    pub asr_backend: &'static str,
+    pub asr_model: String,
+    pub asr_elapsed_ms: u64,
+    pub audio_duration_ms: u64,
+    pub transcript_words: usize,
+    pub transcript_segments: usize,
+    pub word_error_rate: f64,
+    pub adapter_items: usize,
+    pub assertions: Vec<EvalAssertion>,
+    pub production_batch_asr: bool,
+    pub production_transcript_jsonl_adapter: bool,
+    pub production_sidekick_engine: bool,
+    pub native_microphone_capture: bool,
+    pub native_live_asr: bool,
+    pub native_diarization: bool,
+    pub release_ready_from_this_report_alone: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1048,6 +1083,240 @@ fn evidence_bounds_are_enforced() -> EvalScenario {
     })
 }
 
+fn transcript_jsonl_adapter_replay() -> EvalScenario {
+    scenario("transcript_jsonl_adapter_replay", 720, || {
+        let mut fixture = fixture(true, 6)?;
+        let transcript = concat!(
+            "{\"line\":1,\"ts\":\"2026-07-24T12:00:00+00:00\",\"offset_ms\":0,\"duration_ms\":100,\"text\":\"The synthetic first position is open.\",\"speaker\":\"PARTICIPANT_A\"}\n",
+            "not-json\n",
+            "{\"line\":2,\"ts\":\"2026-07-24T12:00:01+00:00\",\"offset_ms\":100,\"duration_ms\":100,\"text\":\"   \",\"speaker\":null}\n",
+            "{\"line\":3,\"ts\":\"2026-07-24T12:00:02+00:00\",\"offset_ms\":200,\"duration_ms\":100,\"text\":\"The synthetic second position is bounded.\",\"speaker\":\"PARTICIPANT_B\"}\n",
+        );
+        let mut cursor = 0;
+        let first = observe_transcript_jsonl_from_bytes(
+            &mut fixture.engine,
+            &mut cursor,
+            transcript.as_bytes(),
+            "jsonl-line-",
+        )
+        .map_err(|error| error.to_string())?;
+        let second = observe_transcript_jsonl_from_bytes(
+            &mut fixture.engine,
+            &mut cursor,
+            transcript.as_bytes(),
+            "jsonl-line-",
+        )
+        .map_err(|error| error.to_string())?;
+        fixture
+            .engine
+            .send_user("Use the current transcript adapter evidence.")
+            .map_err(|error| error.to_string())?;
+        let request = fixture
+            .strategist
+            .requests()
+            .first()
+            .cloned()
+            .ok_or_else(|| "generation request missing".to_string())?;
+        let rendered_prompt = request.render_prompt();
+        fixture.strategist.complete_candidate(
+            0,
+            candidate(
+                "The current bounded position is supported by the second transcript item.",
+                &["jsonl-line-3"],
+                &[],
+            ),
+        )?;
+        fixture.engine.pump();
+        fixture.verifier.complete_verdict(0, allow_verdict())?;
+        let publications = fixture.engine.take_publications();
+        let labels_are_anonymous = !rendered_prompt.contains("PARTICIPANT_A")
+            && !rendered_prompt.contains("PARTICIPANT_B")
+            && rendered_prompt.matches("anonymous_track_").count() >= 2;
+        fixture
+            .engine
+            .stop_capture()
+            .map_err(|error| error.to_string())?;
+        Ok(vec![
+            assertion(
+                "production_jsonl_cursor_adapter_loaded_finals",
+                first.new_items == 2 && first.cursor == 3 && first.accepted_evidence_ids.len() == 2,
+                format!("items={} cursor={}", first.new_items, first.cursor),
+            ),
+            assertion(
+                "cursor_replay_is_idempotent",
+                second.new_items == 0 && second.cursor == 3,
+                format!("items={} cursor={}", second.new_items, second.cursor),
+            ),
+            assertion(
+                "unverified_speaker_labels_are_anonymized",
+                labels_are_anonymous,
+                "two anonymous tracks",
+            ),
+            assertion(
+                "adapter_grounded_turn_publishes",
+                publications.len() == 1,
+                format!("publications={}", publications.len()),
+            ),
+        ])
+    })
+}
+
+fn context_card_mutation_and_recovery() -> EvalScenario {
+    scenario("context_card_mutation_and_recovery", 1_320, || {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let project = temp.path().join("synthetic-project");
+        let nested = project.join("src");
+        std::fs::create_dir_all(&nested).map_err(|error| error.to_string())?;
+        let readme = project.join("README.md");
+        std::fs::write(
+            &readme,
+            "# Synthetic Project\nUse a reversible bounded rollout.",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            project.join("AGENTS.md"),
+            "---\nsensitivity: restricted\n---\nRESTRICTED_CONTEXT_SENTINEL",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(project.join(".env"), "SECRET_ENV_SENTINEL=1")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(nested.join("private.txt"), "NESTED_CONTEXT_SENTINEL")
+            .map_err(|error| error.to_string())?;
+        let brief = temp.path().join("SIDEKICK_BRIEF.md");
+        std::fs::write(&brief, "Protect the reversible path.")
+            .map_err(|error| error.to_string())?;
+
+        let mut request = ContextCardRequest::new("reversible rollout");
+        request.prepared_brief_path = Some(brief);
+        request.project_root = Some(project.clone());
+        request.max_chars = 5_000;
+        let card = ContextCard::assemble(&Config::default(), request.clone())
+            .map_err(|error| error.to_string())?;
+        let card_json = serde_json::to_string(&card).map_err(|error| error.to_string())?;
+        let expected_classes = card
+            .evidence()
+            .iter()
+            .any(|item| item.context_class == "prepared_brief")
+            && card
+                .evidence()
+                .iter()
+                .any(|item| item.context_class == "project_file");
+        let excluded_ambient = !card_json.contains("RESTRICTED_CONTEXT_SENTINEL")
+            && !card_json.contains("SECRET_ENV_SENTINEL")
+            && !card_json.contains("NESTED_CONTEXT_SENTINEL");
+
+        let mut fixture = fixture(true, 4)?;
+        fixture
+            .engine
+            .load_context_card(card.clone())
+            .map_err(|error| error.to_string())?;
+        observe(
+            &mut fixture.engine,
+            "transcript-a",
+            "The synthetic rollout decision is active.",
+            None,
+        )?;
+        fixture
+            .engine
+            .send_user("Combine current evidence with selected context.")
+            .map_err(|error| error.to_string())?;
+        let first_request = fixture
+            .strategist
+            .requests()
+            .first()
+            .cloned()
+            .ok_or_else(|| "first context request missing".to_string())?;
+        let first_context_id = card
+            .evidence()
+            .first()
+            .map(|item| item.evidence_id.as_str().to_string())
+            .ok_or_else(|| "context card was empty".to_string())?;
+        std::fs::write(
+            &readme,
+            "# Synthetic Project\nUse a newly revised reversible rollout.",
+        )
+        .map_err(|error| error.to_string())?;
+        fixture.strategist.complete_candidate(
+            0,
+            candidate(
+                "The selected context supports a reversible rollout.",
+                &[first_context_id.as_str()],
+                &[],
+            ),
+        )?;
+        let stale_failures = fixture.engine.take_failures();
+        let stale_publications = fixture.engine.take_publications();
+
+        fixture
+            .engine
+            .clear_context_evidence()
+            .map_err(|error| error.to_string())?;
+        let refreshed = ContextCard::assemble(&Config::default(), request)
+            .map_err(|error| error.to_string())?;
+        let refreshed_id = refreshed
+            .evidence()
+            .iter()
+            .find(|item| item.context_class == "project_file")
+            .map(|item| item.evidence_id.as_str().to_string())
+            .ok_or_else(|| "refreshed project context missing".to_string())?;
+        fixture
+            .engine
+            .load_context_card(refreshed)
+            .map_err(|error| error.to_string())?;
+        fixture
+            .engine
+            .send_user("Retry after refreshing selected context.")
+            .map_err(|error| error.to_string())?;
+        fixture.strategist.complete_candidate(
+            1,
+            candidate(
+                "The refreshed project context supports the revised reversible rollout.",
+                &[refreshed_id.as_str()],
+                &[],
+            ),
+        )?;
+        fixture.engine.pump();
+        fixture.verifier.complete_verdict(0, allow_verdict())?;
+        let publications = fixture.engine.take_publications();
+        let first_request_grounded = first_request.window.context.len() == card.evidence().len()
+            && first_request
+                .window
+                .context
+                .iter()
+                .all(|item| item.evidence_only);
+        fixture
+            .engine
+            .stop_capture()
+            .map_err(|error| error.to_string())?;
+        Ok(vec![
+            assertion(
+                "context_assembler_loaded_only_selected_sources",
+                expected_classes && excluded_ambient,
+                format!("items={}", card.evidence().len()),
+            ),
+            assertion(
+                "context_card_entered_real_evidence_window",
+                first_request_grounded,
+                format!("context_items={}", first_request.window.context.len()),
+            ),
+            assertion(
+                "mutated_context_failed_before_publication",
+                stale_failures.len() == 1 && stale_publications.is_empty(),
+                format!(
+                    "failures={} publications={}",
+                    stale_failures.len(),
+                    stale_publications.len()
+                ),
+            ),
+            assertion(
+                "refreshed_context_recovered_and_published",
+                publications.len() == 1,
+                format!("publications={}", publications.len()),
+            ),
+        ])
+    })
+}
+
 fn teardown_rejects_late_completion() -> EvalScenario {
     scenario("teardown_rejects_late_completion", 0, || {
         let mut fixture = fixture(true, 4)?;
@@ -1113,6 +1382,8 @@ fn run_once() -> Vec<EvalScenario> {
         foreground_preempts_stale_background(),
         steerable_foreground_reuses_active_turn(),
         evidence_bounds_are_enforced(),
+        transcript_jsonl_adapter_replay(),
+        context_card_mutation_and_recovery(),
         teardown_rejects_late_completion(),
     ]
 }
@@ -1158,6 +1429,8 @@ pub fn run_live_sidekick_engine_eval() -> LiveSidekickEngineEvalReport {
         coverage: EvalCoverage {
             production_engine: true,
             production_reducer: true,
+            production_transcript_jsonl_adapter: true,
+            production_context_card_adapter: true,
             production_evidence_window: true,
             production_publication_gate: true,
             production_verification_gate: true,
@@ -1172,4 +1445,249 @@ pub fn run_live_sidekick_engine_eval() -> LiveSidekickEngineEvalReport {
         },
         scenarios,
     }
+}
+
+#[cfg(feature = "whisper")]
+fn normalized_words(value: &str) -> Vec<String> {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character.is_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(feature = "whisper")]
+fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
+    let reference = normalized_words(reference);
+    let hypothesis = normalized_words(hypothesis);
+    if reference.is_empty() {
+        return f64::from(!hypothesis.is_empty());
+    }
+    let mut previous = (0..=hypothesis.len()).collect::<Vec<_>>();
+    let mut current = vec![0; hypothesis.len() + 1];
+    for (reference_index, reference_word) in reference.iter().enumerate() {
+        current[0] = reference_index + 1;
+        for (hypothesis_index, hypothesis_word) in hypothesis.iter().enumerate() {
+            let substitution =
+                previous[hypothesis_index] + usize::from(reference_word != hypothesis_word);
+            let insertion = current[hypothesis_index] + 1;
+            let deletion = previous[hypothesis_index + 1] + 1;
+            current[hypothesis_index + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[hypothesis.len()] as f64 / reference.len() as f64
+}
+
+#[cfg(feature = "whisper")]
+fn sha256_file(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Exercise a committed spoken-audio fixture through production batch ASR,
+/// the production live-transcript adapter, and the real Sidekick engine.
+///
+/// This intentionally does not claim microphone, streaming ASR, or
+/// diarization coverage. Those remain native acceptance lanes.
+#[cfg(feature = "whisper")]
+pub fn run_live_sidekick_media_eval(
+    audio_path: &std::path::Path,
+    reference_text: &str,
+    model_dir: &std::path::Path,
+    model: &str,
+) -> Result<LiveSidekickMediaEvalReport, String> {
+    use chrono::{Local, TimeZone};
+    use minutes_core::live_transcript_contract::TranscriptLine;
+    use std::time::Instant;
+
+    let audio_bytes = std::fs::read(audio_path).map_err(|error| error.to_string())?;
+    let model_path = model_dir.join(format!("ggml-{model}.bin"));
+    if !model_path.is_file() {
+        return Err(format!(
+            "required local ASR model {} is unavailable",
+            model_path.display()
+        ));
+    }
+    let model_sha256 = sha256_file(&model_path).map_err(|error| {
+        format!(
+            "could not hash required local ASR model {}: {error}",
+            model_path.display()
+        )
+    })?;
+    let fixture_sha256 = format!("{:x}", Sha256::digest(&audio_bytes));
+
+    let mut config = Config::default();
+    config.transcription.engine = "whisper".into();
+    config.transcription.model = model.to_owned();
+    config.transcription.model_path = model_dir.to_path_buf();
+    config.transcription.language = Some("en".into());
+    config.transcription.noise_reduction = false;
+    config.transcription.min_words = 1;
+
+    let started = Instant::now();
+    let transcription = minutes_core::transcribe::transcribe_meeting(audio_path, &config)
+        .map_err(|error| error.to_string())?;
+    let asr_elapsed_ms = started.elapsed().as_millis() as u64;
+    let transcript_segments = transcription.segments.len();
+    let adapter_transcript = transcription
+        .segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let transcript_sha256 = format!("{:x}", Sha256::digest(adapter_transcript.as_bytes()));
+    let transcript_words = normalized_words(&adapter_transcript).len();
+    let word_error_rate = word_error_rate(reference_text, &adapter_transcript);
+
+    let fixed_start = Local
+        .with_ymd_and_hms(2026, 7, 24, 12, 0, 0)
+        .single()
+        .ok_or_else(|| "fixed transcript timestamp is invalid".to_string())?;
+    let mut jsonl = Vec::new();
+    for (index, segment) in transcription.segments.iter().enumerate() {
+        let line = TranscriptLine {
+            line: index + 1,
+            ts: fixed_start,
+            offset_ms: (segment.start * 1_000.0).round() as u64,
+            duration_ms: ((segment.end - segment.start).max(0.0) * 1_000.0).round() as u64,
+            text: segment.text.clone(),
+            speaker: None,
+        };
+        serde_json::to_writer(&mut jsonl, &line).map_err(|error| error.to_string())?;
+        jsonl.push(b'\n');
+    }
+
+    let mut sidekick = fixture(true, transcript_segments.max(4))?;
+    let mut cursor = 0;
+    let adapter = observe_transcript_jsonl_from_bytes(
+        &mut sidekick.engine,
+        &mut cursor,
+        &jsonl,
+        "media-line-",
+    )
+    .map_err(|error| error.to_string())?;
+    sidekick
+        .engine
+        .send_user("Use the current prerecorded-audio evidence.")
+        .map_err(|error| error.to_string())?;
+    let request = sidekick
+        .strategist
+        .requests()
+        .first()
+        .cloned()
+        .ok_or_else(|| "media-backed generation request missing".to_string())?;
+    let accepted_ids = adapter
+        .accepted_evidence_ids
+        .iter()
+        .map(EvidenceId::as_str)
+        .collect::<Vec<_>>();
+    let grounded_window = request.window.transcript.len() == adapter.new_items
+        && request
+            .window
+            .transcript
+            .iter()
+            .all(|item| accepted_ids.contains(&item.evidence_id.as_str()));
+    let grounding_id = accepted_ids
+        .last()
+        .copied()
+        .ok_or_else(|| "production ASR produced no adapter evidence".to_string())?;
+    sidekick.strategist.complete_candidate(
+        0,
+        candidate(
+            "The prerecorded meeting evidence reached the bounded strategy window.",
+            &[grounding_id],
+            &[],
+        ),
+    )?;
+    sidekick.engine.pump();
+    sidekick.verifier.complete_verdict(0, allow_verdict())?;
+    let publications = sidekick.engine.take_publications();
+    sidekick
+        .engine
+        .stop_capture()
+        .map_err(|error| error.to_string())?;
+
+    let corrupt = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    std::fs::write(corrupt.path(), b"not a valid wave file").map_err(|error| error.to_string())?;
+    let corrupt_rejected =
+        minutes_core::transcribe::transcribe_meeting(corrupt.path(), &config).is_err();
+
+    let assertions = vec![
+        assertion(
+            "committed_spoken_fixture_transcribed",
+            transcript_words >= 12 && transcript_segments > 0,
+            format!("words={transcript_words} segments={transcript_segments}"),
+        ),
+        assertion(
+            "asr_quality_within_fixture_bound",
+            word_error_rate <= 0.50,
+            format!("wer={word_error_rate:.3}"),
+        ),
+        assertion(
+            "asr_segments_crossed_production_jsonl_adapter",
+            adapter.new_items == transcript_segments && cursor == transcript_segments,
+            format!("items={} cursor={cursor}", adapter.new_items),
+        ),
+        assertion(
+            "media_evidence_reached_bounded_reasoning_window",
+            grounded_window,
+            format!("window_items={}", request.window.transcript.len()),
+        ),
+        assertion(
+            "media_grounded_candidate_passed_publication_gate",
+            publications.len() == 1,
+            format!("publications={}", publications.len()),
+        ),
+        assertion(
+            "corrupt_media_failed_closed",
+            corrupt_rejected,
+            format!("rejected={corrupt_rejected}"),
+        ),
+    ];
+    let passed = assertions.iter().all(|assertion| assertion.passed);
+
+    Ok(LiveSidekickMediaEvalReport {
+        schema_version: "1",
+        passed,
+        fixture_sha256,
+        model_sha256,
+        transcript_sha256,
+        asr_backend: "whisper",
+        asr_model: model.to_owned(),
+        asr_elapsed_ms,
+        audio_duration_ms: (transcription.stats.audio_duration_secs * 1_000.0).round() as u64,
+        transcript_words,
+        transcript_segments,
+        word_error_rate,
+        adapter_items: adapter.new_items,
+        assertions,
+        production_batch_asr: true,
+        production_transcript_jsonl_adapter: true,
+        production_sidekick_engine: true,
+        native_microphone_capture: false,
+        native_live_asr: false,
+        native_diarization: false,
+        release_ready_from_this_report_alone: false,
+    })
 }

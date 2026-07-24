@@ -117,6 +117,10 @@ pub mod dictation;
 #[cfg(all(feature = "streaming", feature = "whisper"))]
 pub mod live_transcript;
 
+// Stable JSONL evidence contract; parsing already-produced transcript lines
+// does not require linking the audio/Whisper producer.
+pub mod live_transcript_contract;
+
 // Native macOS hotkey monitoring via CGEventTap
 #[cfg(target_os = "macos")]
 pub mod hotkey_macos;

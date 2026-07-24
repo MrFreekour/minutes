@@ -106,6 +106,10 @@ insta = { version = "1", features = ["json"] }
 name = "dogfood_vad_engines"
 required-features = ["streaming", "whisper"]
 
+[[example]]
+name = "live_sidekick_media_eval"
+required-features = ["whisper"]
+
 [[test]]
 name = "integration"
 path = "../../tests/integration/pipeline_test.rs"

@@ -15958,31 +15958,14 @@ fn observe_native_sidekick_transcript_from_path(
     path: &Path,
     evidence_id_prefix: &str,
 ) -> Result<usize, String> {
-    use minutes_core::live_sidekick::{EvidenceId, ReasoningTranscriptEvidence};
-
-    let lines = minutes_core::live_transcript::read_since_line_from_path(path, *cursor)
-        .map_err(|error| format!("Could not read the live transcript: {error}"))?;
-    let mut accepted = 0;
-    for line in lines {
-        *cursor = (*cursor).max(line.line);
-        if line.text.trim().is_empty() {
-            continue;
-        }
-        if engine
-            .observe_transcript(ReasoningTranscriptEvidence {
-                evidence_id: EvidenceId::new(format!("{evidence_id_prefix}{}", line.line)),
-                text: line.text,
-                speaker_label: line.speaker,
-                speaker_verified: false,
-                offset_ms: line.offset_ms,
-                duration_ms: line.duration_ms,
-            })
-            .is_ok_and(|reduction| reduction.accepted)
-        {
-            accepted += 1;
-        }
-    }
-    Ok(accepted)
+    minutes_core::live_sidekick::observe_transcript_jsonl_from_path(
+        engine,
+        cursor,
+        path,
+        evidence_id_prefix,
+    )
+    .map(|receipt| receipt.new_items)
+    .map_err(|error| format!("Could not read the live transcript: {error}"))
 }
 
 fn observe_native_sidekick_transcript_from_bytes(
@@ -15991,31 +15974,14 @@ fn observe_native_sidekick_transcript_from_bytes(
     bytes: &[u8],
     evidence_id_prefix: &str,
 ) -> Result<usize, String> {
-    use minutes_core::live_sidekick::{EvidenceId, ReasoningTranscriptEvidence};
-
-    let lines = minutes_core::live_transcript::read_since_line_from_bytes(bytes, *cursor)
-        .map_err(|error| format!("Could not parse the verified transcript bytes: {error}"))?;
-    let mut accepted = 0;
-    for line in lines {
-        *cursor = (*cursor).max(line.line);
-        if line.text.trim().is_empty() {
-            continue;
-        }
-        if engine
-            .observe_transcript(ReasoningTranscriptEvidence {
-                evidence_id: EvidenceId::new(format!("{evidence_id_prefix}{}", line.line)),
-                text: line.text,
-                speaker_label: line.speaker,
-                speaker_verified: false,
-                offset_ms: line.offset_ms,
-                duration_ms: line.duration_ms,
-            })
-            .is_ok_and(|reduction| reduction.accepted)
-        {
-            accepted += 1;
-        }
-    }
-    Ok(accepted)
+    minutes_core::live_sidekick::observe_transcript_jsonl_from_bytes(
+        engine,
+        cursor,
+        bytes,
+        evidence_id_prefix,
+    )
+    .map(|receipt| receipt.new_items)
+    .map_err(|error| format!("Could not parse the verified transcript bytes: {error}"))
 }
 
 #[cfg(unix)]
