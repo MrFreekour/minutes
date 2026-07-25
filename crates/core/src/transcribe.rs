@@ -1485,15 +1485,23 @@ fn load_audio_samples_with_format(
             // whisper transcribes correctly across all languages. Symphonia's AAC
             // decoder produces subtly different samples that trigger hallucination
             // loops on non-English audio (confirmed in issue #21).
+            // Record which decoder actually ran, not which one was preferred.
+            // Attributing a bounded-worker decode to ffmpeg would misdirect
+            // issue-#21-class quality reports in support traces.
+            let planned = if crate::ffmpeg::resolve_launchable_ffmpeg().is_ok() {
+                "ffmpeg"
+            } else {
+                "bounded-worker"
+            };
             crate::process_trace::stage_with_extra(
                 "decode.start",
-                serde_json::json!({"decoder": "ffmpeg"}),
+                serde_json::json!({"decoder": planned}),
             );
             let samples = decode_with_ffmpeg(path, config)?;
             crate::process_trace::update_audio(samples.len());
             crate::process_trace::stage_with_extra(
                 "decode.done",
-                serde_json::json!({"decoder": "ffmpeg"}),
+                serde_json::json!({"decoder": planned}),
             );
             samples
         }
@@ -1710,21 +1718,48 @@ fn push_pcm_s16le_sample(
 /// This matches exactly what whisper-cli does and produces samples that
 /// whisper transcribes correctly across all languages.
 ///
-/// Returns an error if ffmpeg is not installed and the bounded decode worker is
-/// disabled or also fails. There is still deliberately no *in-process*
-/// compressed-container fallback: Symphonia 0.5.5 can allocate
+/// Returns an error only when ffmpeg cannot decode the input *and* the bounded
+/// decode worker is disabled or also fails. There is still deliberately no
+/// *in-process* compressed-container fallback: Symphonia 0.5.5 can allocate
 /// attacker-declared tables before resource limits run. The fallback below runs
-/// Symphonia only in a child whose `RLIMIT_AS` is installed in `pre_exec`, so
-/// the ceiling binds before the decoder probes the container.
+/// Symphonia only inside a child whose address-space ceiling is installed before
+/// the decoder reads a byte.
+///
+/// The fallback covers a broken ffmpeg as well as a missing one, matching
+/// upstream. A resolvable-but-unusable ffmpeg is a common real state, for
+/// instance after an upgrade leaves a dangling dylib, and gating the fallback on
+/// resolution alone left those users with a hard failure.
 fn decode_with_ffmpeg(path: &Path, config: &Config) -> Result<Vec<f32>, TranscribeError> {
-    let unavailable = match crate::ffmpeg::resolve_ffmpeg() {
+    // resolve_launchable_ffmpeg proves the binary actually starts, matching what
+    // the watcher and desktop preflights ask. resolve_ffmpeg alone accepted
+    // images that fail at decode time, so the two surfaces disagreed.
+    let unavailable = match crate::ffmpeg::resolve_launchable_ffmpeg() {
         Ok(ffmpeg) => {
-            return decode_with_ffmpeg_binary(
+            match decode_with_ffmpeg_binary(
                 path,
                 &ffmpeg,
                 crate::audio_budget::MAX_CANONICAL_SAMPLES,
                 crate::audio_budget::AUDIO_DECODE_DEADLINE,
-            );
+            ) {
+                Ok(samples) => return Ok(samples),
+                Err(error) => {
+                    if !crate::audio_decode_worker::bounded_decode_fallback_enabled(config) {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        source = %crate::pipeline::private_audio_diagnostic_label(path),
+                        "ffmpeg resolved but failed to decode this import; retrying in the \
+                         bounded decode worker: {error}"
+                    );
+                    // Keep ffmpeg's diagnosis when the retry also fails.
+                    // Reporting only the fallback's error would discard the
+                    // reason the preferred decoder rejected the file, which is
+                    // usually the more actionable of the two.
+                    return decode_with_bounded_worker(path).map_err(|fallback| {
+                        TranscribeError::UnsupportedFormat(format!("{error}; {fallback}"))
+                    });
+                }
+            }
         }
         Err(error) => error,
     };
@@ -1739,6 +1774,17 @@ fn decode_with_ffmpeg(path: &Path, config: &Config) -> Result<Vec<f32>, Transcri
          Install ffmpeg for the higher-fidelity decode (issue #21)"
     );
     decode_with_bounded_worker(path)
+}
+
+/// Exercise the real compressed-decode entry point from another module's
+/// tests, so the fallback is covered end to end rather than only at the
+/// worker's internal boundary.
+#[cfg(test)]
+pub(crate) fn decode_compressed_for_test(
+    path: &Path,
+    config: &Config,
+) -> Result<Vec<f32>, TranscribeError> {
+    decode_with_ffmpeg(path, config)
 }
 
 /// Decode a compressed import in the bounded Symphonia worker.

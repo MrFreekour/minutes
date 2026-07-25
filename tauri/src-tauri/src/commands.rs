@@ -5443,10 +5443,12 @@ fn recovery_regular_file_metadata(path: &Path) -> Result<Option<std::fs::Metadat
 }
 
 fn scan_recovery_items(config: &Config) -> Result<Vec<RecoveryItem>, String> {
-    scan_recovery_items_with_ffmpeg_availability(
-        config,
-        minutes_core::ffmpeg::resolve_launchable_ffmpeg().is_ok(),
-    )
+    // "Can we decode" rather than "is ffmpeg installed": the bounded decode
+    // worker covers the same containers, so flagging these items as blocked on
+    // ffmpeg told users to install something they do not need.
+    let decodable = minutes_core::ffmpeg::resolve_launchable_ffmpeg().is_ok()
+        || minutes_core::audio_decode_worker::bounded_decode_fallback_available(config);
+    scan_recovery_items_with_ffmpeg_availability(config, decodable)
 }
 
 fn scan_recovery_items_with_ffmpeg_availability(
@@ -7885,18 +7887,19 @@ fn recovery_retry_mode(retry_type: &str) -> Result<CaptureMode, String> {
     }
 }
 
-fn recovery_retry_decoder_preflight(audio_path: &Path) -> Result<(), String> {
-    if minutes_core::watch::compressed_audio_requires_ffmpeg(audio_path) {
-        minutes_core::ffmpeg::resolve_launchable_ffmpeg().map_err(|error| {
-            format!(
-                "{} The original file remains preserved at {}. Decoder check: {}",
-                minutes_core::watch::compressed_audio_ffmpeg_guidance(),
-                audio_path.display(),
-                error
-            )
-        })?;
+fn recovery_retry_decoder_preflight(audio_path: &Path, config: &Config) -> Result<(), String> {
+    // Ask whether the file is decodable at all, not whether ffmpeg exists. The
+    // bounded decode worker handles these containers when ffmpeg is missing, so
+    // gating on ffmpeg alone made Recovery Center refuse retries that the
+    // pipeline could complete.
+    if minutes_core::watch::compressed_audio_decodable(audio_path, config) {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "{} The original file remains preserved at {}.",
+        minutes_core::watch::compressed_audio_ffmpeg_guidance(),
+        audio_path.display()
+    ))
 }
 
 fn watch_root_owns_file(audio_path: &Path, config: &Config) -> Result<bool, String> {
@@ -8123,7 +8126,7 @@ pub fn cmd_retry_recovery(
             ))
         }
     };
-    recovery_retry_decoder_preflight(&audio_path)?;
+    recovery_retry_decoder_preflight(&audio_path, &config)?;
 
     // Run pipeline on a background thread so the UI stays responsive
     let processing = state.processing.clone();
@@ -15623,17 +15626,35 @@ mod tests {
             assert!(items[0].detail.contains("brew install ffmpeg"));
             assert!(items[0].detail.contains("failed directory"));
             assert_eq!(PathBuf::from(&items[0].path), failed_watch);
+            // With no ffmpeg and the bounded decode worker refused by config,
+            // there is genuinely no decoder, so Recovery must stay open.
+            let refused = Config {
+                transcription: minutes_core::config::TranscriptionConfig {
+                    compressed_decode_fallback: false,
+                    ..Config::default().transcription
+                },
+                ..config.clone()
+            };
             let previous_ffmpeg = std::env::var_os("MINUTES_FFMPEG");
             std::env::set_var("MINUTES_FFMPEG", home.join("missing-ffmpeg"));
-            let preflight = recovery_retry_decoder_preflight(&failed_watch);
+            let blocked = recovery_retry_decoder_preflight(&failed_watch, &refused);
+            // With the fallback left at its default, the same file is
+            // retryable: the bounded worker decodes it without ffmpeg. Gating
+            // this on ffmpeg alone is what made Recovery refuse work the
+            // pipeline could finish.
+            let allowed = recovery_retry_decoder_preflight(&failed_watch, &config);
             if let Some(previous) = previous_ffmpeg {
                 std::env::set_var("MINUTES_FFMPEG", previous);
             } else {
                 std::env::remove_var("MINUTES_FFMPEG");
             }
-            let error = preflight.expect_err("missing ffmpeg must keep Recovery open");
+            let error = blocked.expect_err("no usable decoder must keep Recovery open");
             assert!(error.contains("brew install ffmpeg"));
             assert!(error.contains(&failed_watch.display().to_string()));
+            assert!(
+                allowed.is_ok(),
+                "bounded decode fallback must make a compressed retry admissible: {allowed:?}"
+            );
             assert!(failed_watch.exists());
         });
     }

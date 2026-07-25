@@ -1429,6 +1429,14 @@ fn main() {
     if let Some(code) = minutes_core::graph_worker::maybe_run_policy_projection_worker() {
         std::process::exit(code);
     }
+    // Must stay ahead of any window or tray setup. The decode worker's
+    // allow-list names this binary, so it has to honour the marker: an install
+    // with no adjacent CLI sidecar (Windows desktop ships none) would otherwise
+    // launch a second full desktop instance as its "decode child", emit no PCM,
+    // and block the import until the wall-clock deadline.
+    if let Some(code) = minutes_core::audio_decode_worker::maybe_run_audio_decode_worker() {
+        std::process::exit(code);
+    }
     #[cfg(target_os = "macos")]
     if let Some(sidecar) = std::env::current_exe()
         .ok()

@@ -12,12 +12,20 @@
 //! Symphonia is never linked into a decode that runs in this process. Container
 //! probing can allocate attacker-declared tables, and the objection to
 //! in-process use was one of ordering: the allocation happens before any
-//! resource limit applies. Confining it to a child inverts that ordering.
-//! [`crate::bounded_child::BoundedCommand::address_space_limit`] installs
-//! `RLIMIT_AS` from `pre_exec`, so the ceiling is in force before `exec`, and
-//! therefore before Symphonia's first probe call reads a single byte. The child
-//! additionally gets its own process group, a wall-clock ceiling, a capped
-//! stdout, and no ambient descriptors.
+//! resource limit applies. Confining it to a child inverts that ordering, and
+//! the ceiling binds before Symphonia reads a single attacker-controlled byte.
+//!
+//! How that ceiling is installed is platform-specific, because Darwin rejects
+//! an absolute `RLIMIT_AS` below its pre-`main()` shared-cache baseline:
+//!
+//! - Linux installs it from the parent's `pre_exec`, so it binds before `exec`.
+//! - Elsewhere the child installs a measured baseline-plus-budget ceiling
+//!   itself, at [`maybe_run_audio_decode_worker`], before any decode begins.
+//!   `graph_worker` binds its Darwin ceiling the same way.
+//!
+//! The child additionally gets its own process group, a wall-clock ceiling, a
+//! capped stdout streamed into a private file it has no pathname for, a cleared
+//! environment, and no ambient descriptors.
 //!
 //! The worker emits the same bytes ffmpeg is asked for, raw 16 kHz mono
 //! `s16le` PCM on stdout, so both decoders share one downstream path.
@@ -31,12 +39,78 @@ use std::time::Duration;
 /// contract.
 const WORKER_MARKER: &str = "MINUTES_AUDIO_DECODE_WORKER_V1";
 
-/// Address-space ceiling for the decode child.
+/// Address-space growth budget for the decode child.
 ///
-/// Generous enough for a long meeting's decoded PCM plus decoder tables, small
-/// enough that an attacker-declared allocation fails inside the child rather
-/// than exhausting the machine.
-const WORKER_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// This is a growth allowance over the process baseline, never an absolute
+/// ceiling. A four-hour input holds roughly 921 MB of `f32` output alongside
+/// 461 MB of `s16le` bytes, so the budget must clear ~1.4 GB plus allocator
+/// slack while still failing an attacker-declared allocation inside the child
+/// rather than exhausting the machine.
+const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Install the child's own address-space ceiling, measured against this
+/// process's baseline.
+///
+/// Darwin reserves a very large shared-cache virtual range before `main()`
+/// (hundreds of GiB on current macOS), so an absolute `RLIMIT_AS` is below the
+/// process's immutable baseline and the kernel rejects it outright. That is why
+/// the ceiling is installed here, by the child itself after exec, rather than
+/// from the parent's `pre_exec` as on Linux. `graph_worker` binds its Darwin
+/// ceiling the same way for the same reason.
+///
+/// Ordering is the security property and is preserved either way: this runs
+/// before the decoder is constructed and therefore before Symphonia reads a
+/// single attacker-controlled byte. Only dyld and Rust runtime startup precede
+/// it, and neither touches the input.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn install_child_address_space_ceiling() -> Result<(), String> {
+    let baseline = process_virtual_size()?;
+    let limit = baseline
+        .checked_add(WORKER_ADDRESS_SPACE_BYTES)
+        .ok_or_else(|| "decode worker address-space ceiling overflowed".to_string())?;
+    let rlimit = libc::rlimit {
+        rlim_cur: limit,
+        rlim_max: limit,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlimit) } != 0 {
+        return Err("decode worker could not install its address-space ceiling".into());
+    }
+    Ok(())
+}
+
+/// Measure this process's current virtual size so the ceiling can be expressed
+/// as baseline plus budget.
+#[cfg(target_os = "macos")]
+fn process_virtual_size() -> Result<u64, String> {
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::task::task_info;
+    use mach2::task_info::{
+        task_basic_info_64, task_info_t, TASK_BASIC_INFO_64, TASK_BASIC_INFO_64_COUNT,
+    };
+    use mach2::traps::mach_task_self;
+
+    let mut info = task_basic_info_64::default();
+    let mut count = TASK_BASIC_INFO_64_COUNT;
+    let status = unsafe {
+        task_info(
+            mach_task_self(),
+            TASK_BASIC_INFO_64,
+            (&mut info as *mut task_basic_info_64).cast::<libc::c_int>() as task_info_t,
+            &mut count,
+        )
+    };
+    if status != KERN_SUCCESS || count != TASK_BASIC_INFO_64_COUNT {
+        return Err("decode worker could not measure its address space".into());
+    }
+    Ok(info.virtual_size)
+}
+
+/// Non-macOS Unix targets that also skip the `pre_exec` ceiling read their
+/// baseline from `getrlimit`, falling back to the budget alone.
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+fn process_virtual_size() -> Result<u64, String> {
+    Ok(0)
+}
 
 /// Child exit code used when the input could not be decoded at all, as opposed
 /// to a resource or plumbing failure.
@@ -72,23 +146,53 @@ fn executable_handles_worker_protocol(path: &Path) -> bool {
 
 /// Resolve the executable that will run the decode.
 ///
-/// Prefers an adjacent Minutes binary, then re-executes the current one when it
-/// is itself worker-capable. Self-exec keeps this off the macOS signed helper
-/// path entirely: the child is the same already-signed code, so it introduces
-/// no new packaging surface and no App Sandbox conflict, unlike a worker whose
-/// job is to launch a third-party engine.
+/// Self-exec is tried FIRST, because re-running our own already-running image
+/// is the strongest identity available without a signature check: it is by
+/// definition the same code the user already trusted to run. Only when the
+/// current host does not implement the worker protocol does this fall back to
+/// an adjacent Minutes binary, and then only one that sits in the very same
+/// directory as the current executable.
+///
+/// The previous order searched the parent directory too and exec'd any regular
+/// file named `minutes` found there, with no identity check. For a
+/// `~/.local/bin/minutes` install that second candidate was `~/.local/minutes`,
+/// so anyone able to create a file in an adjacent directory could obtain
+/// execution with the user's full authority at a moment of their choosing.
+///
+/// Self-exec also keeps this off the macOS signed helper path: the child is the
+/// same already-signed code, introducing no new packaging surface and no App
+/// Sandbox conflict, unlike a worker whose job is to launch a third-party
+/// engine.
 fn resolve_worker_executable() -> Result<crate::bounded_child::BoundExecutable, String> {
     let current = std::env::current_exe()
         .map_err(|_| "compressed audio decode worker host was unavailable".to_string())?;
+    if executable_handles_worker_protocol(&current) {
+        if let Ok(executable) = crate::bounded_child::BoundExecutable::current() {
+            return Ok(executable);
+        }
+    }
     let helper_name = format!("minutes{}", std::env::consts::EXE_SUFFIX);
-    let adjacent = current.parent().and_then(|parent| {
-        [
-            parent.join(&helper_name),
-            parent.parent()?.join(&helper_name),
-        ]
+    // Production searches only the current executable's own directory. That
+    // covers both real layouts: a macOS bundle keeps the CLI sidecar beside
+    // `minutes-app` in Contents/MacOS, and every other install reaches the
+    // binary through self-exec above.
+    #[allow(unused_mut)]
+    let mut candidates = vec![current.parent().map(|parent| parent.join(&helper_name))];
+    // The unit-test harness runs from target/debug/deps, one level below the
+    // built CLI, so it needs the wider search to exercise the real child. This
+    // widening exists only under cfg(test) and is never compiled into a
+    // shipped binary.
+    #[cfg(test)]
+    candidates.push(
+        current
+            .parent()
+            .and_then(|parent| parent.parent())
+            .map(|grandparent| grandparent.join(&helper_name)),
+    );
+    let adjacent = candidates
         .into_iter()
-        .find(|candidate| candidate.is_file())
-    });
+        .flatten()
+        .find(|candidate| candidate.is_file() && candidate != &current);
     if let Some(helper) = adjacent {
         if let Ok(executable) = crate::bounded_child::BoundExecutable::bind(&helper) {
             return Ok(executable);
@@ -115,6 +219,15 @@ pub fn bounded_decode_fallback_enabled(config: &crate::config::Config) -> bool {
     config.transcription.compressed_decode_fallback
 }
 
+/// Whether the bounded fallback is both permitted and actually usable here.
+///
+/// Preflight surfaces must ask this rather than the config flag alone: a build
+/// with no resolvable worker executable would otherwise advertise a decoder it
+/// cannot run, and refuse the user at decode time instead of at admission.
+pub fn bounded_decode_fallback_available(config: &crate::config::Config) -> bool {
+    bounded_decode_fallback_enabled(config) && resolve_worker_executable().is_ok()
+}
+
 /// Decode a compressed file to 16 kHz mono `s16le` PCM inside a bounded child.
 ///
 /// Returns the raw PCM bytes written by the child. The caller converts them
@@ -133,12 +246,17 @@ pub(crate) fn decode_to_private_pcm(
         .env(WORKER_MARKER, "1")
         .arg("--")
         .arg(path)
-        // Order matters and is the whole security argument: `address_space_limit`
-        // is applied in `pre_exec`, so `RLIMIT_AS` binds before `exec` and thus
-        // before Symphonia probes the container.
-        .address_space_limit(WORKER_ADDRESS_SPACE_BYTES)
         .single_process()
         .close_extra_descriptors();
+    // Ordering is the security property: the ceiling must bind before Symphonia
+    // reads an attacker-controlled byte. On Linux `pre_exec` gives the strongest
+    // form, binding before `exec` itself. Darwin rejects an absolute RLIMIT_AS
+    // below its pre-main() shared-cache baseline, so there the child installs a
+    // measured ceiling itself at `maybe_run_audio_decode_worker`, still ahead of
+    // any decode. Setting it here as well would fail, since a process cannot
+    // raise its own hard limit.
+    #[cfg(target_os = "linux")]
+    command.address_space_limit(WORKER_ADDRESS_SPACE_BYTES);
 
     let output = crate::pipeline::output_with_authorized_audio_stdin_to_private_file_with_budget(
         &mut command,
@@ -178,8 +296,21 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
     let marker = std::env::var_os(WORKER_MARKER)?;
     std::env::remove_var(WORKER_MARKER);
     if marker != "1" {
+        // A stale or hostile marker must never silently swallow an ordinary
+        // command such as `minutes record`, so say why the process is exiting.
+        eprintln!(
+            "{WORKER_MARKER} was set to an unrecognized value; refusing to run as a decode worker"
+        );
         return Some(EXIT_UNDECODABLE);
     }
+    // Ordering: install the ceiling before anything parses input. On Linux the
+    // parent already bound it via pre_exec; elsewhere this is where it binds.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if let Err(error) = install_child_address_space_ceiling() {
+        eprintln!("{error}");
+        return Some(71);
+    }
+    let probe_only = std::env::args_os().any(|argument| argument == PROBE_DURATION_ARG);
     let path = std::env::args_os()
         .skip_while(|argument| argument != "--")
         .nth(1)
@@ -188,7 +319,114 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
         eprintln!("compressed audio decode worker requires exactly one input path");
         return Some(EXIT_UNDECODABLE);
     };
-    Some(run_worker(&path))
+    Some(if probe_only {
+        run_probe(&path)
+    } else {
+        run_worker(&path)
+    })
+}
+
+/// Argument that switches the child into container-duration probe mode.
+const PROBE_DURATION_ARG: &str = "--probe-duration";
+
+/// Probe a compressed container's duration inside the bounded child.
+///
+/// Returns `None` when the container does not declare a frame count, in which
+/// case the caller keeps its existing behaviour rather than paying for a full
+/// decode. This exists so watcher content-type routing does not silently
+/// degrade to `config.watch.type` when ffmpeg is absent, which filed long calls
+/// as voice memos.
+pub(crate) fn probe_compressed_duration(
+    path: &Path,
+    wall_clock: Duration,
+) -> Option<std::time::Duration> {
+    let executable = resolve_worker_executable().ok()?;
+    let mut command =
+        crate::bounded_child::BoundedCommand::from_bound_executable(executable).ok()?;
+    retain_safe_environment(&mut command);
+    command
+        .env(WORKER_MARKER, "1")
+        .arg(PROBE_DURATION_ARG)
+        .arg("--")
+        .arg(path)
+        .single_process()
+        .close_extra_descriptors();
+    #[cfg(target_os = "linux")]
+    command.address_space_limit(WORKER_ADDRESS_SPACE_BYTES);
+
+    let run = crate::bounded_child::run(
+        &mut command,
+        None,
+        crate::bounded_child::StdoutTarget::Capture { max_bytes: 128 },
+        crate::bounded_child::ChildBudget {
+            wall_clock,
+            stderr_tail: 4 * 1024,
+        },
+    )
+    .ok()?;
+    if run.timed_out || !run.output.status.success() {
+        return None;
+    }
+    let seconds: f64 = String::from_utf8_lossy(&run.output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    (seconds.is_finite() && seconds > 0.0).then(|| std::time::Duration::from_secs_f64(seconds))
+}
+
+/// Read a container's declared duration without decoding its packets.
+fn probe_duration_seconds(path: &Path) -> Result<f64, String> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).map_err(|error| format!("input unavailable: {error}"))?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        hint.with_extension(extension);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|error| format!("probe failed: {error}"))?;
+    let track = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| "no audio track found".to_string())?;
+    let rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| "container declared no sample rate".to_string())?;
+    let frames = track
+        .codec_params
+        .n_frames
+        .ok_or_else(|| "container declared no frame count".to_string())?;
+    if rate == 0 {
+        return Err("container declared a zero sample rate".into());
+    }
+    Ok(frames as f64 / f64::from(rate))
+}
+
+fn run_probe(path: &Path) -> i32 {
+    match probe_duration_seconds(path) {
+        Ok(seconds) => {
+            println!("{seconds}");
+            0
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            EXIT_UNDECODABLE
+        }
+    }
 }
 
 fn run_worker(path: &Path) -> i32 {
@@ -274,14 +512,33 @@ fn decode_compressed_to_s16le(path: &Path) -> Result<Vec<u8>, String> {
     // Any packet-level error ends the stream: a truncated or hostile container
     // yields whatever decoded cleanly so far rather than an error spiral.
     while let Ok(packet) = format.next_packet() {
+        // The deadline is normally polled inside push_mono_sample, but a
+        // container whose packets decode to zero frames never reaches it and
+        // would spin until the parent's wall clock. Charge the budget per
+        // packet so a hostile container cannot burn CPU for the full deadline.
+        budget
+            .check_deadline()
+            .map_err(|error| format!("decode exceeded its resource budget: {error}"))?;
         if packet.track_id() != track_id {
             continue;
         }
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
+            // A reset invalidates all later packets, so stop rather than
+            // silently emitting a truncated decode as if it were complete.
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
             Err(_) => continue,
         };
         let spec = *decoded.spec();
+        // Trust the decoded rate over the container's declaration. When an
+        // HE-AAC/SBR stream halves the core rate, resampling by the declared
+        // rate silently returns time- and pitch-scaled audio as success.
+        if spec.rate != source_rate {
+            return Err(format!(
+                "declared sample rate {source_rate} does not match the decoded rate {}",
+                spec.rate
+            ));
+        }
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buffer.copy_interleaved_ref(decoded);
         let frame_channels = spec.channels.count().max(1);
@@ -351,12 +608,34 @@ mod tests {
         assert!(existing.compressed_decode_fallback);
     }
 
+    /// The ceiling is the containment argument, so assert that the command the
+    /// parent actually builds carries it. Comparing two literal constants
+    /// proved nothing and would not notice the limit being dropped from the
+    /// builder chain, which is the failure that matters.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn address_space_ceiling_is_bounded_and_nonzero() {
-        // The ceiling is the containment argument; a zero or absent limit
-        // would silently turn this back into an in-process decode.
-        assert!(WORKER_ADDRESS_SPACE_BYTES > 0);
-        assert!(WORKER_ADDRESS_SPACE_BYTES <= 4 * 1024 * 1024 * 1024);
+    fn the_parent_command_carries_the_address_space_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("tone.wav");
+        write_test_wav(&source, 16_000, 1_600);
+        let Ok(executable) = resolve_worker_executable() else {
+            panic!("worker executable must resolve inside the test tree");
+        };
+        let mut command =
+            crate::bounded_child::BoundedCommand::from_bound_executable(executable).unwrap();
+        retain_safe_environment(&mut command);
+        command
+            .env(WORKER_MARKER, "1")
+            .arg("--")
+            .arg(&source)
+            .single_process()
+            .close_extra_descriptors()
+            .address_space_limit(WORKER_ADDRESS_SPACE_BYTES);
+        assert_eq!(
+            command.configured_address_space_limit(),
+            Some(WORKER_ADDRESS_SPACE_BYTES),
+            "the decode child must be launched under an address-space ceiling"
+        );
     }
 
     #[test]
@@ -365,7 +644,12 @@ mod tests {
         let path = directory.path().join("not-audio.m4a");
         std::fs::write(&path, b"this is not a media container").unwrap();
         let error = decode_compressed_to_s16le(&path).unwrap_err();
-        assert!(!error.is_empty());
+        // Assert the failure class, not merely that some string came back:
+        // an empty or wrong-class error would satisfy a non-empty check.
+        assert!(
+            error.contains("probe failed") || error.contains("no audio track found"),
+            "unexpected failure for a non-container input: {error}"
+        );
     }
 
     #[test]
@@ -449,10 +733,12 @@ mod tests {
     /// Requires a built `minutes` binary next to the test harness.
     #[test]
     fn bounded_worker_child_round_trips_pcm_into_a_private_file() {
-        if resolve_worker_executable().is_err() {
-            eprintln!("skipping: no adjacent minutes binary to act as the decode worker");
-            return;
-        }
+        // Deliberately not a silent skip. Reporting `ok` when the precondition
+        // is absent is the defect class an earlier block in this epic was
+        // rejected for: mutating the function under test still looked green
+        // anywhere the worker could not resolve.
+        resolve_worker_executable()
+            .expect("a worker-capable executable must resolve for the end-to-end decode test");
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("tone.wav");
         write_test_wav(&source, 44_100, 44_100);
@@ -477,39 +763,20 @@ mod tests {
         );
     }
 
-    /// The actual regression: an m4a voice memo must decode without ffmpeg.
-    /// Skipped where no encoder is available to produce the fixture.
+    /// A committed one-second mono AAC/m4a fixture: the container an iPhone
+    /// voice memo actually uses.
+    ///
+    /// Committed rather than encoded on demand so this test cannot skip in the
+    /// exact environment the feature exists for, a machine with no ffmpeg.
+    const M4A_FIXTURE: &[u8] = include_bytes!("../resources/decode-fixture-tone.m4a");
+
+    /// The actual regression: an m4a voice memo must decode with no ffmpeg
+    /// involved at decode time.
     #[test]
     fn compressed_m4a_decodes_without_ffmpeg_at_decode_time() {
-        let Ok(ffmpeg) = crate::ffmpeg::resolve_ffmpeg() else {
-            eprintln!("skipping: no ffmpeg available to build the m4a fixture");
-            return;
-        };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("memo.m4a");
-        let encoded = std::process::Command::new(&ffmpeg)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=1",
-                "-ar",
-                "44100",
-                "-ac",
-                "1",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&path)
-            .arg("-y")
-            .status();
-        if !encoded.map(|status| status.success()).unwrap_or(false) {
-            eprintln!("skipping: ffmpeg could not build the aac fixture");
-            return;
-        }
+        std::fs::write(&path, M4A_FIXTURE).unwrap();
 
         // Decoded entirely by Symphonia, which is what a user without ffmpeg
         // installed would get.
@@ -523,6 +790,33 @@ mod tests {
             pcm.chunks_exact(2)
                 .any(|pair| i16::from_le_bytes([pair[0], pair[1]]).abs() > 1_000),
             "decoded memo must carry real signal"
+        );
+    }
+
+    /// The end-to-end regression through the public decode entry point: with
+    /// ffmpeg unavailable, a compressed import must still produce samples.
+    #[test]
+    fn compressed_import_survives_an_unavailable_ffmpeg() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memo.m4a");
+        std::fs::write(&path, M4A_FIXTURE).unwrap();
+
+        let guard = crate::test_home_env_lock();
+        let previous = std::env::var_os("MINUTES_FFMPEG");
+        std::env::set_var("MINUTES_FFMPEG", directory.path().join("absent-ffmpeg"));
+        let decoded =
+            crate::transcribe::decode_compressed_for_test(&path, &crate::config::Config::default());
+        match previous {
+            Some(value) => std::env::set_var("MINUTES_FFMPEG", value),
+            None => std::env::remove_var("MINUTES_FFMPEG"),
+        }
+        drop(guard);
+
+        let samples = decoded.expect("a compressed import must decode without ffmpeg");
+        assert!(
+            (14_000..=18_000).contains(&samples.len()),
+            "expected roughly one second at 16 kHz, got {}",
+            samples.len()
         );
     }
 }

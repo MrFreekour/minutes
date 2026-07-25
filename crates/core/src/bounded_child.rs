@@ -23,14 +23,15 @@ pub(crate) struct BoundExecutable {
     /// exact source handle on Windows. Worker execution never trusts a later
     /// reopen of the caller-provided source bytes.
     file: std::fs::File,
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     source_path: PathBuf,
-    #[cfg(windows)]
+    #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
     bytes: u64,
-    #[cfg(windows)]
+    #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
     digest: [u8; 32],
     #[cfg(windows)]
     snapshot_owner: Arc<WindowsExecutableSnapshotOwner>,
+    #[cfg(all(unix, not(target_os = "linux")))]
+    snapshot_owner: Arc<UnixExecutableSnapshotOwner>,
 }
 
 #[cfg(windows)]
@@ -40,8 +41,15 @@ struct WindowsExecutableSnapshotOwner {
     _temp_dir: tempfile::TempDir,
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+struct UnixExecutableSnapshotOwner {
+    // Drop the no-delete chain before TempDir attempts recursive cleanup.
+    _directory_guard: crate::policy_fs::BoundRecoveryDirectory,
+    _temp_dir: tempfile::TempDir,
+}
+
 impl BoundExecutable {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn verify(&self) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -54,6 +62,38 @@ impl BoundExecutable {
         } else {
             Ok(())
         }
+    }
+
+    /// Re-verify the snapshot immediately before launch.
+    ///
+    /// Unlike Linux, this snapshot is reachable through a pathname, so mode
+    /// and digest are both re-checked here rather than relying on the inode
+    /// being unlinked. Same contract as the Windows implementation below.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn verify(&self) -> std::io::Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = self.file.try_clone()?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "worker executable snapshot was not immutable",
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let bytes = std::io::copy(&mut file, &mut hasher)?;
+        let digest: [u8; 32] = hasher.finalize().into();
+        if bytes != self.bytes || digest != self.digest {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "worker executable changed after its authority was bound",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -94,16 +134,22 @@ impl BoundExecutable {
         ))
     }
 
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn launch_path(&self) -> PathBuf {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        use std::os::fd::AsRawFd;
         #[cfg(target_os = "linux")]
-        return PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
-        #[cfg(target_os = "macos")]
-        return PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()));
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        return self.source_path.clone();
+        {
+            use std::os::fd::AsRawFd;
+            // memfd is sealed and unlinked, so descriptor execution is both
+            // possible and the strongest available binding here.
+            PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+        }
+        // Every other platform launches the snapshot through its pathname.
+        // Darwin returns ETXTBSY for descriptor execution while any writer is
+        // live, so `/dev/fd` execution is not available; `verify()` re-checks
+        // mode and digest immediately before launch instead.
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.source_path.clone()
+        }
     }
 
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -131,11 +177,11 @@ impl BoundExecutable {
         Ok(Self {
             file: self.file.try_clone()?,
             source_path: self.source_path.clone(),
-            #[cfg(windows)]
+            #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
             bytes: self.bytes,
-            #[cfg(windows)]
+            #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
             digest: self.digest,
-            #[cfg(windows)]
+            #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
             snapshot_owner: Arc::clone(&self.snapshot_owner),
         })
     }
@@ -203,22 +249,25 @@ fn bind_executable(path: &Path, allow_proc_self_image: bool) -> std::io::Result<
             ));
         }
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let file = immutable_unix_executable_snapshot(&source)?;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let (file, source_path, snapshot_owner, bytes, digest) =
+        immutable_unix_executable_snapshot(&source)?;
     #[cfg(windows)]
     let (file, source_path, snapshot_owner, bytes, digest) =
         immutable_windows_executable_snapshot(&source)?;
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, all(unix, not(target_os = "linux")))))]
     let source_path = path.to_path_buf();
 
     Ok(BoundExecutable {
         file,
         source_path,
-        #[cfg(windows)]
+        #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
         bytes,
-        #[cfg(windows)]
+        #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
         digest,
-        #[cfg(windows)]
+        #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
         snapshot_owner,
     })
 }
@@ -335,20 +384,76 @@ fn immutable_unix_executable_snapshot(source: &std::fs::File) -> std::io::Result
     Ok(snapshot)
 }
 
+/// Snapshot to a real owner-private pathname rather than an unlinked inode.
+///
+/// Darwin (and the BSDs) refuse `execve` with `ETXTBSY` on any vnode that some
+/// process still holds open for writing, so the previous unlinked-`tempfile`
+/// plus `/dev/fd/N` construction could never exec here: the retained setup
+/// handle is itself the live writer. That made this whole path dead on macOS.
+///
+/// The fix mirrors the Windows snapshot exactly, which has always exec'd a
+/// real path for the same reason: write the bytes into an owner-private
+/// directory, drop the writable handle so no live writer remains, then retain
+/// only a read handle. Immutability is preserved by mode 0500 inside a 0700
+/// directory plus the digest re-check in `verify()` immediately before launch,
+/// rather than by unlinking.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn immutable_unix_executable_snapshot(source: &std::fs::File) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::PermissionsExt;
+fn immutable_unix_executable_snapshot(
+    source: &std::fs::File,
+) -> std::io::Result<(
+    std::fs::File,
+    PathBuf,
+    Arc<UnixExecutableSnapshotOwner>,
+    u64,
+    [u8; 32],
+)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    // tempfile() creates an unlinked private inode. Once the writable setup
-    // handle is changed to mode 0500 and retained only inside BoundExecutable,
-    // there is no ambient pathname through which another process can reopen or
-    // replace the executable bytes before /dev/fd execution. The platform
-    // acceptance gate must also prove that its kernel accepts execution through
-    // this retained descriptor; no ambient-path fallback is permitted.
-    let mut snapshot = tempfile::tempfile()?;
-    copy_executable_snapshot(source, &mut snapshot)?;
-    snapshot.set_permissions(std::fs::Permissions::from_mode(0o500))?;
-    Ok(snapshot)
+    let temp_dir = tempfile::Builder::new()
+        .prefix("minutes-bound-worker-")
+        .tempdir()?;
+    let directory_guard =
+        crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(temp_dir.path())?;
+    let snapshot_path = temp_dir.path().join("worker");
+
+    {
+        let mut snapshot = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&snapshot_path)?;
+        copy_executable_snapshot(source, &mut snapshot)?;
+        snapshot.set_permissions(std::fs::Permissions::from_mode(0o500))?;
+        // Dropping the only writable handle here is what makes exec possible:
+        // with no live writer the kernel no longer returns ETXTBSY.
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&snapshot_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worker executable snapshot was not immutable",
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    let bytes = std::io::copy(&mut file, &mut hasher)?;
+    let digest: [u8; 32] = hasher.finalize().into();
+    file.seek(SeekFrom::Start(0))?;
+
+    let owner = Arc::new(UnixExecutableSnapshotOwner {
+        _directory_guard: directory_guard,
+        _temp_dir: temp_dir,
+    });
+    Ok((file, snapshot_path, owner, bytes, digest))
 }
 
 #[cfg(unix)]
@@ -522,6 +627,14 @@ impl BoundedCommand {
     pub(crate) fn address_space_limit(&mut self, bytes: u64) -> &mut Self {
         self.address_space_limit = Some(bytes);
         self
+    }
+
+    /// The ceiling this command will install, for callers whose containment
+    /// argument depends on it and which therefore need to assert it is present
+    /// rather than assume the builder chain still sets it.
+    #[cfg(test)]
+    pub(crate) fn configured_address_space_limit(&self) -> Option<u64> {
+        self.address_space_limit
     }
 
     /// Refuse descendant process creation where the OS exposes a process-tree
@@ -2242,6 +2355,48 @@ mod tests {
         )
         .unwrap();
         assert!(run.output.status.success());
+    }
+
+    /// Guards the defect class that made the path-backed snapshot unusable:
+    /// Darwin and Linux both refuse `execve` with `ETXTBSY` on any vnode a
+    /// process still holds open for writing. The snapshot therefore has to drop
+    /// its writable handle and retain only a read handle before launch.
+    #[cfg(unix)]
+    #[test]
+    fn path_backed_snapshot_execs_only_after_its_writer_is_dropped() {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker");
+        let script = b"#!/bin/sh\nexit 0\n";
+
+        // A live writable handle must block execution.
+        let mut writable = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        writable.write_all(script).unwrap();
+        writable.flush().unwrap();
+        let busy = crate::engine_process::command(&path).status();
+        assert_eq!(
+            busy.err().map(|error| error.raw_os_error()),
+            Some(Some(libc::ETXTBSY)),
+            "a retained writer must make exec fail with ETXTBSY"
+        );
+
+        // Dropping the writer and sealing the mode is what makes launch work.
+        drop(writable);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let retained_read = std::fs::File::open(&path).unwrap();
+        let status = crate::engine_process::command(&path)
+            .status()
+            .expect("exec must succeed once no writer is live");
+        assert!(status.success());
+        drop(retained_read);
     }
 }
 

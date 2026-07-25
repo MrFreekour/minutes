@@ -672,13 +672,36 @@ fn archive_successful_candidate(audio_path: &Path) -> Result<PathBuf, WatchError
 /// Determine content type based on audio duration and config.
 /// Duration-based routing takes priority over config.watch.type.
 /// Set dictation_threshold_secs = 0 to disable duration-based routing.
+/// Map a probed duration onto a content type using the configured threshold.
+///
+/// Shared so the ffmpeg and bounded-worker probes cannot drift apart.
+fn content_type_for_duration(duration: std::time::Duration, config: &Config) -> ContentType {
+    if duration.as_secs() < config.watch.dictation_threshold_secs {
+        ContentType::Memo
+    } else {
+        ContentType::Meeting
+    }
+}
+
 fn determine_content_type(path: &Path, config: &Config) -> ContentType {
-    let ffmpeg = compressed_audio_requires_ffmpeg(path)
-        .then(crate::ffmpeg::resolve_ffmpeg)
-        .transpose()
-        .ok()
-        .flatten();
-    determine_content_type_with_ffmpeg(path, config, ffmpeg.as_deref())
+    if !compressed_audio_requires_ffmpeg(path) {
+        return determine_content_type_with_ffmpeg(path, config, None);
+    }
+    if let Ok(ffmpeg) = crate::ffmpeg::resolve_launchable_ffmpeg() {
+        return determine_content_type_with_ffmpeg(path, config, Some(ffmpeg.as_path()));
+    }
+    // Without ffmpeg the duration probe used to return None, so routing fell
+    // back to config.watch.type and filed long calls as voice memos. Ask the
+    // bounded worker for the container's declared duration instead.
+    if crate::audio_decode_worker::bounded_decode_fallback_available(config) {
+        if let Some(duration) = crate::audio_decode_worker::probe_compressed_duration(
+            path,
+            std::time::Duration::from_secs(60),
+        ) {
+            return content_type_for_duration(duration, config);
+        }
+    }
+    determine_content_type_with_ffmpeg(path, config, None)
 }
 
 fn determine_content_type_with_ffmpeg(
@@ -690,15 +713,10 @@ fn determine_content_type_with_ffmpeg(
 
     if threshold > 0 {
         if let Some(duration) = audio_duration(path, threshold, ffmpeg_path) {
-            let secs = duration.as_secs();
-            let content_type = if secs < threshold {
-                ContentType::Memo
-            } else {
-                ContentType::Meeting
-            };
+            let content_type = content_type_for_duration(duration, config);
             tracing::info!(
                 path = %path.display(),
-                duration_secs = secs,
+                duration_secs = duration.as_secs(),
                 threshold,
                 content_type = ?content_type,
                 "duration-based routing"
@@ -721,9 +739,12 @@ fn determine_content_type_with_ffmpeg(
 
 /// Process a single file through the pipeline.
 fn process_candidate(candidate: &WatchCandidate, config: &Config) -> Result<(), WatchError> {
-    let ffmpeg_available = !compressed_audio_requires_ffmpeg(&candidate.path)
-        || crate::ffmpeg::resolve_launchable_ffmpeg().is_ok();
-    process_candidate_with_ffmpeg_availability(candidate, config, ffmpeg_available)
+    // Ask whether the file is decodable at all, not whether ffmpeg exists. The
+    // bounded decode worker handles these containers when ffmpeg is missing,
+    // and gating on ffmpeg alone refused iPhone .m4a memos the pipeline could
+    // process perfectly well.
+    let decodable = compressed_audio_decodable(&candidate.path, config);
+    process_candidate_with_ffmpeg_availability(candidate, config, decodable)
 }
 
 fn process_candidate_with_ffmpeg_availability(
@@ -823,16 +844,39 @@ fn process_candidate_with_ffmpeg_availability(
     }
 }
 
-/// Non-WAV inputs are decoded only by the bounded ffmpeg child. WAV stays on
-/// the in-process streaming parser and never requires an external decoder.
+/// Non-WAV inputs need an out-of-process decoder. WAV stays on the in-process
+/// streaming parser and never requires one.
+///
+/// This answers only "is this container compressed". Callers deciding whether
+/// to accept or refuse work must use [`compressed_audio_decodable`], which also
+/// accounts for the bounded decode worker.
 pub fn compressed_audio_requires_ffmpeg(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| !extension.eq_ignore_ascii_case("wav"))
 }
 
+/// Whether a compressed import can actually be decoded on this machine now.
+///
+/// Two decoders can satisfy it: ffmpeg, which stays preferred for quality
+/// (issue #21), and the bounded decode worker, which handles the same
+/// containers when ffmpeg is absent. Every preflight and readiness surface must
+/// ask this rather than asking about ffmpeg alone. Asking the narrower question
+/// is what left `minutes watch`, the desktop import, and Recovery Center
+/// refusing work the pipeline could complete.
+pub fn compressed_audio_decodable(path: &Path, config: &Config) -> bool {
+    !compressed_audio_requires_ffmpeg(path)
+        || crate::ffmpeg::resolve_launchable_ffmpeg().is_ok()
+        || crate::audio_decode_worker::bounded_decode_fallback_available(config)
+}
+
+/// Guidance for a compressed import that genuinely cannot be decoded.
+///
+/// Only reachable when ffmpeg is missing *and* the bounded worker is
+/// unavailable, so it names both remedies rather than implying ffmpeg is the
+/// only path.
 pub fn compressed_audio_ffmpeg_guidance() -> &'static str {
-    "ffmpeg is required for non-WAV imports such as m4a, mp3, ogg, webm, mp4, mov, aac, and flac. Install ffmpeg (macOS: brew install ffmpeg; Linux: use your package manager; Windows: install ffmpeg.exe and add it to PATH), or set MINUTES_FFMPEG to the full executable path. Then restart the watcher or process the original file directly. WAV imports remain available without ffmpeg."
+    "This machine cannot decode non-WAV imports such as m4a, mp3, ogg, webm, mp4, mov, aac, and flac right now. Install ffmpeg (macOS: brew install ffmpeg; Linux: use your package manager; Windows: install ffmpeg.exe and add it to PATH), or set MINUTES_FFMPEG to the full executable path. Alternatively re-enable the bundled decoder with transcription.compressed_decode_fallback = true in ~/.config/minutes/config.toml. Then restart the watcher or process the original file directly. WAV imports remain available either way."
 }
 
 fn content_type_label(content_type: ContentType) -> &'static str {
@@ -1284,9 +1328,48 @@ mod tests {
         assert!(sidecar_path.exists());
         assert_eq!(fs::read(&path).unwrap(), b"synthetic original bytes");
         let message = error.to_string();
-        assert!(message.contains("ffmpeg is required"));
+        assert!(message.contains("cannot decode non-WAV imports"));
         assert!(message.contains("MINUTES_FFMPEG"));
         assert!(message.contains("original audio remains untouched"));
+    }
+
+    /// The regression this track exists to close: an iPhone `.m4a` memo landing
+    /// in the watch folder on a machine with no ffmpeg must be admitted, not
+    /// refused at preflight. The watcher previously asked "is ffmpeg
+    /// installed?" rather than "can this be decoded?", so the bounded decode
+    /// worker was never reached from the headline input mode.
+    #[test]
+    fn compressed_watch_input_is_admitted_without_ffmpeg() {
+        let dir = TempDir::new().unwrap();
+        let memo = dir.path().join("memo.m4a");
+        fs::write(&memo, b"synthetic container bytes").unwrap();
+
+        let guard = crate::test_home_env_lock();
+        let previous = std::env::var_os("MINUTES_FFMPEG");
+        std::env::set_var("MINUTES_FFMPEG", dir.path().join("absent-ffmpeg"));
+        let decodable_by_default = compressed_audio_decodable(&memo, &Config::default());
+        let refused = Config {
+            transcription: crate::config::TranscriptionConfig {
+                compressed_decode_fallback: false,
+                ..Config::default().transcription
+            },
+            ..Config::default()
+        };
+        let decodable_when_refused = compressed_audio_decodable(&memo, &refused);
+        match previous {
+            Some(value) => std::env::set_var("MINUTES_FFMPEG", value),
+            None => std::env::remove_var("MINUTES_FFMPEG"),
+        }
+        drop(guard);
+
+        assert!(
+            decodable_by_default,
+            "a compressed memo must be admitted without ffmpeg so the bounded worker can decode it"
+        );
+        assert!(
+            !decodable_when_refused,
+            "with the fallback refused and no ffmpeg there is genuinely no decoder"
+        );
     }
 
     #[cfg(unix)]
@@ -1331,7 +1414,7 @@ mod tests {
         assert!(sidecar_path.exists());
         assert_eq!(fs::read(&path).unwrap(), b"synthetic original bytes");
         let message = error.to_string();
-        assert!(message.contains("ffmpeg is required"));
+        assert!(message.contains("cannot decode non-WAV imports"));
         assert!(message.contains("original audio remains untouched"));
         assert!(message.contains("MINUTES_FFMPEG"));
     }
