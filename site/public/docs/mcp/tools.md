@@ -196,7 +196,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 
 #### `get_meeting_insights`
 
-Compatibility name only: unavailable until derived insight records carry live-verifiable canonical source policy provenance
+Query decisions, commitments, and questions extracted from meetings; each insight is released only after its source meeting is re-verified against live sensitivity policy
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
 
@@ -300,7 +300,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-add-agent-annotation
 
 #### `get_agent_annotations`
 
-Compatibility name only: unavailable until agent annotations carry live-verifiable canonical source policy provenance
+Read append-only agent.annotation events; each annotation is released only after its source meeting is re-verified against live sensitivity policy
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-agent-annotations
 

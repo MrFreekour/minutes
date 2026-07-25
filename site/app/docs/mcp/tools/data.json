@@ -160,7 +160,7 @@
     },
     {
       "name": "get_meeting_insights",
-      "description": "Compatibility name only: unavailable until derived insight records carry live-verifiable canonical source policy provenance",
+      "description": "Query decisions, commitments, and questions extracted from meetings; each insight is released only after its source meeting is re-verified against live sensitivity policy",
       "group": "Insights",
       "anchorId": "tool-get-meeting-insights",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights"
@@ -230,7 +230,7 @@
     },
     {
       "name": "get_agent_annotations",
-      "description": "Compatibility name only: unavailable until agent annotations carry live-verifiable canonical source policy provenance",
+      "description": "Read append-only agent.annotation events; each annotation is released only after its source meeting is re-verified against live sensitivity policy",
       "group": "Agent Event Bus",
       "anchorId": "tool-get-agent-annotations",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-agent-annotations"

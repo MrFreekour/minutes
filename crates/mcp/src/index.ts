@@ -7280,10 +7280,10 @@ registerTool(
 
 // ── Tool: get_agent_annotations ────────────────────────────
 
-export const MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION =
-  "Compatibility name only: unavailable in MCP until every agent annotation carries canonical source policy provenance that can be revalidated live.";
-export const MCP_MEETING_INSIGHTS_UNAVAILABLE_DESCRIPTION =
-  "Compatibility name only: unavailable in MCP until every derived insight carries canonical source policy provenance that can be revalidated live.";
+export const MCP_AGENT_ANNOTATIONS_DESCRIPTION =
+  "Read append-only agent.annotation events separately from human-authored meeting markdown/frontmatter. Each annotation is released only after its source meeting is re-read from disk and re-verified against the live sensitivity policy; annotations whose source cannot be revalidated are withheld and counted, never silently dropped.";
+export const MCP_MEETING_INSIGHTS_DESCRIPTION =
+  "Query structured insights extracted from meetings, decisions, commitments and questions with confidence levels. Each insight is released only after the meeting it names as its source is re-read from disk and re-verified against the live sensitivity policy; insights whose source cannot be revalidated are withheld and counted, never silently dropped.";
 
 function unavailableDerivedRecordResult(message: string) {
   return {
@@ -7299,39 +7299,267 @@ function unavailableDerivedRecordResult(message: string) {
   };
 }
 
+/** Why a derived record could not be released to an agent surface. */
+export type WithheldSourceReason =
+  | "no-source-provenance"
+  | "source-policy-denied";
+
+/**
+ * Re-verify one derived record's source meeting against live on-disk policy.
+ *
+ * This is the "canonical source policy provenance that can be revalidated
+ * live" requirement in concrete form. Provenance recorded when the annotation
+ * was written is never trusted on its own: the source meeting is re-read from
+ * disk now, re-parsed, confirmed to sit inside the active corpus, and checked
+ * against the current sensitivity designation. A meeting that has since been
+ * marked restricted, moved out of the corpus, deleted, or had its frontmatter
+ * corrupted therefore withholds its annotations on this read, not on the next
+ * restart.
+ *
+ * A record with no resolvable source fails closed. Without a source there is
+ * nothing to revalidate, and an annotation may quote restricted content.
+ */
+export async function revalidateDerivedRecordSource(
+  meetingPath: unknown,
+  meetingsDir: string,
+  includeRestricted: boolean
+): Promise<{ allowed: true } | { allowed: false; reason: WithheldSourceReason }> {
+  if (typeof meetingPath !== "string" || meetingPath.trim() === "") {
+    return { allowed: false, reason: "no-source-provenance" };
+  }
+  const snapshot = await policyVerifiedExactMeetingSnapshot(
+    meetingPath,
+    meetingsDir,
+    includeRestricted
+  );
+  return snapshot
+    ? { allowed: true }
+    : { allowed: false, reason: "source-policy-denied" };
+}
+
+/**
+ * Filter annotations to those whose source survives live revalidation.
+ *
+ * Returns the withheld tally alongside the released records. The lane's
+ * standing rule is that an agent surface must distinguish "unavailable" from
+ * "empty", so a partial view is always reported as partial.
+ */
+export async function releaseRecordsWithLiveSourcePolicy(
+  records: any[],
+  selectSourcePath: (record: any) => unknown,
+  meetingsDir: string,
+  includeRestricted: boolean
+): Promise<{
+  released: any[];
+  withheld: { total: number; noSourceProvenance: number; sourcePolicyDenied: number };
+}> {
+  const released: any[] = [];
+  const withheld = { total: 0, noSourceProvenance: 0, sourcePolicyDenied: 0 };
+  // Sources repeat heavily across records from the same meeting; one verdict
+  // per distinct path keeps a large read from restatting the same file.
+  const verdicts = new Map<string, boolean>();
+  for (const record of records) {
+    const source = selectSourcePath(record);
+    if (typeof source !== "string" || source.trim() === "") {
+      withheld.total += 1;
+      withheld.noSourceProvenance += 1;
+      continue;
+    }
+    let allowed = verdicts.get(source);
+    if (allowed === undefined) {
+      const verdict = await revalidateDerivedRecordSource(
+        source,
+        meetingsDir,
+        includeRestricted
+      );
+      allowed = verdict.allowed;
+      verdicts.set(source, allowed);
+    }
+    if (allowed) {
+      released.push(record);
+    } else {
+      withheld.total += 1;
+      withheld.sourcePolicyDenied += 1;
+    }
+  }
+  return { released, withheld };
+}
+
+export function releaseAnnotationsWithLiveSourcePolicy(
+  annotations: any[],
+  meetingsDir: string,
+  includeRestricted: boolean
+) {
+  return releaseRecordsWithLiveSourcePolicy(
+    annotations,
+    (annotation) => annotation?.target?.meeting_path,
+    meetingsDir,
+    includeRestricted
+  );
+}
+
+/**
+ * Insights carry `source_meeting`, the path to the markdown they were derived
+ * from, so they revalidate through exactly the same live policy check.
+ */
+export function releaseInsightsWithLiveSourcePolicy(
+  insights: any[],
+  meetingsDir: string,
+  includeRestricted: boolean
+) {
+  return releaseRecordsWithLiveSourcePolicy(
+    insights,
+    (insight) => insight?.source_meeting,
+    meetingsDir,
+    includeRestricted
+  );
+}
+
 export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
   registerToolWithRestrictedPolicy(
     serverArg,
     "get_agent_annotations",
-    MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION,
+    MCP_AGENT_ANNOTATIONS_DESCRIPTION,
     {
-      limit: z.number().optional().default(50).describe("Compatibility argument; the tool is unavailable"),
-      agent_id: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
-      meeting_id: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
-      meeting_path: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+      limit: z.number().optional().default(50).describe("Maximum number of annotations"),
+      agent_id: z.string().optional().describe("Filter by agent id"),
+      meeting_id: z.string().optional().describe("Filter by target meeting id"),
+      meeting_path: z.string().optional().describe("Filter by target meeting path"),
+      include_restricted: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Include annotations whose source meeting is designated sensitivity: restricted. Requires the server to have been launched with MINUTES_MCP_RESTRICTED_POLICY=logged-override; the request is durably audited."
+        ),
     },
-    { title: "Get Agent Annotations (Unavailable)", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    async () => unavailableDerivedRecordResult(
-      "Agent annotations are unavailable to MCP until every record carries canonical source policy provenance that can be revalidated live."
-    )
+    { title: "Get Agent Annotations", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async ({ limit, agent_id, meeting_id, meeting_path, include_restricted }: any) => {
+      if (!(await isCliAvailable())) {
+        return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }], isError: true };
+      }
+
+      const matching = (await readAgentAnnotationsFromCli(limit)).filter((event: any) => {
+        if (agent_id && event?.agent?.id !== agent_id) return false;
+        if (meeting_id && event?.target?.meeting_id !== meeting_id) return false;
+        if (meeting_path && event?.target?.meeting_path !== meeting_path) return false;
+        return true;
+      });
+
+      // Every surviving record is re-checked against on-disk policy now. The
+      // provenance stored with the annotation is never sufficient on its own.
+      const meetingsDir = await getEffectiveMeetingsDir();
+      const { released, withheld } = await releaseAnnotationsWithLiveSourcePolicy(
+        matching,
+        meetingsDir,
+        include_restricted === true
+      );
+
+      const summary =
+        withheld.total === 0
+          ? JSON.stringify(released, null, 2)
+          : [
+              JSON.stringify(released, null, 2),
+              "",
+              `${withheld.total} annotation(s) withheld: ${withheld.sourcePolicyDenied} whose source meeting is restricted or no longer verifiable, ${withheld.noSourceProvenance} with no source meeting to revalidate.`,
+            ].join("\n");
+
+      return {
+        content: [{ type: "text" as const, text: summary }],
+        structuredContent: {
+          available: true,
+          annotations: released,
+          withheld,
+          partial: withheld.total > 0,
+        },
+      };
+    }
   );
 
   registerToolWithRestrictedPolicy(
     serverArg,
     "get_meeting_insights",
-    MCP_MEETING_INSIGHTS_UNAVAILABLE_DESCRIPTION,
+    MCP_MEETING_INSIGHTS_DESCRIPTION,
     {
-      kind: z.enum(MEETING_INSIGHT_KINDS).optional().describe("Compatibility argument; the tool is unavailable"),
-      confidence: z.enum(["tentative", "inferred", "strong", "explicit"]).optional().describe("Compatibility argument; the tool is unavailable"),
-      participant: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
-      since: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
-      limit: z.number().optional().default(50).describe("Compatibility argument; the tool is unavailable"),
-      actionable_only: z.boolean().optional().default(false).describe("Compatibility argument; the tool is unavailable"),
+      kind: z.enum(MEETING_INSIGHT_KINDS).optional().describe("Filter by insight type"),
+      confidence: z.enum(["tentative", "inferred", "strong", "explicit"]).optional().describe("Minimum confidence level"),
+      participant: z.string().optional().describe("Filter by participant name (partial match)"),
+      since: z.string().optional().describe("Only insights since this date (YYYY-MM-DD)"),
+      limit: z.number().optional().default(50).describe("Maximum number of results"),
+      actionable_only: z.boolean().optional().default(false).describe("Only return actionable insights (Strong or Explicit confidence)"),
+      include_restricted: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Include insights derived from meetings designated sensitivity: restricted. Requires the server to have been launched with MINUTES_MCP_RESTRICTED_POLICY=logged-override; the request is durably audited."
+        ),
     },
-    { title: "Get Meeting Insights (Unavailable)", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    async () => unavailableDerivedRecordResult(
-      "Meeting insights are unavailable to MCP until every derived record carries canonical source policy provenance that can be revalidated live."
-    )
+    { title: "Get Meeting Insights", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async ({ kind, confidence, participant, since, limit, actionable_only, include_restricted }: any) => {
+      if (!(await isCliAvailable())) {
+        return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }], isError: true };
+      }
+
+      const args = ["insights", "--limit", String(limit ?? 50)];
+      if (kind) args.push("--kind", String(kind));
+      // The CLI treats --actionable as its own confidence floor, so the two
+      // flags are mutually exclusive here exactly as they are upstream.
+      if (actionable_only) {
+        args.push("--actionable");
+      } else if (confidence) {
+        args.push("--confidence", String(confidence));
+      }
+      if (participant) args.push("--participant", String(participant));
+      if (since) args.push("--since", String(since));
+
+      try {
+        const { stdout } = await runMinutes(args, 10000);
+        const parsed = parseJsonOutput(stdout);
+        const insights = Array.isArray(parsed) ? parsed : [];
+
+        // Each insight names the markdown it was derived from. That source is
+        // re-read and re-checked against live policy before release.
+        const meetingsDir = await getEffectiveMeetingsDir();
+        const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+          insights,
+          meetingsDir,
+          include_restricted === true
+        );
+
+        if (released.length === 0 && withheld.total === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No meeting insights found matching the filter criteria. Insights are extracted when meetings are processed with summarization enabled." }],
+            structuredContent: { available: true, count: 0, insights: [], withheld, partial: false },
+          };
+        }
+
+        const withheldNote =
+          withheld.total === 0
+            ? ""
+            : `\n\n${withheld.total} insight(s) withheld: ${withheld.sourcePolicyDenied} whose source meeting is restricted or no longer verifiable, ${withheld.noSourceProvenance} with no source meeting to revalidate.`;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Found ${released.length} insight(s):\n\n${JSON.stringify(released, null, 2)}${withheldNote}`,
+          }],
+          structuredContent: {
+            available: true,
+            count: released.length,
+            insights: released,
+            withheld,
+            partial: withheld.total > 0,
+          },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: `Failed to query insights: ${message}` }],
+          isError: true,
+        };
+      }
+    }
   );
 }
 

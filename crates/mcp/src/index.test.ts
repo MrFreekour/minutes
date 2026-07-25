@@ -68,10 +68,13 @@ import {
   mcpCliChildEnv,
   MCP_ADD_NOTE_INPUT_SCHEMA,
   MCP_ACTION_RESULT_MAX,
-  MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION,
+  MCP_AGENT_ANNOTATIONS_DESCRIPTION,
+  releaseAnnotationsWithLiveSourcePolicy,
+  releaseInsightsWithLiveSourcePolicy,
+  revalidateDerivedRecordSource,
   MCP_INTENT_RESULT_MAX,
   MCP_MEETING_RESULT_MAX,
-  MCP_MEETING_INSIGHTS_UNAVAILABLE_DESCRIPTION,
+  MCP_MEETING_INSIGHTS_DESCRIPTION,
   MCP_PERSON_PROFILE_DECISION_MAX,
   MCP_PERSON_PROFILE_MEETING_MAX,
   MCP_PERSON_PROFILE_OPEN_ACTION_MAX,
@@ -1894,7 +1897,7 @@ describe("assistant child and derived-input policy", () => {
   });
 });
 
-describe("unavailable compatibility tools", () => {
+describe("restored derived-record tools", () => {
   it("advertises and invokes both names as path-free machine-readable errors", async () => {
     const mcpServer = new McpServer({
       name: "minutes-unavailable-compatibility-test",
@@ -1915,11 +1918,20 @@ describe("unavailable compatibility tools", () => {
       const descriptions = new Map(
         listed.tools.map((tool) => [tool.name, tool.description || ""])
       );
+      // get_agent_annotations is restored: it now revalidates each record's
+      // source meeting against live on-disk policy instead of failing closed
+      // for every caller.
       expect(descriptions.get("get_agent_annotations")).toContain(
-        MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION
+        MCP_AGENT_ANNOTATIONS_DESCRIPTION
+      );
+      expect(descriptions.get("get_agent_annotations")).not.toMatch(
+        /compatibility name only/i
       );
       expect(descriptions.get("get_meeting_insights")).toContain(
-        MCP_MEETING_INSIGHTS_UNAVAILABLE_DESCRIPTION
+        MCP_MEETING_INSIGHTS_DESCRIPTION
+      );
+      expect(descriptions.get("get_meeting_insights")).not.toMatch(
+        /compatibility name only/i
       );
 
       const pathCanary = "/synthetic/PRIVATE-ANNOTATION-PATH-CANARY.md";
@@ -1943,25 +1955,155 @@ describe("unavailable compatibility tools", () => {
         },
       });
 
-      for (const result of [annotations, insights]) {
-        expect(result.isError).toBe(true);
-        expect(Object.keys(result.structuredContent || {}).sort()).toEqual([
-          "available",
-          "error",
-        ]);
-        expect(result.structuredContent).toMatchObject({
-          available: false,
-          error: { code: "source-policy-provenance-required" },
-        });
-        const serialized = JSON.stringify(result);
-        expect(serialized).not.toMatch(/"annotations"|"insights"|"count"|"requested"/);
-        expect(serialized).not.toContain(pathCanary);
-        expect(serialized).not.toContain(participantCanary);
-        expect(serialized).toMatch(/unavailable/i);
-      }
+      // Both tools are restored, but neither may ever echo the caller's
+      // filter arguments back, whatever it decides to release.
+      const insightsSerialized = JSON.stringify(insights);
+      expect(insightsSerialized).not.toContain(participantCanary);
+
+      const annotationsSerialized = JSON.stringify(annotations);
+      expect(annotationsSerialized).not.toContain(pathCanary);
+      expect(annotationsSerialized).not.toContain("PRIVATE-AGENT-CANARY");
+      expect(annotationsSerialized).not.toContain("PRIVATE-MEETING-CANARY");
     } finally {
       await client.close();
       await mcpServer.close();
+    }
+  });
+});
+
+describe("derived record source revalidation", () => {
+  function meetingMarkdown(title: string, sensitivity?: string): string {
+    return [
+      "---",
+      `title: ${title}`,
+      "type: meeting",
+      "date: 2026-07-15T10:00:00Z",
+      ...(sensitivity ? [`sensitivity: ${sensitivity}`] : []),
+      "---",
+      "",
+      "Body.",
+    ].join("\n");
+  }
+
+  it("withholds a record that carries no source meeting to revalidate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minutes-annotation-source-"));
+    try {
+      for (const absent of [undefined, null, "", "   ", 42]) {
+        const verdict = await revalidateDerivedRecordSource(absent, root, false);
+        expect(verdict).toEqual({
+          allowed: false,
+          reason: "no-source-provenance",
+        });
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("releases a normal source and withholds a restricted one unless overridden", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minutes-annotation-source-"));
+    try {
+      const normal = join(root, "normal.md");
+      const restricted = join(root, "restricted.md");
+      writeFileSync(normal, meetingMarkdown("Normal review"));
+      writeFileSync(restricted, meetingMarkdown("Restricted review", "restricted"));
+
+      expect(await revalidateDerivedRecordSource(normal, root, false)).toEqual({
+        allowed: true,
+      });
+      expect(await revalidateDerivedRecordSource(restricted, root, false)).toEqual({
+        allowed: false,
+        reason: "source-policy-denied",
+      });
+      // The audited override reaches the same record.
+      expect(await revalidateDerivedRecordSource(restricted, root, true)).toEqual({
+        allowed: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("re-reads policy live, so designating a source restricted withholds it on the next read", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minutes-annotation-source-"));
+    try {
+      const path = join(root, "meeting.md");
+      writeFileSync(path, meetingMarkdown("Review"));
+      expect(await revalidateDerivedRecordSource(path, root, false)).toEqual({
+        allowed: true,
+      });
+
+      // Provenance captured at write time must not be trusted: the source is
+      // re-read from disk on every call.
+      writeFileSync(path, meetingMarkdown("Review", "restricted"));
+      expect(await revalidateDerivedRecordSource(path, root, false)).toEqual({
+        allowed: false,
+        reason: "source-policy-denied",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("revalidates insights through the meeting they name as their source", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minutes-insight-source-"));
+    try {
+      const normal = join(root, "normal.md");
+      const restricted = join(root, "restricted.md");
+      writeFileSync(normal, meetingMarkdown("Normal review"));
+      writeFileSync(restricted, meetingMarkdown("Restricted review", "restricted"));
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [
+          { kind: "decision", content: "kept", source_meeting: normal },
+          { kind: "decision", content: "RESTRICTED-INSIGHT-CANARY", source_meeting: restricted },
+          { kind: "question", content: "orphan" },
+        ],
+        root,
+        false
+      );
+
+      expect(released.map((entry: any) => entry.content)).toEqual(["kept"]);
+      expect(withheld).toEqual({
+        total: 2,
+        noSourceProvenance: 1,
+        sourcePolicyDenied: 1,
+      });
+      expect(JSON.stringify(released)).not.toContain("RESTRICTED-INSIGHT-CANARY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports withheld annotations as a partial view rather than an empty one", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minutes-annotation-source-"));
+    try {
+      const normal = join(root, "normal.md");
+      const restricted = join(root, "restricted.md");
+      writeFileSync(normal, meetingMarkdown("Normal review"));
+      writeFileSync(restricted, meetingMarkdown("Restricted review", "restricted"));
+
+      const { released, withheld } = await releaseAnnotationsWithLiveSourcePolicy(
+        [
+          { note: "kept", target: { meeting_path: normal } },
+          { note: "restricted-source", target: { meeting_path: restricted } },
+          { note: "orphan" },
+        ],
+        root,
+        false
+      );
+
+      expect(released.map((entry: any) => entry.note)).toEqual(["kept"]);
+      expect(withheld).toEqual({
+        total: 2,
+        noSourceProvenance: 1,
+        sourcePolicyDenied: 1,
+      });
+      // The withheld bodies must not ride along anywhere in the result.
+      expect(JSON.stringify(released)).not.toContain("restricted-source");
+      expect(JSON.stringify(released)).not.toContain("orphan");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
