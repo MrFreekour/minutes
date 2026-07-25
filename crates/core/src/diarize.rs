@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-#[cfg(feature = "diarize")]
+#[cfg(any(feature = "diarize", test))]
 use zeroize::Zeroize;
 
 const DIARIZATION_WORKER_DEADLINE: Duration = Duration::from_secs(15 * 60);
@@ -3427,6 +3427,32 @@ fn merge_short_segments(segments: Vec<SpeechSegment>, sample_rate: u32) -> Vec<S
 ///
 /// This function mirrors the same sliding-window logic but feeds the model
 /// correctly normalised f32 waveform data.
+/// Stage the final, short window of a recording into a reusable scratch buffer,
+/// zero-padded out to the model's fixed window length.
+///
+/// Compiled for the `diarize` feature, which supplies its only production
+/// caller, and for tests regardless of features: this is pure buffer handling
+/// with no ONNX involvement, so gating it on the feature alone would put it out
+/// of reach of the default test command.
+#[cfg(any(feature = "diarize", test))]
+fn fill_partial_window(
+    scratch: &mut zeroize::Zeroizing<Vec<f32>>,
+    window_size: usize,
+    tail: &[f32],
+) {
+    debug_assert!(tail.len() <= window_size);
+    // `Zeroize for Vec` wipes the whole allocation and then clears the vector to
+    // length 0. That wipe is what keeps a previous recording's audio out of the
+    // padding, so it is kept, but the buffer has to be restored to a full window
+    // afterwards. Indexing straight after the wipe indexed an empty vector and
+    // panicked on every recording whose length was not an exact multiple of the
+    // window, which is very nearly all of them.
+    scratch.zeroize();
+    scratch.resize(window_size, 0.0);
+    let tail = &tail[..tail.len().min(window_size)];
+    scratch[..tail.len()].copy_from_slice(tail);
+}
+
 #[cfg(feature = "diarize")]
 fn segment_speech(
     samples: &[f32],
@@ -3466,9 +3492,11 @@ fn segment_speech(
         let window = if window_end - window_start == window_size {
             &samples[window_start..window_end]
         } else {
-            final_window.zeroize();
-            final_window[..window_end - window_start]
-                .copy_from_slice(&samples[window_start..window_end]);
+            fill_partial_window(
+                &mut final_window,
+                window_size,
+                &samples[window_start..window_end],
+            );
             final_window.as_slice()
         };
 
@@ -5631,5 +5659,96 @@ mod tests {
         );
         assert!((result[0].end - 0.5).abs() < 1e-6);
         assert!((result[1].start - 3.5).abs() < 1e-6);
+    }
+
+    /// The segmentation model takes fixed 10 s windows, so a recording whose
+    /// length is not an exact multiple of 10 s ends on a short window that must
+    /// be zero-padded. Any real recording hits this.
+    ///
+    /// `zeroize` on a `Vec` wipes the buffer *and clears it to length 0*, so
+    /// reusing the scratch buffer that way left nothing to copy into and
+    /// panicked. The panic was swallowed by `catch_unwind`, the meeting shipped
+    /// with no speaker labels, and nothing in the markdown said why.
+    #[test]
+    fn a_short_final_window_is_zero_padded_rather_than_panicking() {
+        let window_size = 16_000 * 10;
+        let mut scratch = zeroize::Zeroizing::new(vec![0.0f32; window_size]);
+
+        // A 10.63 s recording: the tail is 630 ms of real audio.
+        let tail: Vec<f32> = (0..10_080).map(|i| (i % 7) as f32 * 0.01).collect();
+        fill_partial_window(&mut scratch, window_size, &tail);
+
+        assert_eq!(
+            scratch.len(),
+            window_size,
+            "the model requires a full-length window; a truncated buffer panics the caller"
+        );
+        assert_eq!(
+            &scratch[..tail.len()],
+            tail.as_slice(),
+            "real audio must survive"
+        );
+        assert!(
+            scratch[tail.len()..].iter().all(|sample| *sample == 0.0),
+            "the tail beyond the real audio must be zero padding"
+        );
+    }
+
+    /// The buffer is reused across recordings, so a longer tail must never see
+    /// a previous recording's samples in the padding region.
+    #[test]
+    fn a_reused_window_never_leaks_the_previous_recordings_audio() {
+        let window_size = 512;
+        let mut scratch = zeroize::Zeroizing::new(vec![0.0f32; window_size]);
+
+        let loud: Vec<f32> = vec![0.9; 400];
+        fill_partial_window(&mut scratch, window_size, &loud);
+        let quiet: Vec<f32> = vec![0.1; 100];
+        fill_partial_window(&mut scratch, window_size, &quiet);
+
+        assert_eq!(scratch.len(), window_size);
+        assert_eq!(&scratch[..100], quiet.as_slice());
+        assert!(
+            scratch[100..].iter().all(|sample| *sample == 0.0),
+            "the previous window's audio must not survive into the padding"
+        );
+    }
+
+    /// End-to-end guard for the short-final-window panic, against the real
+    /// segmentation model.
+    ///
+    /// The unit tests above pin the buffer contract; this one proves the whole
+    /// path survives a recording whose length is not an exact multiple of the
+    /// 10 s window, which is what actually reached users. Ignored by default
+    /// because it needs the ONNX models from `minutes setup --diarization`.
+    #[cfg(feature = "diarize")]
+    #[ignore = "requires the local pyannote segmentation ONNX model; run with --features diarize --ignored"]
+    #[test]
+    fn real_segmentation_survives_a_non_multiple_of_ten_seconds() {
+        let model =
+            crate::config::Config::minutes_dir().join("models/diarization/segmentation-3.0.onnx");
+        assert!(
+            model.is_file(),
+            "run `minutes setup --diarization` first: {}",
+            model.display()
+        );
+
+        // 10.63 s: one full window plus a 630 ms tail. Exactly the shape that
+        // panicked and silently produced zero speakers.
+        let sample_rate = 16_000u32;
+        let samples: Vec<f32> = (0..170_080)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (t * 220.0 * std::f32::consts::TAU).sin() * 0.3
+            })
+            .collect();
+        assert_ne!(samples.len() % (sample_rate as usize * 10), 0);
+
+        let options = ort::session::RunOptions::new().expect("run options");
+        let segments = segment_speech(&samples, sample_rate, &model, &options)
+            .expect("segmentation must not panic or fail on a partial final window");
+        // The assertion that matters is that we got here at all; the panic
+        // previously escaped into catch_unwind and yielded zero speakers.
+        let _ = segments;
     }
 }
