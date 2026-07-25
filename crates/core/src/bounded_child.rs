@@ -143,9 +143,10 @@ impl BoundExecutable {
             PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
         }
         // Every other platform launches the snapshot through its pathname.
-        // Darwin returns ETXTBSY for descriptor execution while any writer is
-        // live, so `/dev/fd` execution is not available; `verify()` re-checks
-        // mode and digest immediately before launch instead.
+        // Measured on macOS 26.6: Darwin refuses descriptor execution of an
+        // unlinked inode with EACCES whether or not a writer is live, so
+        // `/dev/fd` execution is not available here. `verify()` re-checks mode
+        // and digest immediately before launch instead.
         #[cfg(not(target_os = "linux"))]
         {
             self.source_path.clone()
@@ -448,8 +449,10 @@ fn immutable_unix_executable_snapshot(
             .open(&snapshot_path)?;
         copy_executable_snapshot(source, &mut snapshot)?;
         snapshot.set_permissions(std::fs::Permissions::from_mode(0o500))?;
-        // Dropping the only writable handle here is what makes exec possible:
-        // with no live writer the kernel no longer returns ETXTBSY.
+        // The writable handle is dropped here so the snapshot is immutable
+        // before it is ever launched. Note this is not what unblocks exec on
+        // Darwin, which permits execve on a linked file another descriptor
+        // holds open for writing; the linked pathname is what unblocks it.
     }
 
     let mut file = std::fs::OpenOptions::new()
@@ -2378,9 +2381,11 @@ mod tests {
     }
 
     /// Guards the defect class that made the path-backed snapshot unusable:
-    /// Darwin and Linux both refuse `execve` with `ETXTBSY` on any vnode a
-    /// process still holds open for writing. The snapshot therefore has to drop
-    /// its writable handle and retain only a read handle before launch.
+    /// Linux refuses `execve` with `ETXTBSY` on any vnode a process still holds
+    /// open for writing, so a snapshot that retains its setup handle cannot be
+    /// launched here. Darwin differs (measured on 26.6: it permits that, and
+    /// instead refuses descriptor execution of an unlinked inode with EACCES),
+    /// which is why the snapshot is reachable by pathname on both.
     #[cfg(unix)]
     #[test]
     fn path_backed_snapshot_execs_only_after_its_writer_is_dropped() {

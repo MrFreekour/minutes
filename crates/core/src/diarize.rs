@@ -492,6 +492,8 @@ fn ffmpeg_preprocess_command(ffmpeg: &Path, input: &str) -> crate::bounded_child
 /// already produces exactly the canonical PCM this path needs.
 fn preprocess_compressed_without_ffmpeg(
     audio_path: &Path,
+    config: &Config,
+    cancellation: &DiarizationCancellation,
 ) -> Result<
     (
         std::path::PathBuf,
@@ -499,18 +501,38 @@ fn preprocess_compressed_without_ffmpeg(
     ),
     String,
 > {
-    let config = crate::config::Config::load();
-    if !crate::audio_decode_worker::bounded_decode_fallback_enabled(&config) {
-        return Err("the bounded decode fallback is disabled by configuration".into());
+    // Use the config the pipeline is running under rather than re-reading from
+    // disk, so the diarization decision cannot diverge from the transcription
+    // decision for the same file, and so no disk I/O happens inside the worker.
+    if !crate::audio_decode_worker::bounded_decode_fallback_available(config) {
+        return Err("the bounded decode fallback is unavailable".into());
     }
+    cancellation.check().map_err(|error| error.to_string())?;
+    // Preprocessing belongs to the same lease and deadline as decode and
+    // inference. Handing the child the 30-minute transcription deadline let it
+    // outlive the 15-minute diarization deadline: the parent returned TimedOut,
+    // the detached child kept the process-global worker lease, and every later
+    // file in the batch failed Busy and shipped unlabeled.
+    let remaining = cancellation.remaining();
+    if remaining.is_zero() {
+        return Err("diarization deadline elapsed before decoding began".into());
+    }
+    // Cap the decode at diarization's own sample budget rather than
+    // transcription's. Decoding four hours only for `load_wav_audio` to refuse
+    // anything past two is guaranteed wasted work, and it materialises the
+    // samples in this process, which has no address-space ceiling.
+    let max_output_bytes =
+        (MAX_DIARIZATION_SAMPLES as u64).saturating_mul(std::mem::size_of::<i16>() as u64);
+
     let mut pcm = crate::pipeline::PrivateAudioTempFile::new("minutes-diarize-fallback-", ".s16le")
         .map_err(|error| format!("private diarization temp file unavailable: {error}"))?;
     crate::audio_decode_worker::decode_to_private_pcm(
         audio_path,
         &mut pcm,
-        crate::audio_budget::AudioWorkBudget::max_pcm_s16le_bytes(),
-        crate::audio_budget::AUDIO_DECODE_DEADLINE,
+        max_output_bytes,
+        remaining,
     )?;
+    cancellation.check().map_err(|error| error.to_string())?;
     let samples = crate::transcribe::load_pcm_s16le_for_diarization(&mut pcm)?;
 
     let mut wav = crate::pipeline::PrivateAudioTempFile::new("minutes-diarize-fallback-", ".wav")
@@ -529,6 +551,7 @@ fn preprocess_compressed_without_ffmpeg(
 
 fn preprocess_audio(
     audio_path: &Path,
+    config: &Config,
     cancellation: &DiarizationCancellation,
 ) -> Result<
     (
@@ -565,7 +588,7 @@ fn preprocess_audio(
             // produced labels, so decode the compressed input through the
             // bounded worker before giving up.
             if crate::watch::compressed_audio_requires_ffmpeg(audio_path) {
-                match preprocess_compressed_without_ffmpeg(audio_path) {
+                match preprocess_compressed_without_ffmpeg(audio_path, config, cancellation) {
                     Ok(prepared) => return Ok(prepared),
                     Err(fallback) => {
                         tracing::warn!(
@@ -1944,7 +1967,7 @@ fn run_diarization_engine_inner(
     let preprocessed = if engine == "pyannote" {
         Ok((source_path.to_path_buf(), None))
     } else {
-        preprocess_audio(source_path, cancellation)
+        preprocess_audio(source_path, config, cancellation)
     };
     let (effective_path, _temp_file) =
         preprocessed.map_err(|error| format!("diarization preprocessing failed: {error}"))?;
@@ -3918,7 +3941,7 @@ mod tests {
     fn cancelled_deadline_preempts_both_diarization_child_paths() {
         let cancellation = DiarizationCancellation::new(Duration::ZERO);
         let synthetic = Path::new("/synthetic/ordinary.wav");
-        let preprocess_error = preprocess_audio(synthetic, &cancellation)
+        let preprocess_error = preprocess_audio(synthetic, &Config::default(), &cancellation)
             .err()
             .expect("preprocessing must check the shared deadline before child setup");
         assert!(preprocess_error.contains("deadline exceeded"));
@@ -3943,7 +3966,8 @@ mod tests {
         audio.finish_write().unwrap();
 
         let cancellation = DiarizationCancellation::new(Duration::from_secs(60));
-        let (effective, temporary) = preprocess_audio(audio.as_path(), &cancellation).unwrap();
+        let (effective, temporary) =
+            preprocess_audio(audio.as_path(), &Config::default(), &cancellation).unwrap();
         assert_eq!(effective, audio.as_path());
         assert!(temporary.is_none());
         let (samples, sample_rate) = load_audio(audio.as_path(), &cancellation).unwrap();
@@ -3990,7 +4014,7 @@ mod tests {
         });
 
         let cancellation = DiarizationCancellation::new(Duration::from_secs(60));
-        let (effective, retained) = preprocess_audio(&source, &cancellation)
+        let (effective, retained) = preprocess_audio(&source, &Config::default(), &cancellation)
             .expect("real ffmpeg preprocessing must complete");
         let retained = retained.expect("ffmpeg output must remain capability-owned");
         assert!(crate::pipeline::is_reserved_private_audio_path(&effective));

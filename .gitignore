@@ -53,6 +53,7 @@ dist/
 # Exception: committed AAC fixture for the bounded decode worker. Encoding it on
 # demand would let the test skip on exactly the machines it exists to cover.
 !crates/core/resources/decode-fixture-tone.m4a
+!crates/core/resources/decode-fixture-chained.ogg
 !tests/eval/fixtures/audio/apple-speech-meeting.wav
 # Exception: parity-test fixtures (deterministic WAVs derived from
 # demo.wav by examples/build_parity_fixtures.rs; committed so

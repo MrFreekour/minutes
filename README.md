@@ -796,7 +796,7 @@ winget install LLVM.LLVM
 [Environment]::SetEnvironmentVariable("LIBCLANG_PATH", "C:\Program Files\LLVM\bin", "User")
 # Restart your terminal after setting LIBCLANG_PATH
 
-# Compressed imports require ffmpeg.exe. Add its bin directory to PATH, or:
+# Compressed imports use ffmpeg.exe when installed, otherwise the bundled bounded decode worker. Add its bin directory to PATH, or:
 [Environment]::SetEnvironmentVariable("MINUTES_FFMPEG", "C:\path\to\ffmpeg.exe", "User")
 
 # Full build (includes speaker diarization):

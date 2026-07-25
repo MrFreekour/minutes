@@ -703,16 +703,22 @@ fn determine_content_type(path: &Path, config: &Config) -> ContentType {
     if !compressed_audio_requires_ffmpeg(path) {
         return determine_content_type_with_ffmpeg(path, config, None);
     }
+    // `dictation_threshold_secs = 0` disables duration-based routing entirely
+    // and is documented that way. Both probes must sit behind that switch, not
+    // just the ffmpeg one: leaving the bounded probe outside it made every
+    // compressed import a Meeting, because `content_type_for_duration` can
+    // never return Memo when the threshold is zero.
     let threshold = config.watch.dictation_threshold_secs;
+    if threshold == 0 {
+        return determine_content_type_with_ffmpeg(path, config, None);
+    }
     // Try ffmpeg first for parity with the decode path, but do not stop there.
     // Its pipe-based probe cannot demux a non-faststart MP4/M4A and returns
     // nothing, so a successful-looking ffmpeg install must still fall through
     // to the bounded probe rather than defaulting the route.
-    if threshold > 0 {
-        if let Ok(ffmpeg) = crate::ffmpeg::resolve_launchable_ffmpeg() {
-            if let Some(duration) = audio_duration(path, threshold, Some(ffmpeg.as_path())) {
-                return content_type_for_duration(duration, config);
-            }
+    if let Ok(ffmpeg) = crate::ffmpeg::resolve_launchable_ffmpeg() {
+        if let Some(duration) = audio_duration(path, threshold, Some(ffmpeg.as_path())) {
+            return content_type_for_duration(duration, config);
         }
     }
     if crate::audio_decode_worker::bounded_decode_fallback_available(config) {
@@ -1946,6 +1952,37 @@ mod tests {
         assert_eq!(ct, ContentType::Meeting);
     }
 
+    /// `dictation_threshold_secs = 0` disables duration routing, so the
+    /// configured type must win for compressed input too.
+    ///
+    /// Uses the committed one-second AAC fixture rather than synthetic bytes:
+    /// the defect only appears for a file whose duration can actually be
+    /// probed, because `content_type_for_duration` can never yield Memo at a
+    /// threshold of zero. Unprobeable bytes fall through to the configured type
+    /// either way and hide the bug. The sibling test above configures
+    /// `type = "meeting"`, which is also what a broken implementation returns,
+    /// so it cannot distinguish the two.
+    #[test]
+    fn disabled_duration_routing_keeps_compressed_input_on_the_configured_type() {
+        const FIXTURE: &[u8] = include_bytes!("../resources/decode-fixture-tone.m4a");
+        let dir = TempDir::new().unwrap();
+        let memo = dir.path().join("memo.m4a");
+        fs::write(&memo, FIXTURE).unwrap();
+
+        let mut config = Config::default();
+        config.watch.dictation_threshold_secs = 0;
+        config.watch.r#type = "memo".into();
+
+        assert_eq!(
+            determine_content_type(&memo, &config),
+            ContentType::Memo,
+            "a dictation-first user who disabled duration routing must keep memos as memos"
+        );
+
+        config.watch.r#type = "meeting".into();
+        assert_eq!(determine_content_type(&memo, &config), ContentType::Meeting);
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_ffmpeg_probe_routes_long_non_wav_as_meeting() {
@@ -1970,6 +2007,34 @@ mod tests {
         assert_eq!(
             determine_content_type_with_ffmpeg(&audio, &config, Some(&ffmpeg)),
             ContentType::Meeting
+        );
+    }
+
+    /// An ffmpeg that exits 0 having produced nothing is a FAILED probe, not a
+    /// measurement of zero seconds.
+    ///
+    /// This is exactly what ffmpeg does for a non-faststart MP4/M4A read from a
+    /// non-seekable pipe. Dividing zero bytes by the byte rate produced a
+    /// fabricated 0 s, filed long meetings as memos, and cost them diarization
+    /// — so installing ffmpeg made routing worse than not having it.
+    #[cfg(unix)]
+    #[test]
+    fn an_ffmpeg_probe_that_emits_nothing_is_a_failure_not_zero_seconds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("long.m4a");
+        fs::write(&audio, b"synthetic container bytes").unwrap();
+        // Exits 0, writes nothing: the real behaviour on a moov-at-end file.
+        let ffmpeg = dir.path().join("ffmpeg");
+        fs::write(&ffmpeg, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&ffmpeg).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&ffmpeg, permissions).unwrap();
+
+        assert!(
+            compressed_audio_duration(&audio, 120, &ffmpeg).is_none(),
+            "an empty probe must report failure so the caller can fall through"
         );
     }
 

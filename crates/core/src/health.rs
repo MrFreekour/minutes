@@ -378,7 +378,7 @@ pub fn ffmpeg_status(config: &Config) -> HealthItem {
         (Err(error), false) => (
             "attention",
             format!(
-                "{error} No decoder is available for compressed imports: ffmpeg is not installed and transcription.compressed_decode_fallback is disabled. Configured watch folders keep original audio and sidecars untouched and show them in Recovery Center; one-off watchers keep originals in place and print restart guidance. WAV imports remain available."
+                "{error} No decoder is available for compressed imports: ffmpeg is not installed, and the bundled bounded decode worker is either disabled by transcription.compressed_decode_fallback or could not be resolved in this install layout. Configured watch folders keep original audio and sidecars untouched and show them in Recovery Center; one-off watchers keep originals in place and print restart guidance. WAV imports remain available."
             ),
         ),
     };

@@ -225,18 +225,35 @@ pub fn bounded_decode_fallback_available(config: &crate::config::Config) -> bool
 ///
 /// Returns the raw PCM bytes written by the child. The caller converts them
 /// with the same reader used for ffmpeg output.
+/// Which job the child is being launched for.
+///
+/// Both jobs run Symphonia over attacker-controlled bytes and therefore need
+/// identical containment; keeping them in one builder is what stops a second,
+/// unasserted command drifting out of sync with the first.
+#[derive(Clone, Copy)]
+enum WorkerMode {
+    Decode,
+    ProbeDuration,
+}
+
 /// Build the decode child's command exactly as production launches it.
 ///
 /// Extracted so tests can assert the real configuration instead of rebuilding
 /// an equivalent-looking command of their own, which cannot catch a setting
 /// being dropped from this chain.
-fn build_decode_command(path: &Path) -> Result<crate::bounded_child::BoundedCommand, String> {
+fn build_decode_command(
+    path: &Path,
+    mode: WorkerMode,
+) -> Result<crate::bounded_child::BoundedCommand, String> {
     let executable = resolve_worker_executable()?;
     let mut command = crate::bounded_child::BoundedCommand::from_bound_executable(executable)
         .map_err(|_| "compressed audio decode worker authority could not be bound".to_string())?;
     retain_safe_environment(&mut command);
+    command.env(WORKER_MARKER, "1");
+    if matches!(mode, WorkerMode::ProbeDuration) {
+        command.arg(PROBE_DURATION_ARG);
+    }
     command
-        .env(WORKER_MARKER, "1")
         .arg("--")
         .arg(path)
         .single_process()
@@ -260,7 +277,7 @@ pub(crate) fn decode_to_private_pcm(
     max_output_bytes: u64,
     wall_clock: Duration,
 ) -> Result<(), String> {
-    let mut command = build_decode_command(path)?;
+    let mut command = build_decode_command(path, WorkerMode::Decode)?;
 
     let output = crate::pipeline::output_with_authorized_audio_stdin_to_private_file_with_budget(
         &mut command,
@@ -344,23 +361,7 @@ pub(crate) fn probe_compressed_duration(
     path: &Path,
     wall_clock: Duration,
 ) -> Option<std::time::Duration> {
-    let executable = resolve_worker_executable().ok()?;
-    let mut command =
-        crate::bounded_child::BoundedCommand::from_bound_executable(executable).ok()?;
-    retain_safe_environment(&mut command);
-    command
-        .env(WORKER_MARKER, "1")
-        .arg(PROBE_DURATION_ARG)
-        .arg("--")
-        .arg(path)
-        .single_process()
-        .close_extra_descriptors();
-    // Windows installs a Job Object memory ceiling from this same setting, at
-    // CREATE_SUSPENDED, which is the strongest ordering of any platform. Only
-    // Darwin rejects an absolute value here, so only Darwin defers to the
-    // in-child measured install.
-    #[cfg(not(target_os = "macos"))]
-    command.address_space_limit(WORKER_ADDRESS_SPACE_BYTES);
+    let mut command = build_decode_command(path, WorkerMode::ProbeDuration).ok()?;
 
     let run = crate::bounded_child::run(
         &mut command,
@@ -514,9 +515,21 @@ fn decode_compressed_to_s16le(path: &Path) -> Result<Vec<u8>, String> {
     let mut resampler: Option<crate::audio_budget::StreamingMonoResampler> = None;
 
     let mut decoded_any = false;
-    // Any packet-level error ends the stream: a truncated or hostile container
-    // yields whatever decoded cleanly so far rather than an error spiral.
-    while let Ok(packet) = format.next_packet() {
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            // A reset from the demuxer is the same event as one from the
+            // decoder, one layer up: a chained stream changes parameters and
+            // everything after it belongs to a different logical stream.
+            // Ending the loop here would return the leading fragment as a
+            // complete transcript.
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                return Err("stream reset mid-file; this container needs ffmpeg".into())
+            }
+            // Any other packet-level error ends the stream: a truncated or
+            // hostile container yields whatever decoded cleanly so far.
+            Err(_) => break,
+        };
         // The deadline is normally polled inside push_mono_sample, but a
         // container whose packets decode to zero frames never reaches it and
         // would spin until the parent's wall clock. Charge the budget per
@@ -640,7 +653,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_production_decode_command_carries_the_address_space_ceiling() {
-        let command = build_decode_command(Path::new("/nonexistent/input.m4a"))
+        let command = build_decode_command(Path::new("/nonexistent/input.m4a"), WorkerMode::Decode)
             .expect("the decode command must be constructible in the test tree");
         assert_eq!(
             command.configured_address_space_limit(),
@@ -654,9 +667,55 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_macos_decode_command_defers_its_ceiling_to_the_child() {
-        let command = build_decode_command(Path::new("/nonexistent/input.m4a"))
+        let command = build_decode_command(Path::new("/nonexistent/input.m4a"), WorkerMode::Decode)
             .expect("the decode command must be constructible in the test tree");
         assert_eq!(command.configured_address_space_limit(), None);
+    }
+
+    /// The probe child runs Symphonia over the same attacker-controlled bytes
+    /// as the decode child, so it needs the same ceiling. It previously had a
+    /// second, inline command builder whose ceiling nothing asserted.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_probe_command_carries_the_same_ceiling_as_the_decode_command() {
+        let decode = build_decode_command(Path::new("/nonexistent/input.m4a"), WorkerMode::Decode)
+            .expect("decode command must be constructible in the test tree");
+        let probe = build_decode_command(
+            Path::new("/nonexistent/input.m4a"),
+            WorkerMode::ProbeDuration,
+        )
+        .expect("probe command must be constructible in the test tree");
+        assert_eq!(
+            probe.configured_address_space_limit(),
+            Some(WORKER_ADDRESS_SPACE_BYTES)
+        );
+        assert_eq!(
+            probe.configured_address_space_limit(),
+            decode.configured_address_space_limit(),
+            "both children parse hostile containers and must be bounded identically"
+        );
+    }
+
+    /// A stream reset invalidates everything after it, so the decode must fail
+    /// rather than return the leading fragment as a complete transcript.
+    ///
+    /// Uses a committed chained OGG (two logical streams at different sample
+    /// rates concatenated, which is what a reset actually looks like in the
+    /// wild) so this cannot skip. Both the demuxer and the decoder can raise
+    /// the reset; either must fail closed.
+    #[test]
+    fn a_mid_stream_reset_fails_instead_of_truncating() {
+        const CHAINED: &[u8] = include_bytes!("../resources/decode-fixture-chained.ogg");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chained.ogg");
+        std::fs::write(&path, CHAINED).unwrap();
+
+        let error = decode_compressed_to_s16le(&path)
+            .expect_err("a chained stream must not be reported as a complete decode");
+        assert!(
+            error.contains("reset"),
+            "expected the reset to be named so the user knows why: {error}"
+        );
     }
 
     #[test]
