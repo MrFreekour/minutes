@@ -65,7 +65,7 @@ Recommended install:
 - `relationship_map` — Rank relationships from the bounded process-private policy-safe graph projection Docs: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 - `list_voices` — List enrolled voice profiles for speaker identification Docs: https://useminutes.app/docs/mcp/tools#tool-list-voices
 - `confirm_speaker` — Compatibility name only: agent-controlled speaker mutation is unavailable; use the Minutes app or human CLI Docs: https://useminutes.app/docs/mcp/tools#tool-confirm-speaker
-- `get_meeting_insights` — Query decisions, commitments, and questions extracted from meetings; each insight is released only after its source meeting is re-verified against live sensitivity policy Docs: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
+- `get_meeting_insights` — Query decisions, commitments, and questions extracted from meetings; each insight is released only after the meeting the pipeline recorded as its source is re-verified against live sensitivity policy, and withheld records are reported as a partial view Docs: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
 - `start_live_transcript` — Start a live transcript session for real-time meeting transcription Docs: https://useminutes.app/docs/mcp/tools#tool-start-live-transcript
 - `read_live_transcript` — Read utterances from the active live transcript with optional cursor or time window Docs: https://useminutes.app/docs/mcp/tools#tool-read-live-transcript
 - `start_copilot` — Start the independent real-time copilot for a goal and observe its CLI nudge stream Docs: https://useminutes.app/docs/mcp/tools#tool-start-copilot
@@ -75,7 +75,7 @@ Recommended install:
 - `ingest_meeting` — Extract facts from a meeting and update the knowledge base (person profiles, log, index) Docs: https://useminutes.app/docs/mcp/tools#tool-ingest-meeting
 - `knowledge_status` — Show the current state of the knowledge base — configuration, adapter, people count, log entries Docs: https://useminutes.app/docs/mcp/tools#tool-knowledge-status
 - `add_agent_annotation` — Append attributed agent commentary as an agent.annotation event, never editing meeting markdown or frontmatter (allowlist-gated by ~/.minutes/agents.allow) Docs: https://useminutes.app/docs/mcp/tools#tool-add-agent-annotation
-- `get_agent_annotations` — Read append-only agent.annotation events; each annotation is released only after its source meeting is re-verified against live sensitivity policy Docs: https://useminutes.app/docs/mcp/tools#tool-get-agent-annotations
+- `get_agent_annotations` — Compatibility name only: unavailable because an annotation's source pointer and body are both author-supplied, so revalidating the pointer cannot bound what the body discloses Docs: https://useminutes.app/docs/mcp/tools#tool-get-agent-annotations
 
 ## MCP Resources
 

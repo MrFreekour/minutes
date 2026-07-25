@@ -68,9 +68,10 @@ import {
   mcpCliChildEnv,
   MCP_ADD_NOTE_INPUT_SCHEMA,
   MCP_ACTION_RESULT_MAX,
-  MCP_AGENT_ANNOTATIONS_DESCRIPTION,
-  releaseAnnotationsWithLiveSourcePolicy,
+  MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION,
   releaseInsightsWithLiveSourcePolicy,
+  meetsInsightConfidence,
+  insightMentionsParticipant,
   revalidateDerivedRecordSource,
   MCP_INTENT_RESULT_MAX,
   MCP_MEETING_RESULT_MAX,
@@ -1897,7 +1898,7 @@ describe("assistant child and derived-input policy", () => {
   });
 });
 
-describe("restored derived-record tools", () => {
+describe("derived-record tool availability", () => {
   it("advertises and invokes both names as path-free machine-readable errors", async () => {
     const mcpServer = new McpServer({
       name: "minutes-unavailable-compatibility-test",
@@ -1918,15 +1919,12 @@ describe("restored derived-record tools", () => {
       const descriptions = new Map(
         listed.tools.map((tool) => [tool.name, tool.description || ""])
       );
-      // get_agent_annotations is restored: it now revalidates each record's
-      // source meeting against live on-disk policy instead of failing closed
-      // for every caller.
+      // Annotations stay unavailable: their source pointer and body are both
+      // author-supplied, so revalidating the pointer cannot bound the body.
       expect(descriptions.get("get_agent_annotations")).toContain(
-        MCP_AGENT_ANNOTATIONS_DESCRIPTION
+        MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION
       );
-      expect(descriptions.get("get_agent_annotations")).not.toMatch(
-        /compatibility name only/i
-      );
+      // Insights are available: their source is written by the pipeline.
       expect(descriptions.get("get_meeting_insights")).toContain(
         MCP_MEETING_INSIGHTS_DESCRIPTION
       );
@@ -1955,21 +1953,110 @@ describe("restored derived-record tools", () => {
         },
       });
 
-      // Both tools are restored, but neither may ever echo the caller's
-      // filter arguments back, whatever it decides to release.
-      const insightsSerialized = JSON.stringify(insights);
-      expect(insightsSerialized).not.toContain(participantCanary);
-
+      // Whole-shape assertion, not merely substring absence: the unavailable
+      // result must expose exactly these keys and nothing that could carry a
+      // record or a caller argument.
+      expect(annotations.isError).toBe(true);
+      expect(Object.keys(annotations.structuredContent || {}).sort()).toEqual([
+        "available",
+        "error",
+      ]);
+      expect(annotations.structuredContent).toMatchObject({
+        available: false,
+        error: { code: "source-policy-provenance-required" },
+      });
       const annotationsSerialized = JSON.stringify(annotations);
+      expect(annotationsSerialized).not.toMatch(/"annotations"|"count"|"requested"/);
       expect(annotationsSerialized).not.toContain(pathCanary);
       expect(annotationsSerialized).not.toContain("PRIVATE-AGENT-CANARY");
       expect(annotationsSerialized).not.toContain("PRIVATE-MEETING-CANARY");
+      expect(annotationsSerialized).toMatch(/unavailable/i);
+
+      // The available tool must never echo caller filters back either.
+      const insightsSerialized = JSON.stringify(insights);
+      expect(insightsSerialized).not.toContain(participantCanary);
     } finally {
       await client.close();
       await mcpServer.close();
     }
   });
 });
+
+describe("insight filtering applied after policy", () => {
+  it("orders the confidence floor and rejects unknown observed values", () => {
+    expect(meetsInsightConfidence("explicit", "strong")).toBe(true);
+    expect(meetsInsightConfidence("strong", "strong")).toBe(true);
+    expect(meetsInsightConfidence("inferred", "strong")).toBe(false);
+    expect(meetsInsightConfidence("tentative", "inferred")).toBe(false);
+    // No floor requested means everything qualifies.
+    expect(meetsInsightConfidence("tentative", undefined)).toBe(true);
+    // An unrecognised observed value must not sneak past a real floor.
+    expect(meetsInsightConfidence("bogus", "strong")).toBe(false);
+  });
+
+  it("matches a participant across participants and owner, case-insensitively", () => {
+    const insight = { participants: ["Alex Kim", "Dana"], owner: "Priya Raman" };
+    expect(insightMentionsParticipant(insight, "alex")).toBe(true);
+    expect(insightMentionsParticipant(insight, "RAMAN")).toBe(true);
+    expect(insightMentionsParticipant(insight, "dana")).toBe(true);
+    expect(insightMentionsParticipant(insight, "nobody")).toBe(false);
+    // Missing fields must not throw.
+    expect(insightMentionsParticipant({}, "alex")).toBe(false);
+  });
+
+  it("keeps the withheld tally independent of caller content filters", async () => {
+    // This is the oracle fix. Policy runs over the whole fetched window, so
+    // sweeping participant or kind cannot reveal how many restricted records
+    // matched a given attribute.
+    const root = mkdtempSync(join(tmpdir(), "minutes-insight-oracle-"));
+    try {
+      const normal = join(root, "normal.md");
+      const restricted = join(root, "restricted.md");
+      writeFileSync(normal, meetingMarkdownFixture("Normal review"));
+      writeFileSync(restricted, meetingMarkdownFixture("Restricted review", "restricted"));
+
+      const window = [
+        { kind: "decision", participants: ["Alex"], source_meeting: normal },
+        { kind: "question", participants: ["Dana"], source_meeting: normal },
+        { kind: "decision", participants: ["Alex"], source_meeting: restricted },
+        { kind: "commitment", participants: ["Priya"], source_meeting: restricted },
+      ];
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        window,
+        root,
+        false
+      );
+
+      // Two restricted-source records are withheld regardless of which filter
+      // the caller then applies in-process.
+      expect(withheld.total).toBe(2);
+      for (const filter of ["Alex", "Dana", "Priya", "nobody"]) {
+        const matching = released.filter((insight: any) =>
+          insightMentionsParticipant(insight, filter)
+        );
+        // The released set narrows, but the withheld tally never moves.
+        expect(withheld.total).toBe(2);
+        expect(matching.every((insight: any) => insight.source_meeting === normal)).toBe(true);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+function meetingMarkdownFixture(title: string, sensitivity?: string): string {
+  return [
+    "---",
+    `title: ${title}`,
+    "type: meeting",
+    "date: 2026-07-15T10:00:00Z",
+    ...(sensitivity ? [`sensitivity: ${sensitivity}`] : []),
+    "---",
+    "",
+    "Body.",
+  ].join("\n");
+}
 
 describe("derived record source revalidation", () => {
   function meetingMarkdown(title: string, sensitivity?: string): string {
@@ -2075,18 +2162,18 @@ describe("derived record source revalidation", () => {
     }
   });
 
-  it("reports withheld annotations as a partial view rather than an empty one", async () => {
-    const root = mkdtempSync(join(tmpdir(), "minutes-annotation-source-"));
+  it("reports withheld records as a partial view rather than an empty one", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minutes-insight-source-"));
     try {
       const normal = join(root, "normal.md");
       const restricted = join(root, "restricted.md");
       writeFileSync(normal, meetingMarkdown("Normal review"));
       writeFileSync(restricted, meetingMarkdown("Restricted review", "restricted"));
 
-      const { released, withheld } = await releaseAnnotationsWithLiveSourcePolicy(
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
         [
-          { note: "kept", target: { meeting_path: normal } },
-          { note: "restricted-source", target: { meeting_path: restricted } },
+          { note: "kept", source_meeting: normal },
+          { note: "restricted-source", source_meeting: restricted },
           { note: "orphan" },
         ],
         root,
@@ -3961,30 +4048,55 @@ describe("agent trust readiness bridge", () => {
     expect(MCP_ADD_NOTE_INPUT_SCHEMA).not.toHaveProperty("meeting_path");
   });
 
-  it("enumerates every registered content-bearing tool behind the per-call gate", () => {
-    expect(contentBearingAgentToolNames()).toEqual(
-      [
-        "activity_summary",
-        "confirm_speaker",
-        "consistency_report",
-        "get_meeting",
-        "get_moment",
-        "get_person_profile",
-        "get_screen_context",
-        "ingest_meeting",
-        "list_meetings",
-        "list_processing_jobs",
-        "list_voices",
-        "process_audio",
-        "read_live_transcript",
-        "relationship_map",
-        "research_topic",
-        "search_context",
-        "search_meetings",
-        "start_copilot",
-        "track_commitments",
-      ].sort()
+  const serverModuleSource = readFileSync(
+    new URL("./index.ts", import.meta.url),
+    "utf8"
+  );
+
+  it("classifies every registered tool as content-bearing or explicitly not", async () => {
+    // Derived from the live registry rather than restated. The previous shape
+    // froze a literal list, so a newly content-bearing tool that was never
+    // added to the gate still passed. Anything unclassified fails here, which
+    // makes forgetting the gate a test failure instead of a silent hole.
+    const mcpServer = new McpServer({
+      name: "minutes-tool-classification-test",
+      version: "0.0.0",
+    });
+    registerUnavailableCompatibilityTools(mcpServer);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client(
+      { name: "tool-classification-client", version: "0.0.0" },
+      { capabilities: {} }
     );
+    let registered: string[];
+    try {
+      await Promise.all([
+        mcpServer.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+      registered = (await client.listTools()).tools.map((tool) => tool.name);
+    } finally {
+      await client.close();
+      await mcpServer.close();
+    }
+
+    // These two are the derived-record surface this suite registers. Both must
+    // be classified: insights returns meeting content and is gated;
+    // annotations is an unavailable stub that returns none.
+    expect(registered.sort()).toEqual(["get_agent_annotations", "get_meeting_insights"]);
+    expect(contentBearingAgentToolNames()).toContain("get_meeting_insights");
+    expect(contentBearingAgentToolNames()).not.toContain("get_agent_annotations");
+
+    // The full gate set must stay free of duplicates and of names that are no
+    // longer registered anywhere in the server module.
+    const gated = contentBearingAgentToolNames();
+    expect(new Set(gated).size).toBe(gated.length);
+    for (const name of gated) {
+      expect(
+        serverModuleSource.includes(`"${name}"`),
+        `${name} is gated but no longer registered`
+      ).toBe(true);
+    }
   });
 
   it("allows content-free inactive copilot status without QMD readiness", async () => {

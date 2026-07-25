@@ -205,6 +205,12 @@ export const MCP_ACTION_RESULT_MAX = 50;
 export const MCP_POLICY_MEETING_RESULT_MAX = 5_000;
 /** Independent structured/text collection caps for derived MCP surfaces. */
 export const MCP_INTENT_RESULT_MAX = 50;
+/**
+ * Window size for one insight read. Bounded like every peer surface so a
+ * caller cannot request an unbounded projection, and so the truncation the
+ * caller is told about has a known ceiling.
+ */
+export const MCP_INSIGHT_RESULT_MAX = 500;
 export const MCP_PERSON_PROFILE_MEETING_MAX = 50;
 export const MCP_PERSON_PROFILE_OPEN_ACTION_MAX = 50;
 export const MCP_PERSON_PROFILE_TOPIC_MAX = 50;
@@ -552,6 +558,12 @@ const CONTENT_BEARING_AGENT_TOOLS = new Set([
   "start_copilot",
   "read_live_transcript",
   "ingest_meeting",
+  // Returns decision and commitment text, owners, deadlines and participant
+  // names drawn from meetings, so it belongs behind the same per-call
+  // readiness gate as every peer above. Omitting it meant a machine whose
+  // registry had degraded withheld track_commitments while serving the same
+  // content through this tool.
+  "get_meeting_insights",
 ]);
 
 export function isContentBearingAgentTool(name: string): boolean {
@@ -7280,10 +7292,32 @@ registerTool(
 
 // ── Tool: get_agent_annotations ────────────────────────────
 
-export const MCP_AGENT_ANNOTATIONS_DESCRIPTION =
-  "Read append-only agent.annotation events separately from human-authored meeting markdown/frontmatter. Each annotation is released only after its source meeting is re-read from disk and re-verified against the live sensitivity policy; annotations whose source cannot be revalidated are withheld and counted, never silently dropped.";
+/**
+ * Annotations stay unavailable, and the reason is architectural rather than
+ * incidental.
+ *
+ * An annotation's only link to a meeting is `target.meeting_path`, which is
+ * free-form caller input to the live `add_agent_annotation` tool; the CLI
+ * validator never checks that the target exists, sits in the corpus, or bears
+ * any relationship to the body. Its `body` and `citations` are likewise
+ * free text. Revalidating the target therefore proves nothing about the
+ * content: an agent that read a restricted meeting under an audited override
+ * can write an annotation targeting a normal meeting with the restricted
+ * content in its body, and every later read releases it with no override and
+ * no audit. One audited grant becomes a permanent unaudited channel.
+ *
+ * This is the same defect the lane cites for disabling QMD persistence, that
+ * revocation cannot be guaranteed after an external meeting-policy change.
+ * Closing it needs provenance the writer cannot choose, which does not exist
+ * today, so the honest answer remains unavailable.
+ *
+ * Insights are different in exactly the way that matters: `source_meeting` is
+ * written by the pipeline as the path it processed, not by a caller.
+ */
+export const MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION =
+  "Compatibility name only: unavailable in MCP because an annotation's source pointer and body are both author-supplied, so revalidating the pointer cannot bound what the body discloses.";
 export const MCP_MEETING_INSIGHTS_DESCRIPTION =
-  "Query structured insights extracted from meetings, decisions, commitments and questions with confidence levels. Each insight is released only after the meeting it names as its source is re-read from disk and re-verified against the live sensitivity policy; insights whose source cannot be revalidated are withheld and counted, never silently dropped.";
+  "Query structured insights extracted from meetings, decisions, commitments and questions with confidence levels. Each insight is released only after the meeting the pipeline recorded as its source is re-read from disk and re-verified against the live sensitivity policy. Withheld records are reported as a partial view rather than an empty one.";
 
 function unavailableDerivedRecordResult(message: string) {
   return {
@@ -7385,23 +7419,40 @@ export async function releaseRecordsWithLiveSourcePolicy(
   return { released, withheld };
 }
 
-export function releaseAnnotationsWithLiveSourcePolicy(
-  annotations: any[],
-  meetingsDir: string,
-  includeRestricted: boolean
-) {
-  return releaseRecordsWithLiveSourcePolicy(
-    annotations,
-    (annotation) => annotation?.target?.meeting_path,
-    meetingsDir,
-    includeRestricted
-  );
-}
-
 /**
  * Insights carry `source_meeting`, the path to the markdown they were derived
  * from, so they revalidate through exactly the same live policy check.
  */
+/** Confidence ladder, lowest first, matching the CLI's ordering. */
+const INSIGHT_CONFIDENCE_ORDER = ["tentative", "inferred", "strong", "explicit"] as const;
+
+/**
+ * Whether an insight meets a minimum confidence floor.
+ *
+ * Applied in this process rather than by the CLI so that policy revalidation
+ * runs before any caller-controlled selector, which is what keeps the withheld
+ * tally from becoming an oracle.
+ */
+export function meetsInsightConfidence(observed: unknown, minimum: unknown): boolean {
+  const observedIndex = INSIGHT_CONFIDENCE_ORDER.indexOf(observed as never);
+  const minimumIndex = INSIGHT_CONFIDENCE_ORDER.indexOf(minimum as never);
+  if (minimumIndex < 0) return true;
+  if (observedIndex < 0) return false;
+  return observedIndex >= minimumIndex;
+}
+
+/** Case-insensitive partial match over participants and owner, as the CLI does. */
+export function insightMentionsParticipant(insight: any, participant: string): boolean {
+  const needle = participant.toLowerCase();
+  if (!needle) return true;
+  const owner = typeof insight?.owner === "string" ? insight.owner : "";
+  if (owner.toLowerCase().includes(needle)) return true;
+  const participants = Array.isArray(insight?.participants) ? insight.participants : [];
+  return participants.some(
+    (value: unknown) => typeof value === "string" && value.toLowerCase().includes(needle)
+  );
+}
+
 export function releaseInsightsWithLiveSourcePolicy(
   insights: any[],
   meetingsDir: string,
@@ -7419,61 +7470,17 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
   registerToolWithRestrictedPolicy(
     serverArg,
     "get_agent_annotations",
-    MCP_AGENT_ANNOTATIONS_DESCRIPTION,
+    MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION,
     {
-      limit: z.number().optional().default(50).describe("Maximum number of annotations"),
-      agent_id: z.string().optional().describe("Filter by agent id"),
-      meeting_id: z.string().optional().describe("Filter by target meeting id"),
-      meeting_path: z.string().optional().describe("Filter by target meeting path"),
-      include_restricted: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe(
-          "Include annotations whose source meeting is designated sensitivity: restricted. Requires the server to have been launched with MINUTES_MCP_RESTRICTED_POLICY=logged-override; the request is durably audited."
-        ),
+      limit: z.number().optional().default(50).describe("Compatibility argument; the tool is unavailable"),
+      agent_id: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+      meeting_id: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
+      meeting_path: z.string().optional().describe("Compatibility argument; the tool is unavailable"),
     },
-    { title: "Get Agent Annotations", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    async ({ limit, agent_id, meeting_id, meeting_path, include_restricted }: any) => {
-      if (!(await isCliAvailable())) {
-        return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }], isError: true };
-      }
-
-      const matching = (await readAgentAnnotationsFromCli(limit)).filter((event: any) => {
-        if (agent_id && event?.agent?.id !== agent_id) return false;
-        if (meeting_id && event?.target?.meeting_id !== meeting_id) return false;
-        if (meeting_path && event?.target?.meeting_path !== meeting_path) return false;
-        return true;
-      });
-
-      // Every surviving record is re-checked against on-disk policy now. The
-      // provenance stored with the annotation is never sufficient on its own.
-      const meetingsDir = await getEffectiveMeetingsDir();
-      const { released, withheld } = await releaseAnnotationsWithLiveSourcePolicy(
-        matching,
-        meetingsDir,
-        include_restricted === true
-      );
-
-      const summary =
-        withheld.total === 0
-          ? JSON.stringify(released, null, 2)
-          : [
-              JSON.stringify(released, null, 2),
-              "",
-              `${withheld.total} annotation(s) withheld: ${withheld.sourcePolicyDenied} whose source meeting is restricted or no longer verifiable, ${withheld.noSourceProvenance} with no source meeting to revalidate.`,
-            ].join("\n");
-
-      return {
-        content: [{ type: "text" as const, text: summary }],
-        structuredContent: {
-          available: true,
-          annotations: released,
-          withheld,
-          partial: withheld.total > 0,
-        },
-      };
-    }
+    { title: "Get Agent Annotations (Unavailable)", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async () => unavailableDerivedRecordResult(
+      "Agent annotations are unavailable to MCP. An annotation's source pointer and its body are both written by the annotation's author, so revalidating the pointer cannot bound what the body discloses."
+    )
   );
 
   registerToolWithRestrictedPolicy(
@@ -7485,14 +7492,21 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
       confidence: z.enum(["tentative", "inferred", "strong", "explicit"]).optional().describe("Minimum confidence level"),
       participant: z.string().optional().describe("Filter by participant name (partial match)"),
       since: z.string().optional().describe("Only insights since this date (YYYY-MM-DD)"),
-      limit: z.number().optional().default(50).describe("Maximum number of results"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MCP_INSIGHT_RESULT_MAX)
+        .optional()
+        .default(50)
+        .describe(`Maximum number of results (1-${MCP_INSIGHT_RESULT_MAX})`),
       actionable_only: z.boolean().optional().default(false).describe("Only return actionable insights (Strong or Explicit confidence)"),
       include_restricted: z
         .boolean()
         .optional()
         .default(false)
         .describe(
-          "Include insights derived from meetings designated sensitivity: restricted. Requires the server to have been launched with MINUTES_MCP_RESTRICTED_POLICY=logged-override; the request is durably audited."
+          "Include insights whose source meeting is designated sensitivity: restricted. Requires the server to have been launched with MINUTES_MCP_RESTRICTED_POLICY=logged-override; the request is durably audited. This does not recover insights withheld for any other reason, such as a source that was archived, moved, or deleted."
         ),
     },
     { title: "Get Meeting Insights", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -7501,64 +7515,110 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
         return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }], isError: true };
       }
 
-      const args = ["insights", "--limit", String(limit ?? 50)];
-      if (kind) args.push("--kind", String(kind));
-      // The CLI treats --actionable as its own confidence floor, so the two
-      // flags are mutually exclusive here exactly as they are upstream.
-      if (actionable_only) {
-        args.push("--actionable");
-      } else if (confidence) {
-        args.push("--confidence", String(confidence));
-      }
-      if (participant) args.push("--participant", String(participant));
+      const requested = normalizeMcpResultLimit(limit ?? 50, MCP_INSIGHT_RESULT_MAX, "insight");
+      // Only window-shaping arguments reach the CLI. Content selectors stay in
+      // this process so that policy filtering happens BEFORE them: computing
+      // the withheld tally after a caller-supplied participant or kind filter
+      // turned that tally into an oracle, letting an agent with no content
+      // access learn who attended a restricted meeting and how many decisions
+      // it held by sweeping the filter.
+      const args = ["insights", "--limit", String(requested)];
       if (since) args.push("--since", String(since));
 
+      let fetched: unknown[];
       try {
-        const { stdout } = await runMinutes(args, 10000);
+        const { stdout } = await runMinutes(args, 30000);
         const parsed = parseJsonOutput(stdout);
-        const insights = Array.isArray(parsed) ? parsed : [];
-
-        // Each insight names the markdown it was derived from. That source is
-        // re-read and re-checked against live policy before release.
-        const meetingsDir = await getEffectiveMeetingsDir();
-        const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
-          insights,
-          meetingsDir,
-          include_restricted === true
-        );
-
-        if (released.length === 0 && withheld.total === 0) {
-          return {
-            content: [{ type: "text" as const, text: "No meeting insights found matching the filter criteria. Insights are extracted when meetings are processed with summarization enabled." }],
-            structuredContent: { available: true, count: 0, insights: [], withheld, partial: false },
-          };
+        if (!Array.isArray(parsed)) {
+          // Never coerce unparseable output to an empty array: reporting
+          // `partial: false` for it would be an affirmative claim of
+          // completeness built on output we could not read.
+          throw new Error("Minutes returned an unreadable insight projection");
         }
-
-        const withheldNote =
-          withheld.total === 0
-            ? ""
-            : `\n\n${withheld.total} insight(s) withheld: ${withheld.sourcePolicyDenied} whose source meeting is restricted or no longer verifiable, ${withheld.noSourceProvenance} with no source meeting to revalidate.`;
-
+        fetched = parsed;
+      } catch {
+        // The raw error can carry the CLI's stdout, which for this command is
+        // the unfiltered insight projection, and would bypass revalidation
+        // entirely through the error channel. Never echo it.
         return {
           content: [{
             type: "text" as const,
-            text: `Found ${released.length} insight(s):\n\n${JSON.stringify(released, null, 2)}${withheldNote}`,
+            text: "Failed to query insights. Run `minutes insights` directly to see the underlying error.",
           }],
-          structuredContent: {
-            available: true,
-            count: released.length,
-            insights: released,
-            withheld,
-            partial: withheld.total > 0,
-          },
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text" as const, text: `Failed to query insights: ${message}` }],
           isError: true,
         };
       }
+
+      // Each insight names the markdown the pipeline derived it from. That
+      // source is re-read and re-checked against live policy before release.
+      const meetingsDir = await getEffectiveMeetingsDir();
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        fetched,
+        meetingsDir,
+        include_restricted === true
+      );
+
+      const minimumConfidence = actionable_only ? "strong" : confidence;
+      const matching = released.filter((insight: any) => {
+        if (kind && insight?.kind !== kind) return false;
+        if (minimumConfidence && !meetsInsightConfidence(insight?.confidence, minimumConfidence)) {
+          return false;
+        }
+        if (participant && !insightMentionsParticipant(insight, String(participant))) return false;
+        return true;
+      });
+
+      // `partial` must account for truncation as well as policy. The previous
+      // shape reported `partial: false` on a limit-truncated window, which let
+      // an agent answer "there are no decisions about X" from an incomplete
+      // read.
+      const truncated = fetched.length >= requested;
+      const partial = withheld.total > 0 || truncated;
+
+      const notes: string[] = [];
+      if (withheld.total > 0) {
+        notes.push(
+          `${withheld.total} insight(s) withheld because their source meeting could not be revalidated against live policy: it is designated restricted, or has been archived, moved, or deleted.`
+        );
+      }
+      if (truncated) {
+        notes.push(
+          `This view is truncated at ${requested} record(s); older insights were not examined. Raise limit or narrow since for a complete answer.`
+        );
+      }
+      const suffix = notes.length === 0 ? "" : `\n\n${notes.join("\n")}`;
+
+      if (matching.length === 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `No meeting insights matched the filter criteria. Insights are extracted when meetings are processed with summarization enabled.${suffix}`,
+          }],
+          structuredContent: {
+            available: true,
+            count: 0,
+            insights: [],
+            withheld,
+            truncated,
+            partial,
+          },
+        };
+      }
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Found ${matching.length} insight(s):\n\n${JSON.stringify(matching, null, 2)}${suffix}`,
+        }],
+        structuredContent: {
+          available: true,
+          count: matching.length,
+          insights: matching,
+          withheld,
+          truncated,
+          partial,
+        },
+      };
     }
   );
 }

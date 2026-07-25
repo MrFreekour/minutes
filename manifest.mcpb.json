@@ -129,7 +129,7 @@
     },
     {
       "name": "get_meeting_insights",
-      "description": "Query decisions, commitments, and questions extracted from meetings; each insight is released only after its source meeting is re-verified against live sensitivity policy"
+      "description": "Query decisions, commitments, and questions extracted from meetings; each insight is released only after the meeting the pipeline recorded as its source is re-verified against live sensitivity policy, and withheld records are reported as a partial view"
     },
     {
       "name": "start_live_transcript",
@@ -169,7 +169,7 @@
     },
     {
       "name": "get_agent_annotations",
-      "description": "Read append-only agent.annotation events; each annotation is released only after its source meeting is re-verified against live sensitivity policy"
+      "description": "Compatibility name only: unavailable because an annotation's source pointer and body are both author-supplied, so revalidating the pointer cannot bound what the body discloses"
     }
   ],
   "prompts": [

@@ -196,7 +196,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 
 #### `get_meeting_insights`
 
-Query decisions, commitments, and questions extracted from meetings; each insight is released only after its source meeting is re-verified against live sensitivity policy
+Query decisions, commitments, and questions extracted from meetings; each insight is released only after the meeting the pipeline recorded as its source is re-verified against live sensitivity policy, and withheld records are reported as a partial view
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
 
@@ -300,7 +300,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-add-agent-annotation
 
 #### `get_agent_annotations`
 
-Read append-only agent.annotation events; each annotation is released only after its source meeting is re-verified against live sensitivity policy
+Compatibility name only: unavailable because an annotation's source pointer and body are both author-supplied, so revalidating the pointer cannot bound what the body discloses
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-agent-annotations
 

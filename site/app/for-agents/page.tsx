@@ -59,7 +59,7 @@ const toolGroups = [
   {
     label: "Insights",
     tools: [
-      ["get_meeting_insights", "Compatibility name only; returns an explicit unavailable error until derived records have live-verifiable source provenance."],
+      ["get_meeting_insights", "Decisions, commitments and questions, released only after the meeting the pipeline recorded as each insight's source is re-verified against live sensitivity policy. Withheld records are reported as a partial view."],
       ["ingest_meeting", "Extract facts from a meeting into the knowledge base."],
       ["knowledge_status", "Current state of the knowledge base."],
     ],
@@ -96,7 +96,7 @@ const toolGroups = [
       ["copilot_status", "Read the current Coach session and provider health."],
       ["read_copilot_nudges", "Read observed Coach nudges incrementally by cursor or time window."],
       ["add_agent_annotation", "Append allowlisted agent commentary without editing meeting markdown or frontmatter."],
-      ["get_agent_annotations", "Compatibility name only; unavailable until annotations have live-verifiable source-policy provenance."],
+      ["get_agent_annotations", "Compatibility name only; unavailable because an annotation's source pointer and body are both author-supplied, so revalidating the pointer cannot bound what the body discloses."],
     ],
   },
 ] as const;
