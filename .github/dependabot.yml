@@ -1,0 +1,105 @@
+# Dependabot configuration
+#
+# Grouped updates keep PR volume manageable for a solo maintainer: patch and
+# minor bumps arrive as one PR per ecosystem per week, while major bumps stay
+# separate so they get read properly.
+#
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+
+version: 2
+
+updates:
+  # ── Rust workspace (core, cli, reader, whisper-guard, tauri) ──────────────
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ── MCP server ────────────────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/crates/mcp"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      mcp-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ── TypeScript SDK (published to npm as minutes-sdk) ──────────────────────
+  - package-ecosystem: npm
+    directory: "/crates/sdk"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      sdk-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ── Landing site ──────────────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/site"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      site-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ── Cowork extension ──────────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/integrations/claude-cowork-extension"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cowork-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ── Skills compiler tooling ───────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/tooling/skills"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      tooling-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ── GitHub Actions used by CI and release workflows ───────────────────────
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions-all:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"
