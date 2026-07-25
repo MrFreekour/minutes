@@ -1643,6 +1643,24 @@ impl Drop for SensitiveDecodedSamples {
     }
 }
 
+/// Read the bounded decode worker's PCM back as samples, for consumers outside
+/// this module that need canonical audio rather than a transcript.
+pub(crate) fn load_pcm_s16le_for_diarization(
+    pcm: &mut crate::pipeline::PrivateAudioTempFile,
+) -> Result<Vec<f32>, String> {
+    let reader = pcm
+        .try_clone_reader()
+        .map_err(|error| format!("decoded audio could not be reopened: {error}"))?;
+    let mut samples = load_pcm_s16le_stream_with_limit(
+        reader,
+        crate::audio_budget::MAX_CANONICAL_SAMPLES,
+        crate::audio_budget::AudioWorkBudget::new(),
+    )
+    .map_err(|error| format!("decoded audio could not be read: {error}"))?;
+    crate::audio_budget::normalize_in_place(&mut samples);
+    Ok(samples)
+}
+
 fn load_pcm_s16le_stream_with_limit<R: Read>(
     mut reader: R,
     max_samples: usize,

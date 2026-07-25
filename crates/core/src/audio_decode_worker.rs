@@ -62,7 +62,7 @@ const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 /// before the decoder is constructed and therefore before Symphonia reads a
 /// single attacker-controlled byte. Only dyld and Rust runtime startup precede
 /// it, and neither touches the input.
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
 fn install_child_address_space_ceiling() -> Result<(), String> {
     let baseline = process_virtual_size()?;
     let limit = baseline
@@ -103,13 +103,6 @@ fn process_virtual_size() -> Result<u64, String> {
         return Err("decode worker could not measure its address space".into());
     }
     Ok(info.virtual_size)
-}
-
-/// Non-macOS Unix targets that also skip the `pre_exec` ceiling read their
-/// baseline from `getrlimit`, falling back to the budget alone.
-#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
-fn process_virtual_size() -> Result<u64, String> {
-    Ok(0)
 }
 
 /// Child exit code used when the input could not be decoded at all, as opposed
@@ -232,12 +225,12 @@ pub fn bounded_decode_fallback_available(config: &crate::config::Config) -> bool
 ///
 /// Returns the raw PCM bytes written by the child. The caller converts them
 /// with the same reader used for ffmpeg output.
-pub(crate) fn decode_to_private_pcm(
-    path: &Path,
-    destination: &mut crate::pipeline::PrivateAudioTempFile,
-    max_output_bytes: u64,
-    wall_clock: Duration,
-) -> Result<(), String> {
+/// Build the decode child's command exactly as production launches it.
+///
+/// Extracted so tests can assert the real configuration instead of rebuilding
+/// an equivalent-looking command of their own, which cannot catch a setting
+/// being dropped from this chain.
+fn build_decode_command(path: &Path) -> Result<crate::bounded_child::BoundedCommand, String> {
     let executable = resolve_worker_executable()?;
     let mut command = crate::bounded_child::BoundedCommand::from_bound_executable(executable)
         .map_err(|_| "compressed audio decode worker authority could not be bound".to_string())?;
@@ -249,14 +242,25 @@ pub(crate) fn decode_to_private_pcm(
         .single_process()
         .close_extra_descriptors();
     // Ordering is the security property: the ceiling must bind before Symphonia
-    // reads an attacker-controlled byte. On Linux `pre_exec` gives the strongest
-    // form, binding before `exec` itself. Darwin rejects an absolute RLIMIT_AS
-    // below its pre-main() shared-cache baseline, so there the child installs a
-    // measured ceiling itself at `maybe_run_audio_decode_worker`, still ahead of
-    // any decode. Setting it here as well would fail, since a process cannot
-    // raise its own hard limit.
-    #[cfg(target_os = "linux")]
+    // reads an attacker-controlled byte. Linux binds it from `pre_exec`, before
+    // `exec` itself. Windows installs a Job Object memory ceiling from this same
+    // setting at CREATE_SUSPENDED, the strongest ordering of any platform.
+    // Only Darwin rejects an absolute RLIMIT_AS below its pre-main()
+    // shared-cache baseline, so only Darwin defers to the measured in-child
+    // install at `maybe_run_audio_decode_worker`; setting it here as well would
+    // fail, since a process cannot raise its own hard limit.
+    #[cfg(not(target_os = "macos"))]
     command.address_space_limit(WORKER_ADDRESS_SPACE_BYTES);
+    Ok(command)
+}
+
+pub(crate) fn decode_to_private_pcm(
+    path: &Path,
+    destination: &mut crate::pipeline::PrivateAudioTempFile,
+    max_output_bytes: u64,
+    wall_clock: Duration,
+) -> Result<(), String> {
+    let mut command = build_decode_command(path)?;
 
     let output = crate::pipeline::output_with_authorized_audio_stdin_to_private_file_with_budget(
         &mut command,
@@ -305,7 +309,7 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
     }
     // Ordering: install the ceiling before anything parses input. On Linux the
     // parent already bound it via pre_exec; elsewhere this is where it binds.
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
     if let Err(error) = install_child_address_space_ceiling() {
         eprintln!("{error}");
         return Some(71);
@@ -351,7 +355,11 @@ pub(crate) fn probe_compressed_duration(
         .arg(path)
         .single_process()
         .close_extra_descriptors();
-    #[cfg(target_os = "linux")]
+    // Windows installs a Job Object memory ceiling from this same setting, at
+    // CREATE_SUSPENDED, which is the strongest ordering of any platform. Only
+    // Darwin rejects an absolute value here, so only Darwin defers to the
+    // in-child measured install.
+    #[cfg(not(target_os = "macos"))]
     command.address_space_limit(WORKER_ADDRESS_SPACE_BYTES);
 
     let run = crate::bounded_child::run(
@@ -496,17 +504,14 @@ fn decode_compressed_to_s16le(path: &Path) -> Result<Vec<u8>, String> {
 
     // Resample and bound in one streaming pass so a hostile declared duration
     // cannot force an unbounded intermediate buffer even under the ceiling.
+    //
+    // The resampler is built from the first decoded frame's actual rate rather
+    // than the container's declaration, so it is created lazily below.
     let budget = crate::audio_budget::AudioWorkBudget::new();
     budget
         .validate_stream(source_rate, channels)
         .map_err(|error| error.to_string())?;
-    let mut resampler = crate::audio_budget::StreamingMonoResampler::new(
-        source_rate,
-        crate::audio_budget::CANONICAL_SAMPLE_RATE,
-        budget,
-        crate::audio_budget::MAX_CANONICAL_SAMPLES,
-    )
-    .map_err(|error| error.to_string())?;
+    let mut resampler: Option<crate::audio_budget::StreamingMonoResampler> = None;
 
     let mut decoded_any = false;
     // Any packet-level error ends the stream: a truncated or hostile container
@@ -524,21 +529,38 @@ fn decode_compressed_to_s16le(path: &Path) -> Result<Vec<u8>, String> {
         }
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
-            // A reset invalidates all later packets, so stop rather than
-            // silently emitting a truncated decode as if it were complete.
-            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            // A reset invalidates every later packet. Returning what decoded
+            // so far would be a truncated transcript presented as complete, so
+            // fail instead: a wrong result is worse than none.
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                return Err("decoder reset mid-stream; this container needs ffmpeg".into())
+            }
             Err(_) => continue,
         };
         let spec = *decoded.spec();
-        // Trust the decoded rate over the container's declaration. When an
-        // HE-AAC/SBR stream halves the core rate, resampling by the declared
-        // rate silently returns time- and pitch-scaled audio as success.
-        if spec.rate != source_rate {
-            return Err(format!(
-                "declared sample rate {source_rate} does not match the decoded rate {}",
-                spec.rate
-            ));
-        }
+        // Trust the decoded rate over the container's declaration, and build
+        // the resampler from it. An HE-AAC/SBR stream declares 44100 in the
+        // AudioSampleEntry while the decoder reports the 22050 core rate;
+        // resampling by the declared rate returns time- and pitch-scaled audio
+        // as success, and refusing the file would deny it to exactly the
+        // no-ffmpeg users this exists for.
+        let resampler = match resampler.as_mut() {
+            Some(resampler) => resampler,
+            None => {
+                budget
+                    .validate_stream(spec.rate, spec.channels.count().max(1))
+                    .map_err(|error| error.to_string())?;
+                resampler.insert(
+                    crate::audio_budget::StreamingMonoResampler::new(
+                        spec.rate,
+                        crate::audio_budget::CANONICAL_SAMPLE_RATE,
+                        budget,
+                        crate::audio_budget::MAX_CANONICAL_SAMPLES,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+            }
+        };
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buffer.copy_interleaved_ref(decoded);
         let frame_channels = spec.channels.count().max(1);
@@ -560,6 +582,7 @@ fn decode_compressed_to_s16le(path: &Path) -> Result<Vec<u8>, String> {
         return Err("no decodable audio was found".into());
     }
     let samples = resampler
+        .ok_or_else(|| "no decodable audio was found".to_string())?
         .finish()
         .map_err(|error| format!("decode exceeded its resource budget: {error}"))?;
     if samples.is_empty() {
@@ -608,34 +631,32 @@ mod tests {
         assert!(existing.compressed_decode_fallback);
     }
 
-    /// The ceiling is the containment argument, so assert that the command the
-    /// parent actually builds carries it. Comparing two literal constants
-    /// proved nothing and would not notice the limit being dropped from the
-    /// builder chain, which is the failure that matters.
-    #[cfg(target_os = "linux")]
+    /// The ceiling is the containment argument, so assert the PRODUCTION
+    /// builder installs it rather than a command the test built itself.
+    ///
+    /// The previous shape called `.address_space_limit(...)` in the test and
+    /// then asserted the getter, so deleting the production call left it green.
+    /// This one drives `decode_to_private_pcm`'s own configuration path.
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn the_parent_command_carries_the_address_space_ceiling() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("tone.wav");
-        write_test_wav(&source, 16_000, 1_600);
-        let Ok(executable) = resolve_worker_executable() else {
-            panic!("worker executable must resolve inside the test tree");
-        };
-        let mut command =
-            crate::bounded_child::BoundedCommand::from_bound_executable(executable).unwrap();
-        retain_safe_environment(&mut command);
-        command
-            .env(WORKER_MARKER, "1")
-            .arg("--")
-            .arg(&source)
-            .single_process()
-            .close_extra_descriptors()
-            .address_space_limit(WORKER_ADDRESS_SPACE_BYTES);
+    fn the_production_decode_command_carries_the_address_space_ceiling() {
+        let command = build_decode_command(Path::new("/nonexistent/input.m4a"))
+            .expect("the decode command must be constructible in the test tree");
         assert_eq!(
             command.configured_address_space_limit(),
             Some(WORKER_ADDRESS_SPACE_BYTES),
             "the decode child must be launched under an address-space ceiling"
         );
+    }
+
+    /// macOS installs the ceiling in the child instead, so the parent command
+    /// deliberately carries none. Assert that too, so the split stays honest.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_decode_command_defers_its_ceiling_to_the_child() {
+        let command = build_decode_command(Path::new("/nonexistent/input.m4a"))
+            .expect("the decode command must be constructible in the test tree");
+        assert_eq!(command.configured_address_space_limit(), None);
     }
 
     #[test]

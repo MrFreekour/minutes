@@ -831,7 +831,7 @@ cargo install --path crates/cli
 - `clang`, `libclang-dev` — bindgen (used by `whisper-rs` and `pipewire-sys`)
 - `libasound2-dev` — cpal's ALSA backend
 - `libpipewire-0.3-dev`, `libspa-0.2-dev` — cpal's PipeWire backend (compiled unconditionally on Linux)
-- `ffmpeg` — required bounded decoder for `.m4a`/`.mp3`/`.ogg`; WAV is decoded directly
+- `ffmpeg` — preferred bounded decoder for `.m4a`/`.mp3`/`.ogg`; optional, since the bundled bounded decode worker handles the same containers when ffmpeg is absent. WAV is decoded directly
 
 **Other distros** (best-effort — Debian/Ubuntu is the validated path; please [open an issue](https://github.com/silverstein/minutes/issues) if any package name is wrong on your distro):
 
@@ -949,7 +949,7 @@ brew install ffmpeg           # macOS
 # apt install ffmpeg          # Linux
 # Windows: install ffmpeg.exe and add it to PATH, or set MINUTES_FFMPEG
 # to its full path (for example C:\path\to\ffmpeg.exe).
-# Without ffmpeg, Minutes fails compressed input closed and explains how to retry;
+# Without ffmpeg, compressed input is decoded by the bundled bounded worker;
 # WAV processing remains available.
 
 # Enable speaker diarization (optional, ~34MB ONNX models)

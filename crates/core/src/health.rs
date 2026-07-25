@@ -35,7 +35,7 @@ pub fn check_all(config: &Config) -> Vec<HealthItem> {
     vec![
         model_status(config),
         vad_model_status(config),
-        ffmpeg_status(),
+        ffmpeg_status(config),
         diarization_status(config),
         mic_status(),
         check_system_audio_capture(config),
@@ -351,23 +351,42 @@ pub fn vad_model_status(config: &Config) -> HealthItem {
     }
 }
 
-/// Check if ffmpeg is available for audio decoding.
-pub fn ffmpeg_status() -> HealthItem {
+/// Report whether compressed imports can be decoded, by either decoder.
+///
+/// This must not ask "is ffmpeg installed?". The bounded decode worker handles
+/// the same containers when ffmpeg is absent, and reporting `attention` with
+/// "ffmpeg is required" while the watcher was successfully transcribing those
+/// files sent users to Recovery Center to hunt for audio that had already been
+/// processed.
+pub fn ffmpeg_status(config: &Config) -> HealthItem {
     let resolved = crate::ffmpeg::resolve_launchable_ffmpeg();
-    let available = resolved.is_ok();
+    let fallback = crate::audio_decode_worker::bounded_decode_fallback_available(config);
+
+    let (state, detail) = match (&resolved, fallback) {
+        (Ok(path), _) => (
+            "ready",
+            format!(
+                "ffmpeg launched successfully at {}. Minutes prefers this decoder for compressed imports; each file's container and codec are still validated at decode time and may be rejected if unsupported. WAV is decoded directly without launching ffmpeg.",
+                path.display()
+            ),
+        ),
+        (Err(_), true) => (
+            "ready",
+            "ffmpeg is not installed, so compressed imports are decoded by the bundled bounded decode worker instead. This works without any extra install. Installing ffmpeg is still recommended for the higher-fidelity decode on non-English audio; WAV is decoded directly either way."
+                .to_string(),
+        ),
+        (Err(error), false) => (
+            "attention",
+            format!(
+                "{error} No decoder is available for compressed imports: ffmpeg is not installed and transcription.compressed_decode_fallback is disabled. Configured watch folders keep original audio and sidecars untouched and show them in Recovery Center; one-off watchers keep originals in place and print restart guidance. WAV imports remain available."
+            ),
+        ),
+    };
 
     HealthItem {
         label: "Compressed audio imports".into(),
-        state: if available { "ready" } else { "attention" }.into(),
-        detail: match resolved {
-            Ok(path) => format!(
-                "ffmpeg launched successfully at {}. Minutes will use this bounded decoder for compressed imports, but each file's container and codec are still validated at decode time and may be rejected if unsupported. WAV is decoded directly without launching ffmpeg.",
-                path.display()
-            ),
-            Err(error) => format!(
-                "{error} ffmpeg is required for compressed audio imports. Configured watch folders keep original audio and sidecars untouched and show them in Recovery Center; one-off watchers keep originals in place and print restart guidance. WAV imports remain available."
-            ),
-        },
+        state: state.into(),
+        detail,
         optional: true,
     }
 }
@@ -733,18 +752,35 @@ mod tests {
             "MINUTES_FFMPEG",
             std::env::temp_dir().join("minutes-definitely-missing-ffmpeg"),
         );
-        let item = ffmpeg_status();
+        // With the bounded fallback refused there is genuinely no decoder, so
+        // the honest report is "attention" plus actionable guidance.
+        let refused = Config {
+            transcription: crate::config::TranscriptionConfig {
+                compressed_decode_fallback: false,
+                ..Config::default().transcription
+            },
+            ..Config::default()
+        };
+        let blocked = ffmpeg_status(&refused);
+        // With the fallback at its default, compressed imports genuinely work
+        // without ffmpeg, so reporting "attention" and pointing at Recovery
+        // Center would send users hunting for files that were transcribed.
+        let working = ffmpeg_status(&Config::default());
         if let Some(previous) = previous {
             std::env::set_var("MINUTES_FFMPEG", previous);
         } else {
             std::env::remove_var("MINUTES_FFMPEG");
         }
 
-        assert_eq!(item.label, "Compressed audio imports");
-        assert_eq!(item.state, "attention");
-        assert!(item.detail.contains("ffmpeg is required"));
-        assert!(item.detail.contains("Recovery Center"));
-        assert!(item.detail.contains("WAV imports remain available"));
+        assert_eq!(blocked.label, "Compressed audio imports");
+        assert_eq!(blocked.state, "attention");
+        assert!(blocked.detail.contains("No decoder is available"));
+        assert!(blocked.detail.contains("Recovery Center"));
+        assert!(blocked.detail.contains("WAV imports remain available"));
+
+        assert_eq!(working.state, "ready");
+        assert!(working.detail.contains("bounded decode worker"));
+        assert!(!working.detail.contains("Recovery Center"));
     }
 
     #[cfg(unix)]
@@ -760,7 +796,14 @@ mod tests {
         let previous = std::env::var_os("MINUTES_FFMPEG");
         std::env::set_var("MINUTES_FFMPEG", &invalid_ffmpeg);
 
-        let item = ffmpeg_status();
+        let refused = Config {
+            transcription: crate::config::TranscriptionConfig {
+                compressed_decode_fallback: false,
+                ..Config::default().transcription
+            },
+            ..Config::default()
+        };
+        let item = ffmpeg_status(&refused);
 
         if let Some(previous) = previous {
             std::env::set_var("MINUTES_FFMPEG", previous);

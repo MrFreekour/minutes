@@ -596,8 +596,24 @@ fn compressed_audio_duration(
         return None;
     }
 
+    // ffmpeg exits 0 having produced nothing when it cannot demux the input
+    // from a non-seekable pipe, which is the normal outcome for an MP4/M4A
+    // whose `moov` atom sits at the end of the file. Treating that as a
+    // measurement of zero seconds routed long meetings to `memo`, and because
+    // only meetings are diarized, silently cost them their speaker labels.
+    // An empty probe is a failed probe, so the caller can fall through to the
+    // bounded worker, which reads the declared frame count instead.
+    let decoded = counter.load(Ordering::Relaxed);
+    if decoded == 0 {
+        tracing::debug!(
+            "ffmpeg duration probe produced no audio (likely a non-faststart container); \
+             falling back to the bounded probe"
+        );
+        return None;
+    }
+
     Some(std::time::Duration::from_secs_f64(
-        counter.load(Ordering::Relaxed) as f64 / CANONICAL_PCM_BYTES_PER_SECOND as f64,
+        decoded as f64 / CANONICAL_PCM_BYTES_PER_SECOND as f64,
     ))
 }
 
@@ -687,12 +703,18 @@ fn determine_content_type(path: &Path, config: &Config) -> ContentType {
     if !compressed_audio_requires_ffmpeg(path) {
         return determine_content_type_with_ffmpeg(path, config, None);
     }
-    if let Ok(ffmpeg) = crate::ffmpeg::resolve_launchable_ffmpeg() {
-        return determine_content_type_with_ffmpeg(path, config, Some(ffmpeg.as_path()));
+    let threshold = config.watch.dictation_threshold_secs;
+    // Try ffmpeg first for parity with the decode path, but do not stop there.
+    // Its pipe-based probe cannot demux a non-faststart MP4/M4A and returns
+    // nothing, so a successful-looking ffmpeg install must still fall through
+    // to the bounded probe rather than defaulting the route.
+    if threshold > 0 {
+        if let Ok(ffmpeg) = crate::ffmpeg::resolve_launchable_ffmpeg() {
+            if let Some(duration) = audio_duration(path, threshold, Some(ffmpeg.as_path())) {
+                return content_type_for_duration(duration, config);
+            }
+        }
     }
-    // Without ffmpeg the duration probe used to return None, so routing fell
-    // back to config.watch.type and filed long calls as voice memos. Ask the
-    // bounded worker for the container's declared duration instead.
     if crate::audio_decode_worker::bounded_decode_fallback_available(config) {
         if let Some(duration) = crate::audio_decode_worker::probe_compressed_duration(
             path,
@@ -865,9 +887,28 @@ pub fn compressed_audio_requires_ffmpeg(path: &Path) -> bool {
 /// is what left `minutes watch`, the desktop import, and Recovery Center
 /// refusing work the pipeline could complete.
 pub fn compressed_audio_decodable(path: &Path, config: &Config) -> bool {
-    !compressed_audio_requires_ffmpeg(path)
-        || crate::ffmpeg::resolve_launchable_ffmpeg().is_ok()
+    // Short-circuit before probing. WAV needs no external decoder, and
+    // `resolve_launchable_ffmpeg` *launches* ffmpeg to prove it starts, so
+    // evaluating the probes eagerly would grant a configured ffmpeg authority
+    // on the pure-WAV path that deliberately never touches it.
+    if !compressed_audio_requires_ffmpeg(path) {
+        return true;
+    }
+    crate::ffmpeg::resolve_launchable_ffmpeg().is_ok()
         || crate::audio_decode_worker::bounded_decode_fallback_available(config)
+}
+
+/// The admission decision with both decoder probes supplied by the caller.
+///
+/// Split out so consumers in other crates can test the decision itself without
+/// depending on a worker binary existing beside their test harness. The probes
+/// are environmental; the decision is the thing worth asserting.
+pub fn compressed_audio_decodable_with(
+    path: &Path,
+    ffmpeg_available: bool,
+    bounded_fallback_available: bool,
+) -> bool {
+    !compressed_audio_requires_ffmpeg(path) || ffmpeg_available || bounded_fallback_available
 }
 
 /// Guidance for a compressed import that genuinely cannot be decoded.

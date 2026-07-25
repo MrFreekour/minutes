@@ -5041,7 +5041,7 @@ fn audio_input_status() -> ReadinessItem {
 }
 
 fn compressed_audio_status() -> ReadinessItem {
-    let item = minutes_core::health::ffmpeg_status();
+    let item = minutes_core::health::ffmpeg_status(&Config::load());
     ReadinessItem {
         label: item.label,
         state: item.state,
@@ -15626,8 +15626,27 @@ mod tests {
             assert!(items[0].detail.contains("brew install ffmpeg"));
             assert!(items[0].detail.contains("failed directory"));
             assert_eq!(PathBuf::from(&items[0].path), failed_watch);
-            // With no ffmpeg and the bounded decode worker refused by config,
-            // there is genuinely no decoder, so Recovery must stay open.
+            // The admission decision itself, with both decoder probes
+            // supplied rather than sampled from the environment. The previous
+            // shape called the real resolver, which cannot find a worker beside
+            // a Tauri test harness, so it failed deterministically and was
+            // never green; `cargo check -p minutes-app --tests` could not see
+            // that, and was wrongly cited as coverage.
+            assert!(
+                !minutes_core::watch::compressed_audio_decodable_with(&failed_watch, false, false),
+                "with neither decoder available the retry must stay blocked"
+            );
+            assert!(
+                minutes_core::watch::compressed_audio_decodable_with(&failed_watch, false, true),
+                "the bounded fallback alone must make a compressed retry admissible"
+            );
+            assert!(
+                minutes_core::watch::compressed_audio_decodable_with(&failed_watch, true, false),
+                "ffmpeg alone must make a compressed retry admissible"
+            );
+
+            // And the preflight wrapper must surface the blocked case with
+            // actionable guidance while preserving the original file.
             let refused = Config {
                 transcription: minutes_core::config::TranscriptionConfig {
                     compressed_decode_fallback: false,
@@ -15638,11 +15657,6 @@ mod tests {
             let previous_ffmpeg = std::env::var_os("MINUTES_FFMPEG");
             std::env::set_var("MINUTES_FFMPEG", home.join("missing-ffmpeg"));
             let blocked = recovery_retry_decoder_preflight(&failed_watch, &refused);
-            // With the fallback left at its default, the same file is
-            // retryable: the bounded worker decodes it without ffmpeg. Gating
-            // this on ffmpeg alone is what made Recovery refuse work the
-            // pipeline could finish.
-            let allowed = recovery_retry_decoder_preflight(&failed_watch, &config);
             if let Some(previous) = previous_ffmpeg {
                 std::env::set_var("MINUTES_FFMPEG", previous);
             } else {
@@ -15651,10 +15665,6 @@ mod tests {
             let error = blocked.expect_err("no usable decoder must keep Recovery open");
             assert!(error.contains("brew install ffmpeg"));
             assert!(error.contains(&failed_watch.display().to_string()));
-            assert!(
-                allowed.is_ok(),
-                "bounded decode fallback must make a compressed retry admissible: {allowed:?}"
-            );
             assert!(failed_watch.exists());
         });
     }

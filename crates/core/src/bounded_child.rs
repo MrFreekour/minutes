@@ -167,7 +167,18 @@ impl BoundExecutable {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let path = std::env::current_exe()?;
+            // macOS has no procfs equivalent, and `_NSGetExecutablePath`, which
+            // backs `current_exe()`, returns the pathname the process was
+            // invoked through rather than the resolved image. Verified on
+            // macOS 26.6: launching through a symlink returns the symlink, and
+            // opening it `O_NOFOLLOW` fails ELOOP. Homebrew links
+            // `bin/minutes` into the Cellar exactly that way, so binding the
+            // raw value made self-exec impossible on a standard install.
+            //
+            // Resolve the symlink chain first, then keep `O_NOFOLLOW` for the
+            // final component so the resolved image still cannot be swapped
+            // for a symlink between canonicalisation and open.
+            let path = std::env::current_exe()?.canonicalize()?;
             bind_executable(&path, false)
         }
     }
@@ -386,10 +397,19 @@ fn immutable_unix_executable_snapshot(source: &std::fs::File) -> std::io::Result
 
 /// Snapshot to a real owner-private pathname rather than an unlinked inode.
 ///
-/// Darwin (and the BSDs) refuse `execve` with `ETXTBSY` on any vnode that some
-/// process still holds open for writing, so the previous unlinked-`tempfile`
-/// plus `/dev/fd/N` construction could never exec here: the retained setup
-/// handle is itself the live writer. That made this whole path dead on macOS.
+/// The previous unlinked-`tempfile` plus `/dev/fd/N` construction could never
+/// exec on macOS. Measured on macOS 26.6 arm64 against a real signed Minutes
+/// binary, all three variants of the original shape:
+///
+/// - unlinked inode, live `O_RDWR` handle, exec `/dev/fd/N`: `EACCES`
+/// - unlinked inode, writer dropped, exec `/dev/fd/N`: `EACCES`
+/// - linked pathname, writer dropped, exec the path: succeeds
+///
+/// So the blocker is descriptor execution of an unlinked inode, not a live
+/// writer, and dropping the writer alone would not have fixed it. Darwin
+/// permits `execve` on a linked file that another descriptor holds open for
+/// writing, unlike Linux, which returns `ETXTBSY` for that case. Only the
+/// third shape works, which is why this snapshot is reachable by pathname.
 ///
 /// The fix mirrors the Windows snapshot exactly, which has always exec'd a
 /// real path for the same reason: write the bytes into an owner-private

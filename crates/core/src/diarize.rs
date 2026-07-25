@@ -484,6 +484,49 @@ fn ffmpeg_preprocess_command(ffmpeg: &Path, input: &str) -> crate::bounded_child
     command
 }
 
+/// Decode a compressed container into bounded 16 kHz mono WAV for diarization
+/// when ffmpeg is unavailable.
+///
+/// `load_audio` accepts only WAV, so without this a compressed import loses its
+/// speaker labels with no user-visible explanation. The bounded decode worker
+/// already produces exactly the canonical PCM this path needs.
+fn preprocess_compressed_without_ffmpeg(
+    audio_path: &Path,
+) -> Result<
+    (
+        std::path::PathBuf,
+        Option<crate::pipeline::PrivateAudioTempFile>,
+    ),
+    String,
+> {
+    let config = crate::config::Config::load();
+    if !crate::audio_decode_worker::bounded_decode_fallback_enabled(&config) {
+        return Err("the bounded decode fallback is disabled by configuration".into());
+    }
+    let mut pcm = crate::pipeline::PrivateAudioTempFile::new("minutes-diarize-fallback-", ".s16le")
+        .map_err(|error| format!("private diarization temp file unavailable: {error}"))?;
+    crate::audio_decode_worker::decode_to_private_pcm(
+        audio_path,
+        &mut pcm,
+        crate::audio_budget::AudioWorkBudget::max_pcm_s16le_bytes(),
+        crate::audio_budget::AUDIO_DECODE_DEADLINE,
+    )?;
+    let samples = crate::transcribe::load_pcm_s16le_for_diarization(&mut pcm)?;
+
+    let mut wav = crate::pipeline::PrivateAudioTempFile::new("minutes-diarize-fallback-", ".wav")
+        .map_err(|error| format!("private diarization WAV unavailable: {error}"))?;
+    crate::transcribe::write_wav_16k_mono_to_writer(
+        wav.prepare_for_write()
+            .map_err(|error| format!("private diarization WAV is not writable: {error}"))?,
+        &samples,
+    )
+    .map_err(|error| format!("private diarization WAV could not be written: {error}"))?;
+    wav.finish_write()
+        .map_err(|error| format!("private diarization WAV could not be sealed: {error}"))?;
+    let path = wav.processing_path();
+    Ok((path, Some(wav)))
+}
+
 fn preprocess_audio(
     audio_path: &Path,
     cancellation: &DiarizationCancellation,
@@ -512,9 +555,26 @@ fn preprocess_audio(
             ));
         }
     }
-    let ffmpeg = match crate::ffmpeg::resolve_ffmpeg() {
+    let ffmpeg = match crate::ffmpeg::resolve_launchable_ffmpeg() {
         Ok(path) => path,
         Err(error) => {
+            // Returning the original path here means `load_audio` rejects any
+            // non-WAV container, the error is swallowed to `NotConfigured`, and
+            // the meeting silently ships with no speaker labels and nothing in
+            // the markdown saying why. origin/main decoded these containers and
+            // produced labels, so decode the compressed input through the
+            // bounded worker before giving up.
+            if crate::watch::compressed_audio_requires_ffmpeg(audio_path) {
+                match preprocess_compressed_without_ffmpeg(audio_path) {
+                    Ok(prepared) => return Ok(prepared),
+                    Err(fallback) => {
+                        tracing::warn!(
+                            error = %fallback,
+                            "diarization could not decode this compressed input without ffmpeg"
+                        );
+                    }
+                }
+            }
             tracing::debug!(error = %error, "ffmpeg not available for preprocessing, using original audio");
             return Ok((audio_path.to_path_buf(), None));
         }
