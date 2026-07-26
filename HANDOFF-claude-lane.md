@@ -1,4 +1,4 @@
-# Privacy-B lane handoff (refreshed 2026-07-25)
+# Privacy-B lane handoff (refreshed 2026-07-26)
 
 You are taking over the **conversation-trust privacy epic, Slice B integration**
 lane. The previous lane ran to ~723k context and was retired deliberately; this
@@ -75,7 +75,7 @@ B) is authorised and can proceed in parallel or after — see below.
 
 ## State of each track
 
-### Track 1 — compressed-import parity. Gate-clean, unreviewed.
+### Track 1 — compressed-import parity. REJECTED 3/3, remediation list in bead.
 
 Restores decoding of m4a/mp3/ogg/etc. when ffmpeg is absent, via a bounded
 child running Symphonia. `origin/main` did this in-process; this branch had
@@ -119,11 +119,6 @@ heuristic — mark its limits in code, A replaces it properly), plus the three
 downstream items: the `limit`-differencing oracle, the `limit` semantics change
 that costs filtered queries their reach, and the two tautological tests
 (rewrite and mutation-verify, do not assert them into existence).
-
-Also outstanding on track 2, all downstream of that decision: the withheld tally
-is still a per-record oracle via `limit`-differencing; `limit` silently changed
-meaning from "max results" to "size of the pre-policy window"; and two of the
-tests are tautological and must be rewritten.
 
 ## Things that are true and easy to get wrong
 
