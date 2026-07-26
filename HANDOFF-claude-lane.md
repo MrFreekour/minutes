@@ -18,19 +18,29 @@ lenses against an exact SHA, told not to trust the commit message. Nine reviews
 were run on track 1 across three rounds and six on track 2; every one returned
 REJECT. That is not unusual for this lane and is not a reason to lower the bar.
 
-**The single most important lesson, learned expensively:** across every round,
-the recurring finding was not a class of bug, it was claims written before they
-were verified. Commit messages asserted behaviour the code did not have, and
-tests were written in the shape of the claim so they could not fail. Three
-separate reviewers independently proved that reverting a "fix" left the suite
-green.
+**The single most important lesson, learned expensively over four rounds:** the
+recurring finding is not a class of bug, it is claims written before they were
+verified. Commit messages asserted behaviour the code did not have, and tests
+were written in the shape of the claim so they could not fail.
 
-The only procedure that reliably catches this, and the one this lane now
-follows: **break the code first, watch the test fail, then restore it.** Not
-"write a test" — prove the test fails. Every fix in the two most recent commits
-was mutation-verified that way, and the reviewers who re-checked them agreed.
-Corollary: never cite a command weaker than the claim implies (`cargo check` is
-not coverage; `cargo test -p minutes-app` had never been run when it was cited).
+The procedure that catches it: **break the code first, watch the test fail, then
+restore it.** Not "write a test" — prove the test fails.
+
+Three hard-won corollaries, each from a specific failure:
+1. **Do it per fix, and scope the claim to what you did.** Round 4 performed the
+   procedure for four of seven bullets and then wrote one blanket sentence
+   covering all seven. Reviewers reverted the other three with a green suite.
+   If a bullet has no test, say so in the same breath.
+2. **Assert the production path, not a helper you call the same way.** A ceiling
+   test called `build_decode_command` directly and never asserted the caller
+   used it, so restoring an unbounded inline builder passed.
+3. **Verify with a different method than you edited with.** A README fix used a
+   plain-literal replace and confirmed with a grep for the same literal; the
+   line contained a markdown link, so both missed it identically.
+
+Also: never cite a command weaker than the claim implies (`cargo check` is not
+coverage), and assert a test's preconditions rather than assuming them — two
+tests passed *with the bug present* when `target/debug/minutes` was absent.
 
 ## Where the code is
 
@@ -38,7 +48,7 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
-| `c6badc34` | track-1 round-3 remediation, gate-clean, **not yet reviewed** |
+| `c6badc34` | track-1 round-3 remediation — **REJECTED 3/3**, remediation list in bead |
 | `d5945d1c` | diarization panic fix (pre-existing epic bug, see below) |
 | `f28182ad` | track-1 round-2 remediation — REJECTED 3/3 |
 | `ca2a659c` | track-2 MCP work — **REJECTED 3/3, do not build on it** |
@@ -50,12 +60,18 @@ Last accepted checkpoint remains block 7; everything after it is unaccepted.
 
 ## Immediate next step
 
-**Run the three-blind-review gate on `c6badc34`.** It is the first track-1
-candidate where every claimed fix is mutation-verified, and it has not been
-reviewed. Suggested lenses, mirroring what has been productive: (1) scope and
-routing across every compressed-audio surface, (2) platform and containment
-across the full cfg matrix, (3) test integrity and claim accuracy with
-instructions to reproduce the mutations independently.
+`c6badc34` was gated and **REJECTED 3/3** (2026-07-26). Full findings and an
+ordered remediation list are in the bead. The short version: the production code
+was judged substantively correct, but the commit claimed "every fix
+mutation-verified" when the procedure had been done for four of seven bullets,
+and reviewers reverted the other three with a fully green suite. Three
+user-facing defects also survived: a WebM/MKV duration probe that reads ~44x
+short (millisecond `n_frames` in Matroska), a guidance message that fires in a
+state its own doc calls impossible (symphonia has no Opus decoder, so
+Opus-in-WebM/OGG and ALAC hit it), and README:453.
+
+**Do the numbered remediation list in the bead, then re-gate.** Track 2 (Option
+B) is authorised and can proceed in parallel or after — see below.
 
 ## State of each track
 
@@ -92,11 +108,17 @@ validated as correct by reviewers: an annotation's source pointer and body are
 both author-supplied, so revalidating the pointer bounds nothing.
 
 `get_meeting_insights` is kept but **rejected 3/3**. It currently returns zero
-records on Mat's own machine. **Do not patch this before the identity decision
-is made** — see the dedicated bead note. Three options are written up there
-(stable frontmatter id, canonical relative path, content hash) with tradeoffs,
-plus two attached sub-decisions (archived meetings, and a rebuild path) and a
-recommendation of B-now/A-durable/C-rejected.
+records on Mat's own machine.
+
+**The identity decision is SETTLED (2026-07-26): Option B (canonical relative
+path) now; Option A (stable frontmatter id + index) later as its own reviewable
+block. Do not build A now.** The full options write-up and tradeoffs are in the
+bead. B-now scope: resolve `source_meeting` relative to the live corpus root,
+normalise historical absolute values by stripping a recognised root prefix (a
+heuristic — mark its limits in code, A replaces it properly), plus the three
+downstream items: the `limit`-differencing oracle, the `limit` semantics change
+that costs filtered queries their reach, and the two tautological tests
+(rewrite and mutation-verify, do not assert them into existence).
 
 Also outstanding on track 2, all downstream of that decision: the withheld tally
 is still a per-record oracle via `limit`-differencing; `limit` silently changed
