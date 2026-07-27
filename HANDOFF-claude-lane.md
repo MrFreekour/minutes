@@ -48,7 +48,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
-| `b341876a` | track-2 Option B remediation — **not yet re-gated** |
+| `8cebbe63` | track-2 Option B round-3 remediation — **not yet re-gated** |
+| `b341876a` | track-2 Option B round-2 — REJECTED 2/3 (P0s fixed by `8cebbe63`) |
 | `49fdf4a5` | track-2 Option B — REJECTED (P0 fixed by `b341876a`) |
 | `c6badc34` | track-1 round-3 remediation — **REJECTED 3/3**, remediation list in bead |
 | `d5945d1c` | diarization panic fix (pre-existing epic bug, see below) |
@@ -129,12 +130,13 @@ used to point at the bead for it, it is not there, and no bead has it. Most
 likely the bd concurrent-write clobber. The decision survived; the reasoning did
 not, so if A is picked up its tradeoffs need rederiving.
 
-B-now is **built across two commits and not yet re-gated**:
+B-now is **built across three commits and not yet re-gated**:
 
 | SHA | What |
 |---|---|
-| `49fdf4a5` | Option B identity, oracle closure, limit semantics, test rewrites. **REJECTED** (1 of 3 lenses; P0 below) |
-| `b341876a` | remediation of that P0 plus two false claims in `49fdf4a5`'s message |
+| `49fdf4a5` | Option B identity, oracle closure, limit semantics, test rewrites. **REJECTED** (P0 below) |
+| `b341876a` | remediation of that P0 plus two false claims in `49fdf4a5`'s message. **REJECTED 2/3** |
+| `8cebbe63` | CI hermeticity, proven absence, guard-3 withdrawal, third false claim corrected |
 
 All four B-now items shipped: `source_meeting` resolves relative to the live
 corpus root (452 of 1537 released on the real log), the `limit`-differencing
@@ -148,7 +150,23 @@ restored corpus could release a restricted meeting's insight under an
 unrestricted namesake. Three guards now cover it (recorded path still exists,
 exactly one anchor, no inactive or hidden segment anywhere).
 
-**Next step: re-gate `b341876a` with three fresh blind reviews.** The residual
+Two rounds of three blind reviews have run. Every round found real defects, and
+three of them were false claims in my own commit messages rather than code
+faults, which is this lane's standing failure mode. Worth carrying forward:
+
+- The insight tests were **CI-breaking** and nobody noticed until a reviewer
+  checked `.github/workflows/ci.yml`. The `mcp` job runs vitest with no cargo
+  build, so a content-bearing tool's readiness bridge had no CLI to shell out
+  to. Any new test that drives a content-bearing MCP tool must be checked
+  against a CI-equivalent environment, not just a dev box.
+- `existsSync` is not an absence test. It answers false for EACCES too, and a
+  guard built on it reopened the exact leak it was added to close.
+- A guard can be **masked by a later guard**: one fixture was refused by a
+  hidden-segment rule rather than by the anchoring it was written to prove.
+  Re-check old mutations after adding new guards; two of the twelve had gone
+  stale and would have reported a false pass.
+
+**Next step: re-gate `8cebbe63` with three fresh blind reviews.** The residual
 heuristic limit is documented at `resolveCorpusRelativeSourcePath` and is
 Option A's to remove.
 
