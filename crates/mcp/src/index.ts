@@ -206,9 +206,10 @@ export const MCP_POLICY_MEETING_RESULT_MAX = 5_000;
 /** Independent structured/text collection caps for derived MCP surfaces. */
 export const MCP_INTENT_RESULT_MAX = 50;
 /**
- * Window size for one insight read. Bounded like every peer surface so a
- * caller cannot request an unbounded projection, and so the truncation the
- * caller is told about has a known ceiling.
+ * Largest number of insight records one read may return. Bounded like every
+ * peer surface so a caller cannot request an unbounded projection. This caps
+ * the answer; the number of records examined is MCP_INSIGHT_SCAN_WINDOW below,
+ * which is deliberately not caller-controlled.
  */
 export const MCP_INSIGHT_RESULT_MAX = 500;
 /**
@@ -3121,6 +3122,18 @@ export function selectCopilotNudges(
 
 // ── Helper: run minutes CLI command (uses execFile, not exec) ──
 
+/**
+ * Ceiling on one CLI read's stdout.
+ *
+ * `execFile` defaults to 1 MiB and turns an overrun into a hard error, not a
+ * truncation, so the ceiling has to clear the largest projection any surface
+ * asks for. The insight read is the binding case: it now always fetches
+ * MCP_INSIGHT_SCAN_WINDOW records rather than the caller's default, measured at
+ * roughly 620 bytes per record on a real log, and a corpus with long decision
+ * text would have pushed a 500-record window past 1 MiB and failed every call.
+ */
+const MCP_CLI_MAX_STDOUT_BYTES = 64 * 1024 * 1024;
+
 async function runMinutes(
   args: string[],
   timeoutMs: number = 30000,
@@ -3131,6 +3144,7 @@ async function runMinutes(
     const { stdout, stderr } = await execFileAsync(MINUTES_BIN, args, {
       timeout: timeoutMs,
       signal,
+      maxBuffer: MCP_CLI_MAX_STDOUT_BYTES,
       env: mcpCliChildEnv({ RUST_LOG: "info", ...extraEnv }),
     });
     return { stdout: stdout.trim(), stderr: stderr.trim() };
@@ -7373,24 +7387,44 @@ export type WithheldSourceReason =
  *   - a relative value, resolved directly against the live root;
  *   - an absolute value, normalised by stripping a recognised root prefix.
  *
- * "Recognised" means the value carries a path segment equal to the live root's
- * own final segment; the remainder after the LAST such segment is taken as the
- * corpus-relative tail. That is deliberately a heuristic, and it has two known
- * limits. Option A — a stable identifier the pipeline writes into frontmatter,
- * plus an index — removes them rather than narrowing them, and is tracked as
- * its own block:
+ * "Recognised" means the value carries exactly one path segment equal to the
+ * live root's own final segment, names no inactive or hidden directory
+ * anywhere, and does not still exist on this machine; the remainder after that
+ * segment is taken as the corpus-relative tail.
  *
- *   - A corpus whose final segment was renamed as well as moved is not
- *     recognised, so its records stay withheld. That direction is the safe
- *     one.
- *   - A foreign path that merely happens to contain a directory sharing the
- *     live root's final segment normalises to a tail that could collide with
- *     an unrelated live meeting at the same relative path. Anchoring on the
- *     root segment rather than on the bare filename is what keeps that from
- *     being the ordinary case: it is why a value such as
- *     `/var/folders/<tmp>/output/2026-04-07-test-meeting.md`, which names no
- *     corpus root at all, resolves to nothing instead of binding to whatever
- *     live meeting shares its filename.
+ * Normalisation only ever applies to a recorded path that is meaningless here.
+ * If the recorded path still resolves to a real file, it is used as recorded,
+ * because a path that exists is evidence that this is not a moved corpus, and
+ * rebinding it would evaluate some other meeting's policy.
+ *
+ * This remains a heuristic with one known residual limit, which Option A — a
+ * stable identifier the pipeline writes into frontmatter, plus an index —
+ * removes rather than narrows, and which is tracked as its own block. State it
+ * precisely, because the consequence is not merely a confusing answer:
+ *
+ *   A foreign path that no longer exists here, carries no inactive or hidden
+ *   component, and happens to contain one directory sharing the live root's
+ *   final segment will bind to whatever live meeting sits at the same relative
+ *   tail. If that live meeting is not restricted and the vanished one was, the
+ *   insight is RELEASED under the live meeting's policy. Anchoring on the root
+ *   segment rather than the bare filename is what keeps this rare rather than
+ *   routine: it is why `/var/folders/<tmp>/output/2026-04-07-test-meeting.md`,
+ *   which names no corpus root, resolves to nothing instead of adopting the
+ *   identity of whatever live meeting shares its filename. It is not why a
+ *   path like `/var/folders/<tmp>/minutes-<run>/meetings/memos/x.md` is safe;
+ *   that one does carry an anchor and does normalise.
+ *
+ * A corpus whose final segment was renamed as well as moved is not recognised,
+ * and neither is one reached through a symlink whose realpath ends in a
+ * different segment, since the anchor is compared against the realpath's
+ * basename. Both stay withheld, which is the safe direction, and both present
+ * as the same conflated withheld reason.
+ *
+ * Segment comparison is exact-case and separator-agnostic across `/` and `\`.
+ * A corpus moved between Windows and POSIX is therefore not recognised: a
+ * recorded `C:\Users\me\meetings\x.md` read on POSIX is not even absolute, so
+ * it takes the relative branch, produces a candidate that does not exist, and
+ * fails closed.
  *
  * Returns null when no corpus-relative identity can be established. Callers
  * must treat null as withheld. Binding a record to the wrong meeting would
@@ -7414,11 +7448,47 @@ export function resolveCorpusRelativeSourcePath(
   } else if (isPathWithinCanonicalRoot(trimmed, canonicalRoot)) {
     // Already names this corpus: keep the recorded path as written.
     candidate = canonicalizeRoot(trimmed);
+  } else if (existsSync(trimmed)) {
+    // The recorded path still names a real file here, so this is not the
+    // moved-corpus case normalisation exists for. Rebinding it to a same-named
+    // file under the live root would evaluate a DIFFERENT meeting's policy: a
+    // restored or duplicated corpus has the same relative tails as the live one
+    // and may carry different `sensitivity:` frontmatter, so the tail lookup
+    // could release a restricted meeting's insight under an unrestricted
+    // namesake. Keep exact semantics instead, which withholds anything outside
+    // the live active corpus.
+    candidate = canonicalizeRoot(trimmed);
   } else {
     const segments = trimmed.split(/[\\/]+/).filter((segment) => segment !== "");
-    const anchor = rootSegment === "" ? -1 : segments.lastIndexOf(rootSegment);
+    const anchors =
+      rootSegment === ""
+        ? []
+        : segments.reduce<number[]>((found, segment, index) => {
+            if (segment === rootSegment) found.push(index);
+            return found;
+          }, []);
+    // Exactly one anchor, or the tail is ambiguous. With two, the last-anchor
+    // rule silently prefers the inner one: a recorded
+    // `/elsewhere/meetings/meetings/x.md` would bind to `<root>/x.md` rather
+    // than `<root>/meetings/x.md`, which is a different meeting.
+    if (anchors.length !== 1) return null;
+    const anchor = anchors[0];
     // An anchor as the final segment names the root itself, not a meeting.
-    if (anchor < 0 || anchor === segments.length - 1) return null;
+    if (anchor === segments.length - 1) return null;
+    // The active-corpus rule has to be applied to the RECORDED path, not only
+    // to the synthesised tail. Everything left of the anchor is discarded by
+    // the join, so without this an inactive or hidden component sitting to the
+    // left is silently dropped and a record from
+    // `<root>/archive/meetings/x.md` re-enters as `<root>/x.md`. `..` is
+    // rejected here for the same reason.
+    if (
+      segments.some(
+        (segment) =>
+          segment.startsWith(".") || INACTIVE_CORPUS_DIRS.has(segment.toLowerCase())
+      )
+    ) {
+      return null;
+    }
     candidate = join(canonicalRoot, ...segments.slice(anchor + 1));
   }
 
@@ -7555,6 +7625,11 @@ const INSIGHT_SINCE_ERROR = "insight since must be a calendar date in YYYY-MM-DD
  * A malformed value is refused rather than ignored. The CLI warns on stderr and
  * then shows everything, which through this surface would silently widen a
  * query the caller believed was narrowed.
+ *
+ * One deliberate divergence: on a date whose local midnight does not exist,
+ * `chrono`'s `single()` returns None and the CLI drops the `since` filter
+ * altogether, while this applies the floor Date rolls forward to. Narrowing
+ * where the CLI widens is the safe direction for a policy surface.
  */
 export function parseInsightSinceFloor(since: unknown): number | null {
   if (since === undefined || since === null) return null;
@@ -7627,11 +7702,16 @@ export function releaseInsightsWithLiveSourcePolicy(
  * Injection points for the insight handler, defaulted to the live ones.
  *
  * The same handler body runs in production and under test; only these three
- * bindings differ. `MINUTES_BIN` is resolved once at module load from a fixed
- * candidate list with no environment override, so without this seam an
- * end-to-end assertion about the handler would silently become a no-op on any
- * machine that happens not to have a built CLI on disk — a failure mode this
- * lane has already shipped once.
+ * bindings differ. `MINUTES_BIN` is chosen from a fixed candidate list with no
+ * environment override (it is reassigned only by the auto-install path), so
+ * without this seam a test could not put known records in front of the handler
+ * and assert the argv it builds.
+ *
+ * This seam does NOT make the handler testable without a CLI. Insights are a
+ * content-bearing agent tool, so `runAgentToolPolicies` routes every call
+ * through `requireAgentTrustReadiness()`, which uses `runMinutes` directly and
+ * is not injectable here. Tests through this seam still spawn a real
+ * `minutes agent-readiness --json` per call.
  */
 export type InsightToolDeps = {
   runner?: MinutesRunner;
@@ -7688,7 +7768,7 @@ export function registerUnavailableCompatibilityTools(
         .optional()
         .default(false)
         .describe(
-          "Include insights whose source meeting is designated sensitivity: restricted. Requires the server to have been launched with MINUTES_MCP_RESTRICTED_POLICY=logged-override; the request is durably audited. This does not recover insights withheld for any other reason, such as a source that was archived, moved, or deleted."
+          "Include insights whose source meeting is designated sensitivity: restricted. Requires the server to have been launched with MINUTES_MCP_RESTRICTED_POLICY=logged-override; the request is durably audited. This does not recover insights withheld for any other reason, such as a source that was archived or deleted, or one whose recorded path cannot be resolved to a meeting in this corpus."
         ),
     },
     { title: "Get Meeting Insights", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -7777,16 +7857,22 @@ export function registerUnavailableCompatibilityTools(
 
       const notes: string[] = [];
       if (withheld.total > 0) {
+        // Covers every bucket the tally counts, including records carrying no
+        // source pointer at all. Naming only the policy case would misdescribe
+        // those.
         notes.push(
-          `${withheld.total} insight(s) withheld because their source meeting could not be revalidated against live policy: it could not be resolved to a meeting in the active corpus, or it is designated restricted, archived, moved, or deleted.`
+          `${withheld.total} insight(s) withheld: the record names no source meeting, or its source could not be resolved to a meeting in the active corpus, or that meeting is designated restricted, archived, or deleted.`
         );
       }
       if (truncated) {
         // Deliberately offers no remedy. `since` is a lower bound, so no
         // argument this tool accepts reaches past the newest scanned record;
         // saying otherwise would advertise a recovery that cannot happen.
+        // Hedged on whether older records exist: this compares the returned
+        // count against the window, which cannot distinguish a log of exactly
+        // the window size from a larger one.
         notes.push(
-          `This view examined the newest ${MCP_INSIGHT_SCAN_WINDOW} record(s); anything older was not examined and is not reachable through this tool.`
+          `This view examined the newest ${MCP_INSIGHT_SCAN_WINDOW} record(s); any older ones were not examined, and are not reachable through this tool.`
         );
       }
       if (capped) {

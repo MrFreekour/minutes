@@ -2223,8 +2223,13 @@ describe("insight source identity survives a moved corpus", () => {
         meetingFixture("Unrelated live meeting")
       );
 
+      // Deliberately carries no dot-directory and no inactive directory, so the
+      // root-segment anchor is the only rule that can refuse it. A fixture with
+      // a `.tmpXXXX` component would be rejected by the hidden-segment guard
+      // even if the anchoring were removed, and would not test anchoring at
+      // all.
       const foreign =
-        "/var/folders/27/jxpp0/T/.tmpfbyC6x/output/2026-04-07-test-meeting.md";
+        "/var/folders/27/jxpp0/T/tmpfbyC6x/output/2026-04-07-test-meeting.md";
       expect(resolveCorpusRelativeSourcePath(foreign, root)).toBeNull();
 
       const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
@@ -2270,6 +2275,99 @@ describe("insight source identity survives a moved corpus", () => {
         true
       );
       expect(overridden.released).toHaveLength(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("does not rebind a recorded path that still exists on this machine", async () => {
+    // The restored-corpus leak. A duplicate corpus has the same relative tails
+    // as the live one but may carry different sensitivity frontmatter, so
+    // normalising a path that still exists would evaluate the wrong meeting's
+    // policy and release a restricted meeting's insight under an unrestricted
+    // namesake.
+    const base = mkdtempSync(join(tmpdir(), "minutes-two-corpora-"));
+    try {
+      const live = join(base, "backup", "meetings");
+      const primary = join(base, "primary", "meetings");
+      mkdirSync(live, { recursive: true });
+      mkdirSync(primary, { recursive: true });
+      // Same relative tail in both corpora, divergent policy.
+      writeFileSync(join(live, "2026-06-01-diligence.md"), meetingFixture("Diligence snapshot"));
+      writeFileSync(
+        join(primary, "2026-06-01-diligence.md"),
+        meetingFixture("Diligence", "restricted")
+      );
+
+      const recorded = join(primary, "2026-06-01-diligence.md");
+      expect(resolveCorpusRelativeSourcePath(recorded, live)).toBeNull();
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [{ content: "CROSS-CORPUS-CANARY", source_meeting: recorded }],
+        live,
+        false
+      );
+      expect(released).toEqual([]);
+      expect(withheld.total).toBe(1);
+      expect(JSON.stringify(released)).not.toContain("CROSS-CORPUS-CANARY");
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a recorded path whose discarded left-hand side names an inactive or hidden directory", async () => {
+    // Everything left of the anchor is dropped by the join, so the
+    // active-corpus rule has to be applied to the recorded path too. Otherwise
+    // an archived or hidden record re-enters the active corpus by way of a
+    // later anchor.
+    const { base, root } = makeMovedCorpus();
+    try {
+      writeFileSync(join(root, "2026-06-01-board.md"), meetingFixture("Board"));
+      for (const recorded of [
+        "/elsewhere/meetings/archive/meetings/2026-06-01-board.md",
+        "/elsewhere/meetings/processed/meetings/2026-06-01-board.md",
+        "/elsewhere/meetings/failed/meetings/2026-06-01-board.md",
+        "/elsewhere/meetings/failed-captures/meetings/2026-06-01-board.md",
+        "/elsewhere/.trash/meetings/2026-06-01-board.md",
+        "/a/../../../meetings/2026-06-01-board.md",
+      ]) {
+        expect(resolveCorpusRelativeSourcePath(recorded, root)).toBeNull();
+      }
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [
+          {
+            content: "ARCHIVED-REENTRY-CANARY",
+            source_meeting: "/elsewhere/meetings/archive/meetings/2026-06-01-board.md",
+          },
+        ],
+        root,
+        false
+      );
+      expect(released).toEqual([]);
+      expect(withheld.total).toBe(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a recorded path carrying more than one anchor segment", async () => {
+    // Two anchors are ambiguous, and the last-anchor rule silently prefers the
+    // inner one, which is a different meeting.
+    const { base, root } = makeMovedCorpus();
+    try {
+      mkdirSync(join(root, "meetings"), { recursive: true });
+      writeFileSync(join(root, "x.md"), meetingFixture("Outer"));
+      writeFileSync(join(root, "meetings", "x.md"), meetingFixture("Inner"));
+
+      expect(
+        resolveCorpusRelativeSourcePath("/elsewhere/meetings/meetings/x.md", root)
+      ).toBeNull();
+      // The unambiguous single-anchor form still resolves, so the guard is not
+      // simply refusing everything.
+      expect(resolveCorpusRelativeSourcePath("/elsewhere/meetings/x.md", root)).toBe(
+        join(root, "x.md")
+      );
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -2323,6 +2421,16 @@ describe("insight source identity survives a moved corpus", () => {
  * what gives these tests teeth. A stub that ignored `--limit` would report a
  * constant tally no matter what the handler asked for, and every oracle
  * assertion below would pass with the oracle wide open.
+ *
+ * PRECONDITION, stated because it is real and not obvious. Injecting the runner
+ * does NOT decouple these tests from the CLI. `get_meeting_insights` is a
+ * content-bearing agent tool, so every call is routed through
+ * `requireAgentTrustReadiness()`, which uses the module's own `runMinutes` and
+ * spawns a real `minutes agent-readiness --json` per call. These tests
+ * therefore need a built `minutes` binary and a healthy trust registry, and
+ * that subprocess is why each call costs about a second. Absent either, they
+ * fail loudly rather than passing vacuously, which is the direction this lane
+ * wants, but they do fail.
  */
 async function insightHarness(meetingsDir: string, records: any[]) {
   const mcpServer = new McpServer({
@@ -2571,8 +2679,12 @@ describe("insight window is not shaped by the caller", () => {
   it("applies since in this process with the CLI's calendar-day semantics", async () => {
     const { base, root } = makeMovedCorpus();
     writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    // Records are a month apart on purpose. The floor is local midnight while
+    // the records are UTC, so day-spaced fixtures would straddle the boundary
+    // differently depending on the host's offset and this assertion would only
+    // hold in some timezones.
     const records = Array.from({ length: 10 }, (_, index) => ({
-      timestamp: `2026-07-${String(10 + index).padStart(2, "0")}T10:00:00Z`,
+      timestamp: `2026-${String(index + 1).padStart(2, "0")}-15T12:00:00Z`,
       kind: "commitment",
       content: `record-${index}`,
       confidence: "strong",
@@ -2581,7 +2693,7 @@ describe("insight window is not shaped by the caller", () => {
     }));
     const harness = await insightHarness(root, records);
     try {
-      const result = await harness.call({ since: "2026-07-17", limit: 500 });
+      const result = await harness.call({ since: "2026-08-01", limit: 500 });
       expect(
         result.structuredContent.insights.map((entry: any) => entry.content)
       ).toEqual(["record-7", "record-8", "record-9"]);
@@ -2597,7 +2709,7 @@ describe("insight window is not shaped by the caller", () => {
       await harness.close();
       rmSync(base, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("distinguishes a withheld partial view from a genuinely empty one", async () => {
     // Rewritten from a test whose name promised the partial-view contract but
@@ -2643,7 +2755,7 @@ describe("insight window is not shaped by the caller", () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 });
 
 describe("restricted content policy", () => {
