@@ -1,0 +1,72 @@
+{
+    "$schema": "https://fundingjson.org/schema/v1.1.0.json",
+    "version": "v1.0.0",
+    "entity": {
+        "type": "individual",
+        "role": "maintainer",
+        "name": "Mat Silverstein",
+        "email": "hello@useminutes.app",
+        "phone": "",
+        "description": "I build local-first software for people who would rather own their data than be promised it is safe. My main project is Minutes, a conversation memory layer that transcribes and diarizes meetings entirely on your own machine, so there is no cloud service to breach and no vendor database of your conversations to subpoena.\n\nI am the sole maintainer. Funding goes toward maintainer time and toward security and privacy work that I currently cannot finish at the pace the project needs.",
+        "webpageUrl": {
+            "url": "https://useminutes.app",
+            "wellKnown": ""
+        }
+    },
+    "projects": [{
+        "guid": "minutes",
+        "name": "Minutes",
+        "description": "Minutes is an open-source, privacy-first conversation memory layer for AI assistants. It captures audio (meetings, calls, voice memos), transcribes it locally with whisper.cpp or parakeet.cpp, diarizes and attributes speakers using local ONNX models, and writes searchable markdown with structured action items and decisions to your own disk.\n\nNothing is uploaded. Transcription, diarization, and speaker matching all run on the device, output files are written with owner-only permissions, and no API key is required to use it. Every meeting notetaker on the market answers the privacy question with policy; Minutes answers it with architecture.\n\nIt ships a CLI, a Tauri desktop app, an MCP server, and a TypeScript SDK, so any AI assistant can read a meeting corpus without the audio ever leaving the machine. It also publishes whisper-guard, a standalone Rust crate that defends against local transcription models fabricating text on silence and noise, which matters because that fabricated text otherwise becomes a record of what somebody said.",
+        "webpageUrl": {
+            "url": "https://useminutes.app"
+        },
+        "repositoryUrl": {
+            "url": "https://github.com/silverstein/minutes",
+            "wellKnown": "https://github.com/silverstein/minutes/blob/main/.well-known/funding-manifest-urls"
+        },
+        "licenses": ["spdx:MIT"],
+        "tags": ["privacy", "local-first", "transcription", "speech-to-text", "meetings", "rust", "mcp", "ai", "whisper", "self-hosted"]
+    }],
+    "funding": {
+        "channels": [
+            {
+                "guid": "github-sponsors",
+                "type": "payment-provider",
+                "address": "https://github.com/sponsors/silverstein",
+                "description": "GitHub Sponsors. One-time or recurring, and the simplest route for most funders."
+            }
+        ],
+        "plans": [
+            {
+                "guid": "security-hardening",
+                "status": "active",
+                "name": "Security and privacy hardening",
+                "description": "Funds a multi-week security program that is specced and partly built but currently paused for lack of capacity. It covers preventing restricted conversation content from reaching agent or model-provider paths it should never touch, a platform-keystore encrypted store for sealed audio, and making data egress and provenance visible to the user rather than implicit. Software that holds recordings of private conversations should be held to a higher standard than a side project can sustain unfunded.",
+                "amount": 25000,
+                "currency": "USD",
+                "frequency": "one-time",
+                "channels": ["github-sponsors"]
+            },
+            {
+                "guid": "maintainer-time",
+                "status": "active",
+                "name": "Maintainer time",
+                "description": "Covers ongoing maintenance: reviewing and merging community contributions, shipping releases, and supporting users across macOS, Linux, and Windows. The project ships roughly two releases a week and is maintained by one person.",
+                "amount": 2000,
+                "currency": "USD",
+                "frequency": "monthly",
+                "channels": ["github-sponsors"]
+            },
+            {
+                "guid": "goodwill",
+                "status": "active",
+                "name": "Goodwill",
+                "description": "Give whatever you like, whenever you like, if the project has been useful to you.",
+                "amount": 0,
+                "currency": "USD",
+                "frequency": "one-time",
+                "channels": ["github-sponsors"]
+            }
+        ]
+    }
+}
