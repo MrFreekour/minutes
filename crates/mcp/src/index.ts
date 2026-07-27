@@ -211,6 +211,25 @@ export const MCP_INTENT_RESULT_MAX = 50;
  * caller is told about has a known ceiling.
  */
 export const MCP_INSIGHT_RESULT_MAX = 500;
+/**
+ * How many of the newest insight records one read examines, whatever the
+ * caller asked for.
+ *
+ * This is a constant on purpose. A withheld tally computed over a
+ * caller-shaped window can be differenced across two calls to read a single
+ * record's policy verdict: ask for the newest k, ask for the newest k+1, and
+ * whichever counter moved names the verdict on the (k+1)-th record. Sweeping k
+ * maps every restricted meeting in the log. Holding the scanned window fixed
+ * makes the tally a function of corpus state alone, so differencing across any
+ * pair of requests yields nothing.
+ *
+ * It is set equal to the largest permitted `limit` so that no request can
+ * widen it, and so that applying `since` in this process returns exactly the
+ * records the CLI would have returned for the same `limit`: `since` is a lower
+ * bound on time, so the newest N records that satisfy it are the same set
+ * whether it is applied before or after taking the newest N.
+ */
+export const MCP_INSIGHT_SCAN_WINDOW = MCP_INSIGHT_RESULT_MAX;
 export const MCP_PERSON_PROFILE_MEETING_MAX = 50;
 export const MCP_PERSON_PROFILE_OPEN_ACTION_MAX = 50;
 export const MCP_PERSON_PROFILE_TOPIC_MAX = 50;
@@ -7339,6 +7358,76 @@ export type WithheldSourceReason =
   | "source-policy-denied";
 
 /**
+ * Resolve a derived record's recorded source pointer to a live corpus path.
+ *
+ * The pipeline writes `source_meeting` as the absolute path it processed, so
+ * the recorded value is only meaningful on the machine and in the directory
+ * layout that produced it. A corpus that has since moved — a different
+ * machine, a different home directory, a restored backup — leaves every
+ * historical record naming a path that does not exist here, and the exact-path
+ * check then withholds the entire projection while reporting it as a policy
+ * denial. Identifying the source by its path *relative to the live corpus
+ * root* survives that move.
+ *
+ * Two shapes are accepted:
+ *   - a relative value, resolved directly against the live root;
+ *   - an absolute value, normalised by stripping a recognised root prefix.
+ *
+ * "Recognised" means the value carries a path segment equal to the live root's
+ * own final segment; the remainder after the LAST such segment is taken as the
+ * corpus-relative tail. That is deliberately a heuristic, and it has two known
+ * limits. Option A — a stable identifier the pipeline writes into frontmatter,
+ * plus an index — removes them rather than narrowing them, and is tracked as
+ * its own block:
+ *
+ *   - A corpus whose final segment was renamed as well as moved is not
+ *     recognised, so its records stay withheld. That direction is the safe
+ *     one.
+ *   - A foreign path that merely happens to contain a directory sharing the
+ *     live root's final segment normalises to a tail that could collide with
+ *     an unrelated live meeting at the same relative path. Anchoring on the
+ *     root segment rather than on the bare filename is what keeps that from
+ *     being the ordinary case: it is why a value such as
+ *     `/var/folders/<tmp>/output/2026-04-07-test-meeting.md`, which names no
+ *     corpus root at all, resolves to nothing instead of binding to whatever
+ *     live meeting shares its filename.
+ *
+ * Returns null when no corpus-relative identity can be established. Callers
+ * must treat null as withheld. Binding a record to the wrong meeting would
+ * release it under the wrong meeting's policy, and this lane's standing rule
+ * is that a wrong binding is worse than none.
+ */
+export function resolveCorpusRelativeSourcePath(
+  value: unknown,
+  meetingsDir: string
+): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed === "" || trimmed.includes("\0")) return null;
+
+  const canonicalRoot = canonicalizeRoot(meetingsDir);
+  const rootSegment = basename(canonicalRoot);
+
+  let candidate: string;
+  if (!isAbsolute(trimmed)) {
+    candidate = join(canonicalRoot, trimmed);
+  } else if (isPathWithinCanonicalRoot(trimmed, canonicalRoot)) {
+    // Already names this corpus: keep the recorded path as written.
+    candidate = canonicalizeRoot(trimmed);
+  } else {
+    const segments = trimmed.split(/[\\/]+/).filter((segment) => segment !== "");
+    const anchor = rootSegment === "" ? -1 : segments.lastIndexOf(rootSegment);
+    // An anchor as the final segment names the root itself, not a meeting.
+    if (anchor < 0 || anchor === segments.length - 1) return null;
+    candidate = join(canonicalRoot, ...segments.slice(anchor + 1));
+  }
+
+  // `..` in either shape, and the inactive corpus directories, are rejected
+  // here before any filesystem access.
+  return isActiveCorpusMeetingPath(candidate, canonicalRoot) ? candidate : null;
+}
+
+/**
  * Re-verify one derived record's source meeting against live on-disk policy.
  *
  * This is the "canonical source policy provenance that can be revalidated
@@ -7352,6 +7441,13 @@ export type WithheldSourceReason =
  *
  * A record with no resolvable source fails closed. Without a source there is
  * nothing to revalidate, and an annotation may quote restricted content.
+ *
+ * The two withheld reasons stay deliberately coarse. `source-policy-denied`
+ * covers "could not be resolved into this corpus" together with "resolved and
+ * refused", because splitting them would publish the number of restricted
+ * source meetings in the window as a clean count to a caller holding no
+ * override. `no-source-provenance` is safe to report separately: it describes
+ * the record's own shape and not any meeting's policy.
  */
 export async function revalidateDerivedRecordSource(
   meetingPath: unknown,
@@ -7361,8 +7457,12 @@ export async function revalidateDerivedRecordSource(
   if (typeof meetingPath !== "string" || meetingPath.trim() === "") {
     return { allowed: false, reason: "no-source-provenance" };
   }
+  const resolved = resolveCorpusRelativeSourcePath(meetingPath, meetingsDir);
+  if (resolved === null) {
+    return { allowed: false, reason: "source-policy-denied" };
+  }
   const snapshot = await policyVerifiedExactMeetingSnapshot(
-    meetingPath,
+    resolved,
     meetingsDir,
     includeRestricted
   );
@@ -7441,6 +7541,63 @@ export function meetsInsightConfidence(observed: unknown, minimum: unknown): boo
   return observedIndex >= minimumIndex;
 }
 
+const INSIGHT_SINCE_ERROR = "insight since must be a calendar date in YYYY-MM-DD form";
+
+/**
+ * Parse the `since` floor the way `minutes insights` does: local midnight of
+ * the given calendar date.
+ *
+ * Applied in this process rather than by the CLI. `since` is a window-shaping
+ * argument, and any caller-shaped window makes the withheld tally differenceable
+ * on that axis exactly as `limit` was. With this in process, no caller-supplied
+ * value reaches the CLI at all.
+ *
+ * A malformed value is refused rather than ignored. The CLI warns on stderr and
+ * then shows everything, which through this surface would silently widen a
+ * query the caller believed was narrowed.
+ */
+export function parseInsightSinceFloor(since: unknown): number | null {
+  if (since === undefined || since === null) return null;
+  if (typeof since !== "string") {
+    throw new McpError(ErrorCode.InvalidParams, INSIGHT_SINCE_ERROR);
+  }
+  const trimmed = since.trim();
+  if (trimmed === "") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) {
+    throw new McpError(ErrorCode.InvalidParams, INSIGHT_SINCE_ERROR);
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const midnight = new Date(year, month - 1, day, 0, 0, 0, 0);
+  // Rejects 2026-02-30 and two-digit-year coercion, both of which Date rolls
+  // over silently.
+  if (
+    midnight.getFullYear() !== year ||
+    midnight.getMonth() !== month - 1 ||
+    midnight.getDate() !== day
+  ) {
+    throw new McpError(ErrorCode.InvalidParams, INSIGHT_SINCE_ERROR);
+  }
+  return midnight.getTime();
+}
+
+/**
+ * Whether one insight falls on or after the requested floor.
+ *
+ * A record this process cannot date is excluded whenever a floor was asked
+ * for: answering a time-bounded question with a record of unknown time would
+ * be a claim the data does not support.
+ */
+export function insightIsSince(insight: any, floor: number | null): boolean {
+  if (floor === null) return true;
+  const raw = insight?.timestamp;
+  if (typeof raw !== "string") return false;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) && at >= floor;
+}
+
 /** Case-insensitive partial match over participants and owner, as the CLI does. */
 export function insightMentionsParticipant(insight: any, participant: string): boolean {
   const needle = participant.toLowerCase();
@@ -7466,7 +7623,30 @@ export function releaseInsightsWithLiveSourcePolicy(
   );
 }
 
-export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
+/**
+ * Injection points for the insight handler, defaulted to the live ones.
+ *
+ * The same handler body runs in production and under test; only these three
+ * bindings differ. `MINUTES_BIN` is resolved once at module load from a fixed
+ * candidate list with no environment override, so without this seam an
+ * end-to-end assertion about the handler would silently become a no-op on any
+ * machine that happens not to have a built CLI on disk — a failure mode this
+ * lane has already shipped once.
+ */
+export type InsightToolDeps = {
+  runner?: MinutesRunner;
+  cliAvailable?: () => Promise<boolean>;
+  meetingsDir?: () => Promise<string>;
+};
+
+export function registerUnavailableCompatibilityTools(
+  serverArg: McpServer,
+  deps: InsightToolDeps = {}
+) {
+  const runCli: MinutesRunner = deps.runner ?? runMinutes;
+  const cliIsAvailable = deps.cliAvailable ?? isCliAvailable;
+  const resolveMeetingsDir = deps.meetingsDir ?? getEffectiveMeetingsDir;
+
   registerToolWithRestrictedPolicy(
     serverArg,
     "get_agent_annotations",
@@ -7491,7 +7671,7 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
       kind: z.enum(MEETING_INSIGHT_KINDS).optional().describe("Filter by insight type"),
       confidence: z.enum(["tentative", "inferred", "strong", "explicit"]).optional().describe("Minimum confidence level"),
       participant: z.string().optional().describe("Filter by participant name (partial match)"),
-      since: z.string().optional().describe("Only insights since this date (YYYY-MM-DD)"),
+      since: z.string().optional().describe("Only insights on or after this calendar date (YYYY-MM-DD)"),
       limit: z
         .number()
         .int()
@@ -7499,7 +7679,9 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
         .max(MCP_INSIGHT_RESULT_MAX)
         .optional()
         .default(50)
-        .describe(`Maximum number of results (1-${MCP_INSIGHT_RESULT_MAX})`),
+        .describe(
+          `Maximum number of results to return (1-${MCP_INSIGHT_RESULT_MAX}). Every read examines the newest ${MCP_INSIGHT_SCAN_WINDOW} records regardless; this caps the answer, not the search.`
+        ),
       actionable_only: z.boolean().optional().default(false).describe("Only return actionable insights (Strong or Explicit confidence)"),
       include_restricted: z
         .boolean()
@@ -7511,23 +7693,27 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
     },
     { title: "Get Meeting Insights", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ kind, confidence, participant, since, limit, actionable_only, include_restricted }: any) => {
-      if (!(await isCliAvailable())) {
+      if (!(await cliIsAvailable())) {
         return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }], isError: true };
       }
 
       const requested = normalizeMcpResultLimit(limit ?? 50, MCP_INSIGHT_RESULT_MAX, "insight");
-      // Only window-shaping arguments reach the CLI. Content selectors stay in
-      // this process so that policy filtering happens BEFORE them: computing
-      // the withheld tally after a caller-supplied participant or kind filter
-      // turned that tally into an oracle, letting an agent with no content
-      // access learn who attended a restricted meeting and how many decisions
-      // it held by sweeping the filter.
-      const args = ["insights", "--limit", String(requested)];
-      if (since) args.push("--since", String(since));
+      const sinceFloor = parseInsightSinceFloor(since);
+      // No caller-supplied value reaches the CLI. Every selector runs in this
+      // process, after policy revalidation, so the withheld tally is computed
+      // over a window the caller cannot shape.
+      //
+      // Content selectors moved here first, because computing the tally after
+      // a caller's participant or kind filter let an agent with no content
+      // access learn who attended a restricted meeting by sweeping the filter.
+      // `limit` and `since` are here for the same reason: both shape the
+      // window, and a tally over a caller-shaped window can be differenced
+      // across two calls to read one record's policy verdict.
+      const args = ["insights", "--limit", String(MCP_INSIGHT_SCAN_WINDOW)];
 
       let fetched: unknown[];
       try {
-        const { stdout } = await runMinutes(args, 30000);
+        const { stdout } = await runCli(args, 30000);
         const parsed = parseJsonOutput(stdout);
         if (!Array.isArray(parsed)) {
           // Never coerce unparseable output to an empty array: reporting
@@ -7551,7 +7737,7 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
 
       // Each insight names the markdown the pipeline derived it from. That
       // source is re-read and re-checked against live policy before release.
-      const meetingsDir = await getEffectiveMeetingsDir();
+      const meetingsDir = await resolveMeetingsDir();
       const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
         fetched,
         meetingsDir,
@@ -7559,7 +7745,8 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
       );
 
       const minimumConfidence = actionable_only ? "strong" : confidence;
-      const matching = released.filter((insight: any) => {
+      const selected = released.filter((insight: any) => {
+        if (!insightIsSince(insight, sinceFloor)) return false;
         if (kind && insight?.kind !== kind) return false;
         if (minimumConfidence && !meetsInsightConfidence(insight?.confidence, minimumConfidence)) {
           return false;
@@ -7568,22 +7755,43 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
         return true;
       });
 
+      // `limit` caps the answer, not the search. Sizing the scanned window with
+      // it was what cost a filtered query its reach: asking for one
+      // participant's commitments examined only the newest `limit` records and
+      // reported whatever few of them matched. The window is now fixed, so a
+      // narrow filter sees all of it.
+      //
+      // The CLI emits oldest-first and takes its own limit from the tail, so
+      // keep the newest matches and preserve that order.
+      const matching =
+        selected.length > requested
+          ? selected.slice(selected.length - requested)
+          : selected;
+
       // `partial` must account for truncation as well as policy. The previous
-      // shape reported `partial: false` on a limit-truncated window, which let
-      // an agent answer "there are no decisions about X" from an incomplete
-      // read.
-      const truncated = fetched.length >= requested;
-      const partial = withheld.total > 0 || truncated;
+      // shape reported `partial: false` on a truncated window, which let an
+      // agent answer "there are no decisions about X" from an incomplete read.
+      const truncated = fetched.length >= MCP_INSIGHT_SCAN_WINDOW;
+      const capped = selected.length > requested;
+      const partial = withheld.total > 0 || truncated || capped;
 
       const notes: string[] = [];
       if (withheld.total > 0) {
         notes.push(
-          `${withheld.total} insight(s) withheld because their source meeting could not be revalidated against live policy: it is designated restricted, or has been archived, moved, or deleted.`
+          `${withheld.total} insight(s) withheld because their source meeting could not be revalidated against live policy: it could not be resolved to a meeting in the active corpus, or it is designated restricted, archived, moved, or deleted.`
         );
       }
       if (truncated) {
+        // Deliberately offers no remedy. `since` is a lower bound, so no
+        // argument this tool accepts reaches past the newest scanned record;
+        // saying otherwise would advertise a recovery that cannot happen.
         notes.push(
-          `This view is truncated at ${requested} record(s); older insights were not examined. Raise limit or narrow since for a complete answer.`
+          `This view examined the newest ${MCP_INSIGHT_SCAN_WINDOW} record(s); anything older was not examined and is not reachable through this tool.`
+        );
+      }
+      if (capped) {
+        notes.push(
+          `${selected.length} record(s) matched; showing the most recent ${requested}. Raise limit for the rest.`
         );
       }
       const suffix = notes.length === 0 ? "" : `\n\n${notes.join("\n")}`;
@@ -7597,9 +7805,11 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
           structuredContent: {
             available: true,
             count: 0,
+            matched: selected.length,
             insights: [],
             withheld,
             truncated,
+            capped,
             partial,
           },
         };
@@ -7613,9 +7823,11 @@ export function registerUnavailableCompatibilityTools(serverArg: McpServer) {
         structuredContent: {
           available: true,
           count: matching.length,
+          matched: selected.length,
           insights: matching,
           withheld,
           truncated,
+          capped,
           partial,
         },
       };

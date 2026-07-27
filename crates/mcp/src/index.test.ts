@@ -70,9 +70,13 @@ import {
   MCP_ACTION_RESULT_MAX,
   MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION,
   releaseInsightsWithLiveSourcePolicy,
+  resolveCorpusRelativeSourcePath,
   meetsInsightConfidence,
   insightMentionsParticipant,
+  insightIsSince,
+  parseInsightSinceFloor,
   revalidateDerivedRecordSource,
+  MCP_INSIGHT_SCAN_WINDOW,
   MCP_INTENT_RESULT_MAX,
   MCP_MEETING_RESULT_MAX,
   MCP_MEETING_INSIGHTS_DESCRIPTION,
@@ -2004,59 +2008,26 @@ describe("insight filtering applied after policy", () => {
     expect(insightMentionsParticipant({}, "alex")).toBe(false);
   });
 
-  it("keeps the withheld tally independent of caller content filters", async () => {
-    // This is the oracle fix. Policy runs over the whole fetched window, so
-    // sweeping participant or kind cannot reveal how many restricted records
-    // matched a given attribute.
-    const root = mkdtempSync(join(tmpdir(), "minutes-insight-oracle-"));
-    try {
-      const normal = join(root, "normal.md");
-      const restricted = join(root, "restricted.md");
-      writeFileSync(normal, meetingMarkdownFixture("Normal review"));
-      writeFileSync(restricted, meetingMarkdownFixture("Restricted review", "restricted"));
+  it("parses the since floor as local midnight and refuses malformed dates", () => {
+    const floor = parseInsightSinceFloor("2026-07-17");
+    expect(floor).toBe(new Date(2026, 6, 17, 0, 0, 0, 0).getTime());
+    expect(parseInsightSinceFloor(undefined)).toBeNull();
+    expect(parseInsightSinceFloor("")).toBeNull();
+    expect(() => parseInsightSinceFloor("2026-7-17")).toThrow(/YYYY-MM-DD/);
+    expect(() => parseInsightSinceFloor("2026-02-30")).toThrow(/YYYY-MM-DD/);
+    expect(() => parseInsightSinceFloor("0026-07-17")).toThrow(/YYYY-MM-DD/);
+    expect(() => parseInsightSinceFloor(20260717 as never)).toThrow(/YYYY-MM-DD/);
 
-      const window = [
-        { kind: "decision", participants: ["Alex"], source_meeting: normal },
-        { kind: "question", participants: ["Dana"], source_meeting: normal },
-        { kind: "decision", participants: ["Alex"], source_meeting: restricted },
-        { kind: "commitment", participants: ["Priya"], source_meeting: restricted },
-      ];
-
-      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
-        window,
-        root,
-        false
-      );
-
-      // Two restricted-source records are withheld regardless of which filter
-      // the caller then applies in-process.
-      expect(withheld.total).toBe(2);
-      for (const filter of ["Alex", "Dana", "Priya", "nobody"]) {
-        const matching = released.filter((insight: any) =>
-          insightMentionsParticipant(insight, filter)
-        );
-        // The released set narrows, but the withheld tally never moves.
-        expect(withheld.total).toBe(2);
-        expect(matching.every((insight: any) => insight.source_meeting === normal)).toBe(true);
-      }
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    // A record this process cannot date is excluded whenever a floor is asked
+    // for, and included when none is.
+    expect(insightIsSince({ timestamp: "2026-07-17T00:00:00Z" }, null)).toBe(true);
+    expect(insightIsSince({}, null)).toBe(true);
+    expect(insightIsSince({}, floor)).toBe(false);
+    expect(insightIsSince({ timestamp: "not a date" }, floor)).toBe(false);
+    expect(insightIsSince({ timestamp: "2026-07-16T10:00:00Z" }, floor)).toBe(false);
+    expect(insightIsSince({ timestamp: "2026-07-18T10:00:00Z" }, floor)).toBe(true);
   });
 });
-
-function meetingMarkdownFixture(title: string, sensitivity?: string): string {
-  return [
-    "---",
-    `title: ${title}`,
-    "type: meeting",
-    "date: 2026-07-15T10:00:00Z",
-    ...(sensitivity ? [`sensitivity: ${sensitivity}`] : []),
-    "---",
-    "",
-    "Body.",
-  ].join("\n");
-}
 
 describe("derived record source revalidation", () => {
   function meetingMarkdown(title: string, sensitivity?: string): string {
@@ -2162,35 +2133,515 @@ describe("derived record source revalidation", () => {
     }
   });
 
-  it("reports withheld records as a partial view rather than an empty one", async () => {
-    const root = mkdtempSync(join(tmpdir(), "minutes-insight-source-"));
+});
+
+/**
+ * A corpus whose own final segment is `meetings`, which is what the
+ * relative-path normaliser anchors on.
+ */
+function makeMovedCorpus(): { base: string; root: string } {
+  const base = mkdtempSync(join(tmpdir(), "minutes-moved-corpus-"));
+  const root = join(base, "meetings");
+  mkdirSync(root, { recursive: true });
+  return { base, root };
+}
+
+function meetingFixture(title: string, sensitivity?: string): string {
+  return [
+    "---",
+    `title: ${title}`,
+    "type: meeting",
+    "date: 2026-07-15T10:00:00Z",
+    ...(sensitivity ? [`sensitivity: ${sensitivity}`] : []),
+    "---",
+    "",
+    "Body.",
+  ].join("\n");
+}
+
+describe("insight source identity survives a moved corpus", () => {
+  it("releases a record whose recorded source names a corpus root that no longer exists here", async () => {
+    // The pipeline records an absolute path. Every historical record in a
+    // corpus that has since moved machines names a root that is not this one,
+    // which is why the exact-path check released nothing at all.
+    const { base, root } = makeMovedCorpus();
     try {
-      const normal = join(root, "normal.md");
-      const restricted = join(root, "restricted.md");
-      writeFileSync(normal, meetingMarkdown("Normal review"));
-      writeFileSync(restricted, meetingMarkdown("Restricted review", "restricted"));
+      writeFileSync(join(root, "2026-07-15-review.md"), meetingFixture("Review"));
 
       const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
         [
-          { note: "kept", source_meeting: normal },
-          { note: "restricted-source", source_meeting: restricted },
-          { note: "orphan" },
+          {
+            kind: "decision",
+            content: "kept",
+            source_meeting: "/Users/someone-else/meetings/2026-07-15-review.md",
+          },
         ],
         root,
         false
       );
 
-      expect(released.map((entry: any) => entry.note)).toEqual(["kept"]);
-      expect(withheld).toEqual({
-        total: 2,
-        noSourceProvenance: 1,
-        sourcePolicyDenied: 1,
-      });
-      // The withheld bodies must not ride along anywhere in the result.
-      expect(JSON.stringify(released)).not.toContain("restricted-source");
-      expect(JSON.stringify(released)).not.toContain("orphan");
+      expect(released.map((entry: any) => entry.content)).toEqual(["kept"]);
+      expect(withheld.total).toBe(0);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a corpus-relative source, including one in a subdirectory", async () => {
+    const { base, root } = makeMovedCorpus();
+    try {
+      mkdirSync(join(root, "memos"), { recursive: true });
+      writeFileSync(join(root, "2026-07-15-review.md"), meetingFixture("Review"));
+      writeFileSync(join(root, "memos", "2026-07-15-memo.md"), meetingFixture("Memo"));
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [
+          { content: "flat", source_meeting: "2026-07-15-review.md" },
+          { content: "nested", source_meeting: "memos/2026-07-15-memo.md" },
+        ],
+        root,
+        false
+      );
+
+      expect(released.map((entry: any) => entry.content)).toEqual(["flat", "nested"]);
+      expect(withheld.total).toBe(0);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to bind a foreign path that names no corpus root to a live meeting of the same filename", async () => {
+    // This is the misattribution the normaliser must not commit. Records from
+    // a temp directory — the shape a test run leaves in the event log — name
+    // no corpus root, so they must resolve to nothing rather than adopt the
+    // identity, and therefore the policy, of whatever live meeting happens to
+    // share their filename.
+    const { base, root } = makeMovedCorpus();
+    try {
+      writeFileSync(
+        join(root, "2026-04-07-test-meeting.md"),
+        meetingFixture("Unrelated live meeting")
+      );
+
+      const foreign =
+        "/var/folders/27/jxpp0/T/.tmpfbyC6x/output/2026-04-07-test-meeting.md";
+      expect(resolveCorpusRelativeSourcePath(foreign, root)).toBeNull();
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [{ content: "MISATTRIBUTION-CANARY", source_meeting: foreign }],
+        root,
+        false
+      );
+
+      expect(released).toEqual([]);
+      expect(withheld.total).toBe(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("still applies live sensitivity policy through the normalised path", async () => {
+    // Normalising identity must not become a way around the policy check: the
+    // resolved path is re-read and re-classified exactly as an exact path is.
+    const { base, root } = makeMovedCorpus();
+    try {
+      writeFileSync(
+        join(root, "2026-07-15-restricted.md"),
+        meetingFixture("Restricted review", "restricted")
+      );
+      const foreignRestricted =
+        "/Users/someone-else/meetings/2026-07-15-restricted.md";
+
+      const denied = await releaseInsightsWithLiveSourcePolicy(
+        [{ content: "RESTRICTED-VIA-MOVED-CORPUS-CANARY", source_meeting: foreignRestricted }],
+        root,
+        false
+      );
+      expect(denied.released).toEqual([]);
+      expect(denied.withheld.total).toBe(1);
+      expect(JSON.stringify(denied.released)).not.toContain(
+        "RESTRICTED-VIA-MOVED-CORPUS-CANARY"
+      );
+
+      // The audited override reaches the same record through the same path.
+      const overridden = await releaseInsightsWithLiveSourcePolicy(
+        [{ content: "RESTRICTED-VIA-MOVED-CORPUS-CANARY", source_meeting: foreignRestricted }],
+        root,
+        true
+      );
+      expect(overridden.released).toHaveLength(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses traversal and inactive corpus directories after normalisation", async () => {
+    const { base, root } = makeMovedCorpus();
+    try {
+      mkdirSync(join(root, "archive"), { recursive: true });
+      writeFileSync(join(root, "archive", "old.md"), meetingFixture("Archived"));
+      writeFileSync(join(base, "outside.md"), meetingFixture("Outside the corpus"));
+
+      // Archived: the file exists and parses, so the inactive-directory rule is
+      // the only thing refusing it.
+      expect(
+        resolveCorpusRelativeSourcePath("/Users/someone-else/meetings/archive/old.md", root)
+      ).toBeNull();
+      expect(resolveCorpusRelativeSourcePath("archive/old.md", root)).toBeNull();
+
+      // Traversal out of the corpus, by either shape.
+      expect(resolveCorpusRelativeSourcePath("../outside.md", root)).toBeNull();
+      expect(
+        resolveCorpusRelativeSourcePath("/Users/someone-else/meetings/../outside.md", root)
+      ).toBeNull();
+
+      // A value naming the root itself is not a meeting.
+      expect(resolveCorpusRelativeSourcePath("/Users/someone-else/meetings", root)).toBeNull();
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [
+          { content: "archived", source_meeting: "archive/old.md" },
+          { content: "escaped", source_meeting: "../outside.md" },
+        ],
+        root,
+        false
+      );
+      expect(released).toEqual([]);
+      expect(withheld.total).toBe(2);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Drive the real `get_meeting_insights` handler.
+ *
+ * The runner stands in for the `minutes insights` process and reproduces its
+ * two window-shaping behaviours faithfully: `--since` filters by event
+ * timestamp, and `--limit` returns the newest N from the tail. That fidelity is
+ * what gives these tests teeth. A stub that ignored `--limit` would report a
+ * constant tally no matter what the handler asked for, and every oracle
+ * assertion below would pass with the oracle wide open.
+ */
+async function insightHarness(meetingsDir: string, records: any[]) {
+  const mcpServer = new McpServer({
+    name: "minutes-insight-handler-test",
+    version: "0.0.0",
+  });
+  const calls: string[][] = [];
+  registerUnavailableCompatibilityTools(mcpServer, {
+    cliAvailable: async () => true,
+    meetingsDir: async () => meetingsDir,
+    runner: async (args: string[]) => {
+      calls.push([...args]);
+      let out = records;
+      const sinceIndex = args.indexOf("--since");
+      if (sinceIndex >= 0) {
+        const floor = new Date(`${args[sinceIndex + 1]}T00:00:00`).getTime();
+        out = out.filter((record) => Date.parse(record.timestamp) >= floor);
+      }
+      const limitIndex = args.indexOf("--limit");
+      if (limitIndex >= 0) {
+        const size = Number(args[limitIndex + 1]);
+        out = out.slice(Math.max(0, out.length - size));
+      }
+      return { stdout: JSON.stringify(out), stderr: "" };
+    },
+  });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client(
+    { name: "insight-handler-client", version: "0.0.0" },
+    { capabilities: {} }
+  );
+  await Promise.all([
+    mcpServer.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+  return {
+    calls,
+    call: async (args: Record<string, unknown>) =>
+      (await client.callTool({
+        name: "get_meeting_insights",
+        arguments: args,
+      })) as any,
+    close: async () => {
+      await client.close();
+      await mcpServer.close();
+    },
+  };
+}
+
+/** Ten records, alternating between a normal and a restricted source. */
+function alternatingInsightWindow(normalPath: string, restrictedPath: string) {
+  return Array.from({ length: 10 }, (_, index) => ({
+    timestamp: `2026-07-${String(10 + index).padStart(2, "0")}T10:00:00Z`,
+    kind: index % 3 === 0 ? "decision" : "commitment",
+    content: `record-${index}`,
+    confidence: "strong",
+    participants: [index % 2 === 0 ? "Alex" : "Dana"],
+    owner: null,
+    source_meeting: index % 2 === 0 ? normalPath : restrictedPath,
+  }));
+}
+
+describe("insight window is not shaped by the caller", () => {
+  it("passes no caller-supplied value to the CLI", async () => {
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    const harness = await insightHarness(root, [
+      {
+        timestamp: "2026-07-15T10:00:00Z",
+        kind: "decision",
+        content: "only",
+        confidence: "strong",
+        participants: ["Alex"],
+        source_meeting: "normal.md",
+      },
+    ]);
+    try {
+      await harness.call({
+        kind: "commitment",
+        confidence: "explicit",
+        participant: "PRIVATE-SWEEP-CANARY",
+        since: "2026-03-04",
+        limit: 7,
+        actionable_only: true,
+      });
+
+      // The window the CLI is asked for is a constant. Nothing the caller sent
+      // appears in the argv at all.
+      expect(harness.calls).toEqual([
+        ["insights", "--limit", String(MCP_INSIGHT_SCAN_WINDOW)],
+      ]);
+      const argv = JSON.stringify(harness.calls);
+      expect(argv).not.toContain("PRIVATE-SWEEP-CANARY");
+      expect(argv).not.toContain("2026-03-04");
+      expect(argv).not.toContain("--since");
+      expect(argv).not.toContain("commitment");
+      expect(argv).not.toContain("7");
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("holds the withheld tally still while the caller sweeps limit", async () => {
+    // The limit-differencing oracle. When `limit` sized the fetched window, the
+    // tally moved by one each time the newly included record was withheld, so
+    // two calls read one record's policy verdict and a sweep mapped every
+    // restricted meeting in the log.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    writeFileSync(join(root, "restricted.md"), meetingFixture("Restricted", "restricted"));
+    const harness = await insightHarness(
+      root,
+      alternatingInsightWindow("normal.md", "restricted.md")
+    );
+    try {
+      const tallies: number[] = [];
+      for (let limit = 1; limit <= 6; limit += 1) {
+        const result = await harness.call({ limit });
+        tallies.push(result.structuredContent.withheld.total);
+      }
+      // Five of the ten records name the restricted source, and that is the
+      // answer for every limit. Sizing the window with `limit` instead would
+      // walk this sequence 1,1,2,2,3,3 — one step per newly included record,
+      // which is the leak stated as a number.
+      expect(tallies).toEqual([5, 5, 5, 5, 5, 5]);
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("holds the withheld tally still while the caller sweeps since", async () => {
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    writeFileSync(join(root, "restricted.md"), meetingFixture("Restricted", "restricted"));
+    const harness = await insightHarness(
+      root,
+      alternatingInsightWindow("normal.md", "restricted.md")
+    );
+    try {
+      const tallies: number[] = [];
+      for (const since of ["2026-07-10", "2026-07-14", "2026-07-17", "2026-07-20"]) {
+        const result = await harness.call({ since });
+        tallies.push(result.structuredContent.withheld.total);
+      }
+      expect(tallies).toEqual([5, 5, 5, 5]);
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("holds the withheld tally still while the caller sweeps content filters", async () => {
+    // Rewritten from a version that captured the tally once and then asserted
+    // the same immutable local inside a loop, which could not fail. Each sweep
+    // step now issues its own request and reads the tally the handler computed
+    // for that request.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    writeFileSync(join(root, "restricted.md"), meetingFixture("Restricted", "restricted"));
+    const harness = await insightHarness(
+      root,
+      alternatingInsightWindow("normal.md", "restricted.md")
+    );
+    try {
+      const sweeps: Record<string, unknown>[] = [
+        {},
+        { participant: "Alex" },
+        { participant: "nobody-at-all" },
+        { kind: "decision" },
+        { confidence: "explicit" },
+      ];
+      const tallies: number[] = [];
+      const counts: number[] = [];
+      for (const sweep of sweeps) {
+        const result = await harness.call(sweep);
+        tallies.push(result.structuredContent.withheld.total);
+        counts.push(result.structuredContent.count);
+      }
+      // The tally never moves...
+      expect(tallies).toEqual(sweeps.map(() => 5));
+      // ...while the released set genuinely does, which is what makes the
+      // constant tally evidence of anything.
+      expect(new Set(counts).size).toBeGreaterThan(1);
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("lets a narrow filter reach records older than the requested limit", async () => {
+    // `limit` caps the answer, not the search. Sizing the fetched window with it
+    // meant a filtered question was answered from only the newest `limit`
+    // records, so a participant whose only commitment was older than that
+    // returned nothing and looked like an absence of evidence.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    const records = Array.from({ length: 10 }, (_, index) => ({
+      timestamp: `2026-07-${String(10 + index).padStart(2, "0")}T10:00:00Z`,
+      kind: "commitment",
+      content: `record-${index}`,
+      confidence: "strong",
+      participants: [index === 0 ? "Zola" : "Alex"],
+      source_meeting: "normal.md",
+    }));
+    const harness = await insightHarness(root, records);
+    try {
+      const result = await harness.call({ participant: "Zola", limit: 1 });
+      expect(result.structuredContent.count).toBe(1);
+      expect(result.structuredContent.insights[0].content).toBe("record-0");
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a capped answer as partial and keeps the newest matches", async () => {
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    const records = Array.from({ length: 10 }, (_, index) => ({
+      timestamp: `2026-07-${String(10 + index).padStart(2, "0")}T10:00:00Z`,
+      kind: "commitment",
+      content: `record-${index}`,
+      confidence: "strong",
+      participants: ["Alex"],
+      source_meeting: "normal.md",
+    }));
+    const harness = await insightHarness(root, records);
+    try {
+      const result = await harness.call({ limit: 3 });
+      expect(result.structuredContent.count).toBe(3);
+      expect(result.structuredContent.matched).toBe(10);
+      expect(result.structuredContent.capped).toBe(true);
+      expect(result.structuredContent.partial).toBe(true);
+      expect(
+        result.structuredContent.insights.map((entry: any) => entry.content)
+      ).toEqual(["record-7", "record-8", "record-9"]);
+      expect(result.content[0].text).toContain("10 record(s) matched");
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("applies since in this process with the CLI's calendar-day semantics", async () => {
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    const records = Array.from({ length: 10 }, (_, index) => ({
+      timestamp: `2026-07-${String(10 + index).padStart(2, "0")}T10:00:00Z`,
+      kind: "commitment",
+      content: `record-${index}`,
+      confidence: "strong",
+      participants: ["Alex"],
+      source_meeting: "normal.md",
+    }));
+    const harness = await insightHarness(root, records);
+    try {
+      const result = await harness.call({ since: "2026-07-17", limit: 500 });
+      expect(
+        result.structuredContent.insights.map((entry: any) => entry.content)
+      ).toEqual(["record-7", "record-8", "record-9"]);
+
+      // A malformed date is refused rather than silently widening the query.
+      for (const malformed of ["17-07-2026", "2026-02-30", "2026-7-17"]) {
+        const refused = await harness.call({ since: malformed });
+        expect(refused.isError).toBe(true);
+        expect(refused.content[0].text).toMatch(/YYYY-MM-DD/);
+        expect(refused.structuredContent).toBeUndefined();
+      }
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes a withheld partial view from a genuinely empty one", async () => {
+    // Rewritten from a test whose name promised the partial-view contract but
+    // whose body only exercised the release helper, which has no notion of
+    // `partial` at all. The flag lives in the handler, so the handler is what
+    // this asserts.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    writeFileSync(join(root, "restricted.md"), meetingFixture("Restricted", "restricted"));
+    try {
+      const withRestricted = await insightHarness(root, [
+        {
+          timestamp: "2026-07-15T10:00:00Z",
+          kind: "decision",
+          content: "RESTRICTED-PARTIAL-CANARY",
+          confidence: "strong",
+          participants: ["Alex"],
+          source_meeting: "restricted.md",
+        },
+      ]);
+      try {
+        const result = await withRestricted.call({});
+        // Nothing released, but the answer must not read as "there is nothing".
+        expect(result.structuredContent.count).toBe(0);
+        expect(result.structuredContent.partial).toBe(true);
+        expect(result.structuredContent.withheld.total).toBe(1);
+        expect(result.content[0].text).toContain("withheld");
+        expect(JSON.stringify(result)).not.toContain("RESTRICTED-PARTIAL-CANARY");
+      } finally {
+        await withRestricted.close();
+      }
+
+      const genuinelyEmpty = await insightHarness(root, []);
+      try {
+        const result = await genuinelyEmpty.call({});
+        expect(result.structuredContent.count).toBe(0);
+        expect(result.structuredContent.partial).toBe(false);
+        expect(result.structuredContent.withheld.total).toBe(0);
+        expect(result.content[0].text).not.toContain("withheld");
+      } finally {
+        await genuinelyEmpty.close();
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
     }
   });
 });
