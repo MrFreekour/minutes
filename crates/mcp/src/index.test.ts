@@ -2354,6 +2354,55 @@ describe("insight source identity survives a moved corpus", () => {
     }
   });
 
+  it("carries the whole tail over, not just the filename", async () => {
+    // The absolute branch is the one that synthesises a tail, and nothing else
+    // pins that the tail survives intact. Binding `/elsewhere/meetings/memos/x.md`
+    // to `<root>/x.md` would evaluate a different meeting's policy. The nested
+    // case elsewhere in this file exercises the relative branch, which is a
+    // different path through the resolver.
+    const { base, root } = makeMovedCorpus();
+    try {
+      mkdirSync(join(root, "memos"), { recursive: true });
+      writeFileSync(join(root, "memos", "2026-07-15-memo.md"), meetingFixture("Memo"));
+      writeFileSync(join(root, "2026-07-15-memo.md"), meetingFixture("Namesake at the root"));
+
+      expect(
+        resolveCorpusRelativeSourcePath(
+          "/home/someone/meetings/memos/2026-07-15-memo.md",
+          root
+        )
+      ).toBe(join(root, "memos", "2026-07-15-memo.md"));
+
+      // Released records must name the nested meeting, not the root namesake.
+      const { released } = await releaseInsightsWithLiveSourcePolicy(
+        [
+          {
+            content: "nested",
+            source_meeting: "/home/someone/meetings/memos/2026-07-15-memo.md",
+          },
+        ],
+        root,
+        false
+      );
+      expect(released).toHaveLength(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a source pointer containing a NUL byte", () => {
+    const { base, root } = makeMovedCorpus();
+    try {
+      writeFileSync(join(root, "x.md"), meetingFixture("X"));
+      expect(resolveCorpusRelativeSourcePath("x.md\0.png", root)).toBeNull();
+      expect(
+        resolveCorpusRelativeSourcePath("/home/someone/meetings/x.md\0.png", root)
+      ).toBeNull();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("recognises a corpus that used to live under a hidden or inactive ancestor", async () => {
     // The ancestors of the old corpus root say nothing about where a record sat
     // inside that corpus. Screening them refused ordinary moved corpora, which
@@ -2784,6 +2833,12 @@ describe("insight window is not shaped by the caller", () => {
       expect(result.structuredContent.matched).toBe(10);
       expect(result.structuredContent.capped).toBe(true);
       expect(result.structuredContent.partial).toBe(true);
+      // Capping the answer is not truncating the search. `truncated` compares
+      // against the scan window, not against the caller's limit; comparing
+      // against the limit would claim older records went unexamined whenever a
+      // caller asked for fewer than were found.
+      expect(result.structuredContent.truncated).toBe(false);
+      expect(result.content[0].text).not.toMatch(/were not examined/);
       expect(
         result.structuredContent.insights.map((entry: any) => entry.content)
       ).toEqual(["record-7", "record-8", "record-9"]);
@@ -2990,6 +3045,53 @@ describe("insight window is not shaped by the caller", () => {
       await client.close();
       await mcpServer.close();
       rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("describes its own arguments truthfully to the agent", async () => {
+    // These strings are the only thing an agent reads before choosing arguments,
+    // and `check:llms` cannot reach them: the generator takes tool descriptions
+    // from manifest.json, not from the zod `.describe()` calls. Without this
+    // they can be reverted to wordings the code has made false.
+    const mcpServer = new McpServer({ name: "minutes-insight-schema-test", version: "0.0.0" });
+    registerUnavailableCompatibilityTools(mcpServer, {
+      cliAvailable: async () => true,
+      meetingsDir: async () => tmpdir(),
+      readiness: async () => ({ ready: true }),
+      runner: async () => ({ stdout: "[]", stderr: "" }),
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client(
+      { name: "insight-schema-client", version: "0.0.0" },
+      { capabilities: {} }
+    );
+    try {
+      await Promise.all([
+        mcpServer.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+      const listed = await client.listTools();
+      const tool = listed.tools.find((entry) => entry.name === "get_meeting_insights");
+      const properties = (tool?.inputSchema as any)?.properties ?? {};
+
+      // `limit` caps the answer, not the search, and must say so.
+      expect(properties.limit?.description).toContain(
+        `Every read examines the newest ${MCP_INSIGHT_SCAN_WINDOW} records regardless`
+      );
+      expect(properties.limit?.description).not.toMatch(/^Maximum number of results \(/);
+      // `since` is a floor on a calendar date.
+      expect(properties.since?.description).toContain("on or after this calendar date");
+      // The override recovers restricted sources only. "Moved" is now recovered
+      // without it, so listing "moved" as unrecoverable would be false.
+      expect(properties.include_restricted?.description).toContain(
+        "cannot be resolved to a meeting in this corpus"
+      );
+      expect(properties.include_restricted?.description).not.toMatch(
+        /archived, moved, or deleted/
+      );
+    } finally {
+      await client.close();
+      await mcpServer.close();
     }
   }, 60_000);
 
