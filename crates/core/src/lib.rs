@@ -11,6 +11,7 @@ pub mod config;
 pub mod context_store;
 pub mod copilot;
 pub mod daily_notes;
+pub mod derived;
 pub mod desktop_context;
 pub mod desktop_control;
 pub mod device_monitor;

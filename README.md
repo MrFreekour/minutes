@@ -1032,10 +1032,13 @@ minutes redo-speaker-mapping <meeting> --json                   # machine-readab
 minutes resummarize <meeting>                    # preview: show the regenerated summary + merge decisions
 minutes resummarize <meeting> --apply            # splice the regenerated content into the file
 minutes resummarize <meeting> --engine apple     # override the engine for this run
+minutes resummarize <meeting> --apply --ingest   # also re-ingest into the knowledge base
 minutes resummarize <meeting> --json             # machine-readable output
 ```
 
 `<meeting>` is a path or a search term (memos and `minutes import text` files work too — for imported archives this is their first AI pass). The preview **does invoke the model** (on cloud engines the transcript leaves the machine), it just doesn't write. Only the AI-owned sections (`## Summary`, `## Decisions`, `## Action Items`, `## Open Questions`, `## Commitments`) and derived frontmatter are replaced — `## Notes`, `## Transcript`, `speaker_map`, and capture/consent metadata are never touched. Action items and decisions keep user-curated state (`status: done`, due dates, decision authority) by exact-identity matching; anything ambiguous is surfaced in the preview instead of silently resolved. A failed run (engine `none`, provider error, empty output) never modifies the file, and the previous version is backed up to a hidden `.<name>.pre-resummarize.<unix-secs>.bak` sibling on every apply; the newest 3 backups per artifact are kept. One redaction caveat: editing the transcript never touches the retained WAV — for true audio redaction, delete or re-record the audio (`minutes cleanup` / retention settings).
+
+Because an apply rewrites summary-derived frontmatter, everything computed from it goes stale. A successful `--apply` therefore refreshes the derived views the same way the recording pipeline does: the relationship graph index is rebuilt, the vault copy re-synced (`strategy = "copy"` only), and the QMD collection reindexed if one is configured. Knowledge-base ingestion is **not** automatic — its chronological log is append-only, so re-ingesting the same meeting would add a duplicate entry every run; pass `--ingest` when you want it. All of this is best-effort: a refresh that fails warns and leaves the derived view stale, but never undoes a write that already succeeded.
 
 **Privacy**: Voice enrollment is self-only (no enrolling others). Level 3 confirmed profiles require explicit opt-in per person. Voice embeddings are stored locally in `~/.minutes/voices.db` with 0600 permissions. Nothing leaves your machine.
 

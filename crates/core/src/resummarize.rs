@@ -55,6 +55,9 @@ pub struct ResummarizeOptions {
     /// the artifact's frontmatter; if that recorded template no longer
     /// resolves, the run fails visibly rather than silently switching shape.
     pub template_override: Option<String>,
+    /// Which derived views to refresh after a successful apply. Ignored in
+    /// preview mode — nothing was written, so nothing is stale.
+    pub refresh: crate::derived::RefreshOptions,
 }
 
 /// How a previous action item / decision fared in the merge.
@@ -120,6 +123,10 @@ pub struct ResummarizeReport {
     pub decisions: Vec<Decision>,
     /// Wall-clock of the summarize stage in milliseconds.
     pub duration_ms: u64,
+    /// Outcome of the post-write derived-view refresh (graph, vault, QMD, and
+    /// optional knowledge ingest). `None` in preview mode and whenever the
+    /// write did not happen — a refresh only ever follows a real write.
+    pub refresh: Option<crate::derived::RefreshReport>,
 }
 
 /// Normalized identity for exact matching: lowercase, whitespace collapsed,
@@ -658,21 +665,46 @@ pub fn splice_ai_sections(
 /// | `entities`, `people`, `intents` | **recomputed** from the merged state |
 /// | `action_items`, `decisions` | **merge-derived** (exact-identity carry-forward, see [`merge_action_items`] / [`merge_decisions`]) |
 /// | `template`, `summarization`, `status`, `processing_warnings` | **recorded**: template slug used, run health block, summarize-scoped warnings removed and status re-derived |
+///
+/// ## Derived views
+///
+/// A successful apply rewrites summary-derived frontmatter, which invalidates
+/// every cached view built from it. This function therefore calls
+/// [`crate::derived::refresh_derived_views`] after — and only after — a real
+/// write: the graph index, vault copy, and QMD collection refresh
+/// automatically, while knowledge-base ingestion stays opt-in via
+/// [`ResummarizeOptions::refresh`] (its log is append-only, so re-ingesting is
+/// not idempotent). The refresh is best-effort and reported in
+/// [`ResummarizeReport::refresh`]; it can never fail a completed write.
 pub fn resummarize_meeting(
     path: &Path,
     config: &Config,
     opts: &ResummarizeOptions,
 ) -> Result<ResummarizeReport, ResummarizeError> {
-    resummarize_meeting_with(path, config, opts, |transcript, notes, template| {
-        summarize::summarize_with_template(
-            transcript,
-            notes,
-            &[], // v1 is text-only: no screenshot re-feed
+    let mut report =
+        resummarize_meeting_with(path, config, opts, |transcript, notes, template| {
+            summarize::summarize_with_template(
+                transcript,
+                notes,
+                &[], // v1 is text-only: no screenshot re-feed
+                config,
+                template,
+                None,
+            )
+        })?;
+
+    // A rewrite invalidates everything derived from this artifact. Refresh
+    // only after a real write, and never let a stale-view refresh turn an
+    // already-successful write into a failure.
+    if report.applied {
+        report.refresh = Some(crate::derived::refresh_derived_views(
+            path,
             config,
-            template,
-            None,
-        )
-    })
+            &opts.refresh,
+        ));
+    }
+
+    Ok(report)
 }
 
 /// [`resummarize_meeting`] with an injectable summarize stage, so the
@@ -786,6 +818,7 @@ where
         action_items: merged_actions.clone(),
         decisions: merged_decisions.clone(),
         duration_ms,
+        refresh: None,
     };
 
     if !opts.apply {

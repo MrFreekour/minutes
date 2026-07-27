@@ -97,7 +97,18 @@ impl SearchIndex {
     /// Open or create the index. Validates schema, rebuilds if corrupted,
     /// triggers a full rebuild if `output_dir` has changed since last open.
     pub fn open(config: &Config) -> Result<Self, SearchIndexError> {
-        let db_path = Self::default_db_path();
+        Self::open_at(&Self::default_db_path(), config)
+    }
+
+    /// [`SearchIndex::open`] against an explicit database path.
+    ///
+    /// [`SearchIndex::default_db_path`] is global (`~/.minutes/search.db`) and
+    /// independent of `config.output_dir`, so a caller that only redirects
+    /// `output_dir` — a test using a `TempDir`, say — would still hit the real
+    /// index and trigger its output-dir-changed full rebuild. Tests point this
+    /// at a temporary file instead.
+    pub fn open_at(db_path: &Path, config: &Config) -> Result<Self, SearchIndexError> {
+        let db_path = db_path.to_path_buf();
         let mut conn = schema::open_db(&db_path)?;
 
         // Ensure schema exists. Idempotent on existing DBs.

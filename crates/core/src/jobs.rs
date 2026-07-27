@@ -1350,20 +1350,6 @@ fn recording_duration(job: &ProcessingJob) -> String {
     }
 }
 
-fn refresh_qmd_collection(config: &Config) {
-    let Some(collection) = config.search.qmd_collection.as_ref() else {
-        return;
-    };
-    let status = crate::engine_process::command("qmd")
-        .args(["update", "-c", collection])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if let Err(error) = status {
-        tracing::debug!(error = %error, collection = %collection, "qmd update skipped");
-    }
-}
-
 fn job_context(job: &ProcessingJob) -> BackgroundPipelineContext {
     let template = job.template_slug.as_deref().and_then(|slug| {
         match crate::template::TemplateResolver::new().resolve(slug) {
@@ -1551,7 +1537,7 @@ fn process_pending_jobs_with_transcriber(
             if let Err(error) = crate::graph::rebuild_index(config) {
                 tracing::warn!(error = %error, "graph index rebuild failed after queued job");
             }
-            refresh_qmd_collection(config);
+            let _ = crate::derived::refresh_qmd_collection(config);
             sync_processing_status();
             on_job_update(&review_job);
             continue;
@@ -1638,7 +1624,7 @@ fn process_pending_jobs_with_transcriber(
                 if let Err(error) = crate::graph::rebuild_index(config) {
                     tracing::warn!(error = %error, "graph index rebuild failed after queued job");
                 }
-                refresh_qmd_collection(config);
+                let _ = crate::derived::refresh_qmd_collection(config);
                 // Run post_record hook (async, non-blocking)
                 pipeline::run_post_record_hook(config, &result.path);
                 if completed_job.state == JobState::Complete {

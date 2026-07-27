@@ -784,6 +784,10 @@ enum Commands {
         #[arg(long)]
         template: Option<String>,
 
+        /// With --apply, also re-ingest into the knowledge base (adds a new entry to its append-only log)
+        #[arg(long)]
+        ingest: bool,
+
         /// Emit machine-readable JSON instead of human output
         #[arg(long)]
         json: bool,
@@ -1920,8 +1924,9 @@ fn main() -> Result<()> {
             apply,
             engine,
             template,
+            ingest,
             json,
-        } => cmd_resummarize(&meeting, apply, engine, template, json, &config),
+        } => cmd_resummarize(&meeting, apply, engine, template, ingest, json, &config),
         Commands::Process {
             path,
             content_type,
@@ -5137,6 +5142,7 @@ fn cmd_resummarize(
     apply: bool,
     engine: Option<String>,
     template: Option<String>,
+    ingest: bool,
     json: bool,
     config: &Config,
 ) -> Result<()> {
@@ -5173,6 +5179,12 @@ fn cmd_resummarize(
         cfg.summarization.engine = e.clone();
     }
 
+    if ingest && !apply && !json {
+        // A refresh only ever follows a real write, so --ingest is inert in
+        // preview mode. Say so rather than letting it look like it ran.
+        eprintln!("Note: --ingest has no effect without --apply (preview writes nothing).");
+    }
+
     if !json {
         // Cost/privacy transparency: preview still runs the model (M3).
         eprintln!(
@@ -5189,6 +5201,9 @@ fn cmd_resummarize(
     let opts = minutes_core::resummarize::ResummarizeOptions {
         apply,
         template_override: template,
+        refresh: minutes_core::derived::RefreshOptions {
+            ingest_knowledge: ingest,
+        },
     };
     let report = match minutes_core::resummarize::resummarize_meeting(&path, &cfg, &opts) {
         Ok(report) => report,
@@ -5224,6 +5239,17 @@ fn cmd_resummarize(
             "decisions": report.decisions,
             "new_ai_body": report.new_ai_body,
             "backup": report.backup.as_ref().map(|p| p.display().to_string()),
+            "derived_views": report.refresh.as_ref().map(|refresh| {
+                serde_json::json!({
+                    "graph_rebuilt": refresh.graph.is_some(),
+                    "meetings_indexed": refresh.graph.as_ref().map(|g| g.meeting_count),
+                    "vault_path": refresh.vault.as_ref().map(|p| p.display().to_string()),
+                    "qmd_refreshed": refresh.qmd_refreshed,
+                    "knowledge_ingested": refresh.knowledge.is_some(),
+                    "facts_written": refresh.knowledge.as_ref().map(|k| k.facts_written),
+                    "warnings": refresh.warnings,
+                })
+            }),
         });
         println!(
             "{}",
@@ -5273,6 +5299,39 @@ fn cmd_resummarize(
                 path.display(),
                 backup.display()
             );
+        }
+        if let Some(refresh) = report.refresh.as_ref() {
+            let mut refreshed: Vec<String> = Vec::new();
+            if let Some(stats) = refresh.graph.as_ref() {
+                refreshed.push(format!("graph ({} meetings)", stats.meeting_count));
+            }
+            if refresh.search_indexed {
+                refreshed.push("search".into());
+            }
+            if refresh.vault.is_some() {
+                refreshed.push("vault".into());
+            }
+            if refresh.qmd_refreshed {
+                refreshed.push("qmd".into());
+            }
+            if let Some(update) = refresh.knowledge.as_ref() {
+                refreshed.push(format!("knowledge ({} facts)", update.facts_written));
+            }
+            if !refreshed.is_empty() {
+                println!("  refreshed: {}", refreshed.join(", "));
+            }
+            if !refresh.warnings.is_empty() {
+                // Deliberately generic: these cover both genuine failures and
+                // policy exclusions (a `sensitivity: restricted` artifact is
+                // refused by knowledge ingest by design, not stale).
+                eprintln!("  the artifact was written; some derived views were not updated:");
+                for warning in &refresh.warnings {
+                    eprintln!("    - {warning}");
+                }
+            }
+            if !ingest && config.knowledge.enabled {
+                println!("  knowledge base not re-ingested — pass --ingest to include it.");
+            }
         }
     } else {
         println!("  preview only — the model WAS invoked, but nothing was written.");
@@ -8246,11 +8305,29 @@ life (qmd://life/)
                 "apple",
                 "--template",
                 "standup",
+                "--ingest",
                 "--json",
             ],
         ] {
             let parsed = Cli::try_parse_from(args).expect("resummarize must parse");
             assert!(matches!(parsed.command, Commands::Resummarize { .. }));
+        }
+    }
+
+    #[test]
+    fn resummarize_ingest_flag_defaults_off_and_parses_on() {
+        // The knowledge log is append-only, so ingestion must never be
+        // implied by --apply.
+        let default = Cli::try_parse_from(["minutes", "resummarize", "m.md", "--apply"]).unwrap();
+        match default.command {
+            Commands::Resummarize { ingest, .. } => assert!(!ingest),
+            _ => panic!("expected a Resummarize command"),
+        }
+        let opted =
+            Cli::try_parse_from(["minutes", "resummarize", "m.md", "--apply", "--ingest"]).unwrap();
+        match opted.command {
+            Commands::Resummarize { ingest, .. } => assert!(ingest),
+            _ => panic!("expected a Resummarize command"),
         }
     }
 
