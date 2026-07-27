@@ -48,7 +48,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
-| `8cebbe63` | track-2 Option B round-3 remediation — **not yet re-gated** |
+| `7aa0d217` | track-2 Option B round-4 coverage — **not yet re-gated** |
+| `8cebbe63` | track-2 Option B round-3 remediation |
 | `b341876a` | track-2 Option B round-2 — REJECTED 2/3 (P0s fixed by `8cebbe63`) |
 | `49fdf4a5` | track-2 Option B — REJECTED (P0 fixed by `b341876a`) |
 | `c6badc34` | track-1 round-3 remediation — **REJECTED 3/3**, remediation list in bead |
@@ -166,7 +167,7 @@ faults, which is this lane's standing failure mode. Worth carrying forward:
   Re-check old mutations after adding new guards; two of the twelve had gone
   stale and would have reported a false pass.
 
-**Next step: re-gate `8cebbe63` with three fresh blind reviews.** The residual
+**Next step: re-gate `7aa0d217` with three fresh blind reviews.** The residual
 heuristic limit is documented at `resolveCorpusRelativeSourcePath` and is
 Option A's to remove.
 
