@@ -71,11 +71,13 @@ import {
   MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION,
   releaseInsightsWithLiveSourcePolicy,
   resolveCorpusRelativeSourcePath,
+  resolveInsightToolDeps,
   meetsInsightConfidence,
   insightMentionsParticipant,
   insightIsSince,
   parseInsightSinceFloor,
   revalidateDerivedRecordSource,
+  MCP_INSIGHT_RESULT_MAX,
   MCP_INSIGHT_SCAN_WINDOW,
   MCP_INTENT_RESULT_MAX,
   MCP_MEETING_RESULT_MAX,
@@ -2315,21 +2317,22 @@ describe("insight source identity survives a moved corpus", () => {
     }
   });
 
-  it("refuses a recorded path whose discarded left-hand side names an inactive or hidden directory", async () => {
-    // Everything left of the anchor is dropped by the join, so the
-    // active-corpus rule has to be applied to the recorded path too. Otherwise
-    // an archived or hidden record re-enters the active corpus by way of a
-    // later anchor.
+  it("refuses a recorded path that sat outside the active corpus it came from", async () => {
+    // What decides this is the record's own corpus-relative tail, not where its
+    // corpus lived. A tail naming an inactive or hidden directory, or one that
+    // traverses out, must not re-enter the live active corpus. Variants that
+    // re-enter through a SECOND anchor are refused as ambiguous instead, which
+    // the dedicated anchor test covers.
     const { base, root } = makeMovedCorpus();
     try {
       writeFileSync(join(root, "2026-06-01-board.md"), meetingFixture("Board"));
       for (const recorded of [
-        "/elsewhere/meetings/archive/meetings/2026-06-01-board.md",
-        "/elsewhere/meetings/processed/meetings/2026-06-01-board.md",
-        "/elsewhere/meetings/failed/meetings/2026-06-01-board.md",
-        "/elsewhere/meetings/failed-captures/meetings/2026-06-01-board.md",
-        "/elsewhere/.trash/meetings/2026-06-01-board.md",
-        "/a/../../../meetings/2026-06-01-board.md",
+        "/elsewhere/meetings/archive/2026-06-01-board.md",
+        "/elsewhere/meetings/processed/2026-06-01-board.md",
+        "/elsewhere/meetings/failed/2026-06-01-board.md",
+        "/elsewhere/meetings/failed-captures/2026-06-01-board.md",
+        "/elsewhere/meetings/.trash/2026-06-01-board.md",
+        "/elsewhere/meetings/../outside.md",
       ]) {
         expect(resolveCorpusRelativeSourcePath(recorded, root)).toBeNull();
       }
@@ -2338,7 +2341,7 @@ describe("insight source identity survives a moved corpus", () => {
         [
           {
             content: "ARCHIVED-REENTRY-CANARY",
-            source_meeting: "/elsewhere/meetings/archive/meetings/2026-06-01-board.md",
+            source_meeting: "/elsewhere/meetings/archive/2026-06-01-board.md",
           },
         ],
         root,
@@ -2346,6 +2349,115 @@ describe("insight source identity survives a moved corpus", () => {
       );
       expect(released).toEqual([]);
       expect(withheld.total).toBe(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("recognises a corpus that used to live under a hidden or inactive ancestor", async () => {
+    // The ancestors of the old corpus root say nothing about where a record sat
+    // inside that corpus. Screening them refused ordinary moved corpora, which
+    // is the case this normaliser exists to serve.
+    const { base, root } = makeMovedCorpus();
+    try {
+      writeFileSync(join(root, "2026-06-01-board.md"), meetingFixture("Board"));
+      for (const recorded of [
+        "/home/someone/Archive/meetings/2026-06-01-board.md",
+        "/home/someone/.local/share/meetings/2026-06-01-board.md",
+        "/home/someone/processed/meetings/2026-06-01-board.md",
+      ]) {
+        expect(resolveCorpusRelativeSourcePath(recorded, root)).toBe(
+          join(root, "2026-06-01-board.md")
+        );
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a recorded path it cannot stat as present rather than absent", async () => {
+    // existsSync answers false for EVERY stat failure, so an unreadable parent
+    // reads as "not there" and hands the path to the normaliser, reopening the
+    // duplicate-corpus rebinding. Absence has to be proven, not inferred from a
+    // failed syscall.
+    const base = mkdtempSync(join(tmpdir(), "minutes-unreadable-corpus-"));
+    const vaultParent = join(base, "vault");
+    try {
+      const live = join(base, "live", "meetings");
+      const vault = join(vaultParent, "meetings");
+      mkdirSync(live, { recursive: true });
+      mkdirSync(vault, { recursive: true });
+      writeFileSync(join(live, "2026-06-01-diligence.md"), meetingFixture("Namesake"));
+      writeFileSync(
+        join(vault, "2026-06-01-diligence.md"),
+        meetingFixture("Diligence", "restricted")
+      );
+      const recorded = join(vault, "2026-06-01-diligence.md");
+
+      // Readable: refused because the path exists.
+      expect(resolveCorpusRelativeSourcePath(recorded, live)).toBeNull();
+
+      // Unreadable parent: the stat now fails, but the answer must not change.
+      chmodSync(vaultParent, 0o000);
+      const stillRefused = resolveCorpusRelativeSourcePath(recorded, live);
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [{ content: "UNREADABLE-PARENT-CANARY", source_meeting: recorded }],
+        live,
+        false
+      );
+      chmodSync(vaultParent, 0o755);
+      expect(stillRefused).toBeNull();
+      expect(released).toEqual([]);
+      expect(withheld.total).toBe(1);
+      expect(JSON.stringify(released)).not.toContain("UNREADABLE-PARENT-CANARY");
+    } finally {
+      try {
+        chmodSync(vaultParent, 0o755);
+      } catch {
+        /* already restored */
+      }
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("counts anchors case-insensitively so a case variant cannot smuggle a second one", () => {
+    // Exact-case counting sees one anchor here and binds the inner tail. On a
+    // case-insensitive filesystem `Meetings` is an ordinary spelling of the same
+    // directory, so this is the same wrong-meeting binding the two-anchor rule
+    // exists to refuse.
+    const { base, root } = makeMovedCorpus();
+    try {
+      expect(
+        resolveCorpusRelativeSourcePath("/elsewhere/Meetings/meetings/x.md", root)
+      ).toBeNull();
+      expect(
+        resolveCorpusRelativeSourcePath("/elsewhere/meetings/Meetings/x.md", root)
+      ).toBeNull();
+      // A single case-variant anchor is still recognised, so folding widens what
+      // resolves rather than only refusing more.
+      expect(resolveCorpusRelativeSourcePath("/elsewhere/Meetings/x.md", root)).toBe(
+        join(root, "x.md")
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a backslash as a separator on POSIX", () => {
+    // A POSIX filename may legitimately contain a backslash. Splitting on it
+    // unconditionally re-segments the tail and binds a different meeting.
+    const { base, root } = makeMovedCorpus();
+    try {
+      const resolved = resolveCorpusRelativeSourcePath(
+        "/elsewhere/meetings/sub\\x.md",
+        root
+      );
+      if (process.platform === "win32") {
+        expect(resolved).toBe(join(root, "sub", "x.md"));
+      } else {
+        expect(resolved).toBe(join(root, "sub\\x.md"));
+        expect(resolved).not.toBe(join(root, "sub", "x.md"));
+      }
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -2441,6 +2553,12 @@ async function insightHarness(meetingsDir: string, records: any[]) {
   registerUnavailableCompatibilityTools(mcpServer, {
     cliAvailable: async () => true,
     meetingsDir: async () => meetingsDir,
+    // Insights are content-bearing, so the trust bridge runs before the handler
+    // body, and the live bridge shells out to the CLI. Stubbing it is what makes
+    // these tests hermetic: CI runs this suite with no `minutes` binary built.
+    // Two separate tests below cover what this stub removes, namely that the
+    // gate is really wired and that production binds the live bridge.
+    readiness: async () => ({ ready: true }),
     runner: async (args: string[]) => {
       calls.push([...args]);
       let out = records;
@@ -2532,7 +2650,7 @@ describe("insight window is not shaped by the caller", () => {
       await harness.close();
       rmSync(base, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("holds the withheld tally still while the caller sweeps limit", async () => {
     // The limit-differencing oracle. When `limit` sized the fetched window, the
@@ -2646,7 +2764,7 @@ describe("insight window is not shaped by the caller", () => {
       await harness.close();
       rmSync(base, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("reports a capped answer as partial and keeps the newest matches", async () => {
     const { base, root } = makeMovedCorpus();
@@ -2674,7 +2792,7 @@ describe("insight window is not shaped by the caller", () => {
       await harness.close();
       rmSync(base, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("applies since in this process with the CLI's calendar-day semantics", async () => {
     const { base, root } = makeMovedCorpus();
@@ -2755,6 +2873,204 @@ describe("insight window is not shaped by the caller", () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  }, 60_000);
+
+  it("reports the empty branch's counters too", async () => {
+    // `matched` and `capped` are set in both return branches. The non-empty
+    // branch is asserted above; without this the empty branch's copies could be
+    // dropped with the suite green.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    const harness = await insightHarness(root, [
+      {
+        timestamp: "2026-07-15T10:00:00Z",
+        kind: "decision",
+        content: "only",
+        confidence: "strong",
+        participants: ["Alex"],
+        source_meeting: "normal.md",
+      },
+    ]);
+    try {
+      const result = await harness.call({ participant: "nobody-at-all" });
+      expect(result.structuredContent.count).toBe(0);
+      expect(result.structuredContent.matched).toBe(0);
+      expect(result.structuredContent.capped).toBe(false);
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("states the withheld and truncation reasons the agent is shown", async () => {
+    // Both notes were rewritten because their previous wordings asserted things
+    // that were not true. Nothing asserted either text, so both could be
+    // reverted with the suite green. The truncation branch additionally needs a
+    // saturated window, which no other test produces.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    writeFileSync(join(root, "restricted.md"), meetingFixture("Restricted", "restricted"));
+    const saturated = Array.from({ length: MCP_INSIGHT_SCAN_WINDOW }, (_, index) => ({
+      timestamp: "2026-07-15T10:00:00Z",
+      kind: "commitment",
+      content: `record-${index}`,
+      confidence: "strong",
+      participants: ["Alex"],
+      source_meeting: index === 0 ? "restricted.md" : "normal.md",
+    }));
+    const harness = await insightHarness(root, saturated);
+    try {
+      const result = await harness.call({ limit: 500 });
+      expect(result.structuredContent.truncated).toBe(true);
+      expect(result.structuredContent.withheld.total).toBe(1);
+
+      const text = result.content[0].text;
+      // The withheld note must cover the missing-source case too, not only the
+      // policy one, because the tally counts both.
+      expect(text).toContain("the record names no source meeting");
+      expect(text).toContain("could not be resolved to a meeting in the active corpus");
+      expect(text).toContain("designated restricted, archived, or deleted");
+      // The truncation note must not claim older records exist, and must not
+      // offer a remedy this tool does not have.
+      expect(text).toContain(
+        `examined the newest ${MCP_INSIGHT_SCAN_WINDOW} record(s); any older ones were not examined`
+      );
+      expect(text).not.toMatch(/raise limit or narrow since/i);
+      expect(text).not.toMatch(/anything older was not examined/i);
+    } finally {
+      await harness.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("enforces its own window rather than trusting the CLI to honour --limit", async () => {
+    // Both notes state the window as fact. If an over-long projection came back,
+    // `matched` would exceed the window and the capped note would tell the agent
+    // to raise `limit` past the schema's own maximum, which it cannot do.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    const overlong = Array.from({ length: MCP_INSIGHT_SCAN_WINDOW + 50 }, (_, index) => ({
+      timestamp: "2026-07-15T10:00:00Z",
+      kind: "commitment",
+      content: `record-${index}`,
+      confidence: "strong",
+      participants: ["Alex"],
+      source_meeting: "normal.md",
+    }));
+    // Deliberately ignores --limit, which is the failure being guarded against.
+    const mcpServer = new McpServer({ name: "minutes-overlong-test", version: "0.0.0" });
+    registerUnavailableCompatibilityTools(mcpServer, {
+      cliAvailable: async () => true,
+      meetingsDir: async () => root,
+      readiness: async () => ({ ready: true }),
+      runner: async () => ({ stdout: JSON.stringify(overlong), stderr: "" }),
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client(
+      { name: "overlong-client", version: "0.0.0" },
+      { capabilities: {} }
+    );
+    try {
+      await Promise.all([
+        mcpServer.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+      const result: any = await client.callTool({
+        name: "get_meeting_insights",
+        arguments: { limit: MCP_INSIGHT_RESULT_MAX },
+      });
+      expect(result.structuredContent.matched).toBe(MCP_INSIGHT_SCAN_WINDOW);
+      expect(result.structuredContent.capped).toBe(false);
+      expect(result.content[0].text).not.toMatch(/Raise limit for the rest/);
+      // The newest records are the ones kept.
+      expect(result.structuredContent.insights.at(-1).content).toBe(
+        `record-${MCP_INSIGHT_SCAN_WINDOW + 49}`
+      );
+    } finally {
+      await client.close();
+      await mcpServer.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("keeps the scanned window at the largest limit a caller may request", () => {
+    // The invariant the window's whole argument rests on. Asserting it through
+    // String(MCP_INSIGHT_SCAN_WINDOW) in the argv test only proves the handler
+    // read the same constant the test did; narrowing the window would ship
+    // green and silently cost the tool its reach.
+    expect(MCP_INSIGHT_SCAN_WINDOW).toBe(MCP_INSIGHT_RESULT_MAX);
+  });
+
+  it("binds the live implementations when nothing is injected", async () => {
+    // Production registers with no deps. Nothing else asserts that those
+    // defaults are the real functions, so a default rebound to a stub would
+    // ship green as a tool that returns nothing or claims the CLI is missing.
+    const live = resolveInsightToolDeps();
+    expect(live.runCli.name).toBe("runMinutes");
+    expect(live.cliIsAvailable.name).toBe("isCliAvailable");
+    expect(live.resolveMeetingsDir.name).toBe("getEffectiveMeetingsDir");
+    expect(live.readiness.name).toBe("requireAgentTrustReadiness");
+    // An override replaces exactly the one binding it names.
+    const stub = async () => ({ ready: true });
+    const overridden = resolveInsightToolDeps({ readiness: stub });
+    expect(overridden.readiness).toBe(stub);
+    expect(overridden.runCli.name).toBe("runMinutes");
+  });
+
+  it("runs the trust gate before the handler body and withholds when it fails", async () => {
+    // The harness stubs readiness to stay hermetic, which would hide a
+    // regression that removed the gate entirely. This asserts the gate is wired:
+    // a failing bridge must withhold the records, and must do so without the
+    // handler's content reaching the caller.
+    const { base, root } = makeMovedCorpus();
+    writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+    const mcpServer = new McpServer({ name: "minutes-insight-gate-test", version: "0.0.0" });
+    let handlerRan = 0;
+    registerUnavailableCompatibilityTools(mcpServer, {
+      cliAvailable: async () => true,
+      meetingsDir: async () => root,
+      readiness: async () => {
+        throw new Error("trust registry degraded");
+      },
+      runner: async () => {
+        handlerRan += 1;
+        return {
+          stdout: JSON.stringify([
+            {
+              timestamp: "2026-07-15T10:00:00Z",
+              kind: "decision",
+              content: "READINESS-GATE-CANARY",
+              confidence: "strong",
+              participants: ["Alex"],
+              source_meeting: "normal.md",
+            },
+          ]),
+          stderr: "",
+        };
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client(
+      { name: "insight-gate-client", version: "0.0.0" },
+      { capabilities: {} }
+    );
+    try {
+      await Promise.all([
+        mcpServer.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+      const result: any = await client.callTool({
+        name: "get_meeting_insights",
+        arguments: {},
+      });
+      expect(JSON.stringify(result)).not.toContain("READINESS-GATE-CANARY");
+    } finally {
+      await client.close();
+      await mcpServer.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+    // Whether the body ran is not the contract; not releasing its content is.
+    expect(handlerRan).toBeLessThanOrEqual(1);
   }, 60_000);
 });
 

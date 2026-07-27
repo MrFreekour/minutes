@@ -675,26 +675,36 @@ export function runAgentToolPolicies<T>(
 
 function withAgentToolPolicies(
   name: string,
-  handler: (...args: any[]) => any
+  handler: (...args: any[]) => any,
+  readiness?: () => Promise<unknown>
 ): (...args: any[]) => any {
   return (...args: any[]) =>
-    runAgentToolPolicies(name, args[0], () => handler(...args));
+    readiness
+      ? runAgentToolPolicies(name, args[0], () => handler(...args), readiness)
+      : runAgentToolPolicies(name, args[0], () => handler(...args));
 }
 
+/**
+ * The optional `readiness` override exists so a test can drive a
+ * content-bearing tool without the trust bridge shelling out to the CLI.
+ * Omitting it keeps the live gate, which is what every production registration
+ * does.
+ */
 export function registerToolWithRestrictedPolicy(
   serverArg: McpServer,
   name: string,
   description: string,
   inputSchema: Record<string, unknown>,
   annotations: Record<string, unknown>,
-  handler: (...args: any[]) => any
+  handler: (...args: any[]) => any,
+  readiness?: () => Promise<unknown>
 ) {
   return serverArg.tool(
     name,
     withToolDocs(name, description),
     inputSchema as any,
     annotations as any,
-    withAgentToolPolicies(name, handler) as any
+    withAgentToolPolicies(name, handler, readiness) as any
   );
 }
 
@@ -7414,23 +7424,52 @@ export type WithheldSourceReason =
  *   path like `/var/folders/<tmp>/minutes-<run>/meetings/memos/x.md` is safe;
  *   that one does carry an anchor and does normalise.
  *
- * A corpus whose final segment was renamed as well as moved is not recognised,
- * and neither is one reached through a symlink whose realpath ends in a
- * different segment, since the anchor is compared against the realpath's
- * basename. Both stay withheld, which is the safe direction, and both present
- * as the same conflated withheld reason.
+ * Several shapes refuse to normalise at all. Each fails closed, and each
+ * presents as the same conflated withheld reason:
  *
- * Segment comparison is exact-case and separator-agnostic across `/` and `\`.
- * A corpus moved between Windows and POSIX is therefore not recognised: a
- * recorded `C:\Users\me\meetings\x.md` read on POSIX is not even absolute, so
- * it takes the relative branch, produces a candidate that does not exist, and
- * fails closed.
+ *   - a corpus whose final segment was renamed as well as moved, and one
+ *     reached through a symlink whose realpath ends in a different segment,
+ *     since the anchor is compared against the realpath's basename;
+ *   - a corpus whose own path contains a hidden or inactive component, such as
+ *     a root under `~/.minutes/`, because the recorded path then trips the
+ *     hidden-segment rule. That rule cannot tell such a root apart from a
+ *     record that genuinely sat in `.trash/` or `archive/`, so it refuses both;
+ *   - a corpus whose final segment is itself an inactive name, such as a root
+ *     literally called `archive`, for the same reason;
+ *   - a corpus moved between Windows and POSIX. `\` is treated as a separator
+ *     only on Windows, so a recorded `C:\Users\me\meetings\x.md` read on POSIX
+ *     is not even absolute, takes the relative branch, and yields a candidate
+ *     that does not exist.
  *
  * Returns null when no corpus-relative identity can be established. Callers
  * must treat null as withheld. Binding a record to the wrong meeting would
  * release it under the wrong meeting's policy, and this lane's standing rule
  * is that a wrong binding is worse than none.
  */
+/**
+ * Whether a recorded path can be PROVEN absent from this machine.
+ *
+ * `existsSync` is the wrong instrument: it answers false for every stat
+ * failure, so "I am not permitted to look" is indistinguishable from "it is not
+ * there". That distinction is load-bearing here, because treating an
+ * unreadable path as absent hands it to the normaliser and reopens the
+ * duplicate-corpus rebinding this guard exists to prevent. The unreadable case
+ * is not exotic: another user's home on a shared Mac is `drwxr-x---`, and a
+ * desktop-spawned MCP server without Full Disk Access cannot stat `~/Documents`
+ * or a Time Machine volume at all.
+ *
+ * Only a clean "no entry" counts as absence. Every other outcome, including
+ * EACCES, ELOOP and EIO, means the question could not be answered and the
+ * recorded path is treated as still present.
+ */
+function recordedPathIsProvablyAbsent(recordedPath: string): boolean {
+  try {
+    return statSync(recordedPath, { throwIfNoEntry: false }) === undefined;
+  } catch {
+    return false;
+  }
+}
+
 export function resolveCorpusRelativeSourcePath(
   value: unknown,
   meetingsDir: string
@@ -7439,6 +7478,21 @@ export function resolveCorpusRelativeSourcePath(
   const trimmed = value.trim();
   if (trimmed === "" || trimmed.includes("\0")) return null;
 
+  // Every filesystem touch below can throw: `canonicalizeRoot` calls
+  // `realpathSync`, and a record whose source is unlinked between the stat and
+  // the realpath would otherwise throw out of the tool handler, which returns
+  // the raw message, and with it the recorded source path, to the agent.
+  try {
+    return resolveCorpusRelativeSourcePathInner(trimmed, meetingsDir);
+  } catch {
+    return null;
+  }
+}
+
+function resolveCorpusRelativeSourcePathInner(
+  trimmed: string,
+  meetingsDir: string
+): string | null {
   const canonicalRoot = canonicalizeRoot(meetingsDir);
   const rootSegment = basename(canonicalRoot);
 
@@ -7448,8 +7502,8 @@ export function resolveCorpusRelativeSourcePath(
   } else if (isPathWithinCanonicalRoot(trimmed, canonicalRoot)) {
     // Already names this corpus: keep the recorded path as written.
     candidate = canonicalizeRoot(trimmed);
-  } else if (existsSync(trimmed)) {
-    // The recorded path still names a real file here, so this is not the
+  } else if (!recordedPathIsProvablyAbsent(trimmed)) {
+    // The recorded path may still name a real file here, so this is not the
     // moved-corpus case normalisation exists for. Rebinding it to a same-named
     // file under the live root would evaluate a DIFFERENT meeting's policy: a
     // restored or duplicated corpus has the same relative tails as the live one
@@ -7459,12 +7513,22 @@ export function resolveCorpusRelativeSourcePath(
     // the live active corpus.
     candidate = canonicalizeRoot(trimmed);
   } else {
-    const segments = trimmed.split(/[\\/]+/).filter((segment) => segment !== "");
+    // `\` is a separator only where it is one. Splitting on it unconditionally
+    // re-segments a POSIX filename that legitimately contains a backslash, and
+    // binds `<root>/sub\x.md` to `<root>/sub/x.md`, a different meeting.
+    const segments = trimmed
+      .split(process.platform === "win32" ? /[\\/]+/ : /\/+/)
+      .filter((segment) => segment !== "");
+    // Anchors are matched case-insensitively for the ambiguity count. Exact-case
+    // matching would see one anchor in `/elsewhere/Meetings/meetings/x.md` and
+    // bind the inner tail, and on a case-insensitive filesystem `Meetings` is an
+    // ordinary spelling of the same directory.
+    const foldedRoot = rootSegment.toLowerCase();
     const anchors =
       rootSegment === ""
         ? []
         : segments.reduce<number[]>((found, segment, index) => {
-            if (segment === rootSegment) found.push(index);
+            if (segment.toLowerCase() === foldedRoot) found.push(index);
             return found;
           }, []);
     // Exactly one anchor, or the tail is ambiguous. With two, the last-anchor
@@ -7475,20 +7539,16 @@ export function resolveCorpusRelativeSourcePath(
     const anchor = anchors[0];
     // An anchor as the final segment names the root itself, not a meeting.
     if (anchor === segments.length - 1) return null;
-    // The active-corpus rule has to be applied to the RECORDED path, not only
-    // to the synthesised tail. Everything left of the anchor is discarded by
-    // the join, so without this an inactive or hidden component sitting to the
-    // left is silently dropped and a record from
-    // `<root>/archive/meetings/x.md` re-enters as `<root>/x.md`. `..` is
-    // rejected here for the same reason.
-    if (
-      segments.some(
-        (segment) =>
-          segment.startsWith(".") || INACTIVE_CORPUS_DIRS.has(segment.toLowerCase())
-      )
-    ) {
-      return null;
-    }
+    // Only the tail is carried over, and only the tail decides whether the
+    // record sat in an active part of its own corpus: everything left of the
+    // anchor describes where that corpus lived, not where the record sat
+    // inside it. The `isActiveCorpusMeetingPath` check below sees exactly this
+    // tail under the live root, so an archived, hidden or traversing tail is
+    // refused there. Screening the discarded left-hand side as well would
+    // reject a perfectly ordinary corpus that had lived under `~/Archive/` or
+    // `~/.local/share/` without closing anything, and a record whose corpus
+    // path re-enters through a SECOND anchor is already refused above as
+    // ambiguous.
     candidate = join(canonicalRoot, ...segments.slice(anchor + 1));
   }
 
@@ -7701,31 +7761,49 @@ export function releaseInsightsWithLiveSourcePolicy(
 /**
  * Injection points for the insight handler, defaulted to the live ones.
  *
- * The same handler body runs in production and under test; only these three
+ * The same handler body runs in production and under test; only these four
  * bindings differ. `MINUTES_BIN` is chosen from a fixed candidate list with no
  * environment override (it is reassigned only by the auto-install path), so
  * without this seam a test could not put known records in front of the handler
  * and assert the argv it builds.
  *
- * This seam does NOT make the handler testable without a CLI. Insights are a
- * content-bearing agent tool, so `runAgentToolPolicies` routes every call
- * through `requireAgentTrustReadiness()`, which uses `runMinutes` directly and
- * is not injectable here. Tests through this seam still spawn a real
- * `minutes agent-readiness --json` per call.
+ * `readiness` is here because insights are a content-bearing agent tool, so
+ * every call is routed through the trust bridge before the handler body runs,
+ * and the live bridge shells out to the CLI. Without an override the handler
+ * tests would need a built `minutes` binary and a healthy registry, which CI
+ * has neither of: the `mcp` job runs `npm ci` and vitest with no cargo build.
+ * They would fail there rather than pass vacuously, but they would fail.
  */
 export type InsightToolDeps = {
   runner?: MinutesRunner;
   cliAvailable?: () => Promise<boolean>;
   meetingsDir?: () => Promise<string>;
+  readiness?: () => Promise<unknown>;
 };
+
+/**
+ * Resolve the live bindings for anything the caller did not override.
+ *
+ * Exported so a test can assert that an un-overridden registration really does
+ * bind the production functions. Nothing else asserts that, and a default
+ * silently rebound to a stub would otherwise ship green as a tool that returns
+ * nothing or claims the CLI is missing forever.
+ */
+export function resolveInsightToolDeps(deps: InsightToolDeps = {}) {
+  return {
+    runCli: deps.runner ?? runMinutes,
+    cliIsAvailable: deps.cliAvailable ?? isCliAvailable,
+    resolveMeetingsDir: deps.meetingsDir ?? getEffectiveMeetingsDir,
+    readiness: deps.readiness ?? requireAgentTrustReadiness,
+  };
+}
 
 export function registerUnavailableCompatibilityTools(
   serverArg: McpServer,
   deps: InsightToolDeps = {}
 ) {
-  const runCli: MinutesRunner = deps.runner ?? runMinutes;
-  const cliIsAvailable = deps.cliAvailable ?? isCliAvailable;
-  const resolveMeetingsDir = deps.meetingsDir ?? getEffectiveMeetingsDir;
+  const { runCli, cliIsAvailable, resolveMeetingsDir, readiness } =
+    resolveInsightToolDeps(deps);
 
   registerToolWithRestrictedPolicy(
     serverArg,
@@ -7801,7 +7879,15 @@ export function registerUnavailableCompatibilityTools(
           // completeness built on output we could not read.
           throw new Error("Minutes returned an unreadable insight projection");
         }
-        fetched = parsed;
+        // Enforce the window here rather than trusting the CLI to honour
+        // `--limit`. Both notes below state the window as fact, so their truth
+        // should not depend on a cross-language assumption: an over-long
+        // projection would otherwise make the capped note promise a `limit` the
+        // schema will not accept.
+        fetched =
+          parsed.length > MCP_INSIGHT_SCAN_WINDOW
+            ? parsed.slice(parsed.length - MCP_INSIGHT_SCAN_WINDOW)
+            : parsed;
       } catch {
         // The raw error can carry the CLI's stdout, which for this command is
         // the unfiltered insight projection, and would bypass revalidation
@@ -7917,7 +8003,8 @@ export function registerUnavailableCompatibilityTools(
           partial,
         },
       };
-    }
+    },
+    readiness
   );
 }
 
