@@ -48,6 +48,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
+| `b341876a` | track-2 Option B remediation — **not yet re-gated** |
+| `49fdf4a5` | track-2 Option B — REJECTED (P0 fixed by `b341876a`) |
 | `c6badc34` | track-1 round-3 remediation — **REJECTED 3/3**, remediation list in bead |
 | `d5945d1c` | diarization panic fix (pre-existing epic bug, see below) |
 | `f28182ad` | track-1 round-2 remediation — REJECTED 3/3 |
@@ -70,8 +72,16 @@ short (millisecond `n_frames` in Matroska), a guidance message that fires in a
 state its own doc calls impossible (symphonia has no Opus decoder, so
 Opus-in-WebM/OGG and ALAC hit it), and README:453.
 
-**Do the numbered remediation list in the bead, then re-gate.** Track 2 (Option
-B) is authorised and can proceed in parallel or after — see below.
+**Do the numbered remediation list in the bead, then re-gate.** Track 2 has moved
+on since: Option B is built at `49fdf4a5` + `b341876a` and needs its own re-gate,
+see below.
+
+Add one item to the track-1 list, found 2026-07-27: the documented dev command
+is not deterministically green even at `--test-threads=1`.
+`audio_decode_worker::tests::the_probe_command_carries_the_same_ceiling_as_the_decode_command`
+failed once in two full runs with "no Minutes binary was found next to this
+process" while `target/debug/minutes` existed, and passes in isolation. Order-
+or load-sensitive, same assumed-precondition family as item 3.
 
 ## State of each track
 
@@ -101,24 +111,46 @@ Known and unfixed, deliberately carried rather than dropped:
   solves this with `close_inherited_windows_handles_before_authority()` plus a
   canary test; the decode child does neither.
 
-### Track 2 — MCP derived-record tools. Rejected, blocked on a decision.
+### Track 2 — MCP derived-record tools. Option B built, awaiting a re-gate.
 
 `get_agent_annotations` is retired to an unavailable stub, and that was
 validated as correct by reviewers: an annotation's source pointer and body are
 both author-supplied, so revalidating the pointer bounds nothing.
 
-`get_meeting_insights` is kept but **rejected 3/3**. It currently returns zero
-records on Mat's own machine.
+`get_meeting_insights` returned zero records because the pipeline writes
+`source_meeting` as an absolute path and release required that exact path to sit
+in the live corpus. Measured on the real log: 1537 records, 355 distinct
+sources, 0 released, all reported as a policy denial that was untrue.
 
 **The identity decision is SETTLED (2026-07-26): Option B (canonical relative
 path) now; Option A (stable frontmatter id + index) later as its own reviewable
-block. Do not build A now.** The full options write-up and tradeoffs are in the
-bead. B-now scope: resolve `source_meeting` relative to the live corpus root,
-normalise historical absolute values by stripping a recognised root prefix (a
-heuristic — mark its limits in code, A replaces it properly), plus the three
-downstream items: the `limit`-differencing oracle, the `limit` semantics change
-that costs filtered queries their reach, and the two tautological tests
-(rewrite and mutation-verify, do not assert them into existence).
+block. Do not build A now.** The full options write-up is **lost** — the handoff
+used to point at the bead for it, it is not there, and no bead has it. Most
+likely the bd concurrent-write clobber. The decision survived; the reasoning did
+not, so if A is picked up its tradeoffs need rederiving.
+
+B-now is **built across two commits and not yet re-gated**:
+
+| SHA | What |
+|---|---|
+| `49fdf4a5` | Option B identity, oracle closure, limit semantics, test rewrites. **REJECTED** (1 of 3 lenses; P0 below) |
+| `b341876a` | remediation of that P0 plus two false claims in `49fdf4a5`'s message |
+
+All four B-now items shipped: `source_meeting` resolves relative to the live
+corpus root (452 of 1537 released on the real log), the `limit`-differencing
+oracle is closed along with the same defect on the `since` axis, `limit` means
+max results again, and both tautological tests were deleted and rewritten.
+
+The P0 that got `49fdf4a5` rejected is worth remembering: the normaliser joined
+everything after the anchor onto the live root and never inspected what came
+before, so an `archive/` component to the left was silently dropped and a
+restored corpus could release a restricted meeting's insight under an
+unrestricted namesake. Three guards now cover it (recorded path still exists,
+exactly one anchor, no inactive or hidden segment anywhere).
+
+**Next step: re-gate `b341876a` with three fresh blind reviews.** The residual
+heuristic limit is documented at `resolveCorpusRelativeSourcePath` and is
+Option A's to remove.
 
 ## Things that are true and easy to get wrong
 
