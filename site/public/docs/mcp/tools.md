@@ -3,7 +3,7 @@
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts
 > Regenerate: node scripts/generate_llms_txt.mjs
-> Last generated: 2026-07-25
+> Last generated: 2026-07-28
 
 Minutes exposes 33 tools, 11 resources, and 6 prompt templates through the MCP server.
 
@@ -196,7 +196,7 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 
 #### `get_meeting_insights`
 
-Query decisions, commitments, and questions extracted from meetings; each insight is released only after the meeting the pipeline recorded as its source is re-verified against live sensitivity policy, and withheld records are reported as a partial view
+Query decisions, commitments, and questions extracted from meetings; each insight records a path to its source meeting, that path is resolved to a meeting in the live corpus and the resolved meeting is re-verified against live sensitivity policy before release, and withheld records are reported as a partial view
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
 

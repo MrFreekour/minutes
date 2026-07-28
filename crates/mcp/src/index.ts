@@ -229,6 +229,14 @@ export const MCP_INSIGHT_RESULT_MAX = 500;
  * records the CLI would have returned for the same `limit`: `since` is a lower
  * bound on time, so the newest N records that satisfy it are the same set
  * whether it is applied before or after taking the newest N.
+ *
+ * That last equivalence has a premise worth naming, because it is a property of
+ * this log rather than of `since`. The CLI filters by timestamp but orders and
+ * tail-limits by `seq` (crates/core/src/events.rs), so "newest N" and "newest N
+ * by time" coincide only while the two orders agree. They do on the real log
+ * today: zero inversions among insight records. A restored or merged log with
+ * mixed `seq` would break it, and the symptom would be a `since` query missing
+ * a record that the CLI would have returned.
  */
 export const MCP_INSIGHT_SCAN_WINDOW = MCP_INSIGHT_RESULT_MAX;
 export const MCP_PERSON_PROFILE_MEETING_MAX = 50;
@@ -3133,14 +3141,24 @@ export function selectCopilotNudges(
 // ── Helper: run minutes CLI command (uses execFile, not exec) ──
 
 /**
- * Ceiling on one CLI read's stdout.
+ * Ceiling on one CLI read, applied per stream.
  *
  * `execFile` defaults to 1 MiB and turns an overrun into a hard error, not a
  * truncation, so the ceiling has to clear the largest projection any surface
  * asks for. The insight read is the binding case: it now always fetches
  * MCP_INSIGHT_SCAN_WINDOW records rather than the caller's default, measured at
- * roughly 620 bytes per record on a real log, and a corpus with long decision
- * text would have pushed a 500-record window past 1 MiB and failed every call.
+ * roughly 620 bytes per record on a real log, so about 310 KB today. The
+ * headroom is for corpora with long decision text, and is forward-looking
+ * rather than measured.
+ *
+ * Two things this is NOT, stated because the number is large and applies to
+ * every `runMinutes` caller, not only insights. Node applies `maxBuffer` per
+ * stream, so a call may buffer this much stdout AND this much stderr, and every
+ * child runs with RUST_LOG=info. And the old 1 MiB default doubled as a
+ * circuit breaker on a runaway child; that breaker is now much further out. It
+ * is set here rather than per-call because `MinutesRunner` takes no options
+ * bag, and one ceiling that every surface shares is easier to reason about
+ * than several.
  */
 const MCP_CLI_MAX_STDOUT_BYTES = 64 * 1024 * 1024;
 
@@ -7360,7 +7378,7 @@ registerTool(
 export const MCP_AGENT_ANNOTATIONS_UNAVAILABLE_DESCRIPTION =
   "Compatibility name only: unavailable in MCP because an annotation's source pointer and body are both author-supplied, so revalidating the pointer cannot bound what the body discloses.";
 export const MCP_MEETING_INSIGHTS_DESCRIPTION =
-  "Query structured insights extracted from meetings, decisions, commitments and questions with confidence levels. Each insight is released only after the meeting the pipeline recorded as its source is re-read from disk and re-verified against the live sensitivity policy. Withheld records are reported as a partial view rather than an empty one.";
+  "Query structured insights extracted from meetings, decisions, commitments and questions with confidence levels. Each insight records a path to the meeting it was derived from; that path is resolved to a meeting in the live corpus, and the resolved meeting is re-read from disk and re-verified against the live sensitivity policy before the insight is released. A path that cannot be resolved into this corpus is withheld. Released records carry the source title and path as they were recorded, which may name a location outside this corpus. Withheld records are reported as a partial view rather than an empty one.";
 
 function unavailableDerivedRecordResult(message: string) {
   return {
@@ -7397,10 +7415,12 @@ export type WithheldSourceReason =
  *   - a relative value, resolved directly against the live root;
  *   - an absolute value, normalised by stripping a recognised root prefix.
  *
- * "Recognised" means the value carries exactly one path segment equal to the
- * live root's own final segment, names no inactive or hidden directory
- * anywhere, and does not still exist on this machine; the remainder after that
- * segment is taken as the corpus-relative tail.
+ * "Recognised" means the value carries exactly one path segment matching the
+ * live root's own final segment, case-insensitively, and does not still exist
+ * on this machine; the remainder after that segment is taken as the
+ * corpus-relative tail, and that tail must name an active corpus location.
+ * Nothing to the LEFT of the anchor is screened: it describes where the old
+ * corpus lived, not where the record sat inside it.
  *
  * Normalisation only ever applies to a recorded path that is meaningless here.
  * If the recorded path still resolves to a real file, it is used as recorded,
@@ -7412,34 +7432,49 @@ export type WithheldSourceReason =
  * removes rather than narrows, and which is tracked as its own block. State it
  * precisely, because the consequence is not merely a confusing answer:
  *
- *   A foreign path that no longer exists here, carries no inactive or hidden
- *   component, and happens to contain one directory sharing the live root's
- *   final segment will bind to whatever live meeting sits at the same relative
- *   tail. If that live meeting is not restricted and the vanished one was, the
- *   insight is RELEASED under the live meeting's policy. Anchoring on the root
- *   segment rather than the bare filename is what keeps this rare rather than
- *   routine: it is why `/var/folders/<tmp>/output/2026-04-07-test-meeting.md`,
- *   which names no corpus root, resolves to nothing instead of adopting the
- *   identity of whatever live meeting shares its filename. It is not why a
- *   path like `/var/folders/<tmp>/minutes-<run>/meetings/memos/x.md` is safe;
- *   that one does carry an anchor and does normalise.
+ *   A foreign path that no longer exists here and happens to contain one
+ *   directory sharing the live root's final segment will bind to whatever live
+ *   meeting sits at the same relative tail. If that live meeting is not
+ *   restricted and the vanished one was, the insight is RELEASED under the
+ *   live meeting's policy, and the released record carries the VANISHED
+ *   meeting's recorded title and path, so restricted metadata travels with it.
  *
- * Several shapes refuse to normalise at all. Each fails closed, and each
- * presents as the same conflated withheld reason:
+ *   State the reach honestly: the ancestors of the foreign path are not
+ *   screened, so this covers paths under a trash, archive, backup-volume or
+ *   dot-directory ancestor as readily as any other. What keeps it rare rather
+ *   than routine is anchoring on the root segment rather than the bare
+ *   filename: `/var/folders/<tmp>/output/2026-04-07-test-meeting.md` names no
+ *   corpus root and resolves to nothing instead of adopting the identity of a
+ *   live meeting sharing its filename. A path like
+ *   `/var/folders/<tmp>/minutes-<run>/meetings/memos/x.md` does carry an
+ *   anchor and does normalise; one such value exists in the real event log.
+ *
+ * Several shapes are withheld. Each fails closed, and each presents as the same
+ * conflated withheld reason:
  *
  *   - a corpus whose final segment was renamed as well as moved, and one
  *     reached through a symlink whose realpath ends in a different segment,
- *     since the anchor is compared against the realpath's basename;
- *   - a corpus whose own path contains a hidden or inactive component, such as
- *     a root under `~/.minutes/`, because the recorded path then trips the
- *     hidden-segment rule. That rule cannot tell such a root apart from a
- *     record that genuinely sat in `.trash/` or `archive/`, so it refuses both;
- *   - a corpus whose final segment is itself an inactive name, such as a root
- *     literally called `archive`, for the same reason;
- *   - a corpus moved between Windows and POSIX. `\` is treated as a separator
- *     only on Windows, so a recorded `C:\Users\me\meetings\x.md` read on POSIX
- *     is not even absolute, takes the relative branch, and yields a candidate
- *     that does not exist.
+ *     since the anchor is compared against the realpath's basename. The
+ *     symlink case is likely the commonest unrecovered layout: a `~/meetings`
+ *     pointing at an external volume recovers nothing. Option A's business;
+ *     widening the anchor set is not worth doing to a function that has twice
+ *     leaked by being made more permissive;
+ *   - a record that genuinely sat in an inactive or hidden part of its own
+ *     corpus, since the tail carries that component over and the active-corpus
+ *     check refuses it. A corpus that merely LIVED under such a directory is
+ *     recognised normally, because only the tail is screened;
+ *   - a corpus moved between Windows and POSIX. Here nothing is refused: `\`
+ *     is a separator only on Windows, so a recorded `C:\Users\me\meetings\x.md`
+ *     read on POSIX is not absolute, takes the relative branch, and yields a
+ *     candidate that simply does not exist, so the read withholds it.
+ *
+ * Anchor matching is case-insensitive, which cuts both ways and is stated here
+ * because only one direction is obvious. It refuses a case-variant second
+ * anchor that exact matching would have missed, and it also RECOGNISES
+ * `/nope/MEETINGS/x.md` on a case-sensitive filesystem, where `MEETINGS` is a
+ * genuinely different directory. The widening is deliberate: on the
+ * case-insensitive filesystems this corpus mostly lives on, the variant spelling
+ * names the same directory.
  *
  * Returns null when no corpus-relative identity can be established. Callers
  * must treat null as withheld. Binding a record to the wrong meeting would
@@ -7946,8 +7981,14 @@ export function registerUnavailableCompatibilityTools(
         // Covers every bucket the tally counts, including records carrying no
         // source pointer at all. Naming only the policy case would misdescribe
         // those.
+        // Says what the number counts. The tally is computed over the whole
+        // scanned window before any caller filter, which is what stops it being
+        // differenceable, and the cost of that is it bears no relation to the
+        // caller's query: someone asking for one participant since May is still
+        // told about every unreleasable record in the window. Reporting it as a
+        // query-scoped count would be the false reading.
         notes.push(
-          `${withheld.total} insight(s) withheld: the record names no source meeting, or its source could not be resolved to a meeting in the active corpus, or that meeting is designated restricted, archived, or deleted.`
+          `Of the ${fetched.length} most recent record(s) examined, ${withheld.total} could not be released, independently of the filters in this request: the record names no source meeting, or its source could not be resolved to a meeting in the active corpus, or that meeting is designated restricted, archived, or deleted.`
         );
       }
       if (truncated) {

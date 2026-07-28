@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-25",
+  "generatedAt": "2026-07-28",
   "installCommand": "npx minutes-mcp",
   "documentationUrl": "https://useminutes.app/for-agents",
   "supportUrl": "https://github.com/silverstein/minutes/discussions",
@@ -160,7 +160,7 @@
     },
     {
       "name": "get_meeting_insights",
-      "description": "Query decisions, commitments, and questions extracted from meetings; each insight is released only after the meeting the pipeline recorded as its source is re-verified against live sensitivity policy, and withheld records are reported as a partial view",
+      "description": "Query decisions, commitments, and questions extracted from meetings; each insight records a path to its source meeting, that path is resolved to a meeting in the live corpus and the resolved meeting is re-verified against live sensitivity policy before release, and withheld records are reported as a partial view",
       "group": "Insights",
       "anchorId": "tool-get-meeting-insights",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights"

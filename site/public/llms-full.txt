@@ -2,7 +2,7 @@
 
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts + site/lib/skills-catalog.json
-> Last generated: 2026-07-25
+> Last generated: 2026-07-28
 
 ## Product
 
@@ -82,7 +82,7 @@ What you get:
 - `relationship_map` — Rank relationships from the bounded process-private policy-safe graph projection Docs: https://useminutes.app/docs/mcp/tools#tool-relationship-map
 - `list_voices` — List enrolled voice profiles for speaker identification Docs: https://useminutes.app/docs/mcp/tools#tool-list-voices
 - `confirm_speaker` — Compatibility name only: agent-controlled speaker mutation is unavailable; use the Minutes app or human CLI Docs: https://useminutes.app/docs/mcp/tools#tool-confirm-speaker
-- `get_meeting_insights` — Query decisions, commitments, and questions extracted from meetings; each insight is released only after the meeting the pipeline recorded as its source is re-verified against live sensitivity policy, and withheld records are reported as a partial view Docs: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
+- `get_meeting_insights` — Query decisions, commitments, and questions extracted from meetings; each insight records a path to its source meeting, that path is resolved to a meeting in the live corpus and the resolved meeting is re-verified against live sensitivity policy before release, and withheld records are reported as a partial view Docs: https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights
 - `start_live_transcript` — Start a live transcript session for real-time meeting transcription Docs: https://useminutes.app/docs/mcp/tools#tool-start-live-transcript
 - `read_live_transcript` — Read utterances from the active live transcript with optional cursor or time window Docs: https://useminutes.app/docs/mcp/tools#tool-read-live-transcript
 - `start_copilot` — Start the independent real-time copilot for a goal and observe its CLI nudge stream Docs: https://useminutes.app/docs/mcp/tools#tool-start-copilot

@@ -2448,6 +2448,20 @@ describe("insight source identity survives a moved corpus", () => {
 
       // Unreadable parent: the stat now fails, but the answer must not change.
       chmodSync(vaultParent, 0o000);
+      // Assert the precondition rather than assume it. Root traverses a 0o000
+      // directory, so under root the stat would succeed and this test would
+      // pass for the same reason as the readable case, silently losing the
+      // EACCES path it exists to cover.
+      let statBlocked = false;
+      try {
+        statSync(recorded);
+      } catch {
+        statBlocked = true;
+      }
+      expect(
+        statBlocked,
+        "precondition: the recorded path must be unstattable here (are you root?)"
+      ).toBe(true);
       const stillRefused = resolveCorpusRelativeSourcePath(recorded, live);
       const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
         [{ content: "UNREADABLE-PARENT-CANARY", source_meeting: recorded }],
@@ -2583,15 +2597,10 @@ describe("insight source identity survives a moved corpus", () => {
  * constant tally no matter what the handler asked for, and every oracle
  * assertion below would pass with the oracle wide open.
  *
- * PRECONDITION, stated because it is real and not obvious. Injecting the runner
- * does NOT decouple these tests from the CLI. `get_meeting_insights` is a
- * content-bearing agent tool, so every call is routed through
- * `requireAgentTrustReadiness()`, which uses the module's own `runMinutes` and
- * spawns a real `minutes agent-readiness --json` per call. These tests
- * therefore need a built `minutes` binary and a healthy trust registry, and
- * that subprocess is why each call costs about a second. Absent either, they
- * fail loudly rather than passing vacuously, which is the direction this lane
- * wants, but they do fail.
+ * These tests are hermetic and must stay that way: CI runs this suite with no
+ * `minutes` binary built, so anything that reaches the real CLI fails there.
+ * `readiness` is stubbed below for exactly that reason, and two tests cover
+ * what stubbing it removes.
  */
 async function insightHarness(meetingsDir: string, records: any[]) {
   const mcpServer = new McpServer({
@@ -2909,7 +2918,7 @@ describe("insight window is not shaped by the caller", () => {
         expect(result.structuredContent.count).toBe(0);
         expect(result.structuredContent.partial).toBe(true);
         expect(result.structuredContent.withheld.total).toBe(1);
-        expect(result.content[0].text).toContain("withheld");
+        expect(result.content[0].text).toContain("could not be released");
         expect(JSON.stringify(result)).not.toContain("RESTRICTED-PARTIAL-CANARY");
       } finally {
         await withRestricted.close();
@@ -2921,7 +2930,7 @@ describe("insight window is not shaped by the caller", () => {
         expect(result.structuredContent.count).toBe(0);
         expect(result.structuredContent.partial).toBe(false);
         expect(result.structuredContent.withheld.total).toBe(0);
-        expect(result.content[0].text).not.toContain("withheld");
+        expect(result.content[0].text).not.toContain("could not be released");
       } finally {
         await genuinelyEmpty.close();
       }
@@ -2980,8 +2989,13 @@ describe("insight window is not shaped by the caller", () => {
       expect(result.structuredContent.withheld.total).toBe(1);
 
       const text = result.content[0].text;
-      // The withheld note must cover the missing-source case too, not only the
-      // policy one, because the tally counts both.
+      // The note must say what the number counts. The tally is over the scanned
+      // window and not over the caller's filtered result, and saying so is what
+      // stops an agent reading it as "200 of your matches were suppressed".
+      expect(text).toContain("most recent record(s) examined");
+      expect(text).toContain("independently of the filters in this request");
+      // It must cover the missing-source case too, not only the policy one,
+      // because the tally counts both.
       expect(text).toContain("the record names no source meeting");
       expect(text).toContain("could not be resolved to a meeting in the active corpus");
       expect(text).toContain("designated restricted, archived, or deleted");
@@ -3081,6 +3095,15 @@ describe("insight window is not shaped by the caller", () => {
       expect(properties.limit?.description).not.toMatch(/^Maximum number of results \(/);
       // `since` is a floor on a calendar date.
       expect(properties.since?.description).toContain("on or after this calendar date");
+      // The tool's own policy sentence. Policy is verified on the meeting the
+      // recorded path RESOLVES to, not on the recorded path itself, and a
+      // released record still carries the recorded title and path. Saying
+      // otherwise would tell an agent the boundary is tighter than it is.
+      expect(tool?.description).toContain("resolved to a meeting in the live corpus");
+      expect(tool?.description).toContain("as they were recorded");
+      expect(tool?.description).not.toMatch(
+        /the meeting the pipeline recorded as its source is re-read/
+      );
       // The override recovers restricted sources only. "Moved" is now recovered
       // without it, so listing "moved" as unrecoverable would be false.
       expect(properties.include_restricted?.description).toContain(
@@ -3108,10 +3131,13 @@ describe("insight window is not shaped by the caller", () => {
     // defaults are the real functions, so a default rebound to a stub would
     // ship green as a tool that returns nothing or claims the CLI is missing.
     const live = resolveInsightToolDeps();
+    // By reference where the binding is exported, since a name check passes
+    // against any stub that sets `name`. `runMinutes` and `isCliAvailable` are
+    // module-private, so those fall back to the weaker check.
+    expect(live.readiness).toBe(requireAgentTrustReadiness);
+    expect(live.resolveMeetingsDir).toBe(getEffectiveMeetingsDir);
     expect(live.runCli.name).toBe("runMinutes");
     expect(live.cliIsAvailable.name).toBe("isCliAvailable");
-    expect(live.resolveMeetingsDir.name).toBe("getEffectiveMeetingsDir");
-    expect(live.readiness.name).toBe("requireAgentTrustReadiness");
     // An override replaces exactly the one binding it names.
     const stub = async () => ({ ready: true });
     const overridden = resolveInsightToolDeps({ readiness: stub });
