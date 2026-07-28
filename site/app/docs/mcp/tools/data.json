@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-27",
+  "generatedAt": "2026-07-28",
   "installCommand": "npx minutes-mcp",
   "documentationUrl": "https://useminutes.app/for-agents",
   "supportUrl": "https://github.com/silverstein/minutes/discussions",
@@ -234,6 +234,13 @@
       "group": "Insights",
       "anchorId": "tool-ingest-meeting",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-ingest-meeting"
+    },
+    {
+      "name": "resummarize_meeting",
+      "description": "Re-run the AI pass on an edited meeting or memo, previewing by default and preserving user edits",
+      "group": "Notes and processing",
+      "anchorId": "tool-resummarize-meeting",
+      "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-resummarize-meeting"
     },
     {
       "name": "knowledge_status",

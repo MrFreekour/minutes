@@ -11,6 +11,8 @@
  * 5. List tool returns array
  * 6. Path validation works on get_meeting
  * 7. Path validation works on process_audio
+ * 8. resummarize_meeting is present in the built server with its full schema
+ * 9. resummarize_meeting's path guard (validatePathInDirectory) rejects outside paths
  *
  * Run: node crates/mcp/test/mcp_tools_test.mjs
  */
@@ -19,6 +21,7 @@ import { execFileSync } from "child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { validatePathInDirectory } from "../dist/paths.js";
 
 let passed = 0;
 let failed = 0;
@@ -226,6 +229,64 @@ test("minutes get --json applies speaker overlay from confirm", () => {
   assertEqual(attr.confidence, "high", "overlay confirmations carry high confidence");
 
   rmSync(sandbox, { recursive: true, force: true });
+});
+
+// ── Test 10: resummarize_meeting is registered with its schema ──
+// Asserts against the compiled server source, not a live MCP round-trip —
+// this harness has no protocol client, so registration + schema fields +
+// the exact validation call are checked textually in dist/index.js.
+test("resummarize_meeting is present in the built server with its full schema", () => {
+  const builtSource = readFileSync(
+    join(import.meta.dirname, "..", "dist", "index.js"),
+    "utf-8"
+  );
+  const toolStart = builtSource.indexOf('"resummarize_meeting"');
+  const nextTool = builtSource.indexOf("registerTool(", toolStart + 1);
+  const toolSource = builtSource.slice(
+    toolStart,
+    nextTool === -1 ? builtSource.length : nextTool
+  );
+
+  assert(toolStart !== -1, "resummarize_meeting must be present in the built server");
+  for (const field of ["path", "apply", "engine", "template", "ingest", "include_restricted"]) {
+    assert(
+      new RegExp(`${field}: z\\s*\\.`).test(toolSource),
+      `resummarize_meeting schema must include ${field}`
+    );
+  }
+  assert(
+    toolSource.includes(
+      'validatePathInDirectory(path, await getEffectiveMeetingsDir(), [".md"])'
+    ),
+    "resummarize_meeting must validate paths against the effective meetings directory"
+  );
+});
+
+// ── Test 11: resummarize_meeting's path guard rejects outside files ──
+// Exercises the shared validator the tool calls (verified textually above),
+// not the handler itself — same limitation as test 10.
+test("resummarize_meeting's path guard (validatePathInDirectory) rejects outside paths", () => {
+  const sandbox = mkdtempSync(join(tmpdir(), "minutes-resummarize-path-"));
+  const meetingsDir = join(sandbox, "meetings");
+  const outsidePath = join(sandbox, "outside.md");
+  mkdirSync(meetingsDir, { recursive: true });
+  writeFileSync(outsidePath, "# Outside\n");
+
+  try {
+    let error;
+    try {
+      validatePathInDirectory(outsidePath, meetingsDir, [".md"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert(error, "an outside path must be rejected");
+    assert(
+      error.message.includes("Access denied: path must be within"),
+      "outside-path rejection must explain the meetings-directory boundary"
+    );
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
 });
 
 // ── Summary ──

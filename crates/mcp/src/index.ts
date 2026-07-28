@@ -1498,7 +1498,13 @@ async function runMinutes(
     }
     const stderr = error.stderr?.trim() || "";
     const stdout = error.stdout?.trim() || "";
-    throw new Error(stderr || stdout || error.message);
+    // Preserve both streams on the thrown error: some commands (e.g.
+    // `resummarize --json`) print a structured failure envelope to stdout
+    // while anyhow's text lands on stderr — message alone would lose it.
+    const wrapped = new Error(stderr || stdout || error.message);
+    (wrapped as any).stdout = stdout;
+    (wrapped as any).stderr = stderr;
+    throw wrapped;
   }
 }
 
@@ -1800,6 +1806,11 @@ function parseStructuredCliError(message: string): any | null {
   } catch {
     return null;
   }
+}
+
+function formatResummarizeFailure(data: any, fallback: string): string {
+  if (!data?.error) return fallback;
+  return `Resummarize failed${data.stage ? ` during ${data.stage}` : ""}: ${data.error}`;
 }
 
 async function latestEventSeqFromCli(): Promise<number> {
@@ -4740,6 +4751,223 @@ registerTool(
       const msg = error?.stderr || error?.message || String(error);
       return {
         content: [{ type: "text" as const, text: `Knowledge ingestion failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ── Tool: resummarize_meeting ───────────────────────────────
+
+registerTool(
+  "resummarize_meeting",
+  "Re-run the AI pass (summary, action items, decisions) on an edited meeting or memo. Preview by default: returns the regenerated content WITHOUT writing — note the summarization model IS still invoked (cost applies even in preview). Set apply=true to write the file (a timestamped backup is created and derived views — graph, search index, vault, QMD — refresh automatically). User edits outside AI-owned sections are never touched; checked action items and decision notes are carried forward by the merge.",
+  {
+    path: z.string().describe("Path to the meeting/memo .md file to resummarize."),
+    apply: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Write the regenerated content (default: preview only; the model is invoked either way)."),
+    engine: z
+      .string()
+      .optional()
+      .describe("Override the summarization engine for this run (e.g. 'ollama', 'apple', 'agent'). Default: the engine from config.toml."),
+    template: z
+      .string()
+      .optional()
+      .describe("Template slug to apply for this run. Default: the template recorded in the file's frontmatter."),
+    ingest: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("With apply=true, also re-ingest the artifact into the knowledge base. Off by default because the knowledge log is append-only — every ingest adds a new log entry."),
+    include_restricted: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Resummarize a meeting designated `sensitivity: restricted` (refused by default; the override is logged)."),
+  },
+  { title: "Resummarize Meeting", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  async ({ path, apply, engine, template, ingest, include_restricted }) => {
+    if (!(await isCliAvailable())) {
+      return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
+    }
+
+    let resolved: string;
+    try {
+      resolved = validatePathInDirectory(path, await getEffectiveMeetingsDir(), [".md"]);
+    } catch (error: any) {
+      return {
+        content: [{ type: "text" as const, text: error?.message || String(error) }],
+        isError: true,
+      };
+    }
+
+    let restrictedOverride = false;
+    try {
+      const rawContent = await readFile(resolved, "utf-8");
+      const parsed = reader.parseFrontmatter(rawContent, resolved);
+      if (meetingSensitivity(parsed) === "restricted") {
+        if (!include_restricted) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "This meeting is designated `sensitivity: restricted`; preview output would expose derived content. Pass `include_restricted: true` for an explicit, logged override.",
+              },
+            ],
+            isError: true,
+          };
+        }
+        console.error(
+          `[Minutes] include_restricted override: resummarizing restricted meeting ${resolved} via resummarize_meeting`
+        );
+        restrictedOverride = true;
+      }
+    } catch (error: any) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Could not read: ${error?.message || String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const args = ["resummarize", resolved, "--json"];
+    if (apply) args.push("--apply");
+    if (engine) args.push("--engine", engine);
+    if (template) args.push("--template", template);
+    if (apply && ingest) args.push("--ingest");
+    const ingestIgnored = ingest && !apply;
+
+    try {
+      const { stdout } = await runMinutes(args, 300000);
+      const envelope = parseJsonOutput(stdout);
+      const data = envelope?.data;
+
+      if (data?.error) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: formatResummarizeFailure(data, stdout),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (!data || typeof data !== "object") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Resummarize returned an unexpected response: ${stdout}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const lines = [
+        apply ? `Applied: ${data.path || resolved}` : "Preview (no changes written)",
+      ];
+      let engineLine = `engine: ${data.engine ?? "unknown"} (model: ${data.model ?? "unknown"})`;
+      if (data.template) engineLine += `, template: ${data.template}`;
+      lines.push(engineLine);
+
+      const sectionsReplaced = Array.isArray(data.sections_replaced)
+        ? data.sections_replaced
+        : [];
+      lines.push(
+        sectionsReplaced.length > 0
+          ? `sections replaced: ${sectionsReplaced.join(", ")}`
+          : "first AI pass"
+      );
+
+      if (Array.isArray(data.merge_notes) && data.merge_notes.length > 0) {
+        lines.push("merge notes needing eyes:");
+        for (const note of data.merge_notes) {
+          lines.push(
+            `- ${note?.kind ?? "unknown"}: ${note?.previous ?? "unknown"} — ${note?.disposition ?? "unknown"}`
+          );
+        }
+      }
+
+      if (apply) {
+        lines.push(`backup: ${data.backup ?? "none"}`);
+        if (data.derived_views) {
+          const derived = data.derived_views;
+          const derivedWarnings = Array.isArray(derived.warnings)
+            ? derived.warnings
+            : [];
+          const refreshed: string[] = [];
+          if (derived.graph_rebuilt) {
+            refreshed.push(
+              derived.meetings_indexed == null
+                ? "graph"
+                : `graph (${derived.meetings_indexed} meetings indexed)`
+            );
+          }
+          const searchRefreshed =
+            typeof derived.search_indexed === "boolean"
+              ? derived.search_indexed
+              : typeof derived.search_refreshed === "boolean"
+                ? derived.search_refreshed
+                : !derivedWarnings.some((warning: unknown) =>
+                    String(warning).startsWith("search index:")
+                  );
+          if (searchRefreshed) refreshed.push("search");
+          if (derived.vault_path) refreshed.push(`vault (${derived.vault_path})`);
+          if (derived.qmd_refreshed) refreshed.push("qmd");
+          if (derived.knowledge_ingested) {
+            refreshed.push(
+              derived.facts_written == null
+                ? "knowledge"
+                : `knowledge (${derived.facts_written} facts written)`
+            );
+          }
+          lines.push(`refreshed views: ${refreshed.length > 0 ? refreshed.join(", ") : "none"}`);
+
+          if (derivedWarnings.length > 0) {
+            lines.push("derived view warnings:");
+            for (const warning of derivedWarnings) lines.push(`- ${warning}`);
+          }
+        }
+      } else {
+        if (ingestIgnored) lines.push("--ingest ignored in preview");
+        lines.push("", "--- regenerated content ---", data.new_ai_body ?? "");
+      }
+
+      const { new_ai_body: _newAiBody, ...leanData } = data;
+      const structuredContent = apply ? leanData : data;
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        structuredContent: restrictedOverride
+          ? {
+              ...structuredContent,
+              sensitivity_override: { applied: true, logged: "server-log" },
+            }
+          : structuredContent,
+      };
+    } catch (error: any) {
+      const message = error?.message || String(error);
+      // The CLI's failure envelope goes to stdout while anyhow's text goes to
+      // stderr (which wins in the thrown message) — check stdout first.
+      const envelope =
+        parseStructuredCliError(error?.stdout || "") ??
+        parseStructuredCliError(message);
+      const data = envelope?.data;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: formatResummarizeFailure(data, message),
+          },
+        ],
         isError: true,
       };
     }

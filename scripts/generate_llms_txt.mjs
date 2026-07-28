@@ -212,7 +212,7 @@ function categorizeTool(name) {
     Insights: new Set(["get_meeting_insights", "ingest_meeting", "knowledge_status"]),
     "Live and dictation": new Set(["start_live_transcript", "read_live_transcript", "start_dictation", "stop_dictation"]),
     "Real-time Coach": new Set(["start_copilot", "stop_copilot", "copilot_status", "read_copilot_nudges"]),
-    "Notes and processing": new Set(["add_note", "process_audio", "open_dashboard"]),
+    "Notes and processing": new Set(["add_note", "process_audio", "resummarize_meeting", "open_dashboard"]),
     "Voice and speaker ID": new Set(["list_voices", "confirm_speaker"]),
     Integration: new Set(["qmd_collection_status", "register_qmd_collection"]),
     "Agent Event Bus": new Set(["add_agent_annotation", "get_agent_annotations"]),

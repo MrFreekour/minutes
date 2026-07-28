@@ -3,9 +3,9 @@
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts
 > Regenerate: node scripts/generate_llms_txt.mjs
-> Last generated: 2026-07-27
+> Last generated: 2026-07-28
 
-Minutes exposes 36 tools, 8 resources, and 6 prompt templates through the MCP server.
+Minutes exposes 37 tools, 8 resources, and 6 prompt templates through the MCP server.
 
 ## Install
 
@@ -275,6 +275,14 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-add-note
 Open the Meeting Intelligence Dashboard in the browser — visual overview of conversation memory
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-open-dashboard
+
+<a id="tool-resummarize-meeting"></a>
+
+#### `resummarize_meeting`
+
+Re-run the AI pass on an edited meeting or memo, previewing by default and preserving user edits
+
+Reference URL: https://useminutes.app/docs/mcp/tools#tool-resummarize-meeting
 
 ### Voice and speaker ID
 
