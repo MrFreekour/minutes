@@ -7,8 +7,11 @@ document plus bead **minutes-ew09** is how you pick up without loss.
 - Worktree: `~/Sites/minutes-conversation-trust-privacy-b-v4`
 - Branch: `integrate/conversation-trust-privacy-b-v4`
 - **Never push, merge, tag, sign, or release.** Steady-background only.
-- Durable state and full verdict history: `bd show minutes-ew09`. Read it. The
-  notes there are the authority; this file is the orientation.
+- Durable state: `bd show minutes-ew09` for current status, and
+  `docs/investigations/privacy-b-gate-history.md` for the full verdict history.
+  That history used to live in the bead's notes and was silently lost twice in
+  one session, so it lives in git now and the bead carries a pointer. This file
+  is the orientation.
 
 ## Read this first: how work gets accepted here
 
@@ -48,7 +51,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
-| `7aa0d217` | track-2 Option B round-4 coverage — **not yet re-gated** |
+| `228d68c3` | track-2 Option B gate-3 remediation — **not yet re-gated** |
+| `7aa0d217` | track-2 Option B round-4 coverage — gated REJECT/REJECT/ACCEPT |
 | `8cebbe63` | track-2 Option B round-3 remediation |
 | `b341876a` | track-2 Option B round-2 — REJECTED 2/3 (P0s fixed by `8cebbe63`) |
 | `49fdf4a5` | track-2 Option B — REJECTED (P0 fixed by `b341876a`) |
@@ -167,7 +171,7 @@ faults, which is this lane's standing failure mode. Worth carrying forward:
   Re-check old mutations after adding new guards; two of the twelve had gone
   stale and would have reported a false pass.
 
-**Next step: re-gate `7aa0d217` with three fresh blind reviews.** The residual
+**Next step: gate 4 on `228d68c3`, run from a fresh context.** The residual
 heuristic limit is documented at `resolveCorpusRelativeSourcePath` and is
 Option A's to remove.
 
