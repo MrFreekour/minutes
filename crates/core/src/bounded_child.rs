@@ -1464,6 +1464,7 @@ impl ProcessTree {
             limits.ProcessMemoryLimit = bytes;
         }
         if let Some(bytes) = job_memory_limit {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
             limits.JobMemoryLimit = bytes;
         }
         if single_process {
