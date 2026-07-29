@@ -1408,66 +1408,13 @@ impl ProcessTree {
 
         #[cfg(windows)]
         {
-            use std::mem::{size_of, zeroed};
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-            };
-
-            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if job.is_null() || job == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut limits = unsafe { zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if let Some(bytes) = address_space_limit {
-                let bytes = usize::try_from(bytes).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "child memory limit exceeds Windows address range",
-                    )
-                })?;
-                limits.BasicLimitInformation.LimitFlags |=
-                    JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
-                limits.ProcessMemoryLimit = bytes;
-                limits.JobMemoryLimit = bytes;
-            }
-            if single_process {
-                limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-                limits.BasicLimitInformation.ActiveProcessLimit = 1;
-            }
-            if unsafe {
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            } == 0
-            {
-                let error = std::io::Error::last_os_error();
-                unsafe { CloseHandle(job) };
-                return Err(error);
-            }
-            if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } == 0 {
-                let error = std::io::Error::last_os_error();
-                unsafe { CloseHandle(job) };
-                return Err(error);
-            }
-            let resume_status = unsafe { NtResumeProcess(child.as_raw_handle() as _) };
-            if resume_status < 0 {
-                unsafe { CloseHandle(job) };
-                return Err(std::io::Error::other(format!(
-                    "failed to resume supervised child (NTSTATUS 0x{:08x})",
-                    resume_status as u32
-                )));
-            }
-            let _ = use_outer_group;
-            Ok(Self { job })
+            Self::attach_windows(
+                child,
+                use_outer_group,
+                address_space_limit,
+                address_space_limit,
+                single_process,
+            )
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -1475,6 +1422,83 @@ impl ProcessTree {
             let _ = (child, use_outer_group, address_space_limit, single_process);
             Ok(Self {})
         }
+    }
+
+    #[cfg(windows)]
+    fn attach_windows(
+        child: &mut std::process::Child,
+        use_outer_group: bool,
+        process_memory_limit: Option<u64>,
+        job_memory_limit: Option<u64>,
+        single_process: bool,
+    ) -> std::io::Result<Self> {
+        use std::mem::{size_of, zeroed};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        };
+
+        let to_native_limit = |bytes| {
+            usize::try_from(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "child memory limit exceeds Windows address range",
+                )
+            })
+        };
+        let process_memory_limit = process_memory_limit.map(to_native_limit).transpose()?;
+        let job_memory_limit = job_memory_limit.map(to_native_limit).transpose()?;
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() || job == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits = unsafe { zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(bytes) = process_memory_limit {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            limits.ProcessMemoryLimit = bytes;
+        }
+        if let Some(bytes) = job_memory_limit {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            limits.JobMemoryLimit = bytes;
+        }
+        if single_process {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        }
+        if unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+        if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+        let resume_status = unsafe { NtResumeProcess(child.as_raw_handle() as _) };
+        if resume_status < 0 {
+            unsafe { CloseHandle(job) };
+            return Err(std::io::Error::other(format!(
+                "failed to resume supervised child (NTSTATUS 0x{:08x})",
+                resume_status as u32
+            )));
+        }
+        let _ = use_outer_group;
+        Ok(Self { job })
     }
 
     fn terminate(&self, child: &mut std::process::Child) {
@@ -2580,6 +2604,38 @@ mod windows_tests {
         }
     }
 
+    fn run_with_windows_memory_limits(
+        script: &str,
+        process_memory_limit: u64,
+        job_memory_limit: u64,
+    ) -> Output {
+        let mut bounded = powershell(script);
+        bounded
+            .command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        configure_process_tree(&mut bounded.command, false, None, false, false);
+
+        let mut child = bounded
+            .command
+            .spawn()
+            .expect("the independently limited child must launch suspended");
+        let tree = ProcessTree::attach_windows(
+            &mut child,
+            false,
+            Some(process_memory_limit),
+            Some(job_memory_limit),
+            false,
+        )
+        .expect("the independently limited child must attach to its Job");
+        let output = child
+            .wait_with_output()
+            .expect("the independently limited child must exit");
+        drop(tree);
+        output
+    }
+
     fn quote_powershell_literal(value: &std::path::Path) -> String {
         value.display().to_string().replace('\'', "''")
     }
@@ -2631,20 +2687,25 @@ mod windows_tests {
         panic!("supervised Windows descendant {pid} survived Job Object retirement");
     }
 
-    /// Prove the configured Windows Job Object limits committed memory at
-    /// runtime, rather than only asserting the command builder carries a
+    /// Prove both configured Windows Job Object committed-memory controls at
+    /// runtime, rather than only asserting that the command builder carries a
     /// number.
     ///
-    /// The unbounded control is load-bearing: without it, an unrelated
-    /// PowerShell allocation failure would look like enforcement. The same
-    /// 512 MiB allocation must first succeed outside the Job memory ceiling,
-    /// then fail with `OutOfMemoryException` under a 384 MiB process+job limit.
+    /// The per-process probe uses a deliberately looser whole-Job limit, so
+    /// only `JOB_OBJECT_LIMIT_PROCESS_MEMORY` can refuse its allocation. The
+    /// aggregate probe keeps each descendant below that per-process ceiling
+    /// while their combined commit exceeds the whole-Job ceiling, so only
+    /// `JOB_OBJECT_LIMIT_JOB_MEMORY` can refuse the second allocation.
+    /// Unbounded controls are load-bearing in both cases: without them, ambient
+    /// allocation pressure would look like enforcement.
     #[test]
     fn windows_job_memory_limit_refuses_committed_memory_over_budget() {
         const MIB: u64 = 1024 * 1024;
         const LIMIT_BYTES: u64 = 384 * MIB;
+        const LOOSE_JOB_LIMIT_BYTES: u64 = 768 * MIB;
         const ALLOCATION_BYTES: u64 = 512 * MIB;
-        let script = format!(
+        const DESCENDANT_ALLOCATION_BYTES: u64 = 160 * MIB;
+        let process_script = format!(
             "$ErrorActionPreference = 'Stop'; \
              [Console]::Out.Write('started|'); \
              try {{ \
@@ -2663,7 +2724,7 @@ mod windows_tests {
         );
 
         let control = run(
-            &mut powershell(&script),
+            &mut powershell(&process_script),
             None,
             StdoutTarget::Capture { max_bytes: 1024 },
             budget(15_000),
@@ -2680,24 +2741,116 @@ mod windows_tests {
             "the allocation must be viable before attributing refusal to the Job limit"
         );
 
-        let mut bounded = powershell(&script);
-        bounded.address_space_limit(LIMIT_BYTES).single_process();
-        let limited = run(
-            &mut bounded,
-            None,
-            StdoutTarget::Capture { max_bytes: 1024 },
-            budget(15_000),
-        )
-        .expect("the memory-limited allocation must launch");
-        assert!(!limited.timed_out);
+        let process_limited =
+            run_with_windows_memory_limits(&process_script, LIMIT_BYTES, LOOSE_JOB_LIMIT_BYTES);
         assert_eq!(
-            limited.output.status.code(),
+            process_limited.status.code(),
             Some(0),
-            "the limited child must catch the Job-enforced allocation refusal"
+            "the child must catch the independently enforced per-process refusal"
         );
         assert_eq!(
-            limited.output.stdout, b"started|refused",
-            "the child must start inside the Job and refuse only the over-budget allocation"
+            process_limited.stdout, b"started|refused",
+            "the loose whole-Job limit must leave the per-process limit as the refusing control"
+        );
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let holder_path = directory.path().join("memory-holder.ps1");
+        let probe_path = directory.path().join("memory-probe.ps1");
+        let ready_path = directory.path().join("memory-holder.ready");
+        std::fs::write(
+            &holder_path,
+            format!(
+                "$ErrorActionPreference = 'Stop'\n\
+                 $bytes = [byte[]]::new({DESCENDANT_ALLOCATION_BYTES})\n\
+                 [IO.File]::WriteAllText('{}', 'allocated')\n\
+                 Start-Sleep -Seconds 15\n",
+                quote_powershell_literal(&ready_path)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &probe_path,
+            format!(
+                "$ErrorActionPreference = 'Stop'\n\
+                 try {{\n\
+                     $bytes = [byte[]]::new({DESCENDANT_ALLOCATION_BYTES})\n\
+                     exit 91\n\
+                 }} catch {{\n\
+                     $base = $_.Exception.GetBaseException()\n\
+                     if ($base -is [System.OutOfMemoryException]) {{ exit 0 }}\n\
+                     [Console]::Error.Write($base.GetType().FullName + ': ' + $base.Message)\n\
+                     exit 92\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+        let aggregate_script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $holder = Start-Process -FilePath 'powershell.exe' \
+                 -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-File','{}') \
+                 -WindowStyle Hidden -PassThru; \
+             try {{ \
+                 $deadline = [DateTime]::UtcNow.AddSeconds(10); \
+                 while (-not [IO.File]::Exists('{}')) {{ \
+                     if ($holder.HasExited) {{ throw 'memory holder exited before allocating' }} \
+                     if ([DateTime]::UtcNow -ge $deadline) {{ throw 'memory holder did not become ready' }} \
+                     Start-Sleep -Milliseconds 25; \
+                 }} \
+                 $probe = Start-Process -FilePath 'powershell.exe' \
+                     -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-File','{}') \
+                     -WindowStyle Hidden -Wait -PassThru; \
+                 [Console]::Out.Write('holder|' + [IO.File]::ReadAllText('{}') + \
+                     '|probe-exit:' + [string]$probe.ExitCode); \
+                 exit $probe.ExitCode; \
+             }} finally {{ \
+                 if (-not $holder.HasExited) {{ Stop-Process -Id $holder.Id -Force }} \
+                 $holder.WaitForExit(); \
+             }}",
+            quote_powershell_literal(&holder_path),
+            quote_powershell_literal(&ready_path),
+            quote_powershell_literal(&probe_path),
+            quote_powershell_literal(&ready_path),
+        );
+
+        let aggregate_control = run(
+            &mut powershell(&aggregate_script),
+            None,
+            StdoutTarget::Capture { max_bytes: 1024 },
+            budget(20_000),
+        )
+        .expect("the unbounded aggregate allocation control must launch");
+        assert!(!aggregate_control.timed_out);
+        assert_eq!(
+            aggregate_control.output.status.code(),
+            Some(91),
+            "both descendant allocations must succeed without a Job memory ceiling"
+        );
+        assert_eq!(
+            aggregate_control.output.stdout,
+            b"holder|allocated|probe-exit:91",
+            "the unbounded aggregate control must keep the first allocation alive through the second"
+        );
+
+        std::fs::remove_file(&ready_path).unwrap();
+        let mut aggregate_limited = powershell(&aggregate_script);
+        aggregate_limited.address_space_limit(LIMIT_BYTES);
+        let aggregate_limited = run(
+            &mut aggregate_limited,
+            None,
+            StdoutTarget::Capture { max_bytes: 1024 },
+            budget(20_000),
+        )
+        .expect("the aggregate-limited process tree must launch");
+        assert!(!aggregate_limited.timed_out);
+        assert_eq!(
+            aggregate_limited.output.status.code(),
+            Some(0),
+            "the second under-process-budget allocation must catch the whole-Job refusal"
+        );
+        assert_eq!(
+            aggregate_limited.output.stdout,
+            b"holder|allocated|probe-exit:0",
+            "the first under-budget descendant must stay committed while the whole-Job limit refuses the second"
         );
     }
 
