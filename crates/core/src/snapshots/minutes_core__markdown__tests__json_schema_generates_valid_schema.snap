@@ -1,6 +1,5 @@
 ---
 source: crates/core/src/markdown.rs
-assertion_line: 1586
 expression: schema
 ---
 {
@@ -269,14 +268,22 @@ expression: schema
     },
     "AttributionSource": {
       "description": "How the attribution was determined.",
-      "type": "string",
-      "enum": [
-        "deterministic",
-        "llm",
-        "enrollment",
-        "manual",
-        "ml-bleed-degraded",
-        "stem-recovery"
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "deterministic",
+            "llm",
+            "enrollment",
+            "manual",
+            "ml-bleed-degraded",
+            "stem-recovery"
+          ]
+        },
+        {
+          "description": "A provenance label this build does not know, preserved verbatim.\n\nHand-edited files and `minutes import text` archives are supported\ninputs, so an unrecognized label must not make a meeting unreadable\n(#595). The raw string round-trips untouched rather than being\nnormalized away, so provenance survives a rewrite by a command that\nnever consumed it.",
+          "type": "string"
+        }
       ]
     },
     "CapturePolicy": {

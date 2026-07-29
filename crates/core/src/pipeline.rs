@@ -346,7 +346,7 @@ impl SelfAttributionOutcome {
                 speaker_label: Some(attribution.speaker_label.clone()),
                 name: Some(attribution.name.clone()),
                 confidence: Some(confidence_label(attribution.confidence)),
-                source: Some(attribution_source_label(attribution.source)),
+                source: Some(attribution_source_label(&attribution.source)),
                 applied_via: Some(applied_via),
                 skipped_reason: None,
                 fallback_reason,
@@ -445,7 +445,7 @@ fn confidence_label(confidence: diarize::Confidence) -> String {
     }
 }
 
-fn attribution_source_label(source: diarize::AttributionSource) -> String {
+fn attribution_source_label(source: &diarize::AttributionSource) -> String {
     match source {
         diarize::AttributionSource::Deterministic => "deterministic".into(),
         diarize::AttributionSource::Llm => "llm".into(),
@@ -453,6 +453,8 @@ fn attribution_source_label(source: diarize::AttributionSource) -> String {
         diarize::AttributionSource::Manual => "manual".into(),
         diarize::AttributionSource::MlBleedDegraded => "ml-bleed-degraded".into(),
         diarize::AttributionSource::StemRecovery => "stem-recovery".into(),
+        // Round-trip an unrecognized label verbatim rather than normalizing it (#595).
+        diarize::AttributionSource::Unknown(raw) => raw.clone(),
     }
 }
 
@@ -501,7 +503,7 @@ fn debug_speaker_map(speaker_map: &[diarize::SpeakerAttribution]) -> Vec<Speaker
             speaker_label: entry.speaker_label.clone(),
             name: entry.name.clone(),
             confidence: confidence_label(entry.confidence),
-            source: attribution_source_label(entry.source),
+            source: attribution_source_label(&entry.source),
         })
         .collect()
 }
