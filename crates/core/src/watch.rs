@@ -917,12 +917,12 @@ pub fn compressed_audio_decodable_with(
     !compressed_audio_requires_ffmpeg(path) || ffmpeg_available || bounded_fallback_available
 }
 
-/// Guidance for a compressed import that genuinely cannot be decoded.
-///
-/// Only reachable when ffmpeg is missing *and* the bounded worker is
-/// unavailable, so it names both remedies rather than implying ffmpeg is the
-/// only path.
 /// Guidance for a compressed import this machine could not decode.
+///
+/// It is NOT limited to "ffmpeg missing and the bounded worker unavailable",
+/// which is what this comment used to claim and what made the message wrong:
+/// the commonest state that reaches it is ffmpeg missing while the bounded
+/// worker is present, enabled, and simply has no decoder for the codec.
 ///
 /// This must stay true in BOTH states that reach it, which the previous wording
 /// did not. It told every affected user to "re-enable the bundled decoder",
@@ -1615,6 +1615,16 @@ mod tests {
     /// work without ffmpeg.
     #[test]
     fn health_and_watch_guidance_agree_about_the_unsupported_codecs() {
+        // The branch under test is "ffmpeg absent, bundled decoder present".
+        // Without a worker-capable binary the third branch answers instead, and
+        // the failure would name a wording problem that is not the real cause.
+        assert!(
+            crate::audio_decode_worker::bounded_decode_fallback_available(
+                &crate::config::Config::default()
+            ),
+            "this test needs a worker-capable binary beside the harness; build one with \
+             `cargo build -p minutes-cli --no-default-features`"
+        );
         let _env_lock = crate::test_home_env_lock();
         let previous = std::env::var_os("MINUTES_FFMPEG");
         std::env::set_var(
@@ -2046,6 +2056,24 @@ mod tests {
         fs::write(&memo, FIXTURE).unwrap();
 
         let mut config = Config::default();
+
+        // Precondition, asserted rather than assumed. This test observes the
+        // defect only where a duration probe actually runs: with no ffmpeg and
+        // no worker binary beside the harness, the broken code falls through to
+        // the configured type and looks correct. Proven behaviourally rather
+        // than by inspecting the environment, because either probe route will
+        // do. A one-second fixture under a 1000 s threshold routes as Memo only
+        // if something measured it, and the configured type says otherwise.
+        config.watch.dictation_threshold_secs = 1000;
+        config.watch.r#type = "meeting".into();
+        assert_eq!(
+            determine_content_type(&memo, &config),
+            ContentType::Memo,
+            "duration routing is not live here, so this test cannot see the defect it \
+             exists for: no launchable ffmpeg and no worker-capable binary beside the \
+             harness. Build one with `cargo build -p minutes-cli --no-default-features`"
+        );
+
         config.watch.dictation_threshold_secs = 0;
         config.watch.r#type = "memo".into();
 

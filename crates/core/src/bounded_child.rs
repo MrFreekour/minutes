@@ -2413,15 +2413,26 @@ mod tests {
         assert!(run.output.status.success());
     }
 
-    /// Guards the defect class that made the path-backed snapshot unusable:
+    /// Guards the defect class that made the path-backed snapshot unusable, and
+    /// records that the two Unixes disagree about it.
+    ///
     /// Linux refuses `execve` with `ETXTBSY` on any vnode a process still holds
     /// open for writing, so a snapshot that retains its setup handle cannot be
-    /// launched here. Darwin differs (measured on 26.6: it permits that, and
-    /// instead refuses descriptor execution of an unlinked inode with EACCES),
-    /// which is why the snapshot is reachable by pathname on both.
+    /// launched there. Darwin permits exactly that, measured on macOS 26.6, and
+    /// instead refuses descriptor execution of an unlinked inode with EACCES.
+    ///
+    /// Item 4 of the track-1 remediation list. This asserted ETXTBSY for every
+    /// Unix, so the suite was deterministically red on macOS: the prose above
+    /// had been corrected to say Darwin differs while the assertion below still
+    /// said it did not. The universal half is the second one - once no writer is
+    /// live and the mode is sealed, launch succeeds on both.
+    ///
+    /// What actually protects Darwin from a swapped snapshot is not the exec
+    /// rule but the launch-time digest re-check in `verify()`, covered by
+    /// `a_mutated_path_backed_snapshot_is_refused_before_launch` below.
     #[cfg(unix)]
     #[test]
-    fn path_backed_snapshot_execs_only_after_its_writer_is_dropped() {
+    fn path_backed_snapshot_execs_once_sealed_whatever_the_platform_write_rule() {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -2429,7 +2440,6 @@ mod tests {
         let path = dir.path().join("worker");
         let script = b"#!/bin/sh\nexit 0\n";
 
-        // A live writable handle must block execution.
         let mut writable = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2440,13 +2450,27 @@ mod tests {
         writable.write_all(script).unwrap();
         writable.flush().unwrap();
         let busy = crate::engine_process::command(&path).status();
+        #[cfg(target_os = "linux")]
         assert_eq!(
             busy.err().map(|error| error.raw_os_error()),
             Some(Some(libc::ETXTBSY)),
-            "a retained writer must make exec fail with ETXTBSY"
+            "Linux must refuse exec on a vnode with a live writer"
         );
+        #[cfg(target_os = "macos")]
+        assert!(
+            busy.is_ok(),
+            "Darwin permits exec with a live writer, measured on macOS 26.6; if this now \
+             fails, the platform rule changed and the snapshot design should be re-read: {busy:?}"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // No measurement exists for other Unixes from this lane, so assert
+            // nothing rather than assume Linux's rule holds there.
+            let _ = busy;
+        }
 
-        // Dropping the writer and sealing the mode is what makes launch work.
+        // Dropping the writer and sealing the mode is what makes launch work,
+        // and that half is the same everywhere.
         drop(writable);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
         let retained_read = std::fs::File::open(&path).unwrap();
@@ -2455,6 +2479,63 @@ mod tests {
             .expect("exec must succeed once no writer is live");
         assert!(status.success());
         drop(retained_read);
+    }
+
+    /// The control that actually protects the path-backed platforms: a snapshot
+    /// whose bytes changed after its authority was bound must be refused before
+    /// launch, not executed and audited afterwards.
+    ///
+    /// NOT EXECUTED FROM THIS LANE, and that is stated rather than implied. The
+    /// digest re-check is `cfg(all(unix, not(target_os = "linux")))` because
+    /// Linux binds a sealed memfd that cannot be rewritten, so this test is
+    /// compiled out here and runs on macOS CI only. It was type-checked on Linux
+    /// by temporarily widening the cfg to `unix`, which is the most this lane can
+    /// verify - it cannot compile or run Darwin.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn a_mutated_path_backed_snapshot_is_refused_before_launch() {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        file.flush().unwrap();
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let authority = BoundExecutable::bind(&path).expect("a sealed script must bind");
+        // Rewrite the snapshot the authority is holding, which is what a
+        // pathname-reachable snapshot makes possible and a memfd does not. The
+        // mode is restored afterwards so the refusal comes from the digest
+        // rather than from the mode half of the same check.
+        let snapshot = authority.launch_path();
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&snapshot, b"#!/bin/sh\nexit 9\n").unwrap();
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Assert the DIGEST refusal specifically. `verify()` also refuses a
+        // snapshot that is no longer a regular file or has regained a write bit,
+        // and the mode was restored above precisely so those cannot be what
+        // fires; naming the message is what stops a later mode-only check from
+        // keeping this green with the digest comparison deleted.
+        let error = match BoundedCommand::from_bound_executable(authority) {
+            Ok(_) => panic!("a snapshot rewritten after binding must not reach exec"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("changed after its authority was bound"),
+            "the refusal must come from the digest re-check, not another guard: {error}"
+        );
     }
 }
 

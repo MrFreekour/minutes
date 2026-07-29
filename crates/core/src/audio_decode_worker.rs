@@ -18,14 +18,26 @@
 //! How that ceiling is installed is platform-specific, because Darwin rejects
 //! an absolute `RLIMIT_AS` below its pre-`main()` shared-cache baseline:
 //!
-//! - Linux installs it from the parent's `pre_exec`, so it binds before `exec`.
-//! - Elsewhere the child installs a measured baseline-plus-budget ceiling
-//!   itself, at [`maybe_run_audio_decode_worker`], before any decode begins.
-//!   `graph_worker` binds its Darwin ceiling the same way.
+//! - Unix other than macOS installs it from the parent's `pre_exec`, so it binds
+//!   before `exec`, and the child then refuses to parse anything unless it can
+//!   see that ceiling.
+//! - Windows applies process and job memory limits to an initially suspended
+//!   process, so it binds before the child runs its first instruction.
+//! - macOS is the exception the split exists for: the child installs a measured
+//!   baseline-plus-budget ceiling itself, at [`maybe_run_audio_decode_worker`],
+//!   before any decode begins. `graph_worker` binds its Darwin ceiling the same
+//!   way.
 //!
 //! The child additionally gets its own process group, a wall-clock ceiling, a
-//! capped stdout streamed into a private file it has no pathname for, a cleared
-//! environment, and no ambient descriptors.
+//! capped stdout streamed into a private file it has no pathname for, and a
+//! cleared environment.
+//!
+//! Ambient descriptors are closed before `exec` on Unix. On Windows the child
+//! calls `graph_worker`'s inherited-handle sweep instead, because
+//! `CreateProcessW` is invoked with `bInheritHandles: TRUE` there. That sweep is
+//! canary-tested through `graph_worker` on Windows CI; this call site is not,
+//! and has never been compiled or run on Windows, so read the Windows half as
+//! "the same sweep, called from here" rather than as a verified property.
 //!
 //! The worker emits the same bytes ffmpeg is asked for, raw 16 kHz mono
 //! `s16le` PCM on stdout, so both decoders share one downstream path.
@@ -103,6 +115,53 @@ fn process_virtual_size() -> Result<u64, String> {
         return Err("decode worker could not measure its address space".into());
     }
     Ok(info.virtual_size)
+}
+
+/// Refuse to parse anything unless the parent bound this child's address space.
+///
+/// Everywhere except macOS the ceiling is installed by the parent, before
+/// `exec`, so nothing inside the child would otherwise notice it missing: an
+/// unbounded worker decodes attacker-controlled bytes exactly as a bounded one
+/// does, right up until it exhausts the machine. Checking it here makes the
+/// ceiling an observable property of every launch, which is what lets the real
+/// entry points be tested for containment instead of a command builder a test
+/// called itself and then asserted. macOS installs its own ceiling just above
+/// and reports failure through that call.
+///
+/// Both limits must equal the worker budget EXACTLY, which is what makes this a
+/// provenance check rather than a bounded-somehow check. An earlier version
+/// accepted anything finite and no looser than the budget, and its comment
+/// claimed that refused an ambient `ulimit -v`; it did not, since an ambient
+/// limit at or under the budget satisfied it and is indistinguishable from a
+/// parent-installed one. The parent sets `rlim_cur` and `rlim_max` to this
+/// constant, so equality holds for every real launch: if a lower ambient hard
+/// limit were in force, the parent's own `setrlimit` would fail and no child
+/// would exist to run this. Checking `rlim_max` too is what rules out a child
+/// that could raise its own soft limit back up.
+///
+/// The consequence, stated rather than left implicit: a decode child contained
+/// by some OTHER mechanism, a cgroup or an outer sandbox, while presenting an
+/// unbounded `RLIMIT_AS`, is refused here. That is deliberate. This worker's
+/// containment argument is the ceiling its own parent installs, and no launch
+/// path in this crate omits it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn verify_parent_bound_address_space() -> Result<(), String> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
+        return Err("decode worker could not read its address-space ceiling".into());
+    }
+    // `rlim_t` is u64 on our Unix builders but is not guaranteed to be.
+    #[allow(clippy::useless_conversion)]
+    let current = u64::from(limit.rlim_cur);
+    #[allow(clippy::useless_conversion)]
+    let maximum = u64::from(limit.rlim_max);
+    if current != WORKER_ADDRESS_SPACE_BYTES || maximum != WORKER_ADDRESS_SPACE_BYTES {
+        return Err("decode worker refuses to parse input without an address-space ceiling".into());
+    }
+    Ok(())
 }
 
 /// Child exit code used when the input could not be decoded at all, as opposed
@@ -186,17 +245,34 @@ fn resolve_worker_executable() -> Result<crate::bounded_child::BoundExecutable, 
         .into_iter()
         .flatten()
         .find(|candidate| candidate.is_file() && candidate != &current);
+    // Binding copies the whole executable into an immutable snapshot, so it can
+    // fail for reasons that have nothing to do with the binary being absent:
+    // memory pressure, a full temp filesystem, a snapshot budget. Reporting
+    // those as "no Minutes binary was found" is what made an intermittent bind
+    // failure look like a missing build for a whole gate round.
+    //
+    // Scope, precisely: this preserves the cause for the ADJACENT-HELPER branch
+    // only. A failure inside `BoundExecutable::current()` below is still
+    // flattened into one generic string. There is no test for this branch either
+    // - injecting a bind failure means planting a file in the harness's own
+    // target directory, which is not hermetic and races other tests.
+    let mut bind_failure = None;
     if let Some(helper) = adjacent {
-        if let Ok(executable) = crate::bounded_child::BoundExecutable::bind(&helper) {
-            return Ok(executable);
+        match crate::bounded_child::BoundExecutable::bind(&helper) {
+            Ok(executable) => return Ok(executable),
+            Err(error) => bind_failure = Some(error),
         }
     }
     if !executable_handles_worker_protocol(&current) {
-        return Err(
-            "compressed audio decode worker is unavailable because no Minutes binary was found \
-             next to this process"
-                .into(),
-        );
+        return Err(match bind_failure {
+            Some(error) => format!(
+                "compressed audio decode worker is unavailable because the Minutes binary \
+                 beside this process could not be bound: {error}"
+            ),
+            None => "compressed audio decode worker is unavailable because no Minutes binary \
+                     was found next to this process"
+                .to_string(),
+        });
     }
     crate::bounded_child::BoundExecutable::current()
         .map_err(|_| "compressed audio decode worker executable could not be resolved".to_string())
@@ -328,6 +404,26 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
     // parent already bound it via pre_exec; elsewhere this is where it binds.
     #[cfg(target_os = "macos")]
     if let Err(error) = install_child_address_space_ceiling() {
+        eprintln!("{error}");
+        return Some(71);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Err(error) = verify_parent_bound_address_space() {
+        eprintln!("{error}");
+        return Some(71);
+    }
+    // Windows inherits ambient inheritable HANDLEs whenever stdio is
+    // redirected. Checked rather than assumed, in the pinned toolchain's own
+    // source: `sys::process::windows` defaults `inherit_handles: true` and
+    // passes it straight to `CreateProcessW`, so the sweep is load-bearing
+    // rather than decorative. `graph_worker` already implements and canary-tests
+    // it on Windows CI; this worker parses attacker-controlled bytes with the
+    // same user authority, so it retires the same handles before it reads any.
+    //
+    // The sweep body is not exercised by this lane: nothing here can compile or
+    // run Windows. It is the identical, already-tested function, called from a
+    // second place, and the audio worker has no canary of its own.
+    if let Err(error) = crate::graph_worker::close_inherited_windows_handles_before_authority() {
         eprintln!("{error}");
         return Some(71);
     }
@@ -660,7 +756,11 @@ mod tests {
     ///
     /// The previous shape called `.address_space_limit(...)` in the test and
     /// then asserted the getter, so deleting the production call left it green.
-    /// This one drives `decode_to_private_pcm`'s own configuration path.
+    /// This one reads the builder every launch goes through. It does NOT prove
+    /// a caller still uses that builder - an earlier version of this comment
+    /// claimed it drove `decode_to_private_pcm`'s own path, which it never did.
+    /// `the_production_probe_child_runs_under_an_address_space_ceiling` is the
+    /// test that covers the caller.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_production_decode_command_carries_the_address_space_ceiling() {
@@ -710,10 +810,28 @@ mod tests {
     /// A stream reset invalidates everything after it, so the decode must fail
     /// rather than return the leading fragment as a complete transcript.
     ///
-    /// Uses a committed chained OGG (two logical streams at different sample
-    /// rates concatenated, which is what a reset actually looks like in the
-    /// wild) so this cannot skip. Both the demuxer and the decoder can raise
-    /// the reset; either must fail closed.
+    /// The committed fixture is two complete Vorbis streams at different sample
+    /// rates concatenated, which is what a chained container looks like in the
+    /// wild: 3 s at 44.1 kHz followed by 2 s at 48 kHz. Both the demuxer and the
+    /// decoder can raise the reset; either must fail closed.
+    ///
+    /// Item 2 of the track-1 remediation list. The previous fixture was 0.25 s
+    /// and delivered no packets before the reset, so the pre-fix code failed
+    /// closed too and this test could tell the two apart only by the word
+    /// "reset" in a message. It now asserts the VERDICT as well as the wording:
+    /// with the reset arms restored to `break`, the decode hands back the leading
+    /// three seconds of a five-second file as a success, which is exactly the
+    /// truncated-transcript outcome that has to fail here. The substring check
+    /// remains, deliberately, on the error branch only - it is secondary, and no
+    /// longer the thing standing between a truncated decode and a green suite.
+    ///
+    /// Fixture provenance, so it can be rebuilt rather than treated as opaque:
+    ///
+    /// ```text
+    /// ffmpeg -f lavfi -i "sine=frequency=440:duration=3:sample_rate=44100" -ac 1 -c:a libvorbis a.ogg
+    /// ffmpeg -f lavfi -i "sine=frequency=880:duration=2:sample_rate=48000" -ac 1 -c:a libvorbis b.ogg
+    /// cat a.ogg b.ogg > decode-fixture-chained.ogg
+    /// ```
     #[test]
     fn a_mid_stream_reset_fails_instead_of_truncating() {
         const CHAINED: &[u8] = include_bytes!("../resources/decode-fixture-chained.ogg");
@@ -721,12 +839,18 @@ mod tests {
         let path = directory.path().join("chained.ogg");
         std::fs::write(&path, CHAINED).unwrap();
 
-        let error = decode_compressed_to_s16le(&path)
-            .expect_err("a chained stream must not be reported as a complete decode");
-        assert!(
-            error.contains("reset"),
-            "expected the reset to be named so the user knows why: {error}"
-        );
+        match decode_compressed_to_s16le(&path) {
+            Ok(pcm) => panic!(
+                "a chained stream must not be reported as a complete decode: got {} samples, \
+                 {:.2} s at 16 kHz, from a 5 s file",
+                pcm.len() / 2,
+                (pcm.len() / 2) as f64 / 16_000.0
+            ),
+            Err(error) => assert!(
+                error.contains("reset"),
+                "expected the reset to be named so the user knows why: {error}"
+            ),
+        }
     }
 
     #[test]
@@ -881,6 +1005,122 @@ mod tests {
         assert!(
             (7.5..=8.5).contains(&seconds),
             "8 s webm must probe as about 8 s, got {seconds}"
+        );
+    }
+
+    /// Item 1 of the track-1 remediation list, the half that must be asserted
+    /// through `probe_compressed_duration` itself.
+    ///
+    /// `the_probe_command_carries_the_same_ceiling_as_the_decode_command` calls
+    /// `build_decode_command` and never asserts the production probe uses it, so
+    /// restoring the inline builder that had no ceiling at all leaves it green.
+    /// This launches the real probe child and reads its answer, and the child
+    /// now refuses to parse input unless the parent bound its address space, so
+    /// a probe launched without a ceiling returns `None` here.
+    ///
+    /// The first half is a precondition, not decoration. The child's behaviour
+    /// comes from a SEPARATELY built `minutes` binary, so a stale one beside the
+    /// harness would let the second half pass whatever the parent did. Proving
+    /// the refusal first is what rules that out.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_production_probe_child_runs_under_an_address_space_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memo.m4a");
+        std::fs::write(&path, M4A_FIXTURE).unwrap();
+
+        let executable = resolve_worker_executable()
+            .expect("a worker-capable executable must resolve for the end-to-end probe test");
+        let mut unbounded = crate::bounded_child::BoundedCommand::from_bound_executable(executable)
+            .expect("the worker authority must bind");
+        retain_safe_environment(&mut unbounded);
+        unbounded.env(WORKER_MARKER, "1");
+        unbounded.arg(PROBE_DURATION_ARG).arg("--").arg(&path);
+        let refused = crate::bounded_child::run(
+            &mut unbounded,
+            None,
+            crate::bounded_child::StdoutTarget::Capture { max_bytes: 128 },
+            crate::bounded_child::ChildBudget {
+                wall_clock: Duration::from_secs(30),
+                stderr_tail: 4 * 1024,
+            },
+        )
+        .expect("an unbounded probe child must at least launch");
+        // Assert the SPECIFIC refusal, not merely a nonzero exit. Any argument,
+        // loader or decoder failure would satisfy `!success()`, and then this
+        // precondition would pass for a reason unrelated to containment and the
+        // second half would prove nothing.
+        let diagnostic = String::from_utf8_lossy(&refused.output.stderr).into_owned();
+        assert_eq!(
+            refused.output.status.code(),
+            Some(71),
+            "an unbounded probe child must exit with the containment refusal code; got \
+             {:?} with stderr {diagnostic:?}. If this is not 71, the `minutes` binary beside \
+             this harness predates the worker's self-check and this test cannot observe the \
+             ceiling: rebuild it with `cargo build -p minutes-cli --no-default-features`",
+            refused.output.status.code()
+        );
+        assert!(
+            diagnostic.contains("address-space ceiling"),
+            "the refusal must name the ceiling so it cannot be confused with another \
+             fail-closed exit: {diagnostic:?}"
+        );
+
+        let seconds = probe_compressed_duration(&path, Duration::from_secs(30))
+            .expect("the production probe must report the fixture duration");
+        assert!(
+            (0.75..=1.25).contains(&seconds.as_secs_f64()),
+            "1 s m4a must probe as about 1 s, got {seconds:?}"
+        );
+    }
+
+    /// The child's ceiling check is a PROVENANCE check, not a bounded-somehow
+    /// check, and this is what makes that difference observable.
+    ///
+    /// A child launched under someone else's ceiling is refused even when that
+    /// ceiling is TIGHTER than the worker budget, because a tighter ambient
+    /// limit is indistinguishable from a parent that dropped its own setting on
+    /// a machine where `ulimit -v` happened to be set. The first version of the
+    /// check accepted anything finite and no looser than the budget, and its
+    /// comment claimed it refused ambient limits; it did not, and no test then
+    /// existed that could tell the two apart.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_worker_child_under_someone_elses_ceiling_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memo.m4a");
+        std::fs::write(&path, M4A_FIXTURE).unwrap();
+
+        let executable = resolve_worker_executable()
+            .expect("a worker-capable executable must resolve for the ceiling-provenance test");
+        let mut foreign = crate::bounded_child::BoundedCommand::from_bound_executable(executable)
+            .expect("the worker authority must bind");
+        retain_safe_environment(&mut foreign);
+        foreign.env(WORKER_MARKER, "1");
+        foreign.arg(PROBE_DURATION_ARG).arg("--").arg(&path);
+        // Tighter than the worker budget and still not the worker's own.
+        foreign.address_space_limit(2 * 1024 * 1024 * 1024);
+        let run = crate::bounded_child::run(
+            &mut foreign,
+            None,
+            crate::bounded_child::StdoutTarget::Capture { max_bytes: 128 },
+            crate::bounded_child::ChildBudget {
+                wall_clock: Duration::from_secs(30),
+                stderr_tail: 4 * 1024,
+            },
+        )
+        .expect("a child under a foreign ceiling must still launch");
+        let diagnostic = String::from_utf8_lossy(&run.output.stderr).into_owned();
+        assert_eq!(
+            run.output.status.code(),
+            Some(71),
+            "a ceiling this worker did not install must be refused; got {:?} with stderr \
+             {diagnostic:?}",
+            run.output.status.code()
+        );
+        assert!(
+            diagnostic.contains("address-space ceiling"),
+            "{diagnostic:?}"
         );
     }
 

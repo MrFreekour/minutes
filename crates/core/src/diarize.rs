@@ -490,6 +490,25 @@ fn ffmpeg_preprocess_command(ffmpeg: &Path, input: &str) -> crate::bounded_child
 /// `load_audio` accepts only WAV, so without this a compressed import loses its
 /// speaker labels with no user-visible explanation. The bounded decode worker
 /// already produces exactly the canonical PCM this path needs.
+///
+/// TEST COVERAGE, in one place so the gaps are not spread across comments.
+/// Covered, each verified by applying the mutation alone and watching the named
+/// test fail: the availability check, the config source, the pre-decode
+/// cancellation check and its ORDER against the availability probe, and the call
+/// site in [`preprocess_audio`].
+///
+/// NOT covered, four things, none of which any test here would catch:
+/// 1. the post-decode cancellation check, which needs a cancel to land during a
+///    decode;
+/// 2. the diarization wall clock handed to the child, which needs a decode
+///    slower than a deadline chosen in advance;
+/// 3. the `MAX_DIARIZATION_SAMPLES` cap, which needs an input past two hours;
+/// 4. the zero-remaining guard below, which needs the availability probe's
+///    executable copy to outlast the remaining budget.
+///
+/// All four are races or multi-hour inputs rather than assertions. Listing them
+/// is not a plan to leave them; it is so the next reader does not mistake this
+/// function for fully covered because four of its properties are.
 fn preprocess_compressed_without_ffmpeg(
     audio_path: &Path,
     config: &Config,
@@ -501,18 +520,28 @@ fn preprocess_compressed_without_ffmpeg(
     ),
     String,
 > {
+    // Cancellation is checked before availability, not after. Resolving the
+    // worker executable copies this process's whole image in order to bind it,
+    // so asking whether the fallback is available after the caller has already
+    // given up spends real I/O producing an answer nobody reads. `preprocess_audio`
+    // checks in this order for the same reason.
+    cancellation.check().map_err(|error| error.to_string())?;
     // Use the config the pipeline is running under rather than re-reading from
     // disk, so the diarization decision cannot diverge from the transcription
     // decision for the same file, and so no disk I/O happens inside the worker.
     if !crate::audio_decode_worker::bounded_decode_fallback_available(config) {
         return Err("the bounded decode fallback is unavailable".into());
     }
-    cancellation.check().map_err(|error| error.to_string())?;
     // Preprocessing belongs to the same lease and deadline as decode and
     // inference. Handing the child the 30-minute transcription deadline let it
     // outlive the 15-minute diarization deadline: the parent returned TimedOut,
     // the detached child kept the process-global worker lease, and every later
     // file in the batch failed Busy and shipped unlabeled.
+    //
+    // The zero check is not dead code behind the check above: the availability
+    // probe between them copies the executable, so a budget with little left can
+    // reach here exhausted. Untested, item 4 of the coverage list on this
+    // function.
     let remaining = cancellation.remaining();
     if remaining.is_zero() {
         return Err("diarization deadline elapsed before decoding began".into());
@@ -3948,6 +3977,190 @@ mod tests {
         let python_error = diarize_with_pyannote(synthetic, &cancellation)
             .expect_err("legacy Python must check the shared deadline before child setup");
         assert!(python_error.to_string().contains("deadline exceeded"));
+    }
+
+    /// The same committed AAC/m4a fixture the decode worker's own tests use: a
+    /// one-second mono container of the kind an iPhone voice memo produces.
+    const M4A_FIXTURE: &[u8] = include_bytes!("../resources/decode-fixture-tone.m4a");
+
+    fn m4a_fixture_in(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = directory.path().join("memo.m4a");
+        std::fs::write(&path, M4A_FIXTURE).unwrap();
+        path
+    }
+
+    /// Item 1 of the track-1 remediation list. The diarization fallback was the
+    /// largest fix in `c6badc34` and carried no test at all, so a reviewer
+    /// reverted the config source, the availability check, both cancellation
+    /// checks, the wall clock and the sample cap and watched the suite stay
+    /// green.
+    ///
+    /// Asserting the refusal string exactly is what gives this test its teeth.
+    /// Deleting the availability check sends the same call on into
+    /// `decode_to_private_pcm`, which names the worker or the input in its
+    /// errors, so the mutation cannot produce this string in either
+    /// environment: with a worker binary beside the harness or without one.
+    #[test]
+    fn the_diarization_fallback_refuses_when_the_pipeline_config_disables_it() {
+        let mut config = Config::default();
+        config.transcription.compressed_decode_fallback = false;
+        let directory = tempfile::tempdir().unwrap();
+        let source = m4a_fixture_in(&directory);
+        let cancellation = DiarizationCancellation::new(Duration::from_secs(60));
+
+        let error = preprocess_compressed_without_ffmpeg(&source, &config, &cancellation)
+            .err()
+            .expect("an operator who refused the bundled decoder must not get a decode");
+        assert_eq!(error, "the bounded decode fallback is unavailable");
+    }
+
+    /// The fallback must read the config the pipeline is running under, not
+    /// re-read one from disk, or diarization can decide differently from
+    /// transcription about the same file in the same run.
+    ///
+    /// Proven by making the two disagree: the passed config permits the
+    /// fallback and the config on disk refuses it. Re-reading from disk returns
+    /// the refusal string; using the passed config gets as far as the decoder.
+    #[test]
+    fn the_diarization_fallback_reads_the_pipeline_config_not_the_one_on_disk() {
+        // Deliberately not a silent skip. Without a worker-capable binary the
+        // permitted branch would refuse for an unrelated reason and the
+        // mutation would look green, which is the defect class item 3 of the
+        // same list exists to fix.
+        assert!(
+            crate::audio_decode_worker::bounded_decode_fallback_available(&Config::default()),
+            "this test needs a worker-capable binary beside the harness; build one with \
+             `cargo build -p minutes-cli --no-default-features`"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = m4a_fixture_in(&directory);
+        let config_home = directory.path().join("xdg");
+        std::fs::create_dir_all(config_home.join("minutes")).unwrap();
+        std::fs::write(
+            config_home.join("minutes").join("config.toml"),
+            "[transcription]\ncompressed_decode_fallback = false\n",
+        )
+        .unwrap();
+
+        let _lock = crate::test_home_env_lock();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        assert!(
+            !Config::load().transcription.compressed_decode_fallback,
+            "the config on disk must refuse the fallback for this test to mean anything"
+        );
+        let cancellation = DiarizationCancellation::new(Duration::from_secs(60));
+        let outcome =
+            preprocess_compressed_without_ffmpeg(&source, &Config::default(), &cancellation);
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        let (effective, retained) =
+            outcome.expect("the pipeline's own config permits the fallback, so it must decode");
+        assert!(crate::pipeline::is_reserved_private_audio_path(&effective));
+        drop(retained);
+    }
+
+    /// Cancellation is checked before the fallback touches anything expensive.
+    ///
+    /// Two assertions because the first one alone does not pin what it claims.
+    /// Deleting the pre-decode check leaves the post-decode check reporting the
+    /// SAME string, so a test that only cancels and reads the message passes
+    /// with the check gone - measured, not assumed. Each half below fails on a
+    /// distinct regression:
+    ///
+    /// - refused config plus cancelled pins the ORDER against the availability
+    ///   probe, which resolves the worker executable by copying this process's
+    ///   image and must not run for a caller that has already given up;
+    /// - an input that does not exist pins that no decode was ATTEMPTED, since
+    ///   attempting one reports the missing input instead.
+    ///
+    /// Neither half depends on a worker binary being present: without one the
+    /// mutation reports the availability refusal, which is also not this string.
+    #[test]
+    fn the_diarization_fallback_checks_cancellation_before_touching_the_decoder() {
+        let cancellation = DiarizationCancellation::new(Duration::from_secs(60));
+        cancellation.cancel();
+
+        let mut refused = Config::default();
+        refused.transcription.compressed_decode_fallback = false;
+        let directory = tempfile::tempdir().unwrap();
+        let source = m4a_fixture_in(&directory);
+        let ordering = preprocess_compressed_without_ffmpeg(&source, &refused, &cancellation)
+            .err()
+            .expect("a cancelled diarization must not reach the availability probe");
+        assert_eq!(ordering, "diarization deadline exceeded");
+
+        let absent = directory.path().join("never-written.m4a");
+        let attempted =
+            preprocess_compressed_without_ffmpeg(&absent, &Config::default(), &cancellation)
+                .err()
+                .expect("a cancelled diarization must not start a decode child");
+        assert_eq!(attempted, "diarization deadline exceeded");
+    }
+
+    /// The regression this fallback exists to close, asserted through the
+    /// production entry point rather than the fallback function.
+    ///
+    /// `preprocess_audio` swallows a fallback failure and returns the original
+    /// path, so the only observable difference between "routed to the worker"
+    /// and "never called it" is a successful decode. That is why this uses the
+    /// real fixture and asserts the private WAV, and why it proves ffmpeg is
+    /// genuinely unlaunchable first: the ffmpeg branch returns a private WAV
+    /// too, so without that assertion this would pass on a machine with ffmpeg
+    /// even if the fallback call site were deleted.
+    #[cfg(unix)]
+    #[test]
+    fn compressed_diarization_input_routes_through_the_worker_when_ffmpeg_is_missing() {
+        assert!(
+            crate::audio_decode_worker::bounded_decode_fallback_available(&Config::default()),
+            "this test needs a worker-capable binary beside the harness; build one with \
+             `cargo build -p minutes-cli --no-default-features`"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let source = m4a_fixture_in(&directory);
+        assert!(crate::watch::compressed_audio_requires_ffmpeg(&source));
+
+        let _lock = crate::test_home_env_lock();
+        let previous = std::env::var_os("MINUTES_FFMPEG");
+        std::env::set_var("MINUTES_FFMPEG", directory.path().join("absent-ffmpeg"));
+        let ffmpeg_is_unlaunchable = crate::ffmpeg::resolve_launchable_ffmpeg().is_err();
+        let cancellation = DiarizationCancellation::new(Duration::from_secs(120));
+        let outcome = preprocess_audio(&source, &Config::default(), &cancellation);
+        match previous {
+            Some(value) => std::env::set_var("MINUTES_FFMPEG", value),
+            None => std::env::remove_var("MINUTES_FFMPEG"),
+        }
+        assert!(
+            ffmpeg_is_unlaunchable,
+            "the routing under test only exists when ffmpeg cannot be launched"
+        );
+
+        let (effective, retained) =
+            outcome.expect("preprocessing must not fail when the bundled decoder can run");
+        assert_ne!(
+            effective, source,
+            "returning the original path is exactly the regression: `load_audio` then \
+             refuses the container and the meeting ships with no speaker labels"
+        );
+        assert!(crate::pipeline::is_reserved_private_audio_path(&effective));
+        let retained = retained.expect("the decoded WAV must be retained for the worker");
+        let reader = crate::pipeline::authorized_audio_stdin(&effective)
+            .unwrap()
+            .expect("the decoded WAV capability must resolve");
+        let wav = hound::WavReader::new(reader).expect("the fallback must produce a real WAV");
+        assert_eq!(wav.spec().channels, 1);
+        assert_eq!(wav.spec().sample_rate, 16_000);
+        assert!(
+            (14_000..=18_000).contains(&wav.duration()),
+            "expected roughly one second at 16 kHz, got {}",
+            wav.duration()
+        );
+        drop(wav);
+        drop(retained);
     }
 
     #[test]

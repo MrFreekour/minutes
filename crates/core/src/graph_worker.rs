@@ -795,7 +795,7 @@ fn read_worker_stream(mut input: impl Read) -> Result<WorkerInput, String> {
 }
 
 #[cfg(windows)]
-fn close_inherited_windows_handles_before_authority() -> Result<(), String> {
+pub(crate) fn close_inherited_windows_handles_before_authority() -> Result<(), String> {
     use std::ffi::c_void;
     use std::mem::size_of;
     use windows_sys::Win32::Foundation::{
@@ -914,7 +914,7 @@ fn close_inherited_windows_handles_before_authority() -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn close_inherited_windows_handles_before_authority() -> Result<(), String> {
+pub(crate) fn close_inherited_windows_handles_before_authority() -> Result<(), String> {
     Ok(())
 }
 
