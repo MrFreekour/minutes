@@ -128,7 +128,7 @@ pub enum Confidence {
 }
 
 /// How the attribution was determined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AttributionSource {
     Deterministic,
@@ -139,6 +139,15 @@ pub enum AttributionSource {
     MlBleedDegraded,
     #[serde(rename = "stem-recovery")]
     StemRecovery,
+    /// A provenance label this build does not know, preserved verbatim.
+    ///
+    /// Hand-edited files and `minutes import text` archives are supported
+    /// inputs, so an unrecognized label must not make a meeting unreadable
+    /// (#595). The raw string round-trips untouched rather than being
+    /// normalized away, so provenance survives a rewrite by a command that
+    /// never consumed it.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// A mapping from an anonymous speaker label to a real person.
@@ -3573,6 +3582,53 @@ mod tests {
         assert!(result.contains("[SPEAKER_1 0:00] [beep]"));
         assert!(result.contains("[Mat 0:01] Hello there"));
         assert!(result.contains("[SPEAKER_1 0:02] [typing]"));
+    }
+
+    #[test]
+    fn unknown_attribution_source_parses_and_roundtrips_verbatim() {
+        // #595: `user-confirmed` is not a value Minutes emits, but the schema
+        // doc's L3 label invited it and hand-edited files are a supported input.
+        // An unrecognized provenance label must not make the document
+        // unparseable, and must not be silently normalized on write-back.
+        let yaml =
+            "speaker_label: SPEAKER_1\nname: Alice\nconfidence: high\nsource: user-confirmed\n";
+        let parsed: SpeakerAttribution =
+            serde_yaml::from_str(yaml).expect("an unknown source must not abort the parse");
+
+        assert_eq!(
+            parsed.source,
+            AttributionSource::Unknown("user-confirmed".into())
+        );
+
+        let rewritten = serde_yaml::to_string(&parsed).unwrap();
+        assert!(
+            rewritten.contains("user-confirmed"),
+            "the original label must survive a rewrite, got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("unknown"),
+            "the label must not be normalized away, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn known_attribution_sources_still_parse_strictly() {
+        // The lenient variant must not swallow the real vocabulary.
+        for (raw, expected) in [
+            ("deterministic", AttributionSource::Deterministic),
+            ("llm", AttributionSource::Llm),
+            ("enrollment", AttributionSource::Enrollment),
+            ("manual", AttributionSource::Manual),
+            ("ml-bleed-degraded", AttributionSource::MlBleedDegraded),
+            ("stem-recovery", AttributionSource::StemRecovery),
+        ] {
+            let yaml = format!("speaker_label: S1\nname: A\nconfidence: high\nsource: {raw}\n");
+            let parsed: SpeakerAttribution = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(
+                parsed.source, expected,
+                "{raw} must not fall through to Unknown"
+            );
+        }
     }
 
     #[test]
