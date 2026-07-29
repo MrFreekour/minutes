@@ -51,7 +51,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
-| `4481ce86` | track-2 Option B gate-4 remediation (Codex) — **not yet re-gated** |
+| `efd58224` | track-2 Option B closeout — Codex BLOCK on residuals, execution lens ACCEPT |
+| `4481ce86` | track-2 Option B gate-4 remediation (Codex) |
 | `228d68c3` | track-2 Option B gate-3 remediation — gated BLOCK by Codex |
 | `7aa0d217` | track-2 Option B round-4 coverage — gated REJECT/REJECT/ACCEPT |
 | `8cebbe63` | track-2 Option B round-3 remediation |
@@ -172,7 +173,7 @@ faults, which is this lane's standing failure mode. Worth carrying forward:
   Re-check old mutations after adding new guards; two of the twelve had gone
   stale and would have reported a false pass.
 
-**Next step: gate 5 on `4481ce86`.** Gate 4 was Codex and found two real defects nine Claude lenses missed, so keep alternating models rather than only adding Claude lenses. The residual
+**Next step: track 1.** Track 2 Option B is closed out at `efd58224`: the execution lens returned ACCEPT with no P0, and Codex returns BLOCK only on documented residuals that Option A removes. Whether those residuals are acceptable is Mat s call, not a gating question. Keep alternating models between gates: one Codex pass found two real defects that nine Claude lenses missed, and one Claude execution pass found three that Codex structurally could not. The residual
 heuristic limit is documented at `resolveCorpusRelativeSourcePath` and is
 Option A's to remove.
 

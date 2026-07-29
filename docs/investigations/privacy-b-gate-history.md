@@ -451,3 +451,63 @@ candidate range explicitly.
 
 Candidate is now **4481ce86**. Gates: MCP vitest 273 passed / 1 skipped, tsc,
 build, integration 11/11, check:llms clean, real-log split unchanged at 452/1085.
+
+---
+
+## 2026-07-29 CLOSEOUT on 4481ce86 (two lenses, split by capability)
+
+Deliberately split: Codex re-read cold (it has no stake in prose I had edited
+four times), one Claude agent executed (Codex's sandbox cannot launch processes
+here). Candidate ended at **efd58224**.
+
+**Codex: BLOCK.** It was right that my dispute of its earlier finding was wrong,
+and that is the round's real catch. I had argued `archive/../notes.md`
+normalising to `notes.md` was harmless because the tail "denotes notes.md and
+always did". That holds only if the cancelled component exists, is a directory,
+and is not a symlink. Measured on Linux with real files:
+
+    missing/../board.md   kernel ENOENT    -> denotes nothing
+    afile/../board.md     kernel ENOTDIR   -> denotes nothing
+    alink/../board.md     kernel opens <base>/outside/board.md, OUTSIDE the corpus
+
+`join` cancels all three lexically to `<root>/board.md`. The symlink case
+launders an out-of-corpus file past the active-corpus check. `.` and `..` are now
+refused before normalisation. Fixed at c3c44a30.
+
+Codex also caught three overclaims in my prose, one of which I wrote WHILE
+fixing an overclaim: the scan-window comment said a fixed window means
+"differencing across any pair of requests yields nothing". It closes differencing
+across caller ARGUMENTS only; state differencing (observe, append, observe)
+still works, and the tally is an aggregate restricted count when every record
+resolves. Both now written as accepted leaks rather than absent ones.
+
+Codex still returns BLOCK overall. Its standing objections are recorded, not
+disputed: path-as-identity is not provenance; "otherwise we return 0 of 1537" is
+an availability argument, not an identity one; seq/timestamp and buffering limits
+are accepted rather than closed. All are Option A's scope or explicit product
+acceptances. **Whether documented residuals are acceptable on this surface at all
+is Mat's call, not the lane's.**
+
+**Claude execution lens: ACCEPT, no P0.** It built ~30 single-line mutations
+itself and confirmed all 33 tests added in the range are killed by a mutation
+matching what their name claims. It reproduced the CI-hermeticity result with a
+better control than mine: it verified the network was live from inside the
+scrubbed environment (302 to the releases URL), so a pass could not be confused
+with an environment where the auto-installer simply had no route. Adopt that
+control for future hermeticity checks.
+
+Its three surviving mutations, all closed at efd58224: an untested inclusive
+`since` boundary (`>=` vs `>`, distinguishable only by a record on exact local
+midnight, which neither the suite nor the real log had); an untested middle
+withheld-bucket branch whose conflation my comment located in the wrong function
+(the caller discards the reason, so `source-policy-denied` is never
+distinguishable in output); and an unreachable anchor-position guard whose
+apparent test coverage came from the lexical guard instead.
+
+**Evidence-line precisions worth not repeating.** "452 released / 1085 withheld"
+measures the release HELPER over the whole log; the tool examines only the newest
+500, so a real call reports 300/200. "273 passed / 1 skipped" holds only after
+`npm run build` (271/3 on a clean checkout). "Integration 11/11" needs a built
+`target/debug/minutes` (2 passed / 9 failed without one). And on this corpus
+`include_restricted: true` returns the same split, because nothing here is
+restricted, so the audited override is an unexercised path on Mat's own data.
