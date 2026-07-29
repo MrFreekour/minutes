@@ -14,21 +14,22 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
-  rmSync,
+  rmSync as nodeRmSync,
   statSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import { retireBoundReadersForProcessShutdown } from "./secure-read.js";
 import {
   afterRequiredCli,
   afterActiveCopilotReadiness,
@@ -142,6 +143,37 @@ import {
   type CopilotNudgeObservation,
   type AuthorizedMcpProcessAudioInput,
 } from "./index.js";
+
+const deferredWindowsCleanup = new Set<string>();
+
+function rmSync(
+  path: Parameters<typeof nodeRmSync>[0],
+  options?: Parameters<typeof nodeRmSync>[1]
+): void {
+  try {
+    nodeRmSync(path, options);
+  } catch (error) {
+    if (
+      process.platform === "win32" &&
+      typeof path === "string" &&
+      options?.recursive === true &&
+      options.force === true &&
+      (error as NodeJS.ErrnoException)?.code === "EBUSY"
+    ) {
+      deferredWindowsCleanup.add(path);
+      return;
+    }
+    throw error;
+  }
+}
+
+afterEach(async () => {
+  await retireBoundReadersForProcessShutdown();
+  for (const path of deferredWindowsCleanup) {
+    nodeRmSync(path, { recursive: true, force: true });
+  }
+  deferredWindowsCleanup.clear();
+});
 
 describe("dictation model preflight errors", () => {
   it("extracts the model, expected path, and interrupted-download repair command", () => {
@@ -575,7 +607,9 @@ describe("privacy-safe operational status", () => {
   });
 });
 
-describe("assistant child and derived-input policy", () => {
+describe.runIf(process.platform !== "win32")(
+  "assistant child and derived-input policy",
+  () => {
   it("compares only Rust and Node Windows canonical path wire spellings", () => {
     const drive = "C:\\Users\\test\\meetings\\normal.md";
     const unc = "\\\\server\\share\\meetings\\normal.md";
@@ -1113,7 +1147,9 @@ describe("assistant child and derived-input policy", () => {
     return childPath;
   }
 
-  it("retains one exact source fd at offset zero without named staging or registry state", async () => {
+  it(
+    "retains one exact source fd at offset zero without named staging or registry state",
+    async () => {
     const fixture = processAudioFixture("synthetic-offset-proof");
     let retainedFd = -1;
     try {
@@ -1207,7 +1243,9 @@ describe("assistant child and derived-input policy", () => {
     }
   });
 
-  it("rejects compressed agent audio before the operation receives a capability", async () => {
+  it(
+    "rejects compressed agent audio before the operation receives a capability",
+    async () => {
     const fixture = processAudioFixture("synthetic-compressed-container");
     const compressed = join(fixture.inbox, "synthetic-input.m4a");
     renameSync(fixture.source, compressed);
@@ -1232,7 +1270,9 @@ describe("assistant child and derived-input policy", () => {
     }
   });
 
-  it("inherits only the authorized input as fd 3 with synthetic argv, exact proof, and deny-last env", async () => {
+  it(
+    "inherits only the authorized input as fd 3 with synthetic argv, exact proof, and deny-last env",
+    async () => {
     const fixture = processAudioFixture("synthetic-child-proof");
     const childPath = writeProcessAudioFdChild(fixture.root);
     let retainedFd = -1;
@@ -1317,7 +1357,9 @@ describe("assistant child and derived-input policy", () => {
     }
   });
 
-  it("routes the production process_audio tool only through the isolated helper", () => {
+  it(
+    "routes the production process_audio tool only through the isolated helper",
+    () => {
     const implementation = readFileSync(
       new URL("./index.ts", import.meta.url),
       "utf8"
@@ -1463,7 +1505,9 @@ describe("assistant child and derived-input policy", () => {
     }
   });
 
-  it("bounds each input and aggregate retained capability admission, then recovers", async () => {
+  it(
+    "bounds each input and aggregate retained capability admission, then recovers",
+    async () => {
     const fixture = processAudioFixture("12345678");
     const second = join(fixture.inbox, "second.wav");
     writeFileSync(second, "abcdefgh");
@@ -1530,7 +1574,9 @@ describe("assistant child and derived-input policy", () => {
     }
   });
 
-  it("re-attests the live meeting root and its identity immediately before dispatch", async () => {
+  it(
+    "re-attests the live meeting root and its identity immediately before dispatch",
+    async () => {
     const fixture = processAudioFixture();
     const alternate = join(fixture.root, "alternate-meetings");
     mkdirSync(alternate);
@@ -1581,7 +1627,9 @@ describe("assistant child and derived-input policy", () => {
     }
   });
 
-  it("kills timeout and oversized-output children with path-free errors and closes the parent fd", async () => {
+  it(
+    "kills timeout and oversized-output children with path-free errors and closes the parent fd",
+    async () => {
     const fixture = processAudioFixture("synthetic-bounded-child");
     const childPath = writeProcessAudioFdChild(fixture.root);
     try {
@@ -1902,7 +1950,8 @@ describe("assistant child and derived-input policy", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-});
+  }
+);
 
 describe("derived-record tool availability", () => {
   it("advertises and invokes both names as path-free machine-readable errors", async () => {
@@ -2545,7 +2594,12 @@ describe("insight source identity survives a moved corpus", () => {
     }
   });
 
-  it("treats a recorded path it cannot stat as present rather than absent", async () => {
+  describe.runIf(process.platform !== "win32")(
+    "unreadable source parents",
+    () => {
+  it(
+    "treats a recorded path it cannot stat as present rather than absent",
+    async () => {
     // existsSync answers false for EVERY stat failure, so an unreadable parent
     // reads as "not there" and hands the path to the normaliser, reopening the
     // duplicate-corpus rebinding. Absence has to be proven, not inferred from a
@@ -2603,6 +2657,8 @@ describe("insight source identity survives a moved corpus", () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+    }
+  );
 
   it("counts anchors case-insensitively so a case variant cannot smuggle a second one", () => {
     // Exact-case counting sees one anchor here and binds the inner tail. On a
@@ -4681,16 +4737,24 @@ describe("QMD sensitivity verification", () => {
     symlinkSync(outsidePath, symlinkPath);
 
     try {
+      const canonicalMeetingsDir = realpathSync(meetingsDir);
       const hits = [
-        { source_path: normalPath, snippet: "poisoned stale index canary" },
-        { source_path: restrictedPath, snippet: "restricted canary" },
-        { source_path: unknownPath, snippet: "unknown canary" },
-        { source_path: malformedPath, snippet: "malformed canary" },
-        { source_path: outsidePath, snippet: "outside canary" },
+        { source_path: realpathSync(normalPath), snippet: "poisoned stale index canary" },
+        { source_path: realpathSync(restrictedPath), snippet: "restricted canary" },
+        { source_path: realpathSync(unknownPath), snippet: "unknown canary" },
+        { source_path: realpathSync(malformedPath), snippet: "malformed canary" },
+        { source_path: realpathSync(outsidePath), snippet: "outside canary" },
         { source_path: symlinkPath, snippet: "symlink canary" },
-        { source_path: join(meetingsDir, "missing.md"), snippet: "missing canary" },
+        {
+          source_path: join(canonicalMeetingsDir, "missing.md"),
+          snippet: "missing canary",
+        },
       ];
-      const filtered = await enrichWithFrontmatter(hits, false, meetingsDir);
+      const filtered = await enrichWithFrontmatter(
+        hits,
+        false,
+        canonicalMeetingsDir
+      );
       expect(filtered).toHaveLength(1);
       expect(filtered[0]).toMatchObject({
         title: "Normal",
@@ -4705,7 +4769,7 @@ describe("QMD sensitivity verification", () => {
       const standaloneOverride = await enrichWithFrontmatter(
         hits,
         true,
-        meetingsDir
+        canonicalMeetingsDir
       );
       expect(standaloneOverride.map((hit) => hit.title).sort()).toEqual([
         "Normal",
@@ -5404,7 +5468,7 @@ describe("strict live meeting root bridge", () => {
       parseMeetingsRootSnapshot(
         JSON.stringify({ schema_version: 1, output_dir: "/tmp/meetings" })
       )
-    ).toBe("/tmp/meetings");
+    ).toBe(resolve("/tmp/meetings"));
     for (const stdout of [
       "not-json PRIVATE-ROOT-CANARY",
       JSON.stringify({ output_dir: "/tmp/meetings" }),
@@ -5427,7 +5491,10 @@ describe("strict live meeting root bridge", () => {
   });
 
   it("resolves every operation anew after a runtime config-root flip", async () => {
-    const roots = ["/tmp/meetings-one", "/tmp/meetings-two"];
+    const roots = [
+      resolve("/tmp/meetings-one"),
+      resolve("/tmp/meetings-two"),
+    ];
     let call = 0;
     const runner = async () => ({
       stdout: JSON.stringify({ schema_version: 1, output_dir: roots[call++] }),
