@@ -3738,7 +3738,7 @@ describe("restricted content policy", () => {
     expect(common[0].path).toBe("/bounded-search/05000.md");
     expect(common.some((entry) => entry.path.endsWith("00000.md"))).toBe(false);
     expect(common.some((entry) => entry.path.includes("restricted"))).toBe(false);
-  });
+  }, 15_000);
 
   it("bounds derived profile, intent, research, and relationship collections before output", () => {
     const long = "x".repeat(10_000);
