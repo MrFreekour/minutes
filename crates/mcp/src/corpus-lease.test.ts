@@ -681,6 +681,61 @@ describe("stable corpus lease", () => {
     });
   });
 
+  it("accepts a bounded retry whose earlier attempt produced no snapshot", async () => {
+    await withCorpus(async (root) => {
+      const fixture = join(root, "skipped-attempt-worker.mjs");
+      writeFileSync(
+        fixture,
+        `import { createInterface } from "node:readline";\n` +
+          `const lines = createInterface({ input: process.stdin });\n` +
+          `let state = 0;\n` +
+          `const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");\n` +
+          `lines.on("line", (line) => {\n` +
+          `  const message = JSON.parse(line);\n` +
+          `  if (state === 0 && message.type === "begin") {\n` +
+          `    state = 1;\n` +
+          `    send({ type: "phase", name: "onWatcherReady", attempt: 2 });\n` +
+          `  } else if (state === 1 && message.type === "phase-result") {\n` +
+          `    state = 2;\n` +
+          `    send({ type: "snapshot-start", attempt: 2, canonicalRoot: "/synthetic", fileCount: 0 });\n` +
+          `  } else if (state === 2 && message.type === "stream-ack") {\n` +
+          `    state = 3;\n` +
+          `    send({ type: "snapshot-end" });\n` +
+          `  } else if (state === 3 && message.type === "finalize") {\n` +
+          `    state = 4;\n` +
+          `    send({ type: "authorized" });\n` +
+          `  } else if (state === 4 && message.type === "acknowledged") {\n` +
+          `    process.exit(0);\n` +
+          `  } else {\n` +
+          `    process.exit(70);\n` +
+          `  }\n` +
+          `});\n`
+      );
+      let phaseCalls = 0;
+      let operationCalls = 0;
+      await expect(
+        withStableCorpusLease(
+          root,
+          (_snapshot, attempt) => {
+            operationCalls += 1;
+            expect(attempt).toBe(2);
+            return "authorized retry";
+          },
+          {
+            timeoutMs: 1_000,
+            workerScriptForTest: fixture,
+            onWatcherReady: ({ attempt }) => {
+              phaseCalls += 1;
+              expect(attempt).toBe(2);
+            },
+          }
+        )
+      ).resolves.toBe("authorized retry");
+      expect(phaseCalls).toBe(1);
+      expect(operationCalls).toBe(1);
+    });
+  });
+
   it("charges paced protocol transients against global memory admission", async () => {
     await withCorpus(async (root) => {
       let release!: () => void;

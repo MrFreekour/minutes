@@ -1758,6 +1758,10 @@ export async function withStableCorpusLease<T>(
   let operationActive = false;
   let operationTermination: Promise<void> = Promise.resolve();
   let lastAttempt = 0;
+  // A watched attempt may fail before it reaches snapshot streaming. Track
+  // every visible retry so protocol attempts stay bounded and monotonic
+  // without requiring those pre-snapshot failures to fabricate a snapshot.
+  let lastObservedAttempt = 0;
   let authorized = false;
   let settled = false;
   let terminated = false;
@@ -1850,13 +1854,14 @@ export async function withStableCorpusLease<T>(
             stream ||
             authorized ||
             !Number.isSafeInteger(attempt) ||
-            attempt < Math.max(1, lastAttempt) ||
-            attempt > lastAttempt + 1 ||
+            attempt < Math.max(1, lastAttempt, lastObservedAttempt) ||
+            attempt > MAX_AUTHORIZATION_ATTEMPTS ||
             typeof hook !== "function"
           ) {
             fail("meeting corpus worker phase protocol was invalid");
             return;
           }
+          lastObservedAttempt = attempt;
           const commands: WorkerControlCommand[] = [];
           const context: any = {
             attempt,
@@ -1898,7 +1903,9 @@ export async function withStableCorpusLease<T>(
             authorized ||
             !operationCompleted && lastAttempt > 0 ||
             !Number.isSafeInteger(attempt) ||
-            attempt !== lastAttempt + 1 ||
+            attempt <= lastAttempt ||
+            attempt < lastObservedAttempt ||
+            attempt > MAX_AUTHORIZATION_ATTEMPTS ||
             typeof message.canonicalRoot !== "string" ||
             !Number.isSafeInteger(fileCount) ||
             fileCount < 0 ||
@@ -1913,6 +1920,7 @@ export async function withStableCorpusLease<T>(
             return;
           }
           lastAttempt = attempt;
+          lastObservedAttempt = attempt;
           operationCompleted = false;
           stream = {
             attempt,
