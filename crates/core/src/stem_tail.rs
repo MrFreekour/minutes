@@ -18,14 +18,12 @@
 //! - Reads land mid-frame. A poll can stop partway through a sample or a frame,
 //!   so leftover bytes carry into the next poll rather than being dropped.
 
-// Wired into the native call-recording path in the follow-up commit on this
-// branch. Kept separate so the decode/tailing logic lands with its own tests
-// rather than inside a larger desktop change.
-#![allow(dead_code)]
-
+use crate::config::Config;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Sample rate the live sidecar consumes.
 const TARGET_RATE: u32 = 16_000;
@@ -227,6 +225,152 @@ fn parse_header(bytes: &[u8]) -> Result<(StemFormat, u64), String> {
     Err("no data chunk in header window".into())
 }
 
+/// How often to check the stems for newly written audio.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long to keep waiting for a stem's header to appear before giving up.
+///
+/// The helper creates the files and writes headers within moments of starting,
+/// so this only has to outlast process startup.
+const HEADER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Feed the live-transcription sidecar from native call-capture stems.
+///
+/// Native capture writes audio to WAV stems rather than handing samples to the
+/// recording path, so the sidecar had no source and live consumers received
+/// nothing during a call (#576). This tails those stems and forwards the audio,
+/// which needs no change to the Swift helper.
+///
+/// Returns the sidecar's join handle when live transcription is available, and
+/// `None` when the build lacks the whisper/streaming features or the sidecar
+/// could not start.
+///
+/// **Failure-isolated by construction.** Everything here runs on its own thread
+/// and only ever reads the stems. A stem that never appears, a malformed
+/// header, or a read error ends this thread quietly; recording and stem
+/// preservation continue regardless. That is the capture-reliability invariant:
+/// an optional consumer must never be able to degrade capture.
+pub fn spawn_live_transcription_from_stems(
+    voice_stem: PathBuf,
+    system_stem: Option<PathBuf>,
+    config: &Config,
+    stop_flag: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let (live_tx, sidecar_handle) = crate::capture::start_live_sidecar(config, &stop_flag);
+    let live_tx = live_tx?;
+
+    let feeder = std::thread::Builder::new()
+        .name("stem-tail-feeder".into())
+        .spawn(move || {
+            feed_from_stems(voice_stem, system_stem, &live_tx, &stop_flag);
+            // Dropping the sender closes the channel so the sidecar finalizes
+            // rather than waiting on a producer that is gone.
+            drop(live_tx);
+        });
+
+    match feeder {
+        Ok(_) => sidecar_handle,
+        Err(error) => {
+            tracing::warn!(%error, "could not start stem tail feeder; live transcript unavailable");
+            sidecar_handle
+        }
+    }
+}
+
+/// Open both stems, then forward mixed audio until asked to stop.
+fn feed_from_stems(
+    voice_stem: PathBuf,
+    system_stem: Option<PathBuf>,
+    live_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
+    stop_flag: &Arc<AtomicBool>,
+) {
+    let Some(mut voice) = wait_for_stem(&voice_stem, stop_flag) else {
+        return;
+    };
+    let mut system = system_stem
+        .as_deref()
+        .and_then(|path| wait_for_stem(path, stop_flag));
+
+    // Per-stem residue: the stems advance independently, so each round mixes the
+    // overlapping prefix and keeps the rest for the next one.
+    let mut voice_pending: Vec<f32> = Vec::new();
+    let mut system_pending: Vec<f32> = Vec::new();
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        match voice.poll() {
+            Ok(samples) => voice_pending.extend_from_slice(&samples),
+            Err(error) => tracing::debug!(%error, "voice stem poll failed; continuing"),
+        }
+        if let Some(system) = system.as_mut() {
+            match system.poll() {
+                Ok(samples) => system_pending.extend_from_slice(&samples),
+                Err(error) => tracing::debug!(%error, "system stem poll failed; continuing"),
+            }
+        }
+
+        let chunk = take_mixed(&mut voice_pending, &mut system_pending, system.is_some());
+        if !chunk.is_empty() && live_tx.send(chunk).is_err() {
+            // The sidecar is gone; nothing left to feed.
+            return;
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Final sweep so the tail of the call is not lost to the stop race.
+    if let Ok(samples) = voice.poll() {
+        voice_pending.extend_from_slice(&samples);
+    }
+    if let Some(system) = system.as_mut() {
+        if let Ok(samples) = system.poll() {
+            system_pending.extend_from_slice(&samples);
+        }
+    }
+    let tail = take_mixed(&mut voice_pending, &mut system_pending, system.is_some());
+    if !tail.is_empty() {
+        let _ = live_tx.send(tail);
+    }
+}
+
+/// Mix the overlapping prefix of both stems, leaving any surplus buffered.
+///
+/// With no system stem the voice audio passes through untouched. Sums are
+/// clamped rather than scaled so a quiet side is not attenuated by a loud one.
+fn take_mixed(voice: &mut Vec<f32>, system: &mut Vec<f32>, has_system: bool) -> Vec<f32> {
+    if !has_system {
+        return std::mem::take(voice);
+    }
+    let n = voice.len().min(system.len());
+    if n == 0 {
+        return Vec::new();
+    }
+    let mixed: Vec<f32> = voice
+        .drain(..n)
+        .zip(system.drain(..n))
+        .map(|(a, b)| (a + b).clamp(-1.0, 1.0))
+        .collect();
+    mixed
+}
+
+/// Wait for a stem to exist and carry a parseable header.
+fn wait_for_stem(path: &Path, stop_flag: &Arc<AtomicBool>) -> Option<StemTail> {
+    let deadline = std::time::Instant::now() + HEADER_WAIT;
+    while std::time::Instant::now() < deadline {
+        if stop_flag.load(Ordering::Relaxed) {
+            return None;
+        }
+        match StemTail::open(path) {
+            Ok(tail) => return Some(tail),
+            Err(_) => std::thread::sleep(POLL_INTERVAL),
+        }
+    }
+    tracing::warn!(
+        stem = %path.display(),
+        "stem header never appeared; live transcript will not run for this capture"
+    );
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +505,56 @@ mod tests {
         let out = tail.poll().unwrap();
         assert_eq!(out.len(), 1);
         assert!((out[0] - 0.5).abs() < 1e-3, "got {out:?}");
+    }
+
+    #[test]
+    fn mixing_waits_for_both_stems_and_buffers_the_surplus() {
+        // The stems advance independently, so a round must mix only what both
+        // have and keep the rest rather than emitting unaligned audio.
+        let mut voice = vec![0.1, 0.2, 0.3];
+        let mut system = vec![0.4];
+
+        let mixed = take_mixed(&mut voice, &mut system, true);
+        assert_eq!(mixed.len(), 1, "only the overlapping prefix is emitted");
+        assert!((mixed[0] - 0.5).abs() < 1e-6);
+        assert_eq!(voice.len(), 2, "unmatched voice audio stays buffered");
+        assert!(system.is_empty());
+    }
+
+    #[test]
+    fn mixing_passes_voice_through_when_there_is_no_system_stem() {
+        let mut voice = vec![0.1, 0.2];
+        let mut system = Vec::new();
+        let out = take_mixed(&mut voice, &mut system, false);
+        assert_eq!(out, vec![0.1, 0.2]);
+        assert!(voice.is_empty(), "everything is consumed");
+    }
+
+    #[test]
+    fn mixing_clamps_instead_of_wrapping() {
+        // Two loud sides must not produce out-of-range samples.
+        let mut voice = vec![0.9];
+        let mut system = vec![0.9];
+        let out = take_mixed(&mut voice, &mut system, true);
+        assert_eq!(out, vec![1.0]);
+    }
+
+    #[test]
+    fn waiting_for_a_stem_gives_up_when_asked_to_stop() {
+        // Failure isolation: a capture that stops before the helper writes a
+        // header must not leave this thread parked for the full timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created.wav");
+        let stop = Arc::new(AtomicBool::new(true));
+
+        let start = std::time::Instant::now();
+        let result = wait_for_stem(&missing, &stop);
+        assert!(result.is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "should observe the stop flag immediately, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

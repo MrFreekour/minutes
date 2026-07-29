@@ -3219,6 +3219,18 @@ fn rescue_paired_stems(original: &std::path::Path, dest_dir: &Path, new_basename
     }
 }
 
+/// Signals the stem-tail feeder to stop when native recording ends.
+///
+/// `start_native_call_recording` returns from several branches, so a drop guard
+/// is more reliable than setting the flag at each one (#576).
+struct LiveTranscriptStopGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for LiveTranscriptStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn start_native_call_recording(
@@ -3297,14 +3309,57 @@ fn start_native_call_recording(
     crate::sync_tray_state(app_handle);
     minutes_core::notes::save_recording_start().ok();
     maybe_save_and_show_recording_consent(app_handle, mode, config);
+    // Native capture writes audio to per-source stems instead of handing samples
+    // to the recording path, so the live sidecar had no source and live
+    // consumers received nothing during a call (#576). Tail the stems and feed
+    // them in. The stem names are derived the same way the recovery path derives
+    // them, since the files may not exist yet at this point.
+    //
+    // Failure-isolated: this runs on its own thread and only reads the stems, so
+    // a stem that never appears or a read error cannot degrade capture.
+    let live_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Stop the feeder on every exit from this function, including the early
+    // returns in the capture-failure branches below, so a finished recording
+    // never leaves a thread polling the stems.
+    let _live_stop_guard = LiveTranscriptStopGuard(std::sync::Arc::clone(&live_stop));
+    let live_transcript_started = {
+        let base = output_path.with_extension("");
+        let stem_name = base
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let parent = output_path.parent().map(|dir| dir.to_path_buf());
+        match parent {
+            Some(parent) if !stem_name.is_empty() => {
+                let voice = parent.join(format!("{stem_name}.voice.wav"));
+                let system = parent.join(format!("{stem_name}.system.wav"));
+                minutes_core::stem_tail::spawn_live_transcription_from_stems(
+                    voice,
+                    Some(system),
+                    config,
+                    std::sync::Arc::clone(&live_stop),
+                )
+                .is_some()
+            }
+            _ => false,
+        }
+    };
+
+    let mut capabilities = vec![
+        "native-call.capture".to_string(),
+        "screen-capture-kit".to_string(),
+        format!("mode.{}", mode.noun().replace(' ', "-")),
+    ];
+    if live_transcript_started {
+        // Only advertised when the sidecar actually started, so consumers can
+        // trust the capability rather than attaching to a silent stream.
+        capabilities.push("live.utterance.final".to_string());
+    }
     minutes_core::events::append_event(minutes_core::events::recording_started_event(
         context_session_id.clone(),
         "capture",
-        [
-            "native-call.capture".to_string(),
-            "screen-capture-kit".to_string(),
-            format!("mode.{}", mode.noun().replace(' ', "-")),
-        ],
+        capabilities,
     ));
 
     eprintln!(

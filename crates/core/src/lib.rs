@@ -70,7 +70,7 @@ pub mod sensitive;
 pub mod sherpa_engine;
 pub(crate) mod stem_probe;
 /// Incremental reader for stems that are still being written (#576).
-pub(crate) mod stem_tail;
+pub mod stem_tail;
 #[cfg(feature = "streaming-diarize")]
 pub mod streaming_diarize;
 pub mod summarize;
