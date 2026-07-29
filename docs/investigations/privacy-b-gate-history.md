@@ -393,3 +393,61 @@ NEXT: gate 4 on 228d68c3. Three rounds have now run; every round found real
 problems and the trend is that they are shrinking and moving from code into
 prose. A fresh context should run it, since the author cannot review his own
 prose for the fourth time with fresh eyes.
+
+---
+
+## 2026-07-29 GATE 4 on 228d68c3, run by Codex (cross-model)
+
+Run via the `/codex` skill, `codex exec` adversarial mode, gpt-5.x through
+codex-cli 0.145.0. Chosen over more Claude subagents because the surviving
+findings in rounds 1-3 were prose I had written and re-edited, and the author is
+the worst available reviewer of his own prose. Verdict: BLOCK with findings.
+Remediated at 4481ce86.
+
+**Two real defects, both missed by all nine prior Claude lens-reviews.**
+
+1. `.trim()` on the recorded source pointer could rebind one real file to
+   another. Leading and trailing whitespace is legal in POSIX and macOS
+   filenames, so with both `<root>/notes.md ` and `<root>/notes.md` present, a
+   record naming the first resolved to the second. Different meeting, different
+   policy. Verified locally against real files before fixing. Trimming is now
+   only an emptiness probe; any other change refuses the value.
+2. The empty-result message claimed something the code never evaluated. Filters
+   run only over records that already survived policy, so when everything was
+   withheld the filter was never tested, yet the reply said "No meeting insights
+   matched the filter criteria." Now says no RELEASABLE insights matched, and
+   that withheld records are not filter-tested. The capped note had the same
+   defect.
+
+**Two false comments, both mine.** The resolver claimed `..` and inactive dirs
+were "rejected before any filesystem access"; they are normalised away by `join`
+first, so `archive/../notes.md` resolves to `notes.md`. Measured. The outcome is
+correct (that tail denotes `notes.md`, and the control `archive/notes.md` still
+withholds), so it was a comment defect, not a leak. The Windows-to-POSIX note
+said the candidate "simply does not exist"; backslash and colon are legal POSIX
+filename characters, so it is a real path that withholds only because nothing is
+there.
+
+**Recorded, not fixed.** A path is a mutable locator, not an identity: replace
+the recorded file, or retarget a symlink, and the re-read validates the
+replacement and releases the old record under the new file's policy. Relative
+recorded values are accepted although the pipeline only writes absolute ones.
+Both fail toward releasing and are exactly what Option A removes; both are now
+written at the function. Codex also showed the withheld tally is an aggregate
+restricted-count in a healthy corpus and is differenceable across corpus
+CHANGES (observe, append a record, observe again) even though it is not
+differenceable across caller arguments. That angle is new; removing counts is
+the only complete fix and would cost the partial-view contract.
+
+**Method note.** Codex could not execute anything here: its sandbox fails before
+process launch (`bwrap: loopback: Failed RTM_NEWADDR`). It correctly refused to
+invent findings and asked for the diff, which was pasted inline. So this was a
+pure code-reading review, weaker than the Claude gates that could run tests and
+mutations, and stronger exactly where those were weakest. Every acted-on finding
+was re-verified locally before any change. Note also that `codex review --base`
+no longer accepts a prompt argument in codex-cli 0.145.0, and that the default
+base would have handed it the whole epic (88k insertions); scope to the
+candidate range explicitly.
+
+Candidate is now **4481ce86**. Gates: MCP vitest 273 passed / 1 skipped, tsc,
+build, integration 11/11, check:llms clean, real-log split unchanged at 452/1085.

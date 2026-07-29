@@ -51,7 +51,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
-| `228d68c3` | track-2 Option B gate-3 remediation — **not yet re-gated** |
+| `4481ce86` | track-2 Option B gate-4 remediation (Codex) — **not yet re-gated** |
+| `228d68c3` | track-2 Option B gate-3 remediation — gated BLOCK by Codex |
 | `7aa0d217` | track-2 Option B round-4 coverage — gated REJECT/REJECT/ACCEPT |
 | `8cebbe63` | track-2 Option B round-3 remediation |
 | `b341876a` | track-2 Option B round-2 — REJECTED 2/3 (P0s fixed by `8cebbe63`) |
@@ -171,7 +172,7 @@ faults, which is this lane's standing failure mode. Worth carrying forward:
   Re-check old mutations after adding new guards; two of the twelve had gone
   stale and would have reported a false pass.
 
-**Next step: gate 4 on `228d68c3`, run from a fresh context.** The residual
+**Next step: gate 5 on `4481ce86`.** Gate 4 was Codex and found two real defects nine Claude lenses missed, so keep alternating models rather than only adding Claude lenses. The residual
 heuristic limit is documented at `resolveCorpusRelativeSourcePath` and is
 Option A's to remove.
 
