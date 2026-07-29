@@ -2,6 +2,12 @@ name: Release Windows Desktop
 
 on:
   workflow_dispatch:
+    inputs:
+      validation_only:
+        description: "Run only the Windows Job memory-enforcement regression"
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -14,8 +20,29 @@ env:
   TAURI_CLI_VERSION: "2.10.1"
 
 jobs:
+  windows_job_memory_validation:
+    name: Validate Windows Job memory enforcement
+    if: github.event_name == 'workflow_dispatch' && inputs.validation_only
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Execute focused Job Object regression
+        run: >-
+          cargo test -p minutes-core --no-default-features --lib
+          bounded_child::windows_tests::windows_job_memory_limit_refuses_committed_memory_over_budget
+          -- --exact --nocapture --test-threads=1
+
   release_readiness:
     name: Release readiness
+    if: github.event_name != 'workflow_dispatch' || !inputs.validation_only
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
