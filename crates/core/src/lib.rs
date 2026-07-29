@@ -69,6 +69,8 @@ pub mod sensitive;
 // can install models without the engine. Only `transcribe_samples` is gated.
 pub mod sherpa_engine;
 pub(crate) mod stem_probe;
+/// Incremental reader for stems that are still being written (#576).
+pub(crate) mod stem_tail;
 #[cfg(feature = "streaming-diarize")]
 pub mod streaming_diarize;
 pub mod summarize;
