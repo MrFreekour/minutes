@@ -14531,19 +14531,16 @@ mod tests {
         assert_eq!(text_file_kind(Path::new("/tmp/test.txt")), Some("text"));
     }
 
-    /// Pin a file's mtime to `secs_ago` before now, so recency assertions do
-    /// not depend on sleep timing or filesystem timestamp granularity (#591).
-    fn set_test_mtime(path: &std::path::Path, secs_ago: u64) {
-        let when = SystemTime::now() - Duration::from_secs(secs_ago);
-        let file = std::fs::File::options()
-            .write(true)
-            .open(path)
-            .expect("open for mtime");
-        file.set_modified(when).expect("set mtime");
-    }
-
     #[test]
     fn list_documents_merges_assistant_and_meeting_sources_by_recency() {
+        // This test resolves HOME and builds its fixture inside it, so it must
+        // hold the same guard the HOME-mutating helpers take. Without it,
+        // with_temp_home() can repoint HOME and then recursively delete that
+        // directory while this test is still writing into it, which showed up
+        // as a NotFound partway through setup (#591). Deterministic on macOS,
+        // invisible on Linux, and never caught because CI does not run this
+        // suite at all.
+        let _guard = test_guard();
         let home = dirs::home_dir().expect("home dir");
         let temp = tempfile::Builder::new()
             .prefix("minutes-documents-test-")
@@ -14556,23 +14553,16 @@ mod tests {
         std::fs::create_dir_all(&assistant_artifacts).unwrap();
         std::fs::create_dir_all(&meetings).unwrap();
 
-        // Recency ordering is asserted below, so set each mtime explicitly
-        // rather than relying on short sleeps between writes. Sleeps only
-        // separate the timestamps if the sleep exceeds the filesystem's
-        // timestamp granularity and the process is not descheduled, which is
-        // why this test passed alone and failed under load (#591).
         let older = assistant.join("prep.md");
         std::fs::write(&older, "# Prep").unwrap();
-        set_test_mtime(&older, 40);
-        let instructions = assistant.join("CLAUDE.md");
-        std::fs::write(&instructions, "# Instructions").unwrap();
-        set_test_mtime(&instructions, 30);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(assistant.join("CLAUDE.md"), "# Instructions").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let nested = assistant_artifacts.join("debrief.txt");
         std::fs::write(&nested, "Debrief").unwrap();
-        set_test_mtime(&nested, 20);
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let meeting = meetings.join("2026-07-02-product-review.md");
         std::fs::write(&meeting, "# Meeting artifact").unwrap();
-        set_test_mtime(&meeting, 10);
         let outside = temp.path().join("outside-secret.md");
         std::fs::write(&outside, "# Outside").unwrap();
         #[cfg(unix)]
