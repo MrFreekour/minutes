@@ -2631,6 +2631,76 @@ mod windows_tests {
         panic!("supervised Windows descendant {pid} survived Job Object retirement");
     }
 
+    /// Prove the configured Windows Job Object limits committed memory at
+    /// runtime, rather than only asserting the command builder carries a
+    /// number.
+    ///
+    /// The unbounded control is load-bearing: without it, an unrelated
+    /// PowerShell allocation failure would look like enforcement. The same
+    /// 512 MiB allocation must first succeed outside the Job memory ceiling,
+    /// then fail with `OutOfMemoryException` under a 384 MiB process+job limit.
+    #[test]
+    fn windows_job_memory_limit_refuses_committed_memory_over_budget() {
+        const MIB: u64 = 1024 * 1024;
+        const LIMIT_BYTES: u64 = 384 * MIB;
+        const ALLOCATION_BYTES: u64 = 512 * MIB;
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             [Console]::Out.Write('started|'); \
+             try {{ \
+                 $bytes = [byte[]]::new({ALLOCATION_BYTES}); \
+                 [Console]::Out.Write('allocated'); \
+                 exit 91; \
+             }} catch {{ \
+                 $base = $_.Exception.GetBaseException(); \
+                 if ($base -is [System.OutOfMemoryException]) {{ \
+                     [Console]::Out.Write('refused'); \
+                     exit 0; \
+                 }} \
+                 [Console]::Error.Write($base.GetType().FullName + ': ' + $base.Message); \
+                 exit 92; \
+             }}"
+        );
+
+        let control = run(
+            &mut powershell(&script),
+            None,
+            StdoutTarget::Capture { max_bytes: 1024 },
+            budget(15_000),
+        )
+        .expect("the unbounded allocation control must launch");
+        assert!(!control.timed_out);
+        assert_eq!(
+            control.output.status.code(),
+            Some(91),
+            "the unbounded control must reach its intentional success exit"
+        );
+        assert_eq!(
+            control.output.stdout, b"started|allocated",
+            "the allocation must be viable before attributing refusal to the Job limit"
+        );
+
+        let mut bounded = powershell(&script);
+        bounded.address_space_limit(LIMIT_BYTES).single_process();
+        let limited = run(
+            &mut bounded,
+            None,
+            StdoutTarget::Capture { max_bytes: 1024 },
+            budget(15_000),
+        )
+        .expect("the memory-limited allocation must launch");
+        assert!(!limited.timed_out);
+        assert_eq!(
+            limited.output.status.code(),
+            Some(0),
+            "the limited child must catch the Job-enforced allocation refusal"
+        );
+        assert_eq!(
+            limited.output.stdout, b"started|refused",
+            "the child must start inside the Job and refuse only the over-budget allocation"
+        );
+    }
+
     #[test]
     fn timeout_kills_windows_child_and_grandchild_tree() {
         let directory = tempfile::TempDir::new().unwrap();
