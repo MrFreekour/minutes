@@ -1,4 +1,4 @@
-# Privacy-B lane handoff (refreshed 2026-07-26)
+# Privacy-B lane handoff (refreshed 2026-07-29)
 
 You are taking over the **conversation-trust privacy epic, Slice B integration**
 lane. The previous lane ran to ~723k context and was retired deliberately; this
@@ -132,10 +132,15 @@ Known and unfixed, deliberately carried rather than dropped:
   decode). On macOS/Windows that is real temp-dir I/O per file. It is also why
   cancellation is now checked before it, and why the zero-remaining guard after
   it is reachable at all.
-- Three tests pollute process-global env: two set `MINUTES_FFMPEG` and one sets
-  `XDG_CONFIG_HOME`. All take `test_home_env_lock()` and restore before
-  asserting, but the documented dev command in CLAUDE.md is still red without
-  `--test-threads=1`. CI passes only because it uses that flag.
+- **At least six tests set `MINUTES_FFMPEG`** (in `watch.rs` x2, `health.rs`,
+  `audio_decode_worker.rs`, `diarize.rs`) and one sets `XDG_CONFIG_HOME`. An
+  earlier version of this bullet said three, and said they all use the same
+  mechanism; they do not. Some capture-and-restore by hand under
+  `test_home_env_lock()`, and an RAII `EnvVarGuard` already exists TWICE in this
+  crate's test code (`watch.rs` and `pipeline.rs`) - worth knowing before writing
+  a third by hand, since a comment in `diarize.rs` reads as though none exists.
+  The documented dev command in CLAUDE.md is still red without
+  `--test-threads=1`; CI passes only because it uses that flag.
 - `verify()` re-hashes the retained descriptor while `execve` resolves the
   pathname, so a `rename()` over the snapshot defeats it on macOS. Linux is
   immune (sealed memfd); Windows incidentally so (share mode). The digest

@@ -677,6 +677,11 @@ impl BoundedCommand {
     /// need this boundary must additionally retire inherited HANDLEs inside an
     /// immutable trusted worker before reading any authority; graph_worker does
     /// so as its first operation.
+    ///
+    /// `audio_decode_worker` is a KNOWN EXCEPTION to that "must": it calls this
+    /// and deliberately does not retire handles on Windows. The reasoning lives
+    /// at its `maybe_run_audio_decode_worker`, and it is noted here so a reader
+    /// of this contract does not conclude every caller satisfies it.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn close_extra_descriptors(&mut self) -> &mut Self {
         self.close_extra_descriptors = true;
@@ -2421,7 +2426,10 @@ mod tests {
     /// launched there. Darwin permits exactly that, measured on macOS 26.6.
     ///
     /// It constructs no `BoundExecutable` and no `BoundedCommand`: it execs a
-    /// plain script, so no production mutation can fail it. It is a canary for
+    /// plain script, so no production mutation can fail it. Note also that the
+    /// write-rule half is asserted on Linux and macOS only; on any other Unix
+    /// this test compiles and asserts nothing about it, and only the universal
+    /// second half, that a sealed snapshot execs once no writer is live, runs. It is a canary for
     /// the platform rule the snapshot design rests on, not coverage OF the
     /// snapshot. The separate Darwin measurement that descriptor execution of an
     /// unlinked inode fails EACCES is recorded at `launch_path`; nothing here

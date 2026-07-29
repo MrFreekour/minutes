@@ -540,6 +540,9 @@ the same day:
    worker budget exactly, which is what makes it a provenance check. There is now
    a test that launches a child under a foreign 2 GiB ceiling and requires
    refusal; under the looser form that child exits 0.
+   **[SUPERSEDED by the 2026-07-29 gate-3 entry: "which is what makes it a
+   provenance check" was itself an overclaim. It compares two numbers to a
+   constant; a foreign launcher setting exactly that value is accepted.]**
 2. The uncovered list said three items and omitted the zero-remaining guard
    (Codex). It says four, at the function, in one place.
 3. "canary-tested through graph_worker on Windows CI" was false (Claude lens).
@@ -590,6 +593,8 @@ WINDOWS, CHECKED BEFORE IMPLEMENTED, which was Codex's advice and was right.
 passes it to CreateProcessW at line 417; nothing in this crate calls the setter
 that would change it. Both reviewers confirmed it independently. So the sweep is
 load-bearing rather than theatre, and the decode child now calls it.
+**[SUPERSEDED by the 2026-07-29 gate-2 entry: the call was backed out. The
+sweep's load-bearing-ness stands; "the decode child now calls it" does not.]**
 
 TWO TECHNIQUES WORTH REUSING:
 - Type-check a platform-gated test by temporarily widening its cfg, compiling,

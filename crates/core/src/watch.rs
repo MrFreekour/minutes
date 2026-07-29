@@ -928,15 +928,43 @@ pub fn compressed_audio_decodable_with(
 ///
 /// This must stay true in BOTH states that reach it, which the previous wording
 /// did not. It told every affected user to "re-enable the bundled decoder",
-/// advice that is useless in the commonest case: the bundled decoder is enabled
+/// advice that is useless in that case: the bundled decoder is enabled
 /// by default, and it has no Opus or ALAC decoder, so Opus-in-WebM (browser and
 /// Meet recordings), Opus-in-OGG (WhatsApp and Telegram voice notes) and
 /// ALAC-in-m4a fail with an unsupported-codec exit while the setting the
 /// message named was already `true`. Naming the codecs that genuinely require
 /// ffmpeg is what makes it actionable, and it is the same thing
 /// `health::ffmpeg_status` reports, so the two surfaces agree.
+/// The single sentence both user-facing surfaces must carry about what the
+/// bundled decoder cannot do.
+///
+/// A macro rather than a `const` so each call site can build its own
+/// `&'static str` around it with `concat!`. Sharing the BYTES is the point: the
+/// two surfaces were independently written strings, and a test that checked both
+/// merely CONTAINED the words "Opus" and "ALAC" stayed green while one of them
+/// said the bundled decoder handles those codecs fine. Vocabulary agreement is
+/// not agreement. Now they cannot disagree without one of them dropping this
+/// sentence, which is a thing a test can see.
+macro_rules! bundled_decoder_codec_limit {
+    () => {
+        "the bundled decoder handles AAC, MP3, Vorbis and FLAC but cannot decode Opus or ALAC"
+    };
+}
+pub(crate) use bundled_decoder_codec_limit;
+
 pub fn compressed_audio_ffmpeg_guidance() -> &'static str {
-    "This machine could not decode this non-WAV import. Install ffmpeg (macOS: brew install ffmpeg; Linux: use your package manager; Windows: install ffmpeg.exe and add it to PATH), or set MINUTES_FFMPEG to the full executable path. ffmpeg is required rather than optional for Opus audio, which is what .webm browser and Meet recordings and .ogg voice notes normally contain, and for ALAC in .m4a: the bundled decoder handles AAC, MP3, Vorbis and FLAC but has no decoder for those. If transcription.compressed_decode_fallback is set to false in ~/.config/minutes/config.toml, setting it back to true restores the bundled decoder for the formats it does support. Then restart the watcher or process the original file directly. WAV imports remain available either way."
+    concat!(
+        "This machine could not decode this non-WAV import. Install ffmpeg (macOS: brew install ",
+        "ffmpeg; Linux: use your package manager; Windows: install ffmpeg.exe and add it to PATH), ",
+        "or set MINUTES_FFMPEG to the full executable path. ffmpeg is required rather than optional ",
+        "for Opus audio, which is what .webm browser and Meet recordings and .ogg voice notes ",
+        "normally contain, and for ALAC in .m4a: ",
+        bundled_decoder_codec_limit!(),
+        ". If transcription.compressed_decode_fallback is set to false in ",
+        "~/.config/minutes/config.toml, setting it back to true restores the bundled decoder for ",
+        "the formats it does support. Then restart the watcher or process the original file ",
+        "directly. WAV imports remain available either way.",
+    )
 }
 
 fn content_type_label(content_type: ContentType) -> &'static str {
@@ -1658,20 +1686,23 @@ mod tests {
             health.detail
         );
 
-        // The other side of the agreement. Without this the test could not fail
-        // for a guidance that said the opposite of health.
+        // The agreement itself, asserted as SHARED BYTES rather than as shared
+        // vocabulary. The previous version of this block checked that both
+        // strings contained "Opus" and "ALAC", which a guidance saying "the
+        // bundled decoder decodes Opus and ALAC perfectly well" satisfies
+        // while telling the user the opposite of health. A reviewer proved that
+        // with the whole suite green.
         let guidance = compressed_audio_ffmpeg_guidance();
-        for codec in ["Opus", "ALAC"] {
-            assert!(
-                health.detail.contains(codec) && guidance.contains(codec),
-                "both surfaces must name {codec}; health said {:?} and guidance said {guidance:?}",
-                health.detail
-            );
-        }
+        let shared = bundled_decoder_codec_limit!();
         assert!(
-            !guidance.contains("handles every compressed format")
-                && !guidance.contains("without any extra install"),
-            "guidance must not claim the coverage health denies: {guidance:?}"
+            health.detail.contains(shared),
+            "health must carry the canonical codec-limit sentence verbatim: {:?}",
+            health.detail
+        );
+        assert!(
+            guidance.contains(shared),
+            "the watcher guidance must carry the canonical codec-limit sentence verbatim: \
+             {guidance:?}"
         );
     }
 

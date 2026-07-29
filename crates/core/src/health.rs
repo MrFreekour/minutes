@@ -372,8 +372,16 @@ pub fn ffmpeg_status(config: &Config) -> HealthItem {
         ),
         (Err(_), true) => (
             "ready",
-            "ffmpeg is not installed, so compressed imports are decoded by the bundled bounded decode worker instead. That covers AAC, MP3, Vorbis and FLAC with no extra install, but it cannot decode Opus or ALAC: Opus is what browser and Meet recordings (.webm) and WhatsApp or Telegram voice notes (.ogg) normally contain, and those files will be refused until ffmpeg is installed. Installing ffmpeg also gives a higher-fidelity decode on non-English audio; WAV is decoded directly either way."
-                .to_string(),
+            concat!(
+                "ffmpeg is not installed, so compressed imports are decoded by the bundled ",
+                "bounded decode worker instead: ",
+                crate::watch::bundled_decoder_codec_limit!(),
+                ". Opus is what browser and Meet recordings (.webm) and WhatsApp or Telegram ",
+                "voice notes (.ogg) normally contain, and those files will be refused until ",
+                "ffmpeg is installed. Installing ffmpeg also gives a higher-fidelity decode on ",
+                "non-English audio; WAV is decoded directly either way.",
+            )
+            .to_string(),
         ),
         (Err(error), false) => (
             "attention",

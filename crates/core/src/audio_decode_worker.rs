@@ -65,10 +65,16 @@ const WORKER_MARKER: &str = "MINUTES_AUDIO_DECODE_WORKER_V1";
 /// which is true on macOS only. Anyone sizing the budget from that sentence on
 /// Linux would be out by the whole image:
 ///
-/// - non-macOS Unix and Windows: an ABSOLUTE ceiling. The parent sets
-///   `rlim_cur = rlim_max = 3 GiB`, or the equivalent Job Object limits, so the
-///   mapped executable and every shared library come out of this figure. The
-///   debug worker binary alone is ~250 MB of it.
+/// - non-macOS Unix: an ABSOLUTE ceiling on VIRTUAL ADDRESS SPACE. The parent
+///   sets `rlim_cur = rlim_max` to this figure, so the mapped executable and
+///   every shared library come out of it. The debug worker binary alone is
+///   ~250 MB.
+/// - Windows: `ProcessMemoryLimit` and `JobMemoryLimit`, which bound COMMITTED
+///   memory, not reserved address space. File-backed image pages are not charged
+///   the way they are under `RLIMIT_AS`, so the sizing above does not transfer.
+///   An earlier version of this doc grouped Windows with Unix and implied it
+///   did. What the two share is only that the figure is absolute rather than a
+///   growth allowance.
 /// - macOS: a growth allowance. The child measures its own virtual size and
 ///   installs baseline plus this budget, because Darwin rejects an absolute
 ///   `RLIMIT_AS` below its pre-`main()` shared-cache baseline.
@@ -88,6 +94,20 @@ const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 /// before the decoder is constructed and therefore before Symphonia reads a
 /// single attacker-controlled byte. Only dyld and Rust runtime startup precede
 /// it, and neither touches the input.
+///
+/// UNTESTED, and this is the containment path for the primary shipping platform.
+/// Deleting the call to this function leaves the macOS suite green: the only
+/// `cfg(target_os = "macos")` test in this file asserts that the PARENT installs
+/// nothing, and the end-to-end child tests only prove the install does not fail,
+/// because failing exits 71. Nothing asserts that any production caller launches
+/// the decode child under a ceiling on macOS.
+///
+/// That is worth stating loudly, because the non-macOS sibling
+/// [`verify_parent_bound_address_space`] carries a per-branch TESTED BY list, so
+/// the least-verified path was reading as the best-covered one. Closing it needs
+/// a macOS runner, which this lane does not have; the shape would be a test that
+/// launches the real child with the ceiling deliberately absent and requires
+/// refusal, the way the Unix tests do.
 #[cfg(target_os = "macos")]
 fn install_child_address_space_ceiling() -> Result<(), String> {
     let baseline = process_virtual_size()?;
@@ -133,14 +153,17 @@ fn process_virtual_size() -> Result<u64, String> {
 
 /// Refuse to parse anything unless the parent bound this child's address space.
 ///
-/// Everywhere except macOS the ceiling is installed by the parent, before
-/// `exec`, so nothing inside the child would otherwise notice it missing: an
-/// unbounded worker decodes attacker-controlled bytes exactly as a bounded one
-/// does, right up until it exhausts the machine. Checking it here makes the
-/// ceiling an observable property of every launch, which is what lets the real
-/// entry points be tested for containment instead of a command builder a test
-/// called itself and then asserted. macOS installs its own ceiling just above
-/// and reports failure through that call.
+/// On non-macOS Unix the ceiling is installed by the parent, before `exec`, so
+/// nothing inside the child would otherwise notice it missing: an unbounded
+/// worker decodes attacker-controlled bytes exactly as a bounded one does, right
+/// up until it exhausts the machine. Checking it here makes the ceiling an
+/// observable property of launches ON THOSE PLATFORMS, which is what lets the
+/// real entry points be tested for containment instead of a command builder a
+/// test called itself and then asserted.
+///
+/// Not "every launch", which is what this said first. macOS installs its own
+/// ceiling in the child and verifies nothing afterwards; Windows installs Job
+/// Object limits in the parent and has no child-side check at all.
 ///
 /// WHAT THIS ESTABLISHES, stated narrowly because an earlier version of this
 /// comment did not. It compares two numbers to a constant. Both `rlim_cur` and
@@ -163,9 +186,12 @@ fn process_virtual_size() -> Result<u64, String> {
 /// The consequence, stated rather than left implicit: a decode child contained
 /// by some OTHER mechanism, a cgroup or an outer sandbox, while presenting an
 /// unbounded `RLIMIT_AS`, is refused here. That is deliberate. This worker's
-/// containment argument is the ceiling its own parent installs, and no
-/// PRODUCTION launch path in this crate omits it. Three tests below deliberately
-/// build launch paths that do, which is how they observe this function at all.
+/// containment argument is the ceiling its own parent installs, and on the
+/// platforms this function is compiled for, no production launch path omits it.
+/// That scope matters: the macOS production path omits the parent ceiling
+/// deliberately, which is the whole reason for the split. Three tests below
+/// build launch paths that omit it on purpose, which is how they observe this
+/// function at all.
 ///
 /// TESTED BY, one test per branch, because a reviewer proved the `rlim_max` half
 /// could be deleted with the whole suite still green:
@@ -201,7 +227,11 @@ fn verify_parent_bound_address_space() -> Result<(), String> {
     #[allow(clippy::useless_conversion)]
     let maximum = u64::try_from(limit.rlim_max).unwrap_or(u64::MAX);
     if current != WORKER_ADDRESS_SPACE_BYTES || maximum != WORKER_ADDRESS_SPACE_BYTES {
-        return Err("decode worker refuses to parse input without an address-space ceiling".into());
+        return Err(
+            "decode worker refuses to parse input: its address-space ceiling is not the one this \
+             worker installs"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -339,10 +369,6 @@ pub fn bounded_decode_fallback_available(config: &crate::config::Config) -> bool
     bounded_decode_fallback_enabled(config) && resolve_worker_executable().is_ok()
 }
 
-/// Decode a compressed file to 16 kHz mono `s16le` PCM inside a bounded child.
-///
-/// Returns the raw PCM bytes written by the child. The caller converts them
-/// with the same reader used for ffmpeg output.
 /// Which job the child is being launched for.
 ///
 /// Both jobs run Symphonia over attacker-controlled bytes and therefore need
@@ -378,8 +404,13 @@ fn build_decode_command(
         .close_extra_descriptors();
     // Ordering is the security property: the ceiling must bind before Symphonia
     // reads an attacker-controlled byte. Every non-macOS Unix binds it from
-    // `pre_exec`, before `exec` itself, not Linux alone. Windows installs a Job Object memory ceiling from this same
-    // setting at CREATE_SUSPENDED, the strongest ordering of any platform.
+    // `pre_exec`, before `exec` itself, not Linux alone. Windows installs a Job
+    // Object memory ceiling from this same setting at CREATE_SUSPENDED, so it
+    // binds before the child runs its first instruction. An earlier version
+    // called that "the strongest ordering of any platform", an unmeasured
+    // superlative of the kind this file has been corrected for twice: on Linux
+    // the rlimit binds inside pre_exec, so the child image never executes
+    // unbounded either.
     // Only Darwin rejects an absolute RLIMIT_AS below its pre-main()
     // shared-cache baseline, so only Darwin defers to the measured in-child
     // install at `maybe_run_audio_decode_worker`; setting it here as well would
@@ -389,6 +420,13 @@ fn build_decode_command(
     Ok(command)
 }
 
+/// Decode a compressed file to 16 kHz mono `s16le` PCM inside a bounded child.
+///
+/// Writes the raw PCM the child produced into the caller's private file. The
+/// caller reads it back with the same reader used for ffmpeg output.
+///
+/// This paragraph used to sit above `WorkerMode`, so rustdoc attached it to the
+/// enum and this function had no docs at all.
 pub(crate) fn decode_to_private_pcm(
     path: &Path,
     destination: &mut crate::pipeline::PrivateAudioTempFile,
@@ -443,12 +481,15 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
         return Some(EXIT_UNDECODABLE);
     }
     // Ordering: the ceiling must be in force before anything parses input.
-    // Where it comes from is three-way, and an earlier version of this comment
-    // said "Linux ... elsewhere this is where it binds", which was wrong about
-    // both other platforms: EVERY non-macOS Unix binds it in the parent's
-    // pre_exec, Windows binds it in a Job Object before the child runs at all,
-    // and macOS alone binds it here. So this is an install on macOS and a
-    // verification everywhere else it runs.
+    // Genuinely three-way, and BOTH earlier versions of this comment collapsed
+    // it to two. It is not "Linux, then everywhere else", and it is not "install
+    // on macOS, verify everywhere else" either:
+    //
+    //   macOS          the child installs it, just below. No verification.
+    //   non-macOS Unix the parent installed it in pre_exec; the child verifies.
+    //   Windows        the parent installed Job Object limits before the child
+    //                  ran at all. NOTHING VERIFIES IT HERE: the check below is
+    //                  cfg(all(unix, not(macos))), so Windows has no equivalent.
     #[cfg(target_os = "macos")]
     if let Err(error) = install_child_address_space_ceiling() {
         eprintln!("{error}");
@@ -505,18 +546,38 @@ const PROBE_DURATION_ARG: &str = "--probe-duration";
 
 /// Probe a compressed container's duration inside the bounded child.
 ///
-/// Returns `None` when the container does not declare a frame count, in which
-/// case the caller keeps its existing behaviour rather than paying for a full
-/// decode. This exists so watcher content-type routing does not silently
-/// degrade to `config.watch.type` when ffmpeg is absent, which filed long calls
-/// as voice memos.
+/// `None` means "no duration is available", which the caller cannot distinguish
+/// from any of the ways getting one can fail, and its response is to fall back to
+/// `config.watch.type`: long calls filed as voice memos with no diarization,
+/// which is the regression this probe exists to prevent.
+///
+/// So every `None` is logged with its cause. An earlier version documented only
+/// the benign case, "the container does not declare a frame count", while five
+/// branches returned `None` and one of them threw away the bind error that
+/// `resolve_worker_executable` goes to some trouble to preserve. That branch
+/// matters most: the caller binds the worker once to answer
+/// `bounded_decode_fallback_available` and this function binds it again
+/// immediately after, so a transient bind failure between the two lands here.
 pub(crate) fn probe_compressed_duration(
     path: &Path,
     wall_clock: Duration,
 ) -> Option<std::time::Duration> {
-    let mut command = build_decode_command(path, WorkerMode::ProbeDuration).ok()?;
+    let label = crate::pipeline::private_audio_diagnostic_label(path);
+    let mut command = match build_decode_command(path, WorkerMode::ProbeDuration) {
+        Ok(command) => command,
+        Err(error) => {
+            // The bind error specifically. Track-1 item 10 exists because a
+            // transient bind failure was being reported as a missing build.
+            tracing::warn!(
+                path = %label,
+                %error,
+                "compressed duration probe could not be built; content-type routing falls back to config"
+            );
+            return None;
+        }
+    };
 
-    let run = crate::bounded_child::run(
+    let run = match crate::bounded_child::run(
         &mut command,
         None,
         crate::bounded_child::StdoutTarget::Capture { max_bytes: 128 },
@@ -524,18 +585,20 @@ pub(crate) fn probe_compressed_duration(
             wall_clock,
             stderr_tail: 4 * 1024,
         },
-    )
-    .ok()?;
-    // `None` here is indistinguishable to the caller from "this container
-    // declares no duration", and the watcher's response to that is to fall back
-    // to `config.watch.type`: long calls filed as memos with no diarization,
-    // which is the exact misrouting this probe exists to prevent. A child that
-    // FAILED is a different event from a container that said nothing, and the
-    // containment self-check added a new way to reach it, so say so rather than
-    // degrade in silence.
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            tracing::warn!(
+                path = %label,
+                %error,
+                "compressed duration probe could not be launched; content-type routing falls back to config"
+            );
+            return None;
+        }
+    };
     if run.timed_out || !run.output.status.success() {
         tracing::warn!(
-            path = %crate::pipeline::private_audio_diagnostic_label(path),
+            path = %label,
             timed_out = run.timed_out,
             exit = ?run.output.status.code(),
             detail = %String::from_utf8_lossy(&run.output.stderr)
@@ -549,11 +612,25 @@ pub(crate) fn probe_compressed_duration(
         );
         return None;
     }
-    let seconds: f64 = String::from_utf8_lossy(&run.output.stdout)
+    let reported = String::from_utf8_lossy(&run.output.stdout)
         .trim()
-        .parse()
-        .ok()?;
-    (seconds.is_finite() && seconds > 0.0).then(|| std::time::Duration::from_secs_f64(seconds))
+        .to_string();
+    let Ok(seconds) = reported.parse::<f64>() else {
+        tracing::warn!(
+            path = %label,
+            "compressed duration probe returned no parseable duration; content-type routing falls back to config"
+        );
+        return None;
+    };
+    if !(seconds.is_finite() && seconds > 0.0) {
+        tracing::warn!(
+            path = %label,
+            seconds,
+            "compressed duration probe reported an unusable duration; content-type routing falls back to config"
+        );
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(seconds))
 }
 
 /// Read a container's declared duration without decoding its packets.
@@ -839,8 +916,12 @@ mod tests {
     /// `decode_to_private_pcm`'s own path, the next called it "the builder every
     /// launch goes through", which reads as coverage of the caller relationship
     /// in the same breath as denying it.
-    /// `the_production_probe_child_runs_under_an_address_space_ceiling` is the
-    /// test that covers the caller.
+    /// On non-macOS UNIX,
+    /// `the_production_probe_child_runs_under_an_address_space_ceiling` covers
+    /// the caller. On Windows nothing does: that test is
+    /// `cfg(all(unix, not(macos)))`, so this builder assertion is the only
+    /// ceiling coverage there, and by its own admission it does not reach a
+    /// caller.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_production_decode_command_carries_the_address_space_ceiling() {
@@ -925,7 +1006,12 @@ mod tests {
         // only in the comment above and in an opaque binary, so a fixture
         // accidentally replaced by one that resets immediately would leave this
         // test green while its name became false. A first stream that probes as
-        // about three seconds is the cheapest available proof that it is there.
+        // about three seconds is the cheapest available check that it is there.
+        //
+        // What this does NOT prove: that packets are DECODED before the reset.
+        // Symphonia derives an OGG duration from the first stream's final page
+        // granule, which is metadata. The packet-delivery premise rests on the
+        // recorded mutation result in the docstring, not on this assertion.
         let first_stream = probe_duration_seconds(&path)
             .expect("the chained fixture's first logical stream must be probeable");
         assert!(
@@ -1187,7 +1273,7 @@ mod tests {
         std::fs::write(&path, M4A_FIXTURE).unwrap();
 
         let executable = resolve_worker_executable()
-            .expect("a worker-capable executable must resolve for the ceiling-provenance test");
+            .expect("a worker-capable executable must resolve for the ceiling-value test");
         let mut foreign = crate::bounded_child::BoundedCommand::from_bound_executable(executable)
             .expect("the worker authority must bind");
         retain_safe_environment(&mut foreign);
@@ -1209,7 +1295,7 @@ mod tests {
         assert_eq!(
             run.output.status.code(),
             Some(71),
-            "a ceiling this worker did not install must be refused; got {:?} with stderr \
+            "a ceiling that is not the worker budget must be refused; got {:?} with stderr \
              {diagnostic:?}",
             run.output.status.code()
         );
@@ -1219,8 +1305,18 @@ mod tests {
         );
     }
 
-    /// A soft limit at the worker budget with an unbounded HARD limit is
-    /// refused, because that child could raise its own ceiling back up.
+    /// A soft limit at the worker budget with a DIFFERENT hard limit is refused,
+    /// because that child could raise its own ceiling back up.
+    ///
+    /// The name says "could raise" rather than "unbounded hard limit", which is
+    /// what it said first, because the shell cannot guarantee unbounded:
+    /// `ulimit -H -v unlimited` fails silently for an unprivileged process that
+    /// inherited a finite hard limit. What the assertions DO establish is
+    /// enough: the soft set succeeded (or the wrapper exits 70), so soft equals
+    /// the budget; a hard limit equal to the budget would make the child exit 0
+    /// and fail this test; and soft can never exceed hard. So reaching exit 71
+    /// means hard is strictly greater than the budget, which is exactly the
+    /// "child could raise it back" case.
     ///
     /// This half went untested for a whole gate round and a reviewer proved it:
     /// deleting the `rlim_max` comparison left the entire suite green, while the
@@ -1233,7 +1329,7 @@ mod tests {
     /// exactly why the case is reachable at all.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_soft_ceiling_with_an_unbounded_hard_ceiling_is_refused() {
+    fn a_soft_ceiling_the_child_could_raise_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("memo.m4a");
         std::fs::write(&path, M4A_FIXTURE).unwrap();

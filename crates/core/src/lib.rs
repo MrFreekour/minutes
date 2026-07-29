@@ -181,11 +181,20 @@ pub fn install_whisper_logging_hooks() {
 
 /// Whether a worker-capable binary sits beside the test harness, answered once.
 ///
-/// Several tests assert this as a precondition rather than skipping silently.
-/// Each answer costs a full copy of the ~250 MB debug executable into an
-/// immutable snapshot, and a reviewer measured the suite 26% slower against a CI
-/// step whose timeout is three minutes. The answer cannot change during a run, so
-/// paying for it once is both cheaper and no weaker.
+/// Several tests assert this as a precondition rather than skipping silently, and
+/// each answer copies the ~250 MB debug executable into an immutable snapshot.
+///
+/// WHAT THIS ACTUALLY SAVES, measured rather than assumed, because the first
+/// version of this comment cited a 26% suite regression that does not reproduce:
+/// about 0.4 s across the three call sites, two avoided binds at roughly 0.2 s
+/// each. Run-to-run noise on the same machine is larger than that. It is kept
+/// because it is free and directionally right, not because it rescued anything.
+///
+/// "The answer cannot change during a run" would be too strong: `bind` can fail
+/// transiently under memory pressure or a full temp filesystem, which is the
+/// documented flake behind track-1 item 10. What is true is that a transient
+/// first-call failure caches `false` and then fails all three preconditions
+/// loudly, which is the safe direction.
 #[cfg(test)]
 pub(crate) fn test_worker_binary_is_available() -> bool {
     use std::sync::OnceLock;

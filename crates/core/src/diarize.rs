@@ -502,9 +502,14 @@ fn ffmpeg_preprocess_command(ffmpeg: &Path, input: &str) -> crate::bounded_child
 /// test here can see whether the availability probe ran before the cancellation
 /// error was returned.
 ///
+/// One scope caveat on that list: the call-site test is `cfg(unix)`, so on
+/// Windows the routing item is uncovered too.
+///
 /// NOT covered, four things, none of which any test here would catch. A reviewer
-/// applied all four simultaneously and the suite stayed green, which is the
-/// evidence that the list is complete as well as honest:
+/// applied all four simultaneously and the suite stayed green, which establishes
+/// that each of the four is genuinely uncovered. It does NOT establish that no
+/// fifth exists, and an earlier version of this sentence claimed it did, one
+/// paragraph after disclaiming exhaustiveness:
 /// 1. the post-decode cancellation check, which needs a cancel to land during a
 ///    decode;
 /// 2. the diarization wall clock handed to the child, which needs a decode
@@ -4100,11 +4105,16 @@ mod tests {
     /// with the check gone - measured, not assumed. Each half below fails on a
     /// distinct regression:
     ///
-    /// - refused config plus cancelled pins the ORDER against the availability
-    ///   probe, which resolves the worker executable by copying this process's
-    ///   image and must not run for a caller that has already given up;
-    /// - an input that does not exist pins that no decode was ATTEMPTED, since
-    ///   attempting one reports the missing input instead.
+    /// - refused config plus cancelled pins that the cancellation error WINS over
+    ///   the availability refusal;
+    /// - an input that does not exist pins that it also wins over the decode
+    ///   failure that a real attempt would report.
+    ///
+    /// Neither half pins EXECUTION ORDER. A reviewer proved it: hoisting the
+    /// availability probe above the cancellation check, while leaving the error
+    /// precedence intact, leaves the whole suite green. Seeing that would need a
+    /// call counter on the resolver. The production comment at the check says why
+    /// the order is what it is; nothing here enforces it.
     ///
     /// Neither half depends on a worker binary being present: without one the
     /// mutation reports the availability refusal, which is also not this string.
@@ -4117,16 +4127,16 @@ mod tests {
         refused.transcription.compressed_decode_fallback = false;
         let directory = tempfile::tempdir().unwrap();
         let source = m4a_fixture_in(&directory);
-        let ordering = preprocess_compressed_without_ffmpeg(&source, &refused, &cancellation)
+        let precedence = preprocess_compressed_without_ffmpeg(&source, &refused, &cancellation)
             .err()
-            .expect("a cancelled diarization must not reach the availability probe");
-        assert_eq!(ordering, "diarization deadline exceeded");
+            .expect("a cancelled diarization must report cancellation, not unavailability");
+        assert_eq!(precedence, "diarization deadline exceeded");
 
         let absent = directory.path().join("never-written.m4a");
         let attempted =
             preprocess_compressed_without_ffmpeg(&absent, &Config::default(), &cancellation)
                 .err()
-                .expect("a cancelled diarization must not start a decode child");
+                .expect("a cancelled diarization must report cancellation, not a decode failure");
         assert_eq!(attempted, "diarization deadline exceeded");
     }
 
