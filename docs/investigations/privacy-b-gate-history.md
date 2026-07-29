@@ -877,3 +877,60 @@ tagged, signed, or released.
 NEXT: execute the disclosed macOS and Windows enforcement paths with runners, or
 make an explicit decision to stop gating track 1. Do not convert missing runtime
 evidence into more confident platform prose.
+
+---
+
+## 2026-07-29 PLATFORM EXECUTION FOLLOW-UP to gate 4. Candidate d301d277.
+
+The macOS half of the disclosed runtime gap was executed natively in an
+isolated temporary checkout on `jexs-imac` (arm64 macOS 26.5, pinned Rust
+1.95.0). The existing iMac Minutes checkout was not modified. Candidate Git
+objects travelled in a local bundle; nothing was pushed.
+
+NATIVE MAC COMPILE FOUND A REAL CANDIDATE-OWNED DEFECT. Strict no-default
+core+CLI clippy failed on `clippy::type_complexity` for the Darwin-only
+five-tuple return type of `immutable_unix_executable_snapshot`. Linux could not
+see that cfg branch. Blame traced it to this lane's path-backed snapshot work.
+`d301d277` introduces a private Darwin/non-Linux-Unix tuple alias; strict native
+no-default core+CLI and core+diarize clippy are green afterwards.
+
+THE MACOS INSTALLER AND KERNEL REFUSAL ARE NOW EXECUTED SEPARATELY. Existing
+native end-to-end decode and duration-probe tests launch the real Minutes child;
+success proves the in-child ceiling install returned success before Symphonia
+construction because an install failure exits 71. The new macOS-only
+`the_macos_child_ceiling_refuses_an_over_budget_mapping` runs the same installer
+in an isolated test subprocess, then requests 3 GiB plus one 16 KiB Darwin page
+of `PROT_NONE` anonymous address space. Darwin refused the mapping, and the
+exact `d301d277` source blobs passed the focused regression 1/1.
+
+ONE MACOS GAP REMAINS, NARROWER THAN BEFORE. The enforcement regression calls
+the installer directly. Deleting the production entry point's call to the
+installer would therefore leave the suite green. The installer and effective
+Darwin `RLIMIT_AS` behavior are verified; the production caller relationship is
+not mutation-sensitive.
+
+MAC EVIDENCE: the code-equivalent full no-default core suite passed 1648, failed
+0, ignored 1; the code-equivalent full core+diarize suite passed 1663, failed 0,
+ignored 3 in 371.53 s; the final production source plus new macOS-only test
+passed minutes-app 284/0. The focused ceiling regression added afterwards
+passed 1/0 against source blobs independently matched to exact
+`d301d2776e470da7f19ab4ec8d4d036292b87b53`. Native fmt and both strict
+crate-scoped clippy invocations are green. The app build rewrote two tracked
+`mic_check` build artifacts; they were identified by exact-tree comparison and
+restored in the disposable checkout before final source verification.
+
+LINUX AND WINDOWS CROSS-CHECK: exact `d301d277` passes fmt, diff check, strict
+core+CLI no-default clippy, and strict core+diarize clippy on Linux. The full
+repo Linux `cargo clippy --all --no-default-features -- -D warnings` remains red
+on 65 unrelated pre-existing Tauri warnings, none in candidate files. Exact
+Windows GNU-target core no-default check is green with 11 known cfg warnings.
+No Windows runtime host was available, so Job Object attachment, suspension
+ordering, and effective memory enforcement remain unexecuted.
+
+STATUS: `d301d277` is a clean local candidate, not an accepted checkpoint. The
+earlier scoped gate-4 second pass accepted before this exact SHA; there are not
+three independent blind exact-SHA accepts. Nothing pushed, merged, tagged,
+signed, or released.
+
+NEXT: execute the Job Object path on real Windows, obtain three fresh blind
+reviews against exact `d301d277`, or have Mat explicitly stop gating track 1.

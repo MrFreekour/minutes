@@ -51,6 +51,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
+| `d301d277` | macOS gate-4 follow-up — native ceiling enforcement regression and Darwin-only clippy fix |
+| `893f7fb6` | durable scoped gate-4 record |
 | `f0977d67` | track-1 gate-4 platform-claim remediation — explicit verification scope, no parent-provenance claim |
 | `a9662ba4` | track-1 gate-3 remediation — shared codec sentence, every degrade logged |
 | `f6232143` | track-1 gate-2 remediation — Windows sweep backed out, ceiling claim scoped |
@@ -77,18 +79,29 @@ Last accepted checkpoint remains block 7; everything after it is unaccepted.
 
 ## Immediate next step
 
-**Hand the remaining platform evidence to someone with macOS and Windows
-runners, or make an explicit decision to stop gating this track.** The scoped
-gate 4 first BLOCKED the working tree on one P1 false-provenance diagnostic and
-five P2 platform/coverage claims. After each was independently verified and
-removed or scoped, the same Codex lens ACCEPTED with zero P1/P2. The remediated
-local candidate is `f0977d67`.
+**Run the Windows Job Object path on a real Windows runner, then obtain three
+independent blind reviews of exact candidate `d301d277`, or make an explicit
+decision to stop gating this track.** The scoped gate 4 first BLOCKED the
+working tree on one P1 false-provenance diagnostic and five P2
+platform/coverage claims. After each was independently verified and removed or
+scoped, the same Codex lens ACCEPTED with zero P1/P2.
 
-That is one scoped reviewer of the gate-4 question, not the three independent
-exact-SHA ACCEPT verdicts required to call a block a checkpoint. Do not turn the
-remaining macOS and Windows gaps into better prose. Execute the kernel-level
-paths on those platforms, or leave their effective enforcement explicitly
-unverified as it is now.
+The follow-up used an isolated temporary checkout on `jexs-imac` to compile and
+execute the candidate natively. The real decode/probe child paths returned
+success after the in-child ceiling install. A new macOS-only subprocess
+regression installs that same ceiling, asks for a mapping larger than the whole
+growth budget, and observes Darwin refuse it. Native no-default, diarize, app,
+strict clippy, path-backed digest, and focused ceiling evidence are green. The
+Darwin-only compile also found one candidate-owned `clippy::type_complexity`
+failure; `d301d277` fixes it with a private tuple alias.
+
+That is still one scoped reviewer of the earlier gate-4 question, not the three
+independent exact-SHA ACCEPT verdicts required to call a block a checkpoint.
+The Windows target cross-check compiles with 11 known cfg warnings, but no real
+Windows process was launched: Job Object attachment, ordering, and effective
+enforcement remain runtime-unverified. On macOS, the installer and kernel
+refusal are verified, but the production entry point's call to the installer is
+not mutation-sensitive. Do not turn either residual into stronger prose.
 
 Two things a fourth round should hunt, because each has now recurred:
 - a test whose fix failed the SAME way twice. Gate 2 found an agreement test that
@@ -249,8 +262,10 @@ Option A's to remove.
   ELOOP on a Homebrew install; `RLIMIT_AS` **is** enforced; and an absolute
   3 GiB ceiling is rejected EINVAL because the baseline is ~425 GiB. Use it
   rather than reasoning about Darwin from Linux.
-- **This lane cannot compile macOS.** Cross-compilation fails at the C
-  toolchain. Say so plainly rather than implying coverage.
+- **The Linux host cannot cross-compile macOS.** Cross-compilation fails at the
+  C toolchain. The exact gate-4 candidate was instead compiled and executed
+  natively in an isolated temporary checkout on `jexs-imac`; do not generalise
+  that Mac evidence into Windows runtime coverage.
 - The suite has order- and load-sensitive tests. Re-run any failure in isolation
   before reporting it, and prefer unloaded single-threaded runs for evidence.
 - **The decode child's behaviour lives in a separately built binary.** Several
