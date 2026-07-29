@@ -826,3 +826,54 @@ the code substance holds under independent mutation every time, and what survive
 is prose about platforms nobody here can run. A fourth round should be scoped to
 that question specifically, or the lane should stop gating and hand the platform
 claims to someone with macOS and Windows runners.
+
+---
+
+## 2026-07-29 GATE 4 on track 1, scoped platform-claim lens. Working tree atop e25bdb48, remediated at f0977d67.
+
+The prepared Codex read-only lens was recovered from the interrupted Claude
+session and regenerated with the current complete
+`crates/core/src/audio_decode_worker.rs`. Its only question was whether every
+remaining platform claim was true of the code or explicitly labelled
+unverified. The first pass BLOCKED on one P1 and five P2 findings.
+
+THE P1 WAS FALSE PROVENANCE AGAIN. The diagnostic said the ceiling was "not the
+one this worker installs", but the verifier compares two values with a constant
+and cannot identify who installed them. It now reports only the property it
+observes: both ceiling values must equal the configured worker budget.
+
+THE P2 FINDINGS WERE ALL CLAIMS AHEAD OF EXECUTION. The module summary described
+Windows process-group isolation without platform scope, repeated unmeasured
+Darwin virtual-memory behavior, asserted no App Sandbox conflict, described the
+adjacent executable search as covering every real layout, and called one
+Windows builder assertion the only ceiling coverage while overlooking the probe
+builder test. Each finding was checked against the code before editing.
+
+The remediation centralises the disclosure instead of rewriting those claims:
+Linux was exercised through the real child path; macOS control flow was
+inspected but ceiling installation and effective kernel enforcement were not
+executed here; Windows builder configuration was inspected and tested but Job
+Object attachment, ordering, and effective enforcement were not executed here.
+The unsupported claims were removed, and the Windows test comment now names
+both builder tests while explicitly denying caller-sensitive or runtime
+enforcement coverage.
+
+The regenerated second pass ACCEPTED with zero P1/P2. It explicitly confirmed
+that the disclosures match the evidence and treated the remaining correction
+history as editorial verbosity rather than a platform-honesty defect.
+
+This was one scoped gate-4 lens against the working-tree contents, not three
+independent blind exact-SHA accepts. `f0977d67` is therefore a local unaccepted
+candidate, not a checkpoint.
+
+Exact Linux gates after remediation: `cargo build -p minutes-cli
+--no-default-features`; strict core+CLI no-default clippy; strict core
+no-default+diarize clippy; fmt and diff checks; core no-default lib 1636 passed,
+0 failed, 1 ignored; core diarize lib 1651 passed, 0 failed, 3 ignored;
+minutes-app no-default 272 passed, 0 failed. The app test build emitted 43
+pre-existing no-default warnings and still passed. Nothing pushed, merged,
+tagged, signed, or released.
+
+NEXT: execute the disclosed macOS and Windows enforcement paths with runners, or
+make an explicit decision to stop gating track 1. Do not convert missing runtime
+evidence into more confident platform prose.

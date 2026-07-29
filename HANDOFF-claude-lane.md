@@ -51,6 +51,7 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
+| `f0977d67` | track-1 gate-4 platform-claim remediation — explicit verification scope, no parent-provenance claim |
 | `a9662ba4` | track-1 gate-3 remediation — shared codec sentence, every degrade logged |
 | `f6232143` | track-1 gate-2 remediation — Windows sweep backed out, ceiling claim scoped |
 | `204d77cc` | track-1 gate-1 remediation — a false "canary-tested on Windows CI" claim |
@@ -76,12 +77,18 @@ Last accepted checkpoint remains block 7; everything after it is unaccepted.
 
 ## Immediate next step
 
-**Gate 4 on `a9662ba4`, or a decision to stop gating.** Three rounds and nine
-lenses have run. The pattern is stable and worth acting on rather than repeating:
-the code substance holds under independent mutation every time, and what survives
-is prose about macOS and Windows, the two platforms this lane cannot execute.
-Rewording cannot fix that. Either scope round four to that question specifically,
-or hand the platform claims to someone with runners.
+**Hand the remaining platform evidence to someone with macOS and Windows
+runners, or make an explicit decision to stop gating this track.** The scoped
+gate 4 first BLOCKED the working tree on one P1 false-provenance diagnostic and
+five P2 platform/coverage claims. After each was independently verified and
+removed or scoped, the same Codex lens ACCEPTED with zero P1/P2. The remediated
+local candidate is `f0977d67`.
+
+That is one scoped reviewer of the gate-4 question, not the three independent
+exact-SHA ACCEPT verdicts required to call a block a checkpoint. Do not turn the
+remaining macOS and Windows gaps into better prose. Execute the kernel-level
+paths on those platforms, or leave their effective enforcement explicitly
+unverified as it is now.
 
 Two things a fourth round should hunt, because each has now recurred:
 - a test whose fix failed the SAME way twice. Gate 2 found an agreement test that
@@ -122,7 +129,7 @@ Wiring them in needs someone who can watch the pipeline go green.
 
 ## State of each track
 
-### Track 1 — compressed-import parity. Remediation list done, awaiting a gate on `a9662ba4`.
+### Track 1 — compressed-import parity. Gate-4 claims remediated at `f0977d67`; platform execution remains.
 
 Restores decoding of m4a/mp3/ogg/etc. when ffmpeg is absent, via a bounded
 child running Symphonia. `origin/main` did this in-process; this branch had
