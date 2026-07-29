@@ -1460,7 +1460,6 @@ impl ProcessTree {
         let mut limits = unsafe { zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if let Some(bytes) = process_memory_limit {
-            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
             limits.ProcessMemoryLimit = bytes;
         }
         if let Some(bytes) = job_memory_limit {
