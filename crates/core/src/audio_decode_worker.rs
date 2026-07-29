@@ -24,11 +24,14 @@
 //! - macOS attempts to install a measured baseline-plus-budget ceiling in the
 //!   child at [`maybe_run_audio_decode_worker`], before constructing a decoder.
 //!
-//! Verification scope for this lane: Linux was exercised through the real child
-//! path. The macOS control flow was inspected, but ceiling installation and
-//! effective kernel enforcement were not executed here. The Windows command
-//! builder was inspected and tested, but Job Object attachment, ordering, and
-//! effective enforcement were not executed here.
+//! Verification scope for this lane: Linux and macOS were exercised through the
+//! real child path. On macOS, successful decode and duration-probe children prove
+//! that ceiling installation returned success before decoder construction, and a
+//! dedicated subprocess test proves Darwin refuses a mapping larger than the
+//! installed growth budget. No mutation-sensitive test proves that the production
+//! entry point retains its call to the installer. The Windows command builder was
+//! inspected and tested, but Job Object attachment, ordering, and effective
+//! enforcement were not executed here.
 //!
 //! The child additionally gets a wall-clock ceiling, capped stdout streamed
 //! into a private file it has no pathname for, and a cleared environment.
@@ -86,27 +89,27 @@ const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 /// process's baseline.
 ///
 /// The macOS path adds the budget to the measured process baseline rather than
-/// configuring an absolute three-GiB limit from the parent. This gate inspected
-/// that control flow but did not execute the kernel behavior on macOS.
+/// configuring an absolute three-GiB limit from the parent.
 ///
 /// Ordering is the security property and is preserved either way: this runs
 /// before the decoder is constructed and therefore before Symphonia reads a
 /// single attacker-controlled byte. Only dyld and Rust runtime startup precede
 /// it, and neither touches the input.
 ///
-/// UNTESTED, and this is the containment path for the primary shipping platform.
-/// Deleting the call to this function leaves the macOS suite green: the only
-/// `cfg(target_os = "macos")` test in this file asserts that the PARENT installs
-/// nothing, and the end-to-end child tests only prove the install does not fail,
-/// because failing exits 71. Nothing asserts that any production caller launches
-/// the decode child under a ceiling on macOS.
+/// EXECUTED AND EFFECTIVELY ENFORCED under test. Native macOS end-to-end decode
+/// and duration-probe tests launch the real child and prove that this function
+/// returns success, because failure exits 71 before decoder construction.
+/// `the_macos_child_ceiling_refuses_an_over_budget_mapping` installs the same
+/// ceiling in an isolated subprocess and requires Darwin to refuse a mapping
+/// larger than the entire growth budget.
 ///
 /// That is worth stating loudly, because the non-macOS sibling
 /// [`verify_parent_bound_address_space`] carries a per-branch TESTED BY list, so
-/// the least-verified path was reading as the best-covered one. Closing it needs
-/// a macOS runner, which this lane does not have; the shape would be a test that
-/// launches the real child with the ceiling deliberately absent and requires
-/// refusal, the way the Unix tests do.
+/// the least-verified path was reading as the best-covered one. One gap remains:
+/// deleting the production entry point's call to this function leaves the suite
+/// green because the enforcement test calls the installer directly. Closing that
+/// caller-relationship gap needs a real child test that deliberately omits the
+/// install and requires refusal, the way the non-macOS Unix tests do.
 #[cfg(target_os = "macos")]
 fn install_child_address_space_ceiling() -> Result<(), String> {
     let baseline = process_virtual_size()?;
@@ -480,7 +483,9 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
     // it to two. It is not "Linux, then everywhere else", and it is not "install
     // on macOS, verify everywhere else" either:
     //
-    //   macOS          the child installs it, just below. No verification.
+    //   macOS          the child installs it, just below. Real child tests prove
+    //                  success and a subprocess proves effective enforcement,
+    //                  but the caller relationship is not mutation-sensitive.
     //   non-macOS Unix the parent installed it in pre_exec; the child verifies.
     //   Windows        the parent installed Job Object limits before the child
     //                  ran at all. NOTHING VERIFIES IT HERE: the check below is
@@ -936,6 +941,65 @@ mod tests {
         let command = build_decode_command(Path::new("/nonexistent/input.m4a"), WorkerMode::Decode)
             .expect("the decode command must be constructible in the test tree");
         assert_eq!(command.configured_address_space_limit(), None);
+    }
+
+    /// Exercise Darwin's enforcement, not merely the `setrlimit` success path.
+    ///
+    /// This must run in a subprocess because an address-space hard limit cannot
+    /// be raised again safely inside the shared test harness. The child installs
+    /// the same measured baseline-plus-budget ceiling as a production decode
+    /// child, then asks for one page more virtual address space than the whole
+    /// growth budget. Removing the install makes that mapping succeed and this
+    /// test fail.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_child_ceiling_refuses_an_over_budget_mapping() {
+        const CHILD_ENV: &str = "MINUTES_AUDIO_DECODE_CEILING_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            install_child_address_space_ceiling()
+                .expect("the decode child ceiling must install on macOS");
+            let requested = usize::try_from(WORKER_ADDRESS_SPACE_BYTES)
+                .unwrap()
+                .checked_add(16 * 1024)
+                .unwrap();
+            // SAFETY: this anonymous PROT_NONE mapping has no backing authority
+            // and is never dereferenced. A surprising success is unmapped below.
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    requested,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if mapping != libc::MAP_FAILED {
+                // SAFETY: `mapping` came from the successful mmap immediately
+                // above and `requested` is the exact length passed to it.
+                unsafe {
+                    libc::munmap(mapping, requested);
+                }
+                panic!("Darwin permitted a mapping larger than the decode child's growth budget");
+            }
+            return;
+        }
+
+        let mut command = crate::engine_process::command(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(
+                "audio_decode_worker::tests::the_macos_child_ceiling_refuses_an_over_budget_mapping",
+            )
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1");
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "macOS ceiling child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     /// The probe child runs Symphonia over the same attacker-controlled bytes

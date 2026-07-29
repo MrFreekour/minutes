@@ -48,6 +48,15 @@ struct UnixExecutableSnapshotOwner {
     _temp_dir: tempfile::TempDir,
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+type ImmutableUnixExecutableSnapshot = (
+    std::fs::File,
+    PathBuf,
+    Arc<UnixExecutableSnapshotOwner>,
+    u64,
+    [u8; 32],
+);
+
 impl BoundExecutable {
     #[cfg(target_os = "linux")]
     fn verify(&self) -> std::io::Result<()> {
@@ -421,13 +430,7 @@ fn immutable_unix_executable_snapshot(source: &std::fs::File) -> std::io::Result
 #[cfg(all(unix, not(target_os = "linux")))]
 fn immutable_unix_executable_snapshot(
     source: &std::fs::File,
-) -> std::io::Result<(
-    std::fs::File,
-    PathBuf,
-    Arc<UnixExecutableSnapshotOwner>,
-    u64,
-    [u8; 32],
-)> {
+) -> std::io::Result<ImmutableUnixExecutableSnapshot> {
     use sha2::{Digest, Sha256};
     use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -2500,14 +2503,12 @@ mod tests {
     /// whose bytes changed after its authority was bound must be refused before
     /// launch, not executed and audited afterwards.
     ///
-    /// NOT EXECUTED FROM THIS LANE, and that is stated rather than implied. The
-    /// digest re-check is `cfg(all(unix, not(target_os = "linux")))` because
-    /// Linux binds a sealed memfd that cannot be rewritten, so this test is
-    /// compiled out here. The cfg selects every non-Linux Unix, not macOS; it is
-    /// this repo's CI matrix, which has a macOS runner and no other non-Linux
-    /// Unix, that makes macOS the only place it currently executes. It was type-checked on Linux
-    /// by temporarily widening the cfg to `unix`, which is the most this lane can
-    /// verify - it cannot compile or run Darwin.
+    /// EXECUTED NATIVELY ON macOS FROM THIS LANE. The digest re-check is
+    /// `cfg(all(unix, not(target_os = "linux")))` because Linux binds a sealed
+    /// memfd that cannot be rewritten, so this test is compiled out there. The
+    /// cfg selects every non-Linux Unix, not macOS; it is this repo's CI matrix,
+    /// which has a macOS runner and no other non-Linux Unix, that makes macOS
+    /// the only place it currently executes in CI.
     #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn a_mutated_path_backed_snapshot_is_refused_before_launch() {
