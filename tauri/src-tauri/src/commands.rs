@@ -14533,6 +14533,14 @@ mod tests {
 
     #[test]
     fn list_documents_merges_assistant_and_meeting_sources_by_recency() {
+        // This test resolves HOME and builds its fixture inside it, so it must
+        // hold the same guard the HOME-mutating helpers take. Without it,
+        // with_temp_home() can repoint HOME and then recursively delete that
+        // directory while this test is still writing into it, which showed up
+        // as a NotFound partway through setup (#591). Deterministic on macOS,
+        // invisible on Linux, and never caught because CI does not run this
+        // suite at all.
+        let _guard = test_guard();
         let home = dirs::home_dir().expect("home dir");
         let temp = tempfile::Builder::new()
             .prefix("minutes-documents-test-")
