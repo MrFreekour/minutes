@@ -51,6 +51,7 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
+| `a9662ba4` | track-1 gate-3 remediation — shared codec sentence, every degrade logged |
 | `f6232143` | track-1 gate-2 remediation — Windows sweep backed out, ceiling claim scoped |
 | `204d77cc` | track-1 gate-1 remediation — a false "canary-tested on Windows CI" claim |
 | `b1cc0952` | track-1 items 1, 2, 3, 4, 9 and the order-sensitive probe test |
@@ -75,25 +76,37 @@ Last accepted checkpoint remains block 7; everything after it is unaccepted.
 
 ## Immediate next step
 
-**A fresh gate on `f6232143`.** Two gate rounds have run on this track's
-remediation; the second was three lenses (Codex read-only, a Claude platform
-lens, a Claude execution lens) and all three rejected. Every finding is
-remediated. The author has now edited this prose five times and should not be the
-one to read it a sixth.
+**Gate 4 on `a9662ba4`, or a decision to stop gating.** Three rounds and nine
+lenses have run. The pattern is stable and worth acting on rather than repeating:
+the code substance holds under independent mutation every time, and what survives
+is prose about macOS and Windows, the two platforms this lane cannot execute.
+Rewording cannot fix that. Either scope round four to that question specifically,
+or hand the platform claims to someone with runners.
+
+Two things a fourth round should hunt, because each has now recurred:
+- a test whose fix failed the SAME way twice. Gate 2 found an agreement test that
+  read one of its two producers; the gate-2 fix made it read both by vocabulary,
+  which a reviewer defeated with a message using the same words to say the
+  opposite. Check every test that asserts two things agree.
+- numbers repeated from a reviewer without being measured. A 26% regression and a
+  113-to-94-second improvement were both noise; the real figure is ~0.4 s.
 
 **The track-1 remediation list is worked through.** All nine items plus the tenth
 added 2026-07-27 are closed across `51146a17`, `8be61da0`, `b1cc0952`,
-`204d77cc` and `f6232143`. Full detail is in
+`204d77cc`, `f6232143` and `a9662ba4`. Full detail is in
 `docs/investigations/privacy-b-gate-history.md`.
 
-Gate 1 on `b1cc0952` was split by capability: Codex read-only BLOCK (3 P1),
-a Claude execution lens REJECT (1 P1). Gate 2 on `204d77cc` ran three lenses
-concurrently, with only the execution lens permitted to mutate the tree so the
-read-only lenses could not observe broken code: BLOCK (6 P1), REJECT (3 P1),
-REJECT (2 P1). Across both rounds every finding was re-verified locally before
-acting on it, and the substance held: all eight declared mutations reproduce
-independently, every evidence number reproduces, and the surviving findings were
-prose plus two mutation survivors of mine.
+Three gate rounds, nine lenses, every one rejecting. Gate 1 on `b1cc0952` was
+split by capability: Codex BLOCK (3 P1), a Claude execution lens REJECT (1 P1).
+Gates 2 and 3 each ran three lenses concurrently, with only the execution lens
+permitted to mutate the tree so the read-only lenses could not observe broken
+code: gate 2 returned BLOCK (6 P1) / REJECT (3 P1) / REJECT (2 P1), gate 3
+returned BLOCK (7 P1) / REJECT (3 P1) / REJECT (3 P1).
+
+Every finding was re-verified locally before acting on it, and across all three
+rounds the code substance held: every declared mutation reproduces
+independently, every evidence number except the timings reproduces exactly, and
+what survived was prose plus four mutation survivors of mine.
 
 Then two decisions that are Mat's, not the lane's: whether track 2's documented
 residuals are acceptable on that surface, and whether Option A (stable
@@ -109,7 +122,7 @@ Wiring them in needs someone who can watch the pipeline go green.
 
 ## State of each track
 
-### Track 1 — compressed-import parity. Remediation list done, awaiting a gate on `f6232143`.
+### Track 1 — compressed-import parity. Remediation list done, awaiting a gate on `a9662ba4`.
 
 Restores decoding of m4a/mp3/ogg/etc. when ffmpeg is absent, via a bounded
 child running Symphonia. `origin/main` did this in-process; this branch had
@@ -245,6 +258,12 @@ Option A's to remove.
 - **Type-check a platform-gated test by temporarily widening its cfg**, compiling,
   then narrowing it back. That is evidence, not a repeatable gate, so say which
   one you have.
+- **Vocabulary agreement is not agreement.** A test that two user-facing strings
+  agree must share their bytes or assert the relationship. Checking that both
+  mention "Opus" passes for a message saying the decoder handles Opus fine.
+- **A reviewer's number is a claim too.** Repeating "the suite got 26% slower"
+  without measuring it made it mine, and it was noise. Measure before you cite,
+  especially before changing CI on the strength of it.
 - **Reusing tested code does not carry its evidence with it.** A sweep that is
   canary-tested in `graph_worker` proves something about THAT caller, in THAT
   child, doing what that child does next. Calling it from a child with a
