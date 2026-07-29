@@ -2390,6 +2390,53 @@ describe("insight source identity survives a moved corpus", () => {
     }
   });
 
+  it("refuses a dot-dot component instead of letting join cancel it lexically", async () => {
+    // `join` cancels `..` lexically; the kernel does not. Measured on Linux:
+    // `missing/../board.md` is ENOENT and `afile/../board.md` is ENOTDIR, so
+    // neither names any file, while `alink/../board.md` with `alink` a symlink
+    // out of the corpus opens a file OUTSIDE it. Lexical cancellation turns all
+    // three into `<root>/board.md`, which binds a record to a meeting its
+    // recorded path never named and, in the symlink case, launders an
+    // out-of-corpus file past the active-corpus check.
+    const base = mkdtempSync(join(tmpdir(), "minutes-dotdot-"));
+    try {
+      const root = join(base, "meetings");
+      mkdirSync(root, { recursive: true });
+      mkdirSync(join(base, "outside"), { recursive: true });
+      writeFileSync(join(root, "board.md"), meetingFixture("Live board"));
+      writeFileSync(join(base, "outside", "board.md"), meetingFixture("Outside board"));
+      writeFileSync(join(root, "afile"), "not a directory");
+      symlinkSync(join(base, "outside", "subdir"), join(root, "alink"));
+
+      for (const tail of [
+        "missing/../board.md",
+        "afile/../board.md",
+        "alink/../board.md",
+        "./board.md",
+      ]) {
+        expect(resolveCorpusRelativeSourcePath(tail, root)).toBeNull();
+        expect(
+          resolveCorpusRelativeSourcePath(`/home/someone/meetings/${tail}`, root)
+        ).toBeNull();
+      }
+      // The same filename without a cancelling component still resolves, so
+      // this refuses the traversal rather than the meeting.
+      expect(resolveCorpusRelativeSourcePath("board.md", root)).toBe(
+        join(root, "board.md")
+      );
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [{ content: "DOTDOT-LAUNDER-CANARY", source_meeting: "alink/../board.md" }],
+        root,
+        false
+      );
+      expect(released).toEqual([]);
+      expect(withheld.total).toBe(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a source pointer whose surrounding whitespace is significant", async () => {
     // Trailing and leading spaces are legal in POSIX filenames, so trimming can
     // silently convert one real file's path into another real file's path.
@@ -2422,6 +2469,9 @@ describe("insight source identity survives a moved corpus", () => {
     try {
       writeFileSync(join(root, "x.md"), meetingFixture("X"));
       expect(resolveCorpusRelativeSourcePath("x.md\0.png", root)).toBeNull();
+      expect(
+        resolveCorpusRelativeSourcePath("/home/someone/meetings/x.md\0.png", root)
+      ).toBeNull();
       expect(
         resolveCorpusRelativeSourcePath("/home/someone/meetings/x.md\0.png", root)
       ).toBeNull();
@@ -2967,6 +3017,9 @@ describe("insight window is not shaped by the caller", () => {
         expect(result.structuredContent.partial).toBe(false);
         expect(result.structuredContent.withheld.total).toBe(0);
         expect(result.content[0].text).not.toContain("could not be released");
+        // A genuinely complete answer must not carry the withheld caveat, or it
+        // reads as partial when it is not.
+        expect(result.content[0].text).not.toContain("not filter-tested");
       } finally {
         await genuinelyEmpty.close();
       }

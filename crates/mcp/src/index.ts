@@ -221,8 +221,18 @@ export const MCP_INSIGHT_RESULT_MAX = 500;
  * record's policy verdict: ask for the newest k, ask for the newest k+1, and
  * whichever counter moved names the verdict on the (k+1)-th record. Sweeping k
  * maps every restricted meeting in the log. Holding the scanned window fixed
- * makes the tally a function of corpus state alone, so differencing across any
- * pair of requests yields nothing.
+ * makes the tally a function of corpus state alone.
+ *
+ * Scope that claim precisely, because it is easy to overstate and was. This
+ * closes differencing across CALLER ARGUMENTS only. It does not close
+ * differencing across CORPUS STATE: observe the tally, cause one record to be
+ * appended or one meeting's designation to change, observe again, and the delta
+ * names that record's verdict. The tally is also an aggregate restricted count
+ * whenever every record in the window has a resolvable source. Both are
+ * accepted leaks, not absent ones. Removing the exact count would close them
+ * and would not cost the partial-view contract, which needs only the boolean;
+ * it is kept because an agent that cannot tell "two withheld" from "two hundred
+ * withheld" cannot judge how incomplete its answer is.
  *
  * It is set equal to the largest permitted `limit` so that no request can
  * widen it, and so that applying `since` in this process returns exactly the
@@ -7473,15 +7483,21 @@ export type WithheldSourceReason =
  *     name inside the corpus could make it bind, which needs corpus write
  *     access and is therefore not the weakest link.
  *
- * Two limits are inherent to identifying a meeting by path at all, and only
- * Option A removes them. A path is a mutable locator, not an identity: if the
- * recorded file is deleted and an unrelated meeting later takes its name, or a
- * symlink is retargeted, the re-read validates the replacement and releases the
- * old record under the new file's policy. And a relative recorded value is
- * accepted even though today's pipeline only ever writes absolute paths, so a
- * corrupt record naming `notes.md` binds to the live `notes.md`. Both fail in
- * the direction of releasing something, which is why the durable fix is an
- * identifier the pipeline writes and the reader can re-verify.
+ * One limit is INHERENT to identifying a meeting by path, and only Option A
+ * removes it: a path is a mutable locator, not an identity. If the recorded
+ * file is deleted and an unrelated meeting later takes its name, or a symlink
+ * is retargeted, the re-read validates whatever now occupies the locator and
+ * releases the old record under that file's policy. Calling this "revalidating
+ * the source" overstates it; what is revalidated is the current occupant.
+ *
+ * A second widening is OPTIONAL and is kept deliberately rather than because it
+ * is forced: a relative recorded value is accepted although today's pipeline
+ * only ever writes absolute paths. It is retained because the anchored branch
+ * already grants the same reach to any crafted absolute value, so refusing
+ * relative closes no distinct hole, and because a corrupt event log is outside
+ * this surface's threat model. If a versioned producer ever emits an explicit
+ * identifier, that should be its own field rather than a reinterpreted path,
+ * and this branch should go.
  *
  * Anchor matching is case-insensitive, which cuts both ways and is stated here
  * because only one direction is obvious. It refuses a case-variant second
@@ -7533,6 +7549,20 @@ export function resolveCorpusRelativeSourcePath(
   // judged under different policy. Trim only to detect emptiness; if it changed
   // anything, refuse rather than guess which file was meant.
   if (trimmed !== value) return null;
+  // Refuse `.` and `..` components before anything normalises them away.
+  //
+  // `join` and `resolve` cancel `..` LEXICALLY, which is not what the kernel
+  // does. Measured on Linux: `missing/../board.md` fails ENOENT and
+  // `afile/../board.md` fails ENOTDIR, so neither denotes any file at all,
+  // while `alink/../board.md` where `alink` is a symlink out of the corpus
+  // opens a file OUTSIDE it. Lexical cancellation turns all three into
+  // `<root>/board.md`, binding a record to a meeting its recorded path never
+  // named, and in the symlink case laundering an out-of-corpus file into the
+  // corpus behind the active-corpus check. Splitting on both separators here
+  // over-refuses on POSIX, which is the safe direction.
+  if (trimmed.split(/[\\/]+/).some((part) => part === "." || part === "..")) {
+    return null;
+  }
 
   // Every filesystem touch below can throw: `canonicalizeRoot` calls
   // `realpathSync`, and a record whose source is unlinked between the stat and
@@ -7608,14 +7638,10 @@ function resolveCorpusRelativeSourcePathInner(
     candidate = join(canonicalRoot, ...segments.slice(anchor + 1));
   }
 
-  // Note what this does and does not do. `join` NORMALISES first, so a `..`
-  // that cancels an earlier component is gone before the check runs: a tail of
-  // `archive/../notes.md` arrives here as `notes.md` and is allowed. That is
-  // correct, because that tail denotes `notes.md` and always did, but it means
-  // this is not a syntactic ban on the strings `..` or `archive`. What it
-  // guarantees is the property that matters: whatever file the candidate
-  // actually denotes must sit inside the live root and outside every inactive
-  // or hidden directory.
+  // This is confinement, not identity. It proves whatever the candidate denotes
+  // sits inside the live root and outside every inactive or hidden directory.
+  // It cannot prove the candidate preserves what the RECORDED path denoted,
+  // which is why `..` is refused above rather than relied on being caught here.
   return isActiveCorpusMeetingPath(candidate, canonicalRoot) ? candidate : null;
 }
 
@@ -8045,7 +8071,15 @@ export function registerUnavailableCompatibilityTools(
             // filter was never evaluated against them and this cannot claim
             // they failed to match. Saying "nothing matched your filter" there
             // would hand the agent a reason the code never established.
-            text: `No releasable meeting insights matched the filter criteria. Records withheld by policy are not filter-tested, so this is not evidence that no such insight exists. Insights are extracted when meetings are processed with summarization enabled.${suffix}`,
+            // The "not filter-tested" caveat belongs only where records were
+            // actually withheld. Emitting it on a genuinely empty result makes
+            // a complete answer sound partial, which is the same class of false
+            // statement in the other direction.
+            text: `No releasable meeting insights matched the filter criteria.${
+              withheld.total > 0
+                ? " Records withheld by policy are not filter-tested, so this is not evidence that no such insight exists."
+                : ""
+            } Insights are extracted when meetings are processed with summarization enabled.${suffix}`,
           }],
           structuredContent: {
             available: true,
