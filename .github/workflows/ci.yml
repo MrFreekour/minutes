@@ -134,8 +134,16 @@ jobs:
         run: cargo build --no-default-features
 
       - name: Unit tests (no whisper)
+        # 5 rather than 3: the compressed-decode tests spawn a real bounded child
+        # per case, and each launch binds the worker by copying the ~250 MB debug
+        # executable into an immutable snapshot. Measured at 113 s single-threaded
+        # on a dev box against 90 s before those tests existed, and the macOS and
+        # Windows runners copy to disk where Linux copies into a memfd. Loosening
+        # a timeout cannot turn a passing run red, which is why this is safe to
+        # change from a lane that cannot watch the runners; adding invocations is
+        # not, and is left for someone who can.
         run: cargo test -p minutes-core --no-default-features --lib -- --test-threads=1
-        timeout-minutes: 3
+        timeout-minutes: 5
 
       - name: Copilot attach, routing, and window-contract tests
         # On Windows this executes the real named-pipe connect/reconnect path.

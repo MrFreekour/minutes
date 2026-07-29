@@ -179,6 +179,25 @@ pub fn install_whisper_logging_hooks() {
     whisper_rs::install_logging_hooks();
 }
 
+/// Whether a worker-capable binary sits beside the test harness, answered once.
+///
+/// Several tests assert this as a precondition rather than skipping silently.
+/// Each answer costs a full copy of the ~250 MB debug executable into an
+/// immutable snapshot, and a reviewer measured the suite 26% slower against a CI
+/// step whose timeout is three minutes. The answer cannot change during a run, so
+/// paying for it once is both cheaper and no weaker.
+#[cfg(test)]
+pub(crate) fn test_worker_binary_is_available() -> bool {
+    use std::sync::OnceLock;
+
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        crate::audio_decode_worker::bounded_decode_fallback_available(
+            &crate::config::Config::default(),
+        )
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};

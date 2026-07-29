@@ -32,18 +32,14 @@
 //! capped stdout streamed into a private file it has no pathname for, and a
 //! cleared environment.
 //!
-//! Ambient descriptors are closed before `exec` on Unix. On Windows the child
-//! calls `graph_worker`'s inherited-handle sweep instead, because
-//! `CreateProcessW` is invoked with `bInheritHandles: TRUE` there.
+//! Ambient descriptors are marked `FD_CLOEXEC` on Unix and therefore closed BY
+//! `exec`, not before it: closing them outright would destroy the spawn-error
+//! pipe std relies on.
 //!
-//! The Windows half is UNVERIFIED, and more weakly than an earlier version of
-//! this paragraph admitted. It claimed the sweep is "canary-tested on Windows
-//! CI". The canary exists, in `crates/cli/tests/policy_graph_worker.rs`, but no
-//! CI workflow runs it: the only `-p minutes-cli` test invocation is filtered on
-//! `copilot`, under which that file reports 0 tests. So the sweep's Windows
-//! behaviour is covered by a test nothing currently executes, this call site has
-//! no canary of its own, and neither has ever been compiled or run on Windows
-//! from this lane. Read it as "the same sweep, called from here".
+//! **Windows has no equivalent sweep here, and the child can inherit ambient
+//! HANDLEs.** `CreateProcessW` is invoked with `bInheritHandles: TRUE`.
+//! `graph_worker` closes them; this worker does not, and the reasoning for that
+//! is at the point in [`maybe_run_audio_decode_worker`] where the call would go.
 //!
 //! The worker emits the same bytes ffmpeg is asked for, raw 16 kHz mono
 //! `s16le` PCM on stdout, so both decoders share one downstream path.
@@ -59,11 +55,23 @@ const WORKER_MARKER: &str = "MINUTES_AUDIO_DECODE_WORKER_V1";
 
 /// Address-space growth budget for the decode child.
 ///
-/// This is a growth allowance over the process baseline, never an absolute
-/// ceiling. A four-hour input holds roughly 921 MB of `f32` output alongside
-/// 461 MB of `s16le` bytes, so the budget must clear ~1.4 GB plus allocator
-/// slack while still failing an attacker-declared allocation inside the child
-/// rather than exhausting the machine.
+/// A four-hour input holds roughly 921 MB of `f32` output alongside 461 MB of
+/// `s16le` bytes, so the budget must clear ~1.4 GB plus allocator slack while
+/// still failing an attacker-declared allocation inside the child rather than
+/// exhausting the machine.
+///
+/// WHAT THIS NUMBER MEANS DIFFERS BY PLATFORM, and this doc used to say it was
+/// "a growth allowance over the process baseline, never an absolute ceiling",
+/// which is true on macOS only. Anyone sizing the budget from that sentence on
+/// Linux would be out by the whole image:
+///
+/// - non-macOS Unix and Windows: an ABSOLUTE ceiling. The parent sets
+///   `rlim_cur = rlim_max = 3 GiB`, or the equivalent Job Object limits, so the
+///   mapped executable and every shared library come out of this figure. The
+///   debug worker binary alone is ~250 MB of it.
+/// - macOS: a growth allowance. The child measures its own virtual size and
+///   installs baseline plus this budget, because Darwin rejects an absolute
+///   `RLIMIT_AS` below its pre-`main()` shared-cache baseline.
 const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 /// Install the child's own address-space ceiling, measured against this
@@ -134,22 +142,43 @@ fn process_virtual_size() -> Result<u64, String> {
 /// called itself and then asserted. macOS installs its own ceiling just above
 /// and reports failure through that call.
 ///
-/// Both limits must equal the worker budget EXACTLY, which is what makes this a
-/// provenance check rather than a bounded-somehow check. An earlier version
-/// accepted anything finite and no looser than the budget, and its comment
-/// claimed that refused an ambient `ulimit -v`; it did not, since an ambient
-/// limit at or under the budget satisfied it and is indistinguishable from a
-/// parent-installed one. The parent sets `rlim_cur` and `rlim_max` to this
-/// constant, so equality holds for every real launch: if a lower ambient hard
+/// WHAT THIS ESTABLISHES, stated narrowly because an earlier version of this
+/// comment did not. It compares two numbers to a constant. Both `rlim_cur` and
+/// `rlim_max` must equal the worker budget exactly. That is a check on the
+/// VALUE, not on who installed it: a foreign launcher that set both limits to
+/// exactly this constant would be accepted, and nothing here could tell the
+/// difference. Calling it a provenance check, as this comment once did, claimed
+/// an authentication property the code does not have.
+///
+/// What exact equality does buy over "finite and no looser than the budget",
+/// which is what this checked first: an ambient `ulimit -v` under the budget no
+/// longer satisfies it. The parent sets `rlim_cur` and `rlim_max` to this
+/// constant, so equality holds for every real launch. If a lower ambient hard
 /// limit were in force, the parent's own `setrlimit` would fail and no child
-/// would exist to run this. Checking `rlim_max` too is what rules out a child
-/// that could raise its own soft limit back up.
+/// would exist to run this.
+///
+/// Requiring `rlim_max` too is what stops a child from raising its own soft
+/// limit back up.
 ///
 /// The consequence, stated rather than left implicit: a decode child contained
 /// by some OTHER mechanism, a cgroup or an outer sandbox, while presenting an
 /// unbounded `RLIMIT_AS`, is refused here. That is deliberate. This worker's
-/// containment argument is the ceiling its own parent installs, and no launch
-/// path in this crate omits it.
+/// containment argument is the ceiling its own parent installs, and no
+/// PRODUCTION launch path in this crate omits it. Three tests below deliberately
+/// build launch paths that do, which is how they observe this function at all.
+///
+/// TESTED BY, one test per branch, because a reviewer proved the `rlim_max` half
+/// could be deleted with the whole suite still green:
+/// - `the_production_probe_child_runs_under_an_address_space_ceiling`: no
+///   ceiling at all, and the production probe succeeding is what shows the
+///   parent installs one;
+/// - `a_ceiling_that_is_not_the_worker_budget_is_refused`: a ceiling of a
+///   different value;
+/// - `a_soft_ceiling_with_an_unbounded_hard_ceiling_is_refused`: the `rlim_max`
+///   half specifically, which needs a shell because
+///   `BoundedCommand::address_space_limit` always sets both limits together.
+///
+/// Untested: the `getrlimit` failure branch, which needs the syscall to fail.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn verify_parent_bound_address_space() -> Result<(), String> {
     let mut limit = libc::rlimit {
@@ -159,11 +188,18 @@ fn verify_parent_bound_address_space() -> Result<(), String> {
     if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
         return Err("decode worker could not read its address-space ceiling".into());
     }
-    // `rlim_t` is u64 on our Unix builders but is not guaranteed to be.
+    // `try_from` rather than `u64::from`: `rlim_t` is u64 on our shipped Unix
+    // targets but is `i64` on the FreeBSD family and `uintptr_t` on Haiku, both
+    // of which this cfg selects and neither of which has a `From` impl. The
+    // parent uses `try_into` at the matching `setrlimit` for the same reason.
+    // A value that cannot be represented becomes `u64::MAX` and therefore fails
+    // the comparison below: unreadable means refused, never accepted.
+    // The conversion is an identity on our shipped targets, which is what the
+    // allow is for; it is not one on the targets named above.
     #[allow(clippy::useless_conversion)]
-    let current = u64::from(limit.rlim_cur);
+    let current = u64::try_from(limit.rlim_cur).unwrap_or(u64::MAX);
     #[allow(clippy::useless_conversion)]
-    let maximum = u64::from(limit.rlim_max);
+    let maximum = u64::try_from(limit.rlim_max).unwrap_or(u64::MAX);
     if current != WORKER_ADDRESS_SPACE_BYTES || maximum != WORKER_ADDRESS_SPACE_BYTES {
         return Err("decode worker refuses to parse input without an address-space ceiling".into());
     }
@@ -341,8 +377,8 @@ fn build_decode_command(
         .single_process()
         .close_extra_descriptors();
     // Ordering is the security property: the ceiling must bind before Symphonia
-    // reads an attacker-controlled byte. Linux binds it from `pre_exec`, before
-    // `exec` itself. Windows installs a Job Object memory ceiling from this same
+    // reads an attacker-controlled byte. Every non-macOS Unix binds it from
+    // `pre_exec`, before `exec` itself, not Linux alone. Windows installs a Job Object memory ceiling from this same
     // setting at CREATE_SUSPENDED, the strongest ordering of any platform.
     // Only Darwin rejects an absolute RLIMIT_AS below its pre-main()
     // shared-cache baseline, so only Darwin defers to the measured in-child
@@ -406,8 +442,13 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
         );
         return Some(EXIT_UNDECODABLE);
     }
-    // Ordering: install the ceiling before anything parses input. On Linux the
-    // parent already bound it via pre_exec; elsewhere this is where it binds.
+    // Ordering: the ceiling must be in force before anything parses input.
+    // Where it comes from is three-way, and an earlier version of this comment
+    // said "Linux ... elsewhere this is where it binds", which was wrong about
+    // both other platforms: EVERY non-macOS Unix binds it in the parent's
+    // pre_exec, Windows binds it in a Job Object before the child runs at all,
+    // and macOS alone binds it here. So this is an install on macOS and a
+    // verification everywhere else it runs.
     #[cfg(target_os = "macos")]
     if let Err(error) = install_child_address_space_ceiling() {
         eprintln!("{error}");
@@ -418,24 +459,31 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
         eprintln!("{error}");
         return Some(71);
     }
-    // Windows inherits ambient inheritable HANDLEs whenever stdio is
-    // redirected. Checked rather than assumed, in the pinned toolchain's own
-    // source: `sys::process::windows` defaults `inherit_handles: true` and
-    // passes it straight to `CreateProcessW`, so the sweep is load-bearing
-    // rather than decorative. This worker parses attacker-controlled bytes with
-    // the user's full authority, so it retires the same handles `graph_worker`
-    // does, before it reads any.
+    // NOT SWEPT ON WINDOWS, and that is a decision rather than an oversight.
     //
-    // What that is NOT: tested. The sweep body cannot be compiled or run from
-    // this lane, and its canary in `crates/cli/tests/policy_graph_worker.rs` is
-    // not run by any CI workflow either, because the only `-p minutes-cli` test
-    // invocation is filtered on `copilot`. Wiring that file into CI is the fix,
-    // and it is deliberately not done blind from a lane that cannot watch the
-    // Windows runner go green.
-    if let Err(error) = crate::graph_worker::close_inherited_windows_handles_before_authority() {
-        eprintln!("{error}");
-        return Some(71);
-    }
+    // The exposure is real and was checked rather than assumed, in the pinned
+    // toolchain's own source: `sys::process::windows` defaults
+    // `inherit_handles: true` and passes it straight to `CreateProcessW`, so
+    // this child can inherit ambient inheritable HANDLEs. `graph_worker` closes
+    // them with `close_inherited_windows_handles_before_authority`, and calling
+    // that here was tried.
+    //
+    // It was backed out because the first execution would be on Windows CI,
+    // which no one working on this can watch. `ci.yml` runs the `minutes-core`
+    // lib tests on `windows-latest` with no guard, and several ungated tests
+    // there spawn this child, so the sweep would immediately become load-bearing
+    // on a runner with no local reproduction. The two children are not
+    // equivalent afterwards: the graph child reads stdin, computes, and writes
+    // stdout, while this one opens files and runs Symphonia container probing,
+    // which can pull delay-loaded imports. The sweep retains only the three
+    // std handles. Whether that leaves this child able to finish is untested and
+    // untestable from here, and the failure mode is losing compressed import on
+    // Windows entirely, which is the regression this whole track exists to
+    // close.
+    //
+    // The fix is the sweep plus a decode-worker canary plus a CI invocation that
+    // actually runs it, landed by someone who can watch it go green. Until then
+    // the honest statement is that Windows has no sweep here.
     let probe_only = std::env::args_os().any(|argument| argument == PROBE_DURATION_ARG);
     let path = std::env::args_os()
         .skip_while(|argument| argument != "--")
@@ -478,7 +526,27 @@ pub(crate) fn probe_compressed_duration(
         },
     )
     .ok()?;
+    // `None` here is indistinguishable to the caller from "this container
+    // declares no duration", and the watcher's response to that is to fall back
+    // to `config.watch.type`: long calls filed as memos with no diarization,
+    // which is the exact misrouting this probe exists to prevent. A child that
+    // FAILED is a different event from a container that said nothing, and the
+    // containment self-check added a new way to reach it, so say so rather than
+    // degrade in silence.
     if run.timed_out || !run.output.status.success() {
+        tracing::warn!(
+            path = %crate::pipeline::private_audio_diagnostic_label(path),
+            timed_out = run.timed_out,
+            exit = ?run.output.status.code(),
+            detail = %String::from_utf8_lossy(&run.output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("no detail")
+                .chars()
+                .take(200)
+                .collect::<String>(),
+            "compressed duration probe failed; content-type routing falls back to config"
+        );
         return None;
     }
     let seconds: f64 = String::from_utf8_lossy(&run.output.stdout)
@@ -765,9 +833,12 @@ mod tests {
     ///
     /// The previous shape called `.address_space_limit(...)` in the test and
     /// then asserted the getter, so deleting the production call left it green.
-    /// This one reads the builder every launch goes through. It does NOT prove
-    /// a caller still uses that builder - an earlier version of this comment
-    /// claimed it drove `decode_to_private_pcm`'s own path, which it never did.
+    /// This one reads the production command builder's configuration. It does
+    /// NOT prove any caller still uses that builder, and the two earlier
+    /// versions of this comment both implied otherwise: one claimed it drove
+    /// `decode_to_private_pcm`'s own path, the next called it "the builder every
+    /// launch goes through", which reads as coverage of the caller relationship
+    /// in the same breath as denying it.
     /// `the_production_probe_child_runs_under_an_address_space_ceiling` is the
     /// test that covers the caller.
     #[cfg(not(target_os = "macos"))]
@@ -847,6 +918,21 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("chained.ogg");
         std::fs::write(&path, CHAINED).unwrap();
+
+        // Assert the fixture's own premise before asserting anything about the
+        // decode. Everything that makes this test meaningful - that the first
+        // logical stream is real and delivers packets before the reset - lived
+        // only in the comment above and in an opaque binary, so a fixture
+        // accidentally replaced by one that resets immediately would leave this
+        // test green while its name became false. A first stream that probes as
+        // about three seconds is the cheapest available proof that it is there.
+        let first_stream = probe_duration_seconds(&path)
+            .expect("the chained fixture's first logical stream must be probeable");
+        assert!(
+            (2.5..=3.5).contains(&first_stream),
+            "the fixture's first stream must be the ~3 s one this test reasons about, got \
+             {first_stream}; if it was regenerated, re-read the provenance commands above"
+        );
 
         match decode_compressed_to_s16le(&path) {
             Ok(pcm) => panic!(
@@ -1083,19 +1169,19 @@ mod tests {
         );
     }
 
-    /// The child's ceiling check is a PROVENANCE check, not a bounded-somehow
-    /// check, and this is what makes that difference observable.
+    /// A ceiling that is not the worker budget is refused even when it is
+    /// TIGHTER than the budget.
     ///
-    /// A child launched under someone else's ceiling is refused even when that
-    /// ceiling is TIGHTER than the worker budget, because a tighter ambient
-    /// limit is indistinguishable from a parent that dropped its own setting on
-    /// a machine where `ulimit -v` happened to be set. The first version of the
-    /// check accepted anything finite and no looser than the budget, and its
-    /// comment claimed it refused ambient limits; it did not, and no test then
-    /// existed that could tell the two apart.
+    /// The name is deliberately about the VALUE rather than about whose ceiling
+    /// it is. An earlier name said "someone else's ceiling is refused", which
+    /// overclaimed: a foreign launcher setting exactly the worker budget is
+    /// accepted, and this check cannot tell that apart from the parent's own.
+    /// What it does buy is that the first version of the check, which accepted
+    /// anything finite and no looser than the budget, is now observable: under
+    /// that version this child exits 0.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn a_worker_child_under_someone_elses_ceiling_is_refused() {
+    fn a_ceiling_that_is_not_the_worker_budget_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("memo.m4a");
         std::fs::write(&path, M4A_FIXTURE).unwrap();
@@ -1126,6 +1212,75 @@ mod tests {
             "a ceiling this worker did not install must be refused; got {:?} with stderr \
              {diagnostic:?}",
             run.output.status.code()
+        );
+        assert!(
+            diagnostic.contains("address-space ceiling"),
+            "{diagnostic:?}"
+        );
+    }
+
+    /// A soft limit at the worker budget with an unbounded HARD limit is
+    /// refused, because that child could raise its own ceiling back up.
+    ///
+    /// This half went untested for a whole gate round and a reviewer proved it:
+    /// deleting the `rlim_max` comparison left the entire suite green, while the
+    /// docstring called it load-bearing. Neither sibling ceiling test can see it,
+    /// because `BoundedCommand::address_space_limit` sets `rlim_cur` and
+    /// `rlim_max` together, so no command it can build varies them apart.
+    ///
+    /// Hence the shell: `ulimit -S -v` lowers the soft limit alone, leaving the
+    /// hard limit as inherited. Nothing here can RAISE a hard limit, which is
+    /// exactly why the case is reachable at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_soft_ceiling_with_an_unbounded_hard_ceiling_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memo.m4a");
+        std::fs::write(&path, M4A_FIXTURE).unwrap();
+
+        // Resolve the adjacent binary directly. The production resolver hands
+        // back a sealed snapshot reachable only through /proc/self/fd, which a
+        // separate `sh` process cannot exec.
+        let current = std::env::current_exe().unwrap();
+        let helper = current
+            .parent()
+            .and_then(|parent| parent.parent())
+            .map(|grandparent| grandparent.join("minutes"))
+            .filter(|candidate| candidate.is_file())
+            .expect(
+                "this test needs a worker-capable binary beside the harness; build one with \
+                 `cargo build -p minutes-cli --no-default-features`",
+            );
+
+        let budget_kib = (WORKER_ADDRESS_SPACE_BYTES / 1024).to_string();
+        let script = format!(
+            "ulimit -H -v unlimited 2>/dev/null; ulimit -S -v {budget_kib} || exit 70; \
+             exec \"$1\" {PROBE_DURATION_ARG} -- \"$2\""
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .arg("minutes-soft-ceiling-probe")
+            .arg(&helper)
+            .arg(&path)
+            .env_clear()
+            .env(WORKER_MARKER, "1")
+            .output()
+            .expect("the shell wrapper must launch");
+
+        let diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_ne!(
+            output.status.code(),
+            Some(70),
+            "the shell could not set a soft-only ceiling, so this test proves nothing: \
+             {diagnostic:?}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(71),
+            "a soft ceiling the child could raise must be refused; got {:?} with stderr \
+             {diagnostic:?}",
+            output.status.code()
         );
         assert!(
             diagnostic.contains("address-space ceiling"),

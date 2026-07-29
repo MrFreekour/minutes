@@ -491,13 +491,20 @@ fn ffmpeg_preprocess_command(ffmpeg: &Path, input: &str) -> crate::bounded_child
 /// speaker labels with no user-visible explanation. The bounded decode worker
 /// already produces exactly the canonical PCM this path needs.
 ///
-/// TEST COVERAGE, in one place so the gaps are not spread across comments.
-/// Covered, each verified by applying the mutation alone and watching the named
-/// test fail: the availability check, the config source, the pre-decode
-/// cancellation check and its ORDER against the availability probe, and the call
-/// site in [`preprocess_audio`].
+/// TEST COVERAGE. This lists the properties this function was GATED on, not an
+/// exhaustive audit of everything it does; read it as "the mutation-surviving
+/// gaps two review rounds found", which is what it is.
 ///
-/// NOT covered, four things, none of which any test here would catch:
+/// Covered, each verified by applying the mutation alone and watching the named
+/// test fail: the availability check, the config source, the PRECEDENCE of the
+/// cancellation error over the availability refusal and over decode failures,
+/// and the call site in [`preprocess_audio`]. Note precedence, not ordering: no
+/// test here can see whether the availability probe ran before the cancellation
+/// error was returned.
+///
+/// NOT covered, four things, none of which any test here would catch. A reviewer
+/// applied all four simultaneously and the suite stayed green, which is the
+/// evidence that the list is complete as well as honest:
 /// 1. the post-decode cancellation check, which needs a cancel to land during a
 ///    decode;
 /// 2. the diarization wall clock handed to the child, which needs a decode
@@ -505,6 +512,10 @@ fn ffmpeg_preprocess_command(ffmpeg: &Path, input: &str) -> crate::bounded_child
 /// 3. the `MAX_DIARIZATION_SAMPLES` cap, which needs an input past two hours;
 /// 4. the zero-remaining guard below, which needs the availability probe's
 ///    executable copy to outlast the remaining budget.
+///
+/// The shared lease this preprocessing runs under is acquired by
+/// `run_bounded_diarization_worker`, not here, so it is that function's property
+/// rather than an undisclosed one of this list.
 ///
 /// All four are races or multi-hour inputs rather than assertions. Listing them
 /// is not a plan to leave them; it is so the next reader does not mistake this
@@ -528,7 +539,9 @@ fn preprocess_compressed_without_ffmpeg(
     cancellation.check().map_err(|error| error.to_string())?;
     // Use the config the pipeline is running under rather than re-reading from
     // disk, so the diarization decision cannot diverge from the transcription
-    // decision for the same file, and so no disk I/O happens inside the worker.
+    // decision for the same file, and so no CONFIGURATION file is read here. The
+    // worker obviously reads the input; an earlier version of this line said "no
+    // disk I/O happens inside the worker", which is not what is meant or true.
     if !crate::audio_decode_worker::bounded_decode_fallback_available(config) {
         return Err("the bounded decode fallback is unavailable".into());
     }
@@ -4028,7 +4041,7 @@ mod tests {
         // mutation would look green, which is the defect class item 3 of the
         // same list exists to fix.
         assert!(
-            crate::audio_decode_worker::bounded_decode_fallback_available(&Config::default()),
+            crate::test_worker_binary_is_available(),
             "this test needs a worker-capable binary beside the harness; build one with \
              `cargo build -p minutes-cli --no-default-features`"
         );
@@ -4043,10 +4056,11 @@ mod tests {
         )
         .unwrap();
 
-        // Nothing between the set and the restore may panic, or every later test
-        // in this process inherits an XDG_CONFIG_HOME pointing into a TempDir
-        // that is about to be deleted. Both observations are captured first and
-        // asserted after the restore.
+        // Both observations are captured first and asserted after the restore,
+        // so an assertion failure cannot leak XDG_CONFIG_HOME into every later
+        // test in this process. That is what the code enforces. It is NOT
+        // panic-freedom: a panic inside the calls between the set and the
+        // restore would still leak, and only an RAII guard would fix that.
         let _lock = crate::test_home_env_lock();
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
@@ -4069,7 +4083,16 @@ mod tests {
         drop(retained);
     }
 
-    /// Cancellation is checked before the fallback touches anything expensive.
+    /// A cancelled diarization reports cancellation, in preference to both the
+    /// availability refusal and any decode failure.
+    ///
+    /// The name is precedence, not ordering, and that is deliberate. An earlier
+    /// name said "checks cancellation before touching the decoder", which the
+    /// body cannot establish: an implementation that ran the availability probe,
+    /// discarded the result, and then returned the cancellation error would keep
+    /// both assertions green. Observing that would need a call counter on the
+    /// resolver. What IS pinned is that the cancellation error wins, which is
+    /// what kills the mutation that deletes the pre-decode check.
     ///
     /// Two assertions because the first one alone does not pin what it claims.
     /// Deleting the pre-decode check leaves the post-decode check reporting the
@@ -4086,7 +4109,7 @@ mod tests {
     /// Neither half depends on a worker binary being present: without one the
     /// mutation reports the availability refusal, which is also not this string.
     #[test]
-    fn the_diarization_fallback_checks_cancellation_before_touching_the_decoder() {
+    fn cancellation_takes_precedence_over_availability_and_over_decode_failures() {
         let cancellation = DiarizationCancellation::new(Duration::from_secs(60));
         cancellation.cancel();
 
@@ -4121,7 +4144,7 @@ mod tests {
     #[test]
     fn compressed_diarization_input_routes_through_the_worker_when_ffmpeg_is_missing() {
         assert!(
-            crate::audio_decode_worker::bounded_decode_fallback_available(&Config::default()),
+            crate::test_worker_binary_is_available(),
             "this test needs a worker-capable binary beside the harness; build one with \
              `cargo build -p minutes-cli --no-default-features`"
         );

@@ -920,9 +920,11 @@ pub fn compressed_audio_decodable_with(
 /// Guidance for a compressed import this machine could not decode.
 ///
 /// It is NOT limited to "ffmpeg missing and the bounded worker unavailable",
-/// which is what this comment used to claim and what made the message wrong:
-/// the commonest state that reaches it is ffmpeg missing while the bounded
-/// worker is present, enabled, and simply has no decoder for the codec.
+/// which is what this comment used to claim and what made the message wrong.
+/// A second state reaches it: ffmpeg missing while the bounded worker is
+/// present, enabled, and simply has no decoder for the codec. Which of the two
+/// is more common is not something this repo measures, and an earlier version of
+/// this line asserted it was.
 ///
 /// This must stay true in BOTH states that reach it, which the previous wording
 /// did not. It told every affected user to "re-enable the bundled decoder",
@@ -1613,15 +1615,20 @@ mod tests {
     /// The watcher and `minutes health` are read by the same person about the
     /// same machine, so they must not disagree about whether compressed imports
     /// work without ffmpeg.
+    ///
+    /// A reviewer proved the earlier version did not deserve its name: it read
+    /// only `health::ffmpeg_status` and never touched the guidance, so replacing
+    /// the whole guidance body with text asserting the OPPOSITE of what health
+    /// says left this test green. Three sibling tests caught that mutation, so no
+    /// production regression escaped, but the test named for agreement was the
+    /// one test that could not see a disagreement. Both sides are read now.
     #[test]
     fn health_and_watch_guidance_agree_about_the_unsupported_codecs() {
         // The branch under test is "ffmpeg absent, bundled decoder present".
         // Without a worker-capable binary the third branch answers instead, and
         // the failure would name a wording problem that is not the real cause.
         assert!(
-            crate::audio_decode_worker::bounded_decode_fallback_available(
-                &crate::config::Config::default()
-            ),
+            crate::test_worker_binary_is_available(),
             "this test needs a worker-capable binary beside the harness; build one with \
              `cargo build -p minutes-cli --no-default-features`"
         );
@@ -1649,6 +1656,22 @@ mod tests {
                 .contains("This works without any extra install"),
             "health must not print an unqualified green check: {}",
             health.detail
+        );
+
+        // The other side of the agreement. Without this the test could not fail
+        // for a guidance that said the opposite of health.
+        let guidance = compressed_audio_ffmpeg_guidance();
+        for codec in ["Opus", "ALAC"] {
+            assert!(
+                health.detail.contains(codec) && guidance.contains(codec),
+                "both surfaces must name {codec}; health said {:?} and guidance said {guidance:?}",
+                health.detail
+            );
+        }
+        assert!(
+            !guidance.contains("handles every compressed format")
+                && !guidance.contains("without any extra install"),
+            "guidance must not claim the coverage health denies: {guidance:?}"
         );
     }
 

@@ -2416,10 +2416,16 @@ mod tests {
     /// Guards the defect class that made the path-backed snapshot unusable, and
     /// records that the two Unixes disagree about it.
     ///
-    /// Linux refuses `execve` with `ETXTBSY` on any vnode a process still holds
+    /// Linux refuses `execve` with `ETXTBSY` on a vnode a process still holds
     /// open for writing, so a snapshot that retains its setup handle cannot be
-    /// launched there. Darwin permits exactly that, measured on macOS 26.6, and
-    /// instead refuses descriptor execution of an unlinked inode with EACCES.
+    /// launched there. Darwin permits exactly that, measured on macOS 26.6.
+    ///
+    /// It constructs no `BoundExecutable` and no `BoundedCommand`: it execs a
+    /// plain script, so no production mutation can fail it. It is a canary for
+    /// the platform rule the snapshot design rests on, not coverage OF the
+    /// snapshot. The separate Darwin measurement that descriptor execution of an
+    /// unlinked inode fails EACCES is recorded at `launch_path`; nothing here
+    /// attempts descriptor execution, so this test does not cover it.
     ///
     /// Item 4 of the track-1 remediation list. This asserted ETXTBSY for every
     /// Unix, so the suite was deterministically red on macOS: the prose above
@@ -2432,7 +2438,7 @@ mod tests {
     /// `a_mutated_path_backed_snapshot_is_refused_before_launch` below.
     #[cfg(unix)]
     #[test]
-    fn path_backed_snapshot_execs_once_sealed_whatever_the_platform_write_rule() {
+    fn the_platform_write_rule_the_path_backed_snapshot_design_depends_on() {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -2488,7 +2494,9 @@ mod tests {
     /// NOT EXECUTED FROM THIS LANE, and that is stated rather than implied. The
     /// digest re-check is `cfg(all(unix, not(target_os = "linux")))` because
     /// Linux binds a sealed memfd that cannot be rewritten, so this test is
-    /// compiled out here and runs on macOS CI only. It was type-checked on Linux
+    /// compiled out here. The cfg selects every non-Linux Unix, not macOS; it is
+    /// this repo's CI matrix, which has a macOS runner and no other non-Linux
+    /// Unix, that makes macOS the only place it currently executes. It was type-checked on Linux
     /// by temporarily widening the cfg to `unix`, which is the most this lane can
     /// verify - it cannot compile or run Darwin.
     #[cfg(all(unix, not(target_os = "linux")))]
