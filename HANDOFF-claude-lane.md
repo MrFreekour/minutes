@@ -82,19 +82,18 @@ remediated. The author has now edited this prose five times and should not be th
 one to read it a sixth.
 
 **The track-1 remediation list is worked through.** All nine items plus the tenth
-added 2026-07-27 are closed across `51146a17`, `8be61da0`, `b1cc0952` and
-`204d77cc`. Full detail is in `docs/investigations/privacy-b-gate-history.md`.
+added 2026-07-27 are closed across `51146a17`, `8be61da0`, `b1cc0952`,
+`204d77cc` and `f6232143`. Full detail is in
+`docs/investigations/privacy-b-gate-history.md`.
 
-`b1cc0952` was gated twice, split by capability: Codex read-only returned BLOCK
-(3 P1 + 4 P2), a Claude execution lens returned REJECT (1 P1 + 2 P2). The lens
-reproduced all eight mutations, all four declared-uncovered survivals, and every
-evidence number. Every finding was re-verified locally before acting; all are
-remediated at `204d77cc`.
-
-**Next: a fresh gate on `204d77cc`.** Both reviews were of `b1cc0952`, and the
-standing lesson is that the author cannot review his own prose - four of this
-round's five surviving defects were prose I had written, one of them inside the
-fix for that same defect class.
+Gate 1 on `b1cc0952` was split by capability: Codex read-only BLOCK (3 P1),
+a Claude execution lens REJECT (1 P1). Gate 2 on `204d77cc` ran three lenses
+concurrently, with only the execution lens permitted to mutate the tree so the
+read-only lenses could not observe broken code: BLOCK (6 P1), REJECT (3 P1),
+REJECT (2 P1). Across both rounds every finding was re-verified locally before
+acting on it, and the substance held: all eight declared mutations reproduce
+independently, every evidence number reproduces, and the surviving findings were
+prose plus two mutation survivors of mine.
 
 Then two decisions that are Mat's, not the lane's: whether track 2's documented
 residuals are acceptable on that surface, and whether Option A (stable
@@ -110,7 +109,7 @@ Wiring them in needs someone who can watch the pipeline go green.
 
 ## State of each track
 
-### Track 1 — compressed-import parity. Remediation list done, awaiting a gate on `204d77cc`.
+### Track 1 — compressed-import parity. Remediation list done, awaiting a gate on `f6232143`.
 
 Restores decoding of m4a/mp3/ogg/etc. when ffmpeg is absent, via a bounded
 child running Symphonia. `origin/main` did this in-process; this branch had
