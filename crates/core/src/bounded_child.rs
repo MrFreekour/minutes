@@ -1431,10 +1431,14 @@ impl ProcessTree {
                         "child memory limit exceeds Windows address range",
                     )
                 })?;
-                limits.BasicLimitInformation.LimitFlags |=
-                    JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
-                limits.ProcessMemoryLimit = bytes;
-                limits.JobMemoryLimit = bytes;
+                // TEST MUTATION: deliberately do not attach the configured
+                // process/job memory limits. The hosted Windows regression must
+                // fail before this mutation is reverted.
+                let _ = (
+                    bytes,
+                    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+                    JOB_OBJECT_LIMIT_JOB_MEMORY,
+                );
             }
             if single_process {
                 limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
