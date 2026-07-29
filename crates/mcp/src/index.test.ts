@@ -4702,6 +4702,8 @@ describe("QMD sensitivity verification", () => {
     const meetingsDir = mkdtempSync(join(tmpdir(), "minutes-qmd-meetings-"));
     const outsideDir = mkdtempSync(join(tmpdir(), "minutes-qmd-outside-"));
     const normalPath = join(meetingsDir, "normal.md");
+    const nestedDir = join(meetingsDir, "memos");
+    const nestedNormalPath = join(nestedDir, "nested-normal.md");
     const restrictedPath = join(meetingsDir, "restricted.md");
     const unknownPath = join(meetingsDir, "unknown.md");
     const malformedPath = join(meetingsDir, "malformed-yaml.md");
@@ -4726,7 +4728,9 @@ describe("QMD sensitivity verification", () => {
         `## Transcript\\n\\n${title} canary`,
       ].join("\n");
 
+    mkdirSync(nestedDir);
     writeFileSync(normalPath, meeting("Normal"));
+    writeFileSync(nestedNormalPath, meeting("Nested Normal"));
     writeFileSync(restrictedPath, meeting("Restricted", "restricted"));
     writeFileSync(unknownPath, meeting("Unknown", "confidential"));
     writeFileSync(
@@ -4740,6 +4744,10 @@ describe("QMD sensitivity verification", () => {
       const canonicalMeetingsDir = realpathSync(meetingsDir);
       const hits = [
         { source_path: realpathSync(normalPath), snippet: "poisoned stale index canary" },
+        {
+          source_path: realpathSync(nestedNormalPath),
+          snippet: "poisoned nested stale index canary",
+        },
         { source_path: realpathSync(restrictedPath), snippet: "restricted canary" },
         { source_path: realpathSync(unknownPath), snippet: "unknown canary" },
         { source_path: realpathSync(malformedPath), snippet: "malformed canary" },
@@ -4755,13 +4763,25 @@ describe("QMD sensitivity verification", () => {
         false,
         canonicalMeetingsDir
       );
-      expect(filtered).toHaveLength(1);
-      expect(filtered[0]).toMatchObject({
-        title: "Normal",
-        path: realpathSync(normalPath),
-      });
-      expect(filtered[0].snippet).toContain("Normal canary");
-      expect(filtered[0].snippet).not.toContain("poisoned stale index canary");
+      expect(filtered).toHaveLength(2);
+      expect(filtered).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            title: "Normal",
+            path: realpathSync(normalPath),
+          }),
+          expect.objectContaining({
+            title: "Nested Normal",
+            path: realpathSync(nestedNormalPath),
+          }),
+        ])
+      );
+      expect(filtered.map((hit) => hit.snippet).join("\n")).toContain(
+        "Nested Normal canary"
+      );
+      expect(filtered.map((hit) => hit.snippet).join("\n")).not.toContain(
+        "poisoned"
+      );
       expect(JSON.stringify(filtered)).not.toMatch(
         /restricted|unknown|malformed|outside|symlink|missing canary/i
       );
@@ -4772,6 +4792,7 @@ describe("QMD sensitivity verification", () => {
         canonicalMeetingsDir
       );
       expect(standaloneOverride.map((hit) => hit.title).sort()).toEqual([
+        "Nested Normal",
         "Normal",
         "Restricted",
       ]);

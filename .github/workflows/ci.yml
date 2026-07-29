@@ -134,8 +134,12 @@ jobs:
         run: cargo build --no-default-features
 
       - name: Unit tests (no whisper)
-        run: cargo test -p minutes-core --no-default-features --lib -- --test-threads=1
-        timeout-minutes: 3
+        # Keep libtest output visible on hosted Windows so a platform-only
+        # assertion is diagnosable even if a later test reaches the job
+        # deadline. Privacy-B also substantially expanded this suite; three
+        # minutes no longer covers its bounded two-worker/QMD regressions.
+        run: cargo test -p minutes-core --no-default-features --lib -- --test-threads=1 --nocapture
+        timeout-minutes: 15
 
       - name: Copilot attach, routing, and window-contract tests
         # On Windows this executes the real named-pipe connect/reconnect path.
@@ -454,7 +458,12 @@ jobs:
 
       - name: MCP corpus policy tests
         working-directory: crates/mcp
-        run: npx vitest run src/index.test.ts src/corpus-lease.test.ts src/secure-read.test.ts
+        run: >-
+          npx vitest run
+          src/index.test.ts
+          src/corpus-lease.test.ts
+          src/secure-read.test.ts
+          src/paths.test.ts
 
       - name: Build MCP production module
         working-directory: crates/mcp

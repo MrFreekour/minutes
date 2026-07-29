@@ -2029,7 +2029,11 @@ export async function enrichWithFrontmatter(
         if (!isActiveCorpusMeetingPath(candidatePath, verifiedMeetingsDir)) continue;
         const filePath = canonicalizeRoot(candidatePath);
         if (!isActiveCorpusMeetingPath(filePath, verifiedMeetingsDir)) continue;
-        const content = liveFiles.get(relative(canonicalMeetingsDir, filePath));
+        const snapshotKey = relative(canonicalMeetingsDir, filePath).replaceAll(
+          "\\",
+          "/"
+        );
+        const content = liveFiles.get(snapshotKey);
         if (content === undefined) continue;
         const meeting = parsePolicyVerifiedMeeting(content, filePath);
         // Verification failure is never overridable: an operator can grant

@@ -13102,7 +13102,15 @@ mod tests {
         let (gate_mutex, gate_condition) = &*gate;
         let mut gate_status = gate_mutex.lock().unwrap();
         while !gate_status.entered {
-            gate_status = gate_condition.wait(gate_status).unwrap();
+            let (status, timeout) = gate_condition
+                .wait_timeout(gate_status, Duration::from_secs(10))
+                .unwrap();
+            gate_status = status;
+            assert!(
+                !timeout.timed_out(),
+                "first QMD worker did not reach the update gate within 10 seconds; finished={}",
+                first.is_finished()
+            );
         }
         drop(gate_status);
         let count_while_first_holds_lock = runner.command_count();

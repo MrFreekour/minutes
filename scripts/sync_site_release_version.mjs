@@ -136,7 +136,9 @@ async function countTsTests() {
   let count = 0;
   for (const f of files) {
     const src = await readFile(f, "utf8");
-    const matches = src.match(/^\s*(?:test|it)\s*\(/gm);
+    const matches = src.match(
+      /^\s*(?:test|it)(?:\.(?:runIf|skipIf|only|skip|todo))?\s*\(/gm,
+    );
     if (matches) count += matches.length;
   }
   return count;

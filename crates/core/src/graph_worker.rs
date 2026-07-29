@@ -1417,11 +1417,14 @@ mod tests {
 
     #[test]
     fn worker_executable_paths_reject_relative_and_parent_traversal() {
+        let absolute = std::env::temp_dir().join("minutes-graph-worker");
+        let parent_traversal = std::env::temp_dir()
+            .join("minutes-graph-worker-parent")
+            .join("..")
+            .join("minutes-graph-worker");
         assert!(!valid_absolute_executable_path(Path::new("minutes")));
-        assert!(!valid_absolute_executable_path(Path::new(
-            "/tmp/../minutes"
-        )));
-        assert!(valid_absolute_executable_path(Path::new("/tmp/minutes")));
+        assert!(!valid_absolute_executable_path(&parent_traversal));
+        assert!(valid_absolute_executable_path(&absolute));
     }
 
     #[test]

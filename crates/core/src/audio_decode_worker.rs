@@ -924,7 +924,10 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_production_decode_command_carries_the_address_space_ceiling() {
-        let command = build_decode_command(Path::new("/nonexistent/input.m4a"), WorkerMode::Decode)
+        let nonexistent_input = std::env::temp_dir()
+            .join("minutes-nonexistent-audio")
+            .join("input.m4a");
+        let command = build_decode_command(&nonexistent_input, WorkerMode::Decode)
             .expect("the decode command must be constructible in the test tree");
         assert_eq!(
             command.configured_address_space_limit(),
@@ -1008,13 +1011,13 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_probe_command_carries_the_same_ceiling_as_the_decode_command() {
-        let decode = build_decode_command(Path::new("/nonexistent/input.m4a"), WorkerMode::Decode)
+        let nonexistent_input = std::env::temp_dir()
+            .join("minutes-nonexistent-audio")
+            .join("input.m4a");
+        let decode = build_decode_command(&nonexistent_input, WorkerMode::Decode)
             .expect("decode command must be constructible in the test tree");
-        let probe = build_decode_command(
-            Path::new("/nonexistent/input.m4a"),
-            WorkerMode::ProbeDuration,
-        )
-        .expect("probe command must be constructible in the test tree");
+        let probe = build_decode_command(&nonexistent_input, WorkerMode::ProbeDuration)
+            .expect("probe command must be constructible in the test tree");
         assert_eq!(
             probe.configured_address_space_limit(),
             Some(WORKER_ADDRESS_SPACE_BYTES)
