@@ -511,3 +511,115 @@ measures the release HELPER over the whole log; the tool examines only the newes
 `target/debug/minutes` (2 passed / 9 failed without one). And on this corpus
 `include_restricted: true` returns the same split, because nothing here is
 restricted, so the audited override is an unexercised path on Mat's own data.
+
+---
+
+## 2026-07-29 TRACK 1, the whole nine-item list plus the tenth. Candidates b1cc0952 then 204d77cc.
+
+Items 5, 6, 7 and 8 closed at 51146a17 and 8be61da0. Items 1, 2, 3, 4, 9 and the
+item added 2026-07-27 closed at b1cc0952, gated, remediated at 204d77cc. Nothing
+pushed.
+
+GATE: one Codex read-only pass (BLOCK, 3 P1 + 4 P2) and one Claude execution lens
+(REJECT, 1 P1 + 2 P2). Split by capability on purpose, as at the track-2 closeout.
+Codex cannot execute here; the Claude lens reproduced all eight mutations, all
+four declared-uncovered survivals, and every evidence number. Both found real
+defects, and neither found what the other did.
+
+A DEFECT INTRODUCED BY THE FIX FOR THE SAME DEFECT CLASS. 51146a17 rewrote
+compressed_audio_ffmpeg_guidance and left the OLD doc paragraph stacked above the
+new one, so the function still claimed it was "only reachable when ffmpeg is
+missing and the bounded worker is unavailable" - the exact false statement that
+commit existed to remove. Found by reading the commit's own diff back a day
+later. That makes five consecutive rounds where a surviving defect was prose.
+
+THREE MORE PROSE DEFECTS FOUND BY REVIEWERS IN THIS ROUND, all mine, all written
+the same day:
+1. The new ceiling check accepted an ambient `ulimit -v` while its comment said
+   it refused one (Codex). Fixed by requiring soft AND hard limits to equal the
+   worker budget exactly, which is what makes it a provenance check. There is now
+   a test that launches a child under a foreign 2 GiB ceiling and requires
+   refusal; under the looser form that child exits 0.
+2. The uncovered list said three items and omitted the zero-remaining guard
+   (Codex). It says four, at the function, in one place.
+3. "canary-tested through graph_worker on Windows CI" was false (Claude lens).
+   The canary exists in crates/cli/tests/policy_graph_worker.rs, but CI's only
+   `-p minutes-cli` invocation is filtered on `copilot`, under which that file
+   reports 0 tests. That sentence was the whole justification for adding an
+   unexercised call to the decode child's pre-authority path. Corrected at
+   204d77cc; wiring the file into CI is the real repair and was deliberately not
+   done blind from a lane that cannot watch the runner.
+
+A TEST OF MINE SURVIVED ITS OWN MUTATION, caught by running it. Cancelling and
+asserting the message passed with the pre-decode check DELETED, because the
+post-decode check reports the same string. The fix asserts two things one message
+cannot: the ORDER against the availability probe (disable the fallback in the
+config, so a passing order check yields the cancellation string and a failing one
+yields the unavailability string) and that no decode was attempted (name a file
+that does not exist, so an attempt reports the missing input).
+
+A PRECONDITION THAT ACCEPTS ANY FAILURE PROVES NOTHING. The probe test's
+staleness check asserted only `!status.success()`, which any argument or loader
+error satisfies (Codex). It now requires exit 71 and the ceiling named in stderr.
+The reviewer then built a deliberately stale child and confirmed the precondition
+fires.
+
+CONTAINMENT MADE OBSERVABLE IS WHAT MADE THE PROBE ASSERTABLE. The old test
+asserted build_decode_command and never asserted the production probe used it, so
+an inline builder with no ceiling passed. The child now refuses to parse input
+unless it can see its own ceiling. Defence in depth on its own, and it turns the
+ceiling into something a test can see through probe_compressed_duration itself.
+The reviewer also removed the ceiling from build_decode_command entirely and
+found four tests die, so the decode path is covered end to end too.
+
+THE CHAINED-OGG NUMBER REPRODUCED TO THE DIGIT. The old fixture was 0.25 s and
+delivered no packets, so pre-fix code failed closed too. The rebuilt fixture is
+3 s at 44.1 kHz plus 2 s at 48 kHz. With the reset arms restored to `break` the
+decode returns 48134 samples, 3.01 s of a 5 s file, as a success: exactly what
+the gate-3 reviewer predicted.
+
+ITEM 10 WAS A MISREPORT, NOT A MISSING BUILD. resolve_worker_executable found the
+adjacent binary, failed to BIND it, and fell through to a branch whose text says
+no binary was found. Binding copies a 256 MB debug executable into an immutable
+snapshot, so it can fail under memory pressure or a full temp filesystem. The
+cause is now carried into the message for that branch. The flake did not recur in
+five full runs and is not fixed, only made diagnosable.
+
+WINDOWS, CHECKED BEFORE IMPLEMENTED, which was Codex's advice and was right.
+1.95.0's sys/process/windows.rs sets `inherit_handles: true` at line 193 and
+passes it to CreateProcessW at line 417; nothing in this crate calls the setter
+that would change it. Both reviewers confirmed it independently. So the sweep is
+load-bearing rather than theatre, and the decode child now calls it.
+
+TWO TECHNIQUES WORTH REUSING:
+- Type-check a platform-gated test by temporarily widening its cfg, compiling,
+  then narrowing it back. Running the Darwin digest test under the widened cfg
+  fails at chmod with EPERM, which is direct evidence that Linux's memfd seal is
+  real and the digest re-check genuinely is a non-Linux control. It is evidence,
+  not a repeatable gate, as Codex noted.
+- The decode child's behaviour lives in a SEPARATELY built target/debug/minutes.
+  Any mutation of child-side code needs `cargo build -p minutes-cli
+  --no-default-features` before a test can observe it. Forgetting that is a false
+  "mutation survived" waiting to happen.
+
+STILL UNCOVERED IN THE DIARIZE FALLBACK, verified complete by the reviewer, who
+applied all four simultaneously and got a fully green suite: the post-decode
+cancellation check, the wall clock handed to the child, MAX_DIARIZATION_SAMPLES,
+and the zero-remaining guard. Each needs a race or a two-hour input.
+
+REPO-LEVEL FINDING FOR MAT, out of scope and pre-existing: two CLI integration
+test files, tests/policy_graph_worker.rs and tests/authorized_process_fd.rs, run
+zero tests in CI because the only `-p minutes-cli` invocation is filtered on
+`copilot`. Worth its own change by someone who can watch the pipeline.
+
+GATES at 204d77cc: core --no-default-features --lib --test-threads=1 1635 passed
+/ 0 failed / 1 ignored, up from 1629; --features diarize 1650 / 0 / 3;
+minutes-app 272 / 0; fmt clean; clippy clean for both documented invocations.
+`--all-targets` clippy is red on four PRE-EXISTING findings in copilot/control.rs,
+live_session.rs and resummarize.rs, untouched here and outside the documented
+gate.
+
+NEXT: the track-1 list is worked through. A fresh gate on 204d77cc is the honest
+next step, since both reviews were of b1cc0952 and the author cannot review his
+own prose for the sixth time. After that, Mat's call on whether track 2's
+documented residuals are acceptable, and Option A as its own block if he wants it.

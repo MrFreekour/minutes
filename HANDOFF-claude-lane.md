@@ -51,6 +51,10 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
+| `204d77cc` | track-1 gate remediation — a false "canary-tested on Windows CI" claim |
+| `b1cc0952` | track-1 items 1, 2, 3, 4, 9 and the order-sensitive probe test |
+| `8be61da0` | track-1 items 5 and 8 — descriptor-sweep bound, README:453 |
+| `51146a17` | track-1 items 6 and 7 — WebM duration, ffmpeg guidance and health |
 | `efd58224` | track-2 Option B closeout — Codex BLOCK on residuals, execution lens ACCEPT |
 | `4481ce86` | track-2 Option B gate-4 remediation (Codex) |
 | `228d68c3` | track-2 Option B gate-3 remediation — gated BLOCK by Codex |
@@ -70,30 +74,36 @@ Last accepted checkpoint remains block 7; everything after it is unaccepted.
 
 ## Immediate next step
 
-`c6badc34` was gated and **REJECTED 3/3** (2026-07-26). Full findings and an
-ordered remediation list are in the bead. The short version: the production code
-was judged substantively correct, but the commit claimed "every fix
-mutation-verified" when the procedure had been done for four of seven bullets,
-and reviewers reverted the other three with a fully green suite. Three
-user-facing defects also survived: a WebM/MKV duration probe that reads ~44x
-short (millisecond `n_frames` in Matroska), a guidance message that fires in a
-state its own doc calls impossible (symphonia has no Opus decoder, so
-Opus-in-WebM/OGG and ALAC hit it), and README:453.
+**The track-1 remediation list is worked through.** All nine items plus the tenth
+added 2026-07-27 are closed across `51146a17`, `8be61da0`, `b1cc0952` and
+`204d77cc`. Full detail is in `docs/investigations/privacy-b-gate-history.md`.
 
-**Do the numbered remediation list in the bead, then re-gate.** Track 2 has moved
-on since: Option B is built at `49fdf4a5` + `b341876a` and needs its own re-gate,
-see below.
+`b1cc0952` was gated twice, split by capability: Codex read-only returned BLOCK
+(3 P1 + 4 P2), a Claude execution lens returned REJECT (1 P1 + 2 P2). The lens
+reproduced all eight mutations, all four declared-uncovered survivals, and every
+evidence number. Every finding was re-verified locally before acting; all are
+remediated at `204d77cc`.
 
-Add one item to the track-1 list, found 2026-07-27: the documented dev command
-is not deterministically green even at `--test-threads=1`.
-`audio_decode_worker::tests::the_probe_command_carries_the_same_ceiling_as_the_decode_command`
-failed once in two full runs with "no Minutes binary was found next to this
-process" while `target/debug/minutes` existed, and passes in isolation. Order-
-or load-sensitive, same assumed-precondition family as item 3.
+**Next: a fresh gate on `204d77cc`.** Both reviews were of `b1cc0952`, and the
+standing lesson is that the author cannot review his own prose - four of this
+round's five surviving defects were prose I had written, one of them inside the
+fix for that same defect class.
+
+Then two decisions that are Mat's, not the lane's: whether track 2's documented
+residuals are acceptable on that surface, and whether Option A (stable
+frontmatter id) gets built as its own block.
+
+One repo-level finding for Mat, out of scope and pre-existing: two CLI
+integration test files, `tests/policy_graph_worker.rs` and
+`tests/authorized_process_fd.rs`, run **zero** tests in CI, because the only
+`-p minutes-cli` invocation is filtered on `copilot`. Measured:
+`cargo test -p minutes-cli --no-default-features -- copilot --list` reports
+`0 tests` for both. That is where the Windows inherited-handle canary lives.
+Wiring them in needs someone who can watch the pipeline go green.
 
 ## State of each track
 
-### Track 1 — compressed-import parity. REJECTED 3/3, remediation list in bead.
+### Track 1 — compressed-import parity. Remediation list done, awaiting a gate on `204d77cc`.
 
 Restores decoding of m4a/mp3/ogg/etc. when ffmpeg is absent, via a bounded
 child running Symphonia. `origin/main` did this in-process; this branch had
@@ -106,18 +116,30 @@ Known and unfixed, deliberately carried rather than dropped:
 - The diarize fallback is asymmetric: a launchable-but-failing ffmpeg, or output
   past the diarization sample cap, still loses speaker labels without reaching
   the worker.
+- Four properties of `preprocess_compressed_without_ffmpeg` have no test, listed
+  at the function itself: the post-decode cancellation check, the wall clock
+  handed to the child, `MAX_DIARIZATION_SAMPLES`, and the zero-remaining guard.
+  A reviewer applied all four mutations simultaneously and got a green suite, so
+  the list is complete as well as honest. Each needs a race or a two-hour input.
 - `bounded_decode_fallback_available()` copies the whole executable to answer a
   boolean, and is called several times per import (admission, routing, probe,
-  decode). On macOS/Windows that is real temp-dir I/O per file.
-- Two tests pollute `MINUTES_FFMPEG` across each other, so the documented dev
-  command in CLAUDE.md is red without `--test-threads=1`. CI passes only because
-  it uses that flag.
+  decode). On macOS/Windows that is real temp-dir I/O per file. It is also why
+  cancellation is now checked before it, and why the zero-remaining guard after
+  it is reachable at all.
+- Three tests pollute process-global env: two set `MINUTES_FFMPEG` and one sets
+  `XDG_CONFIG_HOME`. All take `test_home_env_lock()` and restore before
+  asserting, but the documented dev command in CLAUDE.md is still red without
+  `--test-threads=1`. CI passes only because it uses that flag.
 - `verify()` re-hashes the retained descriptor while `execve` resolves the
   pathname, so a `rename()` over the snapshot defeats it on macOS. Linux is
-  immune (sealed memfd); Windows incidentally so (share mode).
-- On Windows `close_extra_descriptors()` is a no-op. `graph_worker` already
-  solves this with `close_inherited_windows_handles_before_authority()` plus a
-  canary test; the decode child does neither.
+  immune (sealed memfd); Windows incidentally so (share mode). The digest
+  re-check itself now has a test, `cfg(all(unix, not(linux)))`, that **this lane
+  has never run**: macOS CI is the only place it executes.
+- On Windows `close_extra_descriptors()` is still a no-op, but the decode child
+  now calls `graph_worker`'s inherited-handle sweep instead. Read that as "the
+  same sweep, called from here": its canary is in
+  `crates/cli/tests/policy_graph_worker.rs`, which **no CI workflow runs**, and
+  this lane cannot compile or run Windows.
 
 ### Track 2 — MCP derived-record tools. Option B built, awaiting a re-gate.
 
@@ -196,12 +218,25 @@ Option A's to remove.
   toolchain. Say so plainly rather than implying coverage.
 - The suite has order- and load-sensitive tests. Re-run any failure in isolation
   before reporting it, and prefer unloaded single-threaded runs for evidence.
+- **The decode child's behaviour lives in a separately built binary.** Several
+  tests spawn `target/debug/minutes`. Mutating child-side code and re-running
+  `cargo test -p minutes-core` observes nothing: you must
+  `cargo build -p minutes-cli --no-default-features` first. Forgetting it
+  produces a false "mutation survived", which is the one error this lane's whole
+  procedure exists to prevent.
+- **A precondition that accepts any failure proves nothing.** A staleness check
+  asserted `!status.success()`, which loader and argument errors satisfy just as
+  well as the refusal it was written for. Assert the specific exit and message.
+- **Type-check a platform-gated test by temporarily widening its cfg**, compiling,
+  then narrowing it back. That is evidence, not a repeatable gate, so say which
+  one you have.
 
 ## Verification commands
 
 ```bash
-cargo test -p minutes-core --no-default-features --lib -- --test-threads=1   # 1625 pass / 1 ignored
-cargo test -p minutes-core --no-default-features --features diarize --lib -- --test-threads=1  # 1640 / 3 ignored
+cargo build -p minutes-cli --no-default-features   # FIRST: several tests spawn this binary
+cargo test -p minutes-core --no-default-features --lib -- --test-threads=1   # 1635 pass / 1 ignored
+cargo test -p minutes-core --no-default-features --features diarize --lib -- --test-threads=1  # 1650 / 3 ignored
 cargo test -p minutes-app --no-default-features                              # 272 pass
 cargo clippy -p minutes-core -p minutes-cli --no-default-features -- -D warnings
 cargo clippy -p minutes-core --no-default-features --features diarize -- -D warnings
