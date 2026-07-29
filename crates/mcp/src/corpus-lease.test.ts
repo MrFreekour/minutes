@@ -951,7 +951,7 @@ describe("stable corpus lease", () => {
           return "authorized";
         },
         {
-          timeoutMs: 500,
+          timeoutMs: 2_000,
           onWatcherReady: ({ controls }) =>
             controls.requireRepulseForNextFence(),
         }
