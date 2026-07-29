@@ -422,6 +422,17 @@ fn probe_duration_seconds(path: &Path) -> Result<f64, String> {
     if rate == 0 {
         return Err("container declared a zero sample rate".into());
     }
+    // `n_frames` is only a sample count when the container's time base IS the
+    // sample rate. Matroska and WebM express it in the segment's own time base,
+    // which is milliseconds, so dividing by the sample rate read a 150 s
+    // recording as 3.1 s: about 48x short, and short enough that every browser
+    // and Meet recording was filed as a voice memo and never diarized. Prefer
+    // the declared time base, which is what makes the unit explicit, and keep
+    // the sample-rate division only for containers that declare none.
+    if let Some(time_base) = track.codec_params.time_base {
+        let time = time_base.calc_time(frames);
+        return Ok(time.seconds as f64 + time.frac);
+    }
     Ok(frames as f64 / f64::from(rate))
 }
 
@@ -849,6 +860,45 @@ mod tests {
     /// Committed rather than encoded on demand so this test cannot skip in the
     /// exact environment the feature exists for, a machine with no ffmpeg.
     const M4A_FIXTURE: &[u8] = include_bytes!("../resources/decode-fixture-tone.m4a");
+    const WEBM_FIXTURE: &[u8] = include_bytes!("../resources/decode-fixture-tone.webm");
+
+    /// Matroska and WebM express `n_frames` in the segment's own time base,
+    /// which is milliseconds, not in samples. Dividing it by the sample rate
+    /// read this 8 s fixture as 0.167 s, and a real 150 s Meet recording as
+    /// 3.1 s. `webm` is a default watch extension, so with no ffmpeg installed
+    /// every browser recording was short enough to be filed as a voice memo and
+    /// never diarized, while the same file WITH ffmpeg routed correctly.
+    ///
+    /// The tolerance is deliberately tight. A 48x error has to fail here; a
+    /// loose band would let the unit bug back in.
+    #[test]
+    fn webm_duration_is_read_in_seconds_not_container_ticks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meet-recording.webm");
+        std::fs::write(&path, WEBM_FIXTURE).unwrap();
+
+        let seconds = probe_duration_seconds(&path).expect("webm fixture must probe");
+        assert!(
+            (7.5..=8.5).contains(&seconds),
+            "8 s webm must probe as about 8 s, got {seconds}"
+        );
+    }
+
+    /// The container that already worked must keep working: the fix reads the
+    /// declared time base, so a format whose time base IS the sample rate has
+    /// to come out unchanged.
+    #[test]
+    fn m4a_duration_is_unchanged_by_the_time_base_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memo.m4a");
+        std::fs::write(&path, M4A_FIXTURE).unwrap();
+
+        let seconds = probe_duration_seconds(&path).expect("m4a fixture must probe");
+        assert!(
+            (0.75..=1.25).contains(&seconds),
+            "1 s m4a must probe as about 1 s, got {seconds}"
+        );
+    }
 
     /// The actual regression: an m4a voice memo must decode with no ffmpeg
     /// involved at decode time.

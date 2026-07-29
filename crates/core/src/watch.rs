@@ -922,8 +922,19 @@ pub fn compressed_audio_decodable_with(
 /// Only reachable when ffmpeg is missing *and* the bounded worker is
 /// unavailable, so it names both remedies rather than implying ffmpeg is the
 /// only path.
+/// Guidance for a compressed import this machine could not decode.
+///
+/// This must stay true in BOTH states that reach it, which the previous wording
+/// did not. It told every affected user to "re-enable the bundled decoder",
+/// advice that is useless in the commonest case: the bundled decoder is enabled
+/// by default, and it has no Opus or ALAC decoder, so Opus-in-WebM (browser and
+/// Meet recordings), Opus-in-OGG (WhatsApp and Telegram voice notes) and
+/// ALAC-in-m4a fail with an unsupported-codec exit while the setting the
+/// message named was already `true`. Naming the codecs that genuinely require
+/// ffmpeg is what makes it actionable, and it is the same thing
+/// `health::ffmpeg_status` reports, so the two surfaces agree.
 pub fn compressed_audio_ffmpeg_guidance() -> &'static str {
-    "This machine cannot decode non-WAV imports such as m4a, mp3, ogg, webm, mp4, mov, aac, and flac right now. Install ffmpeg (macOS: brew install ffmpeg; Linux: use your package manager; Windows: install ffmpeg.exe and add it to PATH), or set MINUTES_FFMPEG to the full executable path. Alternatively re-enable the bundled decoder with transcription.compressed_decode_fallback = true in ~/.config/minutes/config.toml. Then restart the watcher or process the original file directly. WAV imports remain available either way."
+    "This machine could not decode this non-WAV import. Install ffmpeg (macOS: brew install ffmpeg; Linux: use your package manager; Windows: install ffmpeg.exe and add it to PATH), or set MINUTES_FFMPEG to the full executable path. ffmpeg is required rather than optional for Opus audio, which is what .webm browser and Meet recordings and .ogg voice notes normally contain, and for ALAC in .m4a: the bundled decoder handles AAC, MP3, Vorbis and FLAC but has no decoder for those. If transcription.compressed_decode_fallback is set to false in ~/.config/minutes/config.toml, setting it back to true restores the bundled decoder for the formats it does support. Then restart the watcher or process the original file directly. WAV imports remain available either way."
 }
 
 fn content_type_label(content_type: ContentType) -> &'static str {
@@ -1375,7 +1386,11 @@ mod tests {
         assert!(sidecar_path.exists());
         assert_eq!(fs::read(&path).unwrap(), b"synthetic original bytes");
         let message = error.to_string();
-        assert!(message.contains("cannot decode non-WAV imports"));
+        // Assert the actionable content rather than one opening phrase, so a
+        // reworded but still-correct message does not fail while a message that
+        // dropped the remedy would.
+        assert!(message.contains("could not decode this non-WAV import"));
+        assert!(message.contains("Install ffmpeg"));
         assert!(message.contains("MINUTES_FFMPEG"));
         assert!(message.contains("original audio remains untouched"));
     }
@@ -1461,7 +1476,11 @@ mod tests {
         assert!(sidecar_path.exists());
         assert_eq!(fs::read(&path).unwrap(), b"synthetic original bytes");
         let message = error.to_string();
-        assert!(message.contains("cannot decode non-WAV imports"));
+        // Assert the actionable content rather than one opening phrase, so a
+        // reworded but still-correct message does not fail while a message that
+        // dropped the remedy would.
+        assert!(message.contains("could not decode this non-WAV import"));
+        assert!(message.contains("Install ffmpeg"));
         assert!(message.contains("original audio remains untouched"));
         assert!(message.contains("MINUTES_FFMPEG"));
     }
@@ -1564,6 +1583,63 @@ mod tests {
         assert!(guidance.contains("Linux"));
         assert!(guidance.contains("Windows"));
         assert!(guidance.contains("MINUTES_FFMPEG"));
+    }
+
+    /// The state this message is most often read in is the one it used to
+    /// mis-describe: the bundled decoder is enabled and running, and the file
+    /// failed anyway because Symphonia has no Opus or ALAC decoder. Telling
+    /// that user to enable a setting that is already true is the defect.
+    #[test]
+    fn ffmpeg_guidance_names_the_codecs_that_actually_require_ffmpeg() {
+        let guidance = compressed_audio_ffmpeg_guidance();
+        assert!(
+            guidance.contains("Opus"),
+            "guidance must name Opus, the codec that forces ffmpeg for .webm and .ogg"
+        );
+        assert!(
+            guidance.contains("ALAC"),
+            "guidance must name ALAC, the other codec the bundled decoder cannot handle"
+        );
+        // It must not present enabling the bundled decoder as the fix, because
+        // in the codec-unsupported state it is already enabled and does not
+        // help. Mentioning the setting conditionally is fine; asserting the
+        // decoder is off is not.
+        assert!(
+            !guidance.contains("Alternatively re-enable the bundled decoder"),
+            "guidance must not advise enabling a decoder that is on by default"
+        );
+    }
+
+    /// The watcher and `minutes health` are read by the same person about the
+    /// same machine, so they must not disagree about whether compressed imports
+    /// work without ffmpeg.
+    #[test]
+    fn health_and_watch_guidance_agree_about_the_unsupported_codecs() {
+        let _env_lock = crate::test_home_env_lock();
+        let previous = std::env::var_os("MINUTES_FFMPEG");
+        std::env::set_var(
+            "MINUTES_FFMPEG",
+            std::env::temp_dir().join("minutes-definitely-missing-ffmpeg"),
+        );
+        // Fallback at its default: enabled. This is the state the old message
+        // described wrongly, and the state most users are in.
+        let health = crate::health::ffmpeg_status(&crate::config::Config::default());
+        match previous {
+            Some(value) => std::env::set_var("MINUTES_FFMPEG", value),
+            None => std::env::remove_var("MINUTES_FFMPEG"),
+        }
+        assert!(
+            health.detail.contains("Opus"),
+            "health must not claim the bundled decoder covers everything: {}",
+            health.detail
+        );
+        assert!(
+            !health
+                .detail
+                .contains("This works without any extra install"),
+            "health must not print an unqualified green check: {}",
+            health.detail
+        );
     }
 
     #[test]
