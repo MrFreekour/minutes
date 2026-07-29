@@ -3079,7 +3079,6 @@ fn parse_speaker_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
@@ -3091,7 +3090,7 @@ mod tests {
     /// private mutex here raced with crate::test_home_env_lock users and
     /// flaked parallel runs).
     fn home_env_lock_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_home_env_lock()
+        crate::test_support::home_env_lock()
     }
 
     fn api_env_lock() -> &'static Mutex<()> {
@@ -3099,27 +3098,7 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    struct HomeOverride {
-        previous: Option<OsString>,
-    }
-
-    impl HomeOverride {
-        fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for HomeOverride {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                std::env::set_var("HOME", previous);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
+    use crate::test_support::HomeOverride;
 
     fn with_temp_home<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _guard = home_env_lock_guard();

@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn current_session_breadcrumb_is_metadata_only_and_requires_image_inspection() {
-        let _lock = crate::test_home_env_lock();
+        let _lock = crate::test_support::home_env_lock();
         let home = tempfile::tempdir().unwrap();
         let original_home = std::env::var_os("HOME");
         #[cfg(windows)]

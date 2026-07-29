@@ -151,6 +151,17 @@ fn filename_collision_appends_suffix() {
 
 #[test]
 fn search_filters_by_content_type() {
+    // The search index lives at ~/.minutes/search.db, resolved from the home
+    // directory rather than from `config`, so isolating `output_dir` alone is
+    // not enough: this test used to replace the developer's real index with its
+    // own fixture rows (#588). Redirect HOME so the index it builds is thrown
+    // away with the temp dir.
+    minutes_core::test_support::with_temp_home(|_home| {
+        search_filters_by_content_type_inner();
+    });
+}
+
+fn search_filters_by_content_type_inner() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path().join("output"));
 

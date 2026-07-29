@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn resolve_parakeet_binary_prefers_working_configured_path() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let dir = tempfile::TempDir::new().unwrap();
         let binary_path = dir.path().join(fake_parakeet_filename());
         write_fake_parakeet_binary(&binary_path);
@@ -569,7 +569,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolve_parakeet_binary_auto_finds_homebrew_candidate() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let home = tempfile::TempDir::new().unwrap();
         let homebrew_prefix = tempfile::TempDir::new().unwrap();
         let empty_path = tempfile::TempDir::new().unwrap();
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn resolve_parakeet_binary_errors_when_nothing_is_available() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let home = tempfile::TempDir::new().unwrap();
         let homebrew_prefix = tempfile::TempDir::new().unwrap();
         let empty_path = tempfile::TempDir::new().unwrap();
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn resolve_parakeet_binary_can_fail_strictly_for_broken_config() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let home = tempfile::TempDir::new().unwrap();
         let homebrew_prefix = tempfile::TempDir::new().unwrap();
         let empty_path = tempfile::TempDir::new().unwrap();
@@ -642,7 +642,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolve_parakeet_binary_falls_back_from_broken_config_when_alternative_exists() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let home = tempfile::TempDir::new().unwrap();
         let homebrew_prefix = tempfile::TempDir::new().unwrap();
         let empty_path = tempfile::TempDir::new().unwrap();
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn resolve_parakeet_binary_combines_error_when_fallback_also_fails() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let home = tempfile::TempDir::new().unwrap();
         let homebrew_prefix = tempfile::TempDir::new().unwrap();
         let empty_path = tempfile::TempDir::new().unwrap();
