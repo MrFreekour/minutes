@@ -10839,7 +10839,7 @@ mod windows_private {
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+        READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
     use windows_sys::Win32::System::SystemServices::{
@@ -10988,8 +10988,10 @@ mod windows_private {
                 SetSecurityInfo(
                     handle,
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    null_mut(),
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    self.sid(),
                     null_mut(),
                     self.acl,
                     null(),
@@ -11183,7 +11185,7 @@ mod windows_private {
         // this exact directory until the descriptor is dropped.
         let file = open_existing(
             path,
-            FILE_LIST_DIRECTORY | READ_CONTROL | WRITE_DAC,
+            FILE_LIST_DIRECTORY | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
             true,
             false,
         )?;
@@ -11230,7 +11232,7 @@ mod windows_private {
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                GENERIC_WRITE | READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
+                GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | SYNCHRONIZE,
                 &object_attributes,
                 &mut io_status,
                 null(),
@@ -12038,16 +12040,17 @@ mod tests {
 
     #[test]
     fn qmd_parsers_reject_count_mismatch_and_ambiguous_show_paths() {
+        let mirror = std::env::temp_dir().join("minutes-qmd-parser-mirror");
+        let raw = std::env::temp_dir().join("minutes-qmd-parser-raw");
+        let mirror_line = format!("Path: {}\n", mirror.display());
+        let ambiguous = format!("Path: {}\nPath: {}\n", mirror.display(), raw.display());
         assert!(parse_qmd_collection_names("Collections (1):\n").is_err());
         assert!(
             parse_qmd_collection_names("Collections (2):\nminutes (qmd://minutes/)\n").is_err()
         );
         assert!(parse_qmd_collection_path("Path:\n").is_none());
-        assert!(parse_qmd_collection_path("Path: /mirror\nPath: /raw\n").is_none());
-        assert_eq!(
-            parse_qmd_collection_path("Path: /mirror\n"),
-            Some(PathBuf::from("/mirror"))
-        );
+        assert!(parse_qmd_collection_path(&ambiguous).is_none());
+        assert_eq!(parse_qmd_collection_path(&mirror_line), Some(mirror));
         assert_eq!(
             parse_qmd_collection_names(
                 "No collections found.\nRun 'qmd collection add .' to create one.\n"
@@ -14011,6 +14014,11 @@ mod tests {
         assert!(!outside.join("b").exists());
     }
 
+    // Windows retains a non-delete-sharing preservation capability, so the
+    // rename used to create this POSIX race is refused before the boundary.
+    // The adjacent Windows retained-root/namespace regression covers that
+    // stronger native outcome.
+    #[cfg(unix)]
     #[test]
     fn source_swap_after_backup_is_not_overwritten_or_unlinked() {
         let meetings = TempDir::new().unwrap();
@@ -14982,6 +14990,10 @@ mod tests {
         );
     }
 
+    // Windows' retained exact handles prevent this same-path rename race from
+    // being constructed. Windows provenance action-boundary tests exercise its
+    // stronger handle-based publication contract instead.
+    #[cfg(unix)]
     #[test]
     fn reconciliation_rewrite_preserves_same_path_replacement_at_final_boundary() {
         for adapter in ["wiki", "para"] {
@@ -15062,6 +15074,9 @@ mod tests {
         }
     }
 
+    // See the rewrite variant above for why this adversarial rename is Unix
+    // only and which Windows exact-handle regressions cover the native path.
+    #[cfg(unix)]
     #[test]
     fn reconciliation_delete_preserves_same_path_replacement_at_final_boundary() {
         for adapter in ["wiki", "para"] {
@@ -15360,6 +15375,10 @@ mod tests {
         }
     }
 
+    // Windows denies this directory rename while the retained private
+    // capability is live; `windows_retained_root_and_namespace_block_redirect`
+    // asserts that stronger result directly.
+    #[cfg(unix)]
     #[test]
     fn preservation_root_real_directory_replacement_is_detected_between_operations() {
         let meetings = TempDir::new().unwrap();

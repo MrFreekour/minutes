@@ -21,11 +21,15 @@ import {
   readTextFileInDirectory,
   validatePathInDirectory,
 } from "./paths.js";
-import { readTextFileFromBoundParent } from "./secure-read.js";
+import {
+  readTextFileFromBoundParent,
+  retireBoundReadersForProcessShutdown,
+} from "./secure-read.js";
 
 const tempRoots: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await retireBoundReadersForProcessShutdown();
   for (const root of tempRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -82,15 +86,17 @@ describe("path normalization", () => {
 
 describe("isWithinDirectory", () => {
   it("rejects paths that share a prefix but are not children", () => {
-    // ~/meetings-evil should NOT be within ~/meetings
-    expect(isWithinDirectory("/home/user/meetings-evil", "/home/user/meetings")).toBe(false);
-    expect(isWithinDirectory("/home/user/meetings-evil/file.md", "/home/user/meetings")).toBe(false);
+    const root = join(homedir(), "minutes-within-test", "meetings");
+    const evil = `${root}-evil`;
+    expect(isWithinDirectory(evil, root)).toBe(false);
+    expect(isWithinDirectory(join(evil, "file.md"), root)).toBe(false);
   });
 
   it("accepts exact root match and direct children", () => {
-    expect(isWithinDirectory("/home/user/meetings", "/home/user/meetings")).toBe(true);
-    expect(isWithinDirectory("/home/user/meetings/file.md", "/home/user/meetings")).toBe(true);
-    expect(isWithinDirectory("/home/user/meetings/sub/file.md", "/home/user/meetings")).toBe(true);
+    const root = join(homedir(), "minutes-within-test", "meetings");
+    expect(isWithinDirectory(root, root)).toBe(true);
+    expect(isWithinDirectory(join(root, "file.md"), root)).toBe(true);
+    expect(isWithinDirectory(join(root, "sub", "file.md"), root)).toBe(true);
   });
 
   it("uses native Windows separators when running on Windows", () => {

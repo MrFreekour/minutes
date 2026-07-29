@@ -280,7 +280,7 @@ mod windows_private {
         FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
-        OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+        OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
@@ -406,8 +406,10 @@ mod windows_private {
                 SetSecurityInfo(
                     file.as_raw_handle() as HANDLE,
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    null_mut(),
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    self.sid(),
                     null_mut(),
                     self.acl,
                     null(),
@@ -537,7 +539,7 @@ mod windows_private {
             unsafe {
                 CreateFileW(
                     wide.as_ptr(),
-                    READ_CONTROL | WRITE_DAC,
+                    READ_CONTROL | WRITE_DAC | WRITE_OWNER,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     null(),
                     OPEN_EXISTING,
@@ -550,9 +552,9 @@ mod windows_private {
                 CreateFileW(
                     wide.as_ptr(),
                     if directory {
-                        READ_CONTROL | WRITE_DAC
+                        READ_CONTROL | WRITE_DAC | WRITE_OWNER
                     } else {
-                        GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC
+                        GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER
                     },
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     &attributes,

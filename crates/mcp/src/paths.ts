@@ -17,12 +17,20 @@ export function expandHomeLikePath(input: string): string {
     return join(home, input.slice(2));
   }
 
-  if (input === "$HOME" || input.startsWith("$HOME/") || input.startsWith("$HOME\\")) {
-    return home + input.slice("$HOME".length);
+  if (input === "$HOME") {
+    return home;
   }
 
-  if (input === "${HOME}" || input.startsWith("${HOME}/") || input.startsWith("${HOME}\\")) {
-    return home + input.slice("${HOME}".length);
+  if (input.startsWith("$HOME/") || input.startsWith("$HOME\\")) {
+    return join(home, input.slice("$HOME".length + 1));
+  }
+
+  if (input === "${HOME}") {
+    return home;
+  }
+
+  if (input.startsWith("${HOME}/") || input.startsWith("${HOME}\\")) {
+    return join(home, input.slice("${HOME}".length + 1));
   }
 
   // Minutes core resolves a relative MINUTES_HOME against the user's home,

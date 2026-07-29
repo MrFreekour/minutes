@@ -689,12 +689,14 @@ pub(crate) fn move_entry_at_no_replace(
     destination_dir: &Dir,
     destination_name: &std::ffi::OsStr,
 ) -> std::io::Result<()> {
-    use std::mem::size_of;
+    use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
     };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     validate_entry_name(source_name)?;
     validate_entry_name(destination_name)?;
@@ -717,12 +719,12 @@ pub(crate) fn move_entry_at_no_replace(
         .len()
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let buffer_size = size_of::<FILE_RENAME_INFO>()
+    let buffer_size = size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(filename_size)
         .filter(|size| *size <= u32::MAX as usize)
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let mut buffer = vec![0usize; buffer_size.div_ceil(size_of::<usize>())];
-    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: `buffer` is pointer-aligned and sized for the fixed header plus
     // every UTF-16 code unit. FILE_RENAME_INFO explicitly uses a trailing
     // variable-length FileName array.
@@ -736,18 +738,21 @@ pub(crate) fn move_entry_at_no_replace(
             destination_name.len(),
         );
     }
-    if unsafe {
-        SetFileInformationByHandle(
+    let mut io_status = unsafe { zeroed::<IO_STATUS_BLOCK>() };
+    let status = unsafe {
+        NtSetInformationFile(
             source_file.as_raw_handle() as _,
-            FileRenameInfo,
+            &mut io_status,
             information.cast(),
             buffer_size as u32,
+            FileRenameInformation,
         )
-    } != 0
-    {
+    };
+    if status >= 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let win32 = unsafe { RtlNtStatusToDosError(status) };
+        Err(std::io::Error::from_raw_os_error(win32 as i32))
     }
 }
 
@@ -1459,8 +1464,11 @@ fn private_control_file_open_options(create_new: bool) -> CapOpenOptions {
         const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
         const READ_CONTROL: u32 = 0x0002_0000;
         const WRITE_DAC: u32 = 0x0004_0000;
+        const WRITE_OWNER: u32 = 0x0008_0000;
         options
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC)
+            .access_mode(
+                GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            )
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
         options
@@ -1490,8 +1498,9 @@ fn private_lease_file_open_options(create_new: bool) -> CapOpenOptions {
         const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
         const READ_CONTROL: u32 = 0x0002_0000;
         const WRITE_DAC: u32 = 0x0004_0000;
+        const WRITE_OWNER: u32 = 0x0008_0000;
         options
-            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
         options

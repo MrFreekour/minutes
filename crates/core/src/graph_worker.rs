@@ -585,27 +585,39 @@ fn read_utf8_field(
         .map_err(|_| format!("policy graph {label} was not UTF-8"))
 }
 
+/// Validate the opaque source namespace as a wire identifier, not as a host
+/// filesystem path. The protocol always uses `/`; interpreting it with
+/// `Path::is_absolute` made every valid identifier relative on Windows.
+fn valid_opaque_source_identifier(path: &str) -> bool {
+    let mut components = path.split('/');
+    if components.next() != Some("")
+        || components.next() != Some("__minutes_graph_source")
+        || path.contains('\\')
+        || path.contains('\0')
+    {
+        return false;
+    }
+    let remaining = components.collect::<Vec<_>>();
+    remaining.len() >= 2
+        && remaining
+            .iter()
+            .all(|component| !component.is_empty() && *component != "." && *component != "..")
+}
+
 fn decode_source_payload(payload: &[u8]) -> Result<PolicyGraphStreamSource, String> {
     if payload.len() > MAX_WORKER_SOURCE_FRAME_BYTES {
         return Err("policy graph source frame exceeded its byte budget".into());
     }
     let mut cursor = std::io::Cursor::new(payload);
-    let opaque_path = PathBuf::from(read_utf8_field(
+    let opaque_path = read_utf8_field(
         &mut cursor,
         MAX_WORKER_CORRECTION_FIELD_BYTES,
         "source identifier",
-    )?);
-    if !opaque_path.is_absolute()
-        || !opaque_path.starts_with("/__minutes_graph_source")
-        || opaque_path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
+    )?;
+    if !valid_opaque_source_identifier(&opaque_path) {
         return Err("policy graph source identifier was invalid".into());
     }
+    let opaque_path = PathBuf::from(opaque_path);
     let mut content_sha256 = [0_u8; 32];
     cursor
         .read_exact(&mut content_sha256)
@@ -1598,6 +1610,28 @@ mod tests {
         assert_eq!(decoded.sources.len(), 1);
         assert_eq!(decoded.correction_revision, "revision-1");
         assert_eq!(decoded.manifest_sha256, receipt.manifest_sha256().unwrap());
+    }
+
+    #[test]
+    fn opaque_source_identifier_validation_is_host_independent_and_fail_closed() {
+        assert!(valid_opaque_source_identifier(
+            "/__minutes_graph_source/test/00000000.md"
+        ));
+        for invalid in [
+            "__minutes_graph_source/test/00000000.md",
+            "/__minutes_graph_source",
+            "/__minutes_graph_source/test",
+            "/__minutes_graph_source//00000000.md",
+            "/__minutes_graph_source/./00000000.md",
+            "/__minutes_graph_source/../00000000.md",
+            "/__minutes_graph_source\\test\\00000000.md",
+            "/different/test/00000000.md",
+        ] {
+            assert!(
+                !valid_opaque_source_identifier(invalid),
+                "accepted invalid opaque source identifier {invalid:?}"
+            );
+        }
     }
 
     #[test]

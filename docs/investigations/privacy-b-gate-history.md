@@ -934,3 +934,65 @@ signed, or released.
 
 NEXT: execute the Job Object path on real Windows, obtain three fresh blind
 reviews against exact `d301d277`, or have Mat explicitly stop gating track 1.
+
+---
+
+## 2026-07-29 HOSTED WINDOWS EXECUTION AND INTEGRATION DIAGNOSTICS. Draft PR #604.
+
+Mat authorized a temporary validation branch and draft PR, but did not
+authorize merge, tag, signing, publication, deployment, or release. The current
+delivery boundary is therefore an exact-SHA validation candidate that must
+remain draft and unmerged.
+
+THE FOCUSED WINDOWS ENFORCEMENT GAP WAS CLOSED. Hosted `windows-latest` workflow
+run 30498965752 executed exact candidate `e9b2ac90` and passed the focused Job
+Object committed-memory regression. Release-readiness and installer jobs were
+skipped because the workflow ran in validation-only mode. Earlier
+one-control-at-a-time mutations had independently made that regression fail
+before each control was restored.
+
+THAT FOCUSED PASS DID NOT MAKE THE INTEGRATION READY. Ordinary exact-tree CI run
+30498818041 failed the Windows no-default core suite and timed out while a QMD
+concurrency test waited indefinitely. Three independent exact-SHA reviews
+therefore returned BLOCK. The first remediation candidate, `a62cc0b0`, made
+hosted libtest assertions visible, increased the expanded Windows core suite's
+bounded timeout, made Rust fixtures platform-native, bounded the QMD gate wait,
+normalized nested QMD snapshot keys, and selected the existing Windows MCP
+junction regression in CI.
+
+THE DIAGNOSTIC MATRIX THEN FOUND MORE REAL WINDOWS-ONLY TEST DEFECTS. Run
+30499792662 proved the nested QMD regression on hosted Windows, while the newly
+selected MCP path suite exposed mixed separators in `$HOME` expansion,
+Unix-literal containment fixtures, and cleanup racing reader-held directories.
+The replacement batch uses native joins for home expansion and fixtures, and
+retires bound readers before removing their temporary roots. It also replaces
+a stale hard-coded public site test claim with the generated number of
+test declarations; that number is not described as a pass count.
+
+The Windows core output collapsed most failures onto four platform defects.
+Private-store hardening had replaced the DACL but retained an
+Administrators-group owner on elevated runners; the replacement sets both the
+current-user owner and a protected current-user-only DACL through each exact
+opened handle. Graph-worker opaque source IDs were incorrectly validated as
+host paths, so their slash-delimited wire namespace is now validated
+independently of the host platform. The Win32 descriptor-relative no-replace
+rename form returned invalid-parameter when given the retained target-directory
+handle; the Windows implementation now uses the native NT relative rename on
+the exact source and target handles. Unix rename/swap race fixtures that cannot
+execute while Windows retains a no-delete-share handle are Unix-scoped beside
+the stronger Windows retained-handle tests, and the QMD parser fixture now
+builds a platform-native absolute path.
+
+The companion packaging-parity check correctly detected that the complete
+graph-worker file changed. The replacement refreshes its whole-file golden
+after reviewing the portable fixture and host-independent wire validation in
+the complete authority file; the structural and mutation self-tests remain
+green.
+
+STATUS: neither `e9b2ac90` nor `a62cc0b0` is accepted. Exact terminal receipts
+for the replacement candidate are recorded on draft PR #604 rather than in a
+post-validation receipt-only commit. Acceptance still requires ordinary CI and
+the focused validation-only Windows workflow to be green for the same exact
+current-main-based SHA, followed by three fresh independent non-blocking
+reviews of that SHA. The draft PR must remain unmerged, and no release action is
+authorized.

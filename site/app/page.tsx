@@ -5,6 +5,7 @@ import { APPLE_SILICON_DOWNLOAD_PATH } from "@/lib/downloads";
 import {
   MINUTES_MCP_TOOL_COUNT,
   MINUTES_RELEASE_VERSION,
+  MINUTES_TEST_COUNT,
   WINDOWS_SETUP_EXE,
 } from "@/lib/release";
 
@@ -556,8 +557,9 @@ export default function Home() {
               How we test it
             </p>
             <p className="mt-3 text-[14px] leading-7 text-[var(--text-secondary)]">
-              1,148 automated tests and a public eval harness, with the limits
-              stated plainly. Read the receipts before you trust it.
+              {MINUTES_TEST_COUNT.toLocaleString()} automated test declarations
+              and a public eval harness, with the limits stated plainly. Read
+              the receipts before you trust it.
             </p>
           </a>
           <a

@@ -5,8 +5,13 @@ lane. The previous lane ran to ~723k context and was retired deliberately; this
 document plus bead **minutes-ew09** is how you pick up without loss.
 
 - Worktree: `~/Sites/minutes-conversation-trust-privacy-b-v4`
-- Branch: `integrate/conversation-trust-privacy-b-v4`
-- **Never push, merge, tag, sign, or release.** Steady-background only.
+- Temporary validation branch: `agent/privacy-b-windows-enforcement`
+- Draft integration/validation PR:
+  [#604](https://github.com/silverstein/minutes/pull/604)
+- Authority changed on 2026-07-29: Mat explicitly authorized pushing this
+  temporary branch and opening/updating the draft PR. **Merge, tag, signing,
+  publication, deployment, and release remain forbidden without fresh
+  command-boundary authorization.**
 - Durable state: `bd show minutes-ew09` for current status, and
   `docs/investigations/privacy-b-gate-history.md` for the full verdict history.
   That history used to live in the bead's notes and was silently lost twice in
@@ -51,6 +56,10 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
+| `a62cc0b0` | diagnostic rerun: portable Windows fixtures, bounded QMD gate wait, nested QMD regression, Windows junction-test selection, and visible/extended core CI |
+| `e9b2ac90` | first current-main exact candidate; corpus matrix and focused Windows Job regression green, broader Windows core job red |
+| `52beff7e` | merge current `origin/main` into the long-lived candidate |
+| `5fd8e0e7` | restored independent Windows Job Object memory controls after mutation proof |
 | `d301d277` | macOS gate-4 follow-up — native ceiling enforcement regression and Darwin-only clippy fix |
 | `893f7fb6` | durable scoped gate-4 record |
 | `f0977d67` | track-1 gate-4 platform-claim remediation — explicit verification scope, no parent-provenance claim |
@@ -73,35 +82,62 @@ Recent commits, newest first:
 | `ca2a659c` | track-2 MCP work — **REJECTED 3/3, do not build on it** |
 | `1ed3a82c`/`99b89af1` | earlier track-1 attempts, both REJECTED 3/3 |
 
-Rejected candidates are preserved at `rejected/block8-track1-51f040ba`,
+Historical rejected candidates are preserved at `rejected/block8-track1-51f040ba`,
 `rejected/block8-track2-73d94270`, `wip/block8-suspension-revival-rejected`.
-Last accepted checkpoint remains block 7; everything after it is unaccepted.
+Block 7 remains the last historical accepted checkpoint. The temporary branch
+above is a later integration candidate under new hosted verification; use its
+PR head and checks, not the old checkpoint table, for current delivery state.
 
-## Immediate next step
+## Current integration state
 
-**Run the Windows Job Object path on a real Windows runner, then obtain three
-independent blind reviews of exact candidate `d301d277`, or make an explicit
-decision to stop gating this track.** The scoped gate 4 first BLOCKED the
-working tree on one P1 false-provenance diagnostic and five P2
-platform/coverage claims. After each was independently verified and removed or
-scoped, the same Codex lens ACCEPTED with zero P1/P2.
+The previously missing Windows runtime evidence now exists. Hosted
+`windows-latest` run
+[30498965752](https://github.com/silverstein/minutes/actions/runs/30498965752)
+passed the exact focused Job Object committed-memory regression at
+`e9b2ac90`; release readiness and installer jobs were skipped. Earlier
+one-control-at-a-time mutations independently made the focused regression fail,
+then were reverted.
 
-The follow-up used an isolated temporary checkout on `jexs-imac` to compile and
-execute the candidate natively. The real decode/probe child paths returned
-success after the in-child ceiling install. A new macOS-only subprocess
-regression installs that same ceiling, asks for a mapping larger than the whole
-growth budget, and observes Darwin refuse it. Native no-default, diarize, app,
-strict clippy, path-backed digest, and focused ceiling evidence are green. The
-Darwin-only compile also found one candidate-owned `clippy::type_complexity`
-failure; `d301d277` fixes it with a private tuple alias.
+That did not make the whole candidate ready. Exact-tree CI run
+[30498818041](https://github.com/silverstein/minutes/actions/runs/30498818041)
+failed in the ordinary Windows no-default core suite and timed out while a QMD
+concurrency test waited indefinitely. Three independent reviews therefore
+returned BLOCK. The first remediation batch at `a62cc0b0` makes hosted libtest
+assertions visible, gives the substantially expanded 1,510-test Windows suite a
+15-minute bound, uses platform-native absolute test fixtures, bounds the QMD
+gate wait, normalizes nested QMD snapshot keys, and selects the existing
+Windows MCP junction regression in CI.
 
-That is still one scoped reviewer of the earlier gate-4 question, not the three
-independent exact-SHA ACCEPT verdicts required to call a block a checkpoint.
-The Windows target cross-check compiles with 11 known cfg warnings, but no real
-Windows process was launched: Job Object attachment, ordering, and effective
-enforcement remain runtime-unverified. On macOS, the installer and kernel
-refusal are verified, but the production entry point's call to the installer is
-not mutation-sensitive. Do not turn either residual into stronger prose.
+The `a62cc0b0` diagnostic run then exposed previously unexecuted MCP path-test
+failures: Windows home expansion mixed separators, two tests used Unix literal
+paths, and reader-held directories were removed before process retirement.
+The replacement batch fixes those failures and removes a stale hard-coded site
+test claim in favor of the generated test-declaration count.
+
+The same run reduced the broad Windows core failure set to four concrete
+portability defects. Elevated hosted runners can create private objects owned
+by the Administrators group even when their DACL already names only the current
+user, so the private-store hardening paths now set both the current-user owner
+and a protected current-user-only DACL on the exact opened handle. Graph-worker
+wire identifiers now use an explicitly slash-delimited opaque protocol
+namespace instead of host path rules. Descriptor-relative no-replace rename on
+Windows now uses the native NT relative-rename operation rather than passing a
+directory handle through a Win32 form that rejected it. Finally, Unix
+rename/swap fixtures that Windows cannot perform while a retained no-delete
+handle is open are Unix-scoped beside the stronger Windows retained-handle
+regressions. The QMD parser fixture likewise constructs a native absolute path.
+
+Because the graph-worker authority file now includes both the portable fixture
+and the host-independent wire-identifier validation, the replacement also
+refreshes its whole-file packaging golden after reviewing the complete file;
+the structural and mutation self-tests remain required.
+Its required finish line remains: a clean exact SHA based on current
+`origin/main`, terminal-green ordinary CI plus the isolated focused Windows
+run, and three fresh independent reviews of that exact replacement. The exact
+acceptance receipts belong on draft PR #604 so this tracked handoff does not
+require a post-validation receipt-only commit. The PR must remain
+draft/unmerged. Do not infer merge or release authority from a green validation
+run.
 
 Two things a fourth round should hunt, because each has now recurred:
 - a test whose fix failed the SAME way twice. Gate 2 found an agreement test that
