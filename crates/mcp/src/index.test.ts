@@ -2028,6 +2028,12 @@ describe("insight filtering applied after policy", () => {
     expect(insightIsSince({ timestamp: "not a date" }, floor)).toBe(false);
     expect(insightIsSince({ timestamp: "2026-07-16T10:00:00Z" }, floor)).toBe(false);
     expect(insightIsSince({ timestamp: "2026-07-18T10:00:00Z" }, floor)).toBe(true);
+    // The floor is inclusive, which is what the argument description promises
+    // ("on or after this calendar date"). A record sitting exactly on local
+    // midnight is the only case that distinguishes >= from >, and nothing else
+    // in this suite has one.
+    expect(insightIsSince({ timestamp: new Date(floor!).toISOString() }, floor)).toBe(true);
+    expect(insightIsSince({ timestamp: new Date(floor! - 1).toISOString() }, floor)).toBe(false);
   });
 });
 
@@ -2390,6 +2396,42 @@ describe("insight source identity survives a moved corpus", () => {
     }
   });
 
+  it("counts an unresolvable source in the same bucket as a refused one", async () => {
+    // The middle refusal path. A source that cannot be resolved into this
+    // corpus at all must land in the SAME published bucket as one that resolved
+    // and was refused by policy, because separating them would publish the
+    // number of restricted meetings in the window as a clean count. The bucket
+    // is what an agent sees; the reason value never reaches it.
+    const { base, root } = makeMovedCorpus();
+    try {
+      writeFileSync(join(root, "normal.md"), meetingFixture("Normal"));
+      writeFileSync(join(root, "restricted.md"), meetingFixture("Restricted", "restricted"));
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [
+          { content: "kept", source_meeting: "normal.md" },
+          // Resolves, then refused by policy.
+          { content: "refused", source_meeting: "restricted.md" },
+          // Cannot be resolved into this corpus at all: no anchor segment.
+          { content: "unresolvable", source_meeting: "/var/folders/x/T/tmp/out/notes.md" },
+          // No pointer at all: the one bucket that is safe to report apart.
+          { content: "orphan" },
+        ],
+        root,
+        false
+      );
+
+      expect(released.map((r: any) => r.content)).toEqual(["kept"]);
+      expect(withheld).toEqual({
+        total: 3,
+        noSourceProvenance: 1,
+        sourcePolicyDenied: 2,
+      });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a dot-dot component instead of letting join cancel it lexically", async () => {
     // `join` cancels `..` lexically; the kernel does not. Measured on Linux:
     // `missing/../board.md` is ENOENT and `afile/../board.md` is ENOTDIR, so
@@ -2645,7 +2687,9 @@ describe("insight source identity survives a moved corpus", () => {
         resolveCorpusRelativeSourcePath("/Users/someone-else/meetings/../outside.md", root)
       ).toBeNull();
 
-      // A value naming the root itself is not a meeting.
+      // A value naming the root itself is not a meeting. This is refused by the
+      // active-corpus check rejecting a candidate equal to the root, not by any
+      // dedicated anchor-position guard.
       expect(resolveCorpusRelativeSourcePath("/Users/someone-else/meetings", root)).toBeNull();
 
       const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(

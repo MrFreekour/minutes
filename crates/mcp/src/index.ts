@@ -7623,8 +7623,11 @@ function resolveCorpusRelativeSourcePathInner(
     // than `<root>/meetings/x.md`, which is a different meeting.
     if (anchors.length !== 1) return null;
     const anchor = anchors[0];
-    // An anchor as the final segment names the root itself, not a meeting.
-    if (anchor === segments.length - 1) return null;
+    // An anchor as the final segment names the root itself rather than a
+    // meeting, and produces an empty tail. No explicit guard for that here: the
+    // empty tail joins to the root, and `isActiveCorpusMeetingPath` refuses a
+    // candidate equal to the root. A guard here would be unreachable, and an
+    // unreachable guard invites a comment claiming a check that never runs.
     // Only the tail is carried over, and only the tail decides whether the
     // record sat in an active part of its own corpus: everything left of the
     // anchor describes where that corpus lived, not where the record sat
@@ -7660,12 +7663,18 @@ function resolveCorpusRelativeSourcePathInner(
  * A record with no resolvable source fails closed. Without a source there is
  * nothing to revalidate, and an annotation may quote restricted content.
  *
- * The two withheld reasons stay deliberately coarse. `source-policy-denied`
- * covers "could not be resolved into this corpus" together with "resolved and
- * refused", because splitting them would publish the number of restricted
- * source meetings in the window as a clean count to a caller holding no
- * override. `no-source-provenance` is safe to report separately: it describes
- * the record's own shape and not any meeting's policy.
+ * The returned `reason` is informational and is NOT what keeps the published
+ * tally coarse. `releaseRecordsWithLiveSourcePolicy` discards it, caching only
+ * the boolean and counting every refusal into `sourcePolicyDenied`, so that
+ * bucket already conflates "could not be resolved into this corpus" with
+ * "resolved and refused". That conflation is deliberate, because separating
+ * them would publish the number of restricted source meetings in the window as
+ * a clean count to a caller holding no override, but it is enforced at the
+ * caller, not here. `no-source-provenance` is counted separately there, and is
+ * safe to report because it describes the record's own shape rather than any
+ * meeting's policy. Consequently the `source-policy-denied` value returned
+ * below is never distinguishable in output; it exists so the two refusal paths
+ * read differently at this call site and can be asserted in tests.
  */
 export async function revalidateDerivedRecordSource(
   meetingPath: unknown,
