@@ -16,7 +16,7 @@ Both transcribe locally on your Mac. MacWhisper can offer Whisper and Parakeet t
 - Optional cloud AI — MacWhisper: BYO API keys (or fully local via Ollama/LM Studio); Minutes: explicit opt-in only (Claude via MCP, local LLM, or BYO-key cloud — off by default)
 - Output — MacWhisper: per-file exports (txt/srt/vtt/md/pdf/docx); Minutes: markdown corpus with YAML frontmatter, action items, decisions
 - Speakers — MacWhisper: automatic speaker recognition (Pro); Minutes: diarization + confidence-aware attribution that learns names
-- Agent surface — MacWhisper: CLI + workflow automations, no MCP we could find; Minutes: MCP (33 tools), CLI, SDK, Claude Code plugin
+- Agent surface — MacWhisper: CLI + workflow automations, no MCP we could find; Minutes: MCP (34 tools), CLI, SDK, Claude Code plugin
 - Open source — MacWhisper: no; Minutes: MIT
 - Platforms — MacWhisper: macOS (14+ for the App Store build) and iOS; Minutes: macOS menu bar app + CLI (open source)
 - Pricing — MacWhisper: free tier, Pro €64 one-time direct; Minutes: free

@@ -78,6 +78,7 @@ const toolGroups = [
     tools: [
       ["add_note", "Add a timestamped note to the current recording or an existing meeting."],
       ["process_audio", "Process inbox or Downloads audio on macOS/Linux; Windows fails closed without reading audio; retained library recordings are unavailable."],
+      ["resummarize_meeting", "Regenerate the summary for one policy-authorized meeting."],
     ],
   },
   {

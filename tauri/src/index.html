@@ -3019,6 +3019,37 @@
       border: 1px solid var(--border);
       background: var(--surface-fill);
       color: var(--text-secondary);
+      /* Feedback is set via textContent, so a report that puts one fact per
+         line needs its newlines honoured. `pre-line` keeps them while still
+         wrapping long lines and collapsing incidental whitespace. */
+      white-space: pre-line;
+      /* The completion report names a backup file and quotes action items
+         verbatim — both are things to copy out. `body` sets user-select: none
+         page-wide and every content surface opts back in, so this one must
+         too. break-word matches .detail-section-body, since an unbroken
+         quoted item would otherwise run past the banner. */
+      -webkit-user-select: text;
+      user-select: text;
+      word-break: break-word;
+    }
+
+    /* Detail lines under a report headline: the artifact's normal body text
+       (same colour and weight as .detail-section-body) rather than the
+       banner's accent. A dozen quoted action items in bold green is a wall.
+       The hanging indent keeps a wrapped note aligned under its own text
+       instead of under the leading "- ". */
+    .detail-feedback-note {
+      font-weight: 400;
+      color: var(--text-secondary);
+      padding-left: 1em;
+      text-indent: -1em;
+    }
+
+    /* Separates a new subject (e.g. "Review N items…") from the outcome above
+       it. A blank line in the text would be at the mercy of white-space
+       collapsing; margin is not. */
+    .detail-feedback-spaced {
+      margin-top: 0.75em;
     }
 
     .detail-feedback.success {
@@ -5606,6 +5637,7 @@
         <div class="detail-actions">
           <button class="btn btn-secondary btn-sm" id="btn-create-artifact">Create Draft</button>
           <button class="btn btn-primary btn-sm" id="btn-discuss-ai">Discuss with Agent</button>
+          <button class="btn btn-secondary btn-sm" id="btn-resummarize">Resummarize</button>
           <button class="btn btn-secondary btn-sm" id="btn-open-external">Open in Editor</button>
           <button class="btn btn-danger btn-sm" id="btn-delete-meeting">Delete</button>
         </div>
@@ -6846,7 +6878,9 @@
     const detailTitle = document.getElementById('detail-title');
     const detailMeta = document.getElementById('detail-meta');
     const detailFeedback = document.getElementById('detail-feedback');
+    const detailCard = document.querySelector('.detail-card');
     const detailScroll = document.getElementById('detail-scroll');
+    const resummarizeBtn = document.getElementById('btn-resummarize');
     const openExternalBtn = document.getElementById('btn-open-external');
     const aboutOverlay = document.getElementById('about-overlay');
     const aboutVersion = document.getElementById('about-version');
@@ -6933,6 +6967,14 @@
     let proactiveContextBundle = null;
     let latestOutput = null;
     let detailFeedbackTimer = null;
+    let resummarizeConfirmTimer = null;
+    let resummarizeStatusPollTimer = null;
+    let resummarizeStatusRequestId = 0;
+    let detailOpenRequestId = 0;
+    // How long the "Confirm?" state stays armed. The hint banner is shown for
+    // exactly this long too — a hint that vanishes while the button is still
+    // armed tells the user the arm has lapsed when it has not.
+    const RESUMMARIZE_CONFIRM_MS = 6000;
     let processingJobs = [];
     let readinessItems = [];
     let recoveryItems = [];
@@ -7000,6 +7042,13 @@
       const normalized = path.replace(/[\\/]+$/, '');
       const lastSlash = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'));
       return lastSlash === -1 ? normalized : normalized.slice(0, lastSlash);
+    }
+
+    function fileName(path) {
+      if (!path) return '';
+      const normalized = String(path).replace(/[\\/]+$/, '');
+      const lastSlash = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'));
+      return lastSlash === -1 ? normalized : normalized.slice(lastSlash + 1);
     }
 
     function applyDesktopCapabilities(caps) {
@@ -8860,6 +8909,340 @@
       }
     });
 
+    // The card is centred in the overlay (.detail-overlay { align-items:
+    // center }), so a card shorter than its max-height grows symmetrically
+    // when content is added — moving the header, and the wrapping
+    // .detail-actions row with it, UP by half the growth. That is how a
+    // resting pointer ends up over the red Delete button. Holding the card's
+    // height makes .detail-scroll (overflow-y: auto) absorb the change
+    // instead. The hold is owned by the banner lifecycle and nothing else:
+    // showDetailFeedback() takes it, clearDetailFeedback() releases it. Those
+    // are the only two call sites — keep it that way, because tying it to the
+    // button instead let an unawaited status refresh release it underneath a
+    // report that was already on screen.
+    function pinDetailCardHeight() {
+      if (!detailCard) return;
+      // Idempotent on purpose. The banner is shown repeatedly during one
+      // interaction (armed hint → pending → report); re-measuring on a later
+      // call would capture an ALREADY-GROWN card and make the hold a no-op.
+      // Only the first pin, taken before any banner exists, is the real one.
+      if (detailCard.style.maxHeight) return;
+      // max-height, not height: it stops growth just the same, but keeps
+      // deferring to the stylesheet's viewport cap, so a pin that outlives a
+      // window resize can never leave the card taller than the window.
+      // offsetHeight is the border-box height and `* { box-sizing: border-box }`
+      // is set globally, so the two measure the same thing.
+      const pinned = detailCard.offsetHeight;
+      // Not laid out (overlay hidden) — measuring now would pin the card to 0
+      // and collapse it the moment it is shown.
+      if (!pinned) return;
+      detailCard.style.maxHeight = `min(${pinned}px, calc(100vh - 40px))`;
+      // An unparseable value is dropped silently by the CSSOM, which would
+      // remove the pin with no visible signal and quietly bring the layout
+      // shift back. Fall back to a plain cap if that happens.
+      if (!detailCard.style.maxHeight) {
+        detailCard.style.maxHeight = `${pinned}px`;
+      }
+    }
+
+    function unpinDetailCardHeight() {
+      if (detailCard) {
+        detailCard.style.maxHeight = '';
+      }
+    }
+
+    // Deliberately does NOT unpin the card. The pin protects against the
+    // *banner* resizing the card, so its lifetime is the banner's, not the
+    // button's — see clearDetailFeedback(). Tying it to the button was wrong:
+    // openMeetingDetail() fires refreshResummarizeButton() without awaiting it,
+    // so its idle branch lands here one IPC round trip after the completion
+    // report is already on screen and would unpin underneath the user.
+    function resetResummarizeButton() {
+      if (resummarizeConfirmTimer) {
+        clearTimeout(resummarizeConfirmTimer);
+        resummarizeConfirmTimer = null;
+      }
+      stopResummarizeStatusPoll();
+      resummarizeBtn.disabled = false;
+      resummarizeBtn.style.minWidth = '';
+      resummarizeBtn.textContent = 'Resummarize';
+    }
+
+    // `currentMeetingPath` alone is NOT a detail-view identity check: Recall
+    // reuses it ("Discuss with Agent" closes the overlay and then assigns the
+    // same path back), so a completion could reopen the meeting on top of
+    // Recall. Require the overlay to actually be showing this path.
+    function isDetailViewShowing(path) {
+      return detailOverlay.classList.contains('active') && currentMeetingPath === path;
+    }
+
+    // Core reports replaced sections alphabetically, which buries "Summary"
+    // behind "Action Items" and "Decisions". Report them in the order they
+    // appear in the artifact, so the section the user was just looking at
+    // reads first. Unknown names sort last rather than being dropped.
+    const RESUMMARIZE_SECTION_ORDER = ['Summary', 'Decisions', 'Action Items', 'Open Questions', 'Commitments'];
+
+    function orderResummarizeSections(sections) {
+      const rank = (name) => {
+        const index = RESUMMARIZE_SECTION_ORDER.indexOf(name);
+        return index === -1 ? RESUMMARIZE_SECTION_ORDER.length : index;
+      };
+      return [...sections].sort((a, b) => rank(a) - rank(b) || String(a).localeCompare(String(b)));
+    }
+
+    function formatResummarizeDuration(ms) {
+      const value = Number(ms);
+      if (!Number.isFinite(value) || value <= 0) return null;
+      return value < 1000 ? `${Math.round(value)}ms` : `${(value / 1000).toFixed(1)}s`;
+    }
+
+    // A merge note means the regenerated pass disagreed with something the user
+    // edited by hand. `kind` and `disposition` are backend vocabulary
+    // (`action_item`, `kept-unmatched`) — say what happened instead.
+    const MERGE_KIND_LABELS = { action_item: 'Action item', decision: 'Decision' };
+    // No em dash inside these: one already separates the item from its
+    // disposition, and a second in the same line reads as a sentence break.
+    const MERGE_DISPOSITION_LABELS = {
+      'carried-with-conflict': 'kept your version',
+      'kept-unmatched': 'kept; not in the new pass, but it held your edits',
+      dropped: 'dropped; not in the new pass, and it held no edits of yours',
+      ambiguous: 'needs a look; duplicate text, no safe match',
+    };
+
+    function formatMergeNote(note) {
+      const kind = MERGE_KIND_LABELS[note.kind] || note.kind || 'Item';
+      const disposition = MERGE_DISPOSITION_LABELS[note.disposition] || note.disposition || 'changed';
+      const previous = note.previous ? ` “${note.previous}”` : '';
+      // The backend detail already contains its own parenthetical, so join
+      // with a colon rather than wrapping it in a second set of parentheses.
+      const detail = note.detail ? `: ${note.detail}` : '';
+      // "- " to match the bulleted lists everywhere else in the artifact; the
+      // "•" this used stood out as a different kind of list.
+      return `- ${kind}${previous} — ${disposition}${detail}`;
+    }
+
+    function stopResummarizeStatusPoll() {
+      if (resummarizeStatusPollTimer) {
+        clearTimeout(resummarizeStatusPollTimer);
+        resummarizeStatusPollTimer = null;
+      }
+    }
+
+    async function refreshResummarizeButton() {
+      const requestId = ++resummarizeStatusRequestId;
+      try {
+        const status = await invoke('cmd_resummarize_status');
+        // These queries are fire-and-forget, so an older reply can land after a
+        // newer one. Applying it would strand the button in the stale state.
+        if (requestId !== resummarizeStatusRequestId) return;
+        stopResummarizeStatusPoll();
+        if (status && status.running) {
+          // Runs are globally serialized: disable for any in-flight run, and
+          // say so when it is a different file than the one open here.
+          resummarizeBtn.disabled = true;
+          resummarizeBtn.textContent = 'Resummarizing…';
+          // Overlay-active, not just a path check: this reply can land after the
+          // view was closed, and a banner shown into a hidden overlay is both
+          // pointless and unpinnable (the card has no layout height to hold),
+          // so it would sit there waiting to shift the actions row on reopen.
+          if (
+            status.path
+            && status.path !== currentMeetingPath
+            && detailOverlay.classList.contains('active')
+          ) {
+            showDetailFeedback('Another meeting is being resummarized — this button unlocks when it finishes.');
+          }
+          // Only the view that started a run learns when it ends. Without this
+          // re-check, a view opened during someone else's run keeps a disabled
+          // button for the rest of its life — and the explanation above has
+          // already auto-hidden, so it looks simply broken.
+          if (detailOverlay.classList.contains('active')) {
+            resummarizeStatusPollTimer = setTimeout(refreshResummarizeButton, 2000);
+          }
+        } else {
+          resetResummarizeButton();
+        }
+      } catch (e) {
+        console.error('Resummarize status:', e);
+      }
+    }
+
+    resummarizeBtn.addEventListener('click', async () => {
+      const path = currentMeetingPath;
+      if (!path) return;
+      if (resummarizeBtn.disabled) {
+        showDetailFeedback('Another meeting is being resummarized — try again when it finishes.');
+        return;
+      }
+      // Two-step inline confirm: the AI pass has real cost, so an accidental
+      // click must not fire it. Never window.confirm — WKWebView breaks it.
+      if (!resummarizeConfirmTimer) {
+        // Pin the current width before shortening the label. "Confirm?" is
+        // narrower than "Resummarize", and without this the actions row
+        // reflows and slides "Open in Editor" under the cursor — so the
+        // second click of a double-click lands on the wrong button.
+        resummarizeBtn.style.minWidth = `${resummarizeBtn.offsetWidth}px`;
+        // The vertical twin of the width pin above is handled for us:
+        // showDetailFeedback() holds the card height before it shows the hint
+        // banner below, so the growing banner cannot slide this row up under
+        // the cursor and put "Delete" where the second click lands.
+        resummarizeBtn.textContent = 'Confirm?';
+        showDetailFeedback(
+          'Click again to regenerate the AI summary. A timestamped backup will be saved.',
+          'success',
+          RESUMMARIZE_CONFIRM_MS,
+        );
+        resummarizeConfirmTimer = setTimeout(resetResummarizeButton, RESUMMARIZE_CONFIRM_MS);
+        return;
+      }
+      clearTimeout(resummarizeConfirmTimer);
+      resummarizeConfirmTimer = null;
+      resummarizeBtn.disabled = true;
+      resummarizeBtn.textContent = 'Resummarizing…';
+      // The run outlasts the default toast, so hold the pending message until
+      // the success/error message replaces it.
+      showDetailFeedback('Resummarizing… this can take a minute.', 'success', 0);
+      let result = null;
+      let failure = null;
+      try {
+        result = await invoke('cmd_resummarize_meeting', { path });
+      } catch (e) {
+        failure = e;
+        console.error('Resummarize:', e);
+      } finally {
+        // Restore the button here, before the outcome is rendered below. The
+        // render used to live inside this try, which put the reset *after* it
+        // and let the reset clobber what had just been drawn.
+        resetResummarizeButton();
+      }
+
+      // The run outlives the view: the user can close the detail view or open
+      // another meeting while it is in flight. Only report into the view that
+      // started it — otherwise this reopens meeting A over meeting B and
+      // attaches A's feedback to B.
+      // 'superseded' by default: if the view was already gone, nothing below
+      // may touch it.
+      let refresh = 'superseded';
+      if (isDetailViewShowing(path)) {
+        // Refresh from disk before reporting. On failure this still leaves the
+        // user looking at the artifact's current state rather than retrying —
+        // a ConcurrentEdit means the file moved on.
+        try {
+          refresh = await openMeetingDetail(path);
+        } catch (e) {
+          // openMeetingDetail falls back to cmd_open_file and can still reject
+          // if that fails too. The run itself already finished, so losing the
+          // refresh must not also strand the pending banner with no outcome
+          // ever rendered — treat it like 'failed' and report below.
+          console.error('Resummarize refresh:', e);
+          refresh = 'failed';
+        }
+      }
+
+      // A superseded refresh means the user opened a different meeting while
+      // this run was finishing. The view belongs to that meeting now — its own
+      // open already cleared the banner, and reporting here would staple this
+      // run's backup filename and merge notes onto someone else's meeting.
+      const ownsView = refresh !== 'superseded' && isDetailViewShowing(path);
+
+      if (failure) {
+        if (ownsView) {
+          // Errors are actionable (a ConcurrentEdit asks the user to save their
+          // editor and re-run) — do not auto-hide them.
+          showDetailFeedback(failure?.message || String(failure || 'Unknown error'), 'error', 0);
+        }
+        return;
+      }
+
+      const replaced = orderResummarizeSections(
+        Array.isArray(result.sectionsReplaced) ? result.sectionsReplaced : [],
+      );
+      // `sectionsWritten` is what the pass produced; `sectionsReplaced` is only
+      // the subset that already existed. The difference is what got created —
+      // without it, a transcript-only meeting's first pass reports "replaced
+      // nothing", which reads as "nothing happened" when in fact a whole
+      // summary and its derived sections were just written.
+      const written = orderResummarizeSections(
+        Array.isArray(result.sectionsWritten) ? result.sectionsWritten : [],
+      );
+      const replacedSet = new Set(replaced);
+      const writtenSet = new Set(written);
+      // A section the new pass did not produce is REMOVED, not replaced:
+      // splice_ai_sections deletes every pre-existing AI section and inserts
+      // only what the pass wrote, so a meeting that had Commitments and a pass
+      // that found none leaves no Commitments section at all. Core folds that
+      // into `sections_replaced`, so reporting that list verbatim would say
+      // "replaced Commitments" about a section that is now gone.
+      //
+      // Without `sectionsWritten` there is nothing to subtract, so fall back
+      // to reporting the replaced list as-is rather than inventing removals.
+      const known = written.length > 0;
+      const rewritten = known ? replaced.filter((name) => writtenSet.has(name)) : replaced;
+      // Summary is named by the lead clause either way, so listing it again
+      // under "Created" would be redundant.
+      const created = written.filter((name) => name !== 'Summary' && !replacedSet.has(name));
+      const removed = known ? replaced.filter((name) => !writtenSet.has(name)) : [];
+      const elapsed = formatResummarizeDuration(result.durationMs);
+      const took = elapsed ? ` in ${elapsed}` : '';
+      // "rewritten" only when there was something there to rewrite — an
+      // artifact with no `## Summary` gets one written for the first time.
+      const outcome = replacedSet.has('Summary')
+        ? `Summary rewritten${took}`
+        : `Summary written${took}`;
+      const sentences = [
+        rewritten.length ? `${outcome} — replaced ${rewritten.join(', ')}.` : `${outcome}.`,
+      ];
+      if (created.length) {
+        sentences.push(`Created ${created.join(', ')}.`);
+      }
+      if (removed.length) {
+        sentences.push(`Removed ${removed.join(', ')} — the new pass found none.`);
+      }
+      // One fact per line: the run's outcome, then where the previous version
+      // went, then anything needing a decision. The backup lands beside the
+      // artifact, so its filename is the useful half of the path.
+      const lines = [sentences.join(' ')];
+      if (result.backup) {
+        lines.push(`Backup: ${fileName(result.backup)}`);
+      }
+      const mergeNotes = Array.isArray(result.mergeNotes) ? result.mergeNotes : [];
+      if (mergeNotes.length) {
+        // Set off from the outcome above it: this is a to-do list, not more
+        // detail about the run that just succeeded.
+        lines.push({
+          text: `Review ${mergeNotes.length} item${mergeNotes.length === 1 ? '' : 's'} where the new pass differed from your edits:`,
+          spaced: true,
+        });
+        // Muted: these quote the user's own action items and decisions in full,
+        // so they are long, and the banner's accent colour on all of it drowns
+        // out the one line that says what happened.
+        lines.push(...mergeNotes.map((note) => ({ text: formatMergeNote(note), muted: true })));
+      }
+      // A refresh warning means the write succeeded but a derived view (graph,
+      // vault, QMD) is now stale — silently dropping it is how a stale index
+      // goes unnoticed.
+      const refreshWarnings = Array.isArray(result.refreshWarnings) ? result.refreshWarnings : [];
+      if (refreshWarnings.length) {
+        lines.push(`Derived views need attention: ${refreshWarnings.join(' | ')}`);
+      }
+      // The write succeeded but this view could not be reloaded, so what is on
+      // screen is still the OLD summary. "Summary rewritten" over visibly stale
+      // content reads as a lie — name the mismatch rather than hide it.
+      if (refresh === 'failed') {
+        lines.push('This view could not be reloaded, so it still shows the previous summary — reopen the meeting to see the new one.');
+      }
+      if (ownsView) {
+        // Persist until the user leaves this meeting: closeDetailView clears
+        // it, and openMeetingDetail clears it when the path changes. A run
+        // costs real time and money, and its report names a backup file and
+        // any merge conflicts — none of that should evaporate on a timer
+        // while the user is still reading it. Tone stays 'success' (the write
+        // did succeed, and .detail-feedback has no warning variant).
+        showDetailFeedback(lines, 'success', 0);
+      }
+      loadMeetings();
+    });
+
     document.getElementById('btn-stop').addEventListener('click', async () => {
       try {
         stopRequested = true;
@@ -9168,13 +9551,12 @@
       currentMeetingPath = null;
       currentMeetingDetail = null;
       persistRecallWorkspaceState({ currentMeetingPath: '' });
-      if (detailFeedbackTimer) {
-        clearTimeout(detailFeedbackTimer);
-        detailFeedbackTimer = null;
-      }
-      detailFeedback.hidden = true;
-      detailFeedback.className = 'detail-feedback';
-      detailFeedback.textContent = '';
+      // Closing while the confirm is armed must not leave the armed state
+      // behind: this clears the timer and also the "Confirm?" label, the pinned
+      // button width, and the pinned card height, none of which are repaired
+      // until refreshResummarizeButton() happens to take its idle branch.
+      resetResummarizeButton();
+      clearDetailFeedback();
     }
 
     function closeAbout() {
@@ -9239,20 +9621,68 @@
       closeInputModal(null);
     }, true);
 
-    function showDetailFeedback(message, tone = 'success') {
+    // `durationMs = 0` keeps the message up until the next feedback call or
+    // closeDetailView(). Used for content the user is meant to act on rather
+    // than glance at — resummarize merge notes name the action items and
+    // decisions that did not carry cleanly, and 3.2s is not long enough to
+    // read them.
+    function clearDetailFeedback() {
       if (detailFeedbackTimer) {
         clearTimeout(detailFeedbackTimer);
         detailFeedbackTimer = null;
       }
+      detailFeedback.hidden = true;
+      detailFeedback.className = 'detail-feedback';
+      detailFeedback.textContent = '';
+      // The card is only held to stop a resizing banner from moving the actions
+      // row. With no banner there is nothing to hold it for, and keeping it
+      // would freeze the card at a height the current content never asked for.
+      unpinDetailCardHeight();
+    }
+
+    // `message` is either a plain string — whose newlines `white-space:
+    // pre-line` honours — or an array of lines, where each line is a string or
+    // `{ text, muted, spaced }`. The array form exists because a report is not
+    // uniform: the outcome is the headline, merge notes are a muted to-do list
+    // under it, and CSS cannot tell those apart inside one text node.
+    function showDetailFeedback(message, tone = 'success', durationMs = 3200) {
+      if (detailFeedbackTimer) {
+        clearTimeout(detailFeedbackTimer);
+        detailFeedbackTimer = null;
+      }
+      // Hold the card before the banner changes size — for EVERY message, not
+      // just the resummarize ones. The card is centred, so any banner that
+      // grows it moves the header (and the wrapping actions row, red Delete
+      // included) up under a resting pointer. Doing it here also means a
+      // banner shown by some other feature cannot leave the card grown and
+      // turn a later resummarize pin into a no-op. Idempotent, so the pin is
+      // taken once, at the pre-banner height.
+      pinDetailCardHeight();
       detailFeedback.hidden = false;
       detailFeedback.className = `detail-feedback ${tone}`;
-      detailFeedback.textContent = message;
-      detailFeedbackTimer = setTimeout(() => {
-        detailFeedback.hidden = true;
-        detailFeedback.className = 'detail-feedback';
-        detailFeedback.textContent = '';
-        detailFeedbackTimer = null;
-      }, 3200);
+      if (Array.isArray(message)) {
+        detailFeedback.replaceChildren(
+          ...message.map((line) => {
+            const row = document.createElement('div');
+            const spec = typeof line === 'string' ? { text: line } : line || {};
+            // textContent, never innerHTML: merge notes quote action-item and
+            // decision text straight out of the artifact, which is arbitrary
+            // user content.
+            row.textContent = spec.text || '';
+            const classes = [];
+            if (spec.muted) classes.push('detail-feedback-note');
+            if (spec.spaced) classes.push('detail-feedback-spaced');
+            if (classes.length) row.className = classes.join(' ');
+            return row;
+          }),
+        );
+      } else {
+        detailFeedback.textContent = message;
+      }
+      if (durationMs <= 0) return;
+      // Route the auto-hide through clearDetailFeedback so every path that
+      // removes the banner also releases the card pin.
+      detailFeedbackTimer = setTimeout(clearDetailFeedback, durationMs);
     }
 
     function renderDetailSections(detail) {
@@ -9715,13 +10145,67 @@
       persistRecallWorkspaceState({ currentMeetingPath: detail.path });
     }
 
+    // Returns how the open ended, so a caller that wants to touch the view
+    // afterwards can tell whether it still owns it:
+    //   'rendered'   — this open won and painted the detail view
+    //   'superseded' — a newer open took over; the caller must not touch the view
+    //   'failed'     — detail could not be loaded; the file went to an external
+    //                  editor and the overlay still shows this meeting's old content
     async function openMeetingDetail(path) {
+      // Opens are concurrent: each awaits its own IPC, so a slower earlier open
+      // could land last and render itself over a newer one — restoring the old
+      // meeting's content AND its currentMeetingPath. That is what would let a
+      // finished run attach its report to whichever meeting the user has since
+      // opened. Same request-sequence idiom as refreshResummarizeButton().
+      const requestId = ++detailOpenRequestId;
+      // Feedback belongs to the meeting that produced it. The detail view can
+      // be navigated without ever closing — the "Source" button on a commitment
+      // and "Open" on a related meeting both call straight back into here — and
+      // the resummarize report has no auto-hide timer, so without this the next
+      // meeting renders under the previous one's backup filename and merge
+      // notes.
+      // The one entry allowed to keep its banner is a refresh of the meeting
+      // already on screen, which is what the resummarize completion path does.
+      // Note this is deliberately NOT a bare path comparison: currentMeetingPath
+      // outlives the overlay (Recall reassigns it while the view is closed), so
+      // a path match alone would let a reopen inherit a banner that was never
+      // pinned against this content.
+      if (!isDetailViewShowing(path)) {
+        clearDetailFeedback();
+      }
+      // Clear any armed state synchronously, before the awaits below. The
+      // "Confirm?" label, the pinned button width, and the pinned card height
+      // all belong to the detail that was showing; carrying them into a
+      // different meeting (or leaving them while the status refresh is still
+      // in flight) shows a stale, wrongly-sized control.
+      resetResummarizeButton();
       try {
         const detail = await invoke('cmd_get_meeting_detail', { path });
+        // A newer open superseded this one while the fetch was in flight.
+        // Rendering now would put the older meeting back on screen.
+        if (requestId !== detailOpenRequestId) return 'superseded';
         renderDetailSections(detail);
+        refreshResummarizeButton();
+        return 'rendered';
       } catch (e) {
         console.error('Detail:', e);
-        await invoke('cmd_open_file', { path });
+        if (requestId !== detailOpenRequestId) return 'superseded';
+        // Swallow a fallback failure rather than rethrowing: if this rejected,
+        // the sequence re-check below would be skipped and the caller would be
+        // told the view is stale without that ever having been verified. The
+        // user is no worse off — there is nothing further to try — and the
+        // outcome is still reported honestly as 'failed'.
+        try {
+          await invoke('cmd_open_file', { path });
+        } catch (openError) {
+          console.error('Detail fallback open:', openError);
+        }
+        // Re-check after that await too. A newer open can render fresh content
+        // while the external editor is being launched; reporting 'failed' then
+        // would tell the caller the view is stale when it is not, and the
+        // completion report would contradict the summary actually on screen.
+        if (requestId !== detailOpenRequestId) return 'superseded';
+        return 'failed';
       }
     }
 
@@ -15214,6 +15698,13 @@
       // newly-active md-viewer is actually visible.
       if (detailOverlay.classList.contains('active')) {
         detailOverlay.classList.remove('active');
+        // Hiding the overlay bypasses closeDetailView(), so drop any armed
+        // "Confirm?" state and its pinned width with it, and clear the banner —
+        // which also releases the card pin. Without the clear, a persistent
+        // resummarize report would still be on screen (under a stale pin) when
+        // the meeting is reopened.
+        resetResummarizeButton();
+        clearDetailFeedback();
       }
       meetingsScroll.style.display = 'none';
       mdSearchWrap.style.display = 'none';

@@ -37,12 +37,12 @@ jobs:
           git check-ref-format "refs/tags/$RELEASE_TAG"
 
       - name: Check out release ref
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ format('refs/tags/{0}', env.RELEASE_TAG) }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "22"
 
@@ -66,7 +66,7 @@ jobs:
           git check-ref-format "refs/tags/$RELEASE_TAG"
 
       - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ format('refs/tags/{0}', env.RELEASE_TAG) }}
           fetch-depth: 0
@@ -95,7 +95,7 @@ jobs:
         run: echo "scope=${ImageOS:-noimage}-${ImageVersion:-noversion}" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cargo/registry
@@ -313,14 +313,14 @@ jobs:
             "$RUNNER_TEMP/graph-worker-identity.txt"
 
       - name: Upload signed app bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: minutes-macos-app
           path: target/release/bundle/macos/Minutes.app
           if-no-files-found: error
 
       - name: Upload signed dmg
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: minutes-macos-dmg
           path: target/release/bundle/dmg/*.dmg

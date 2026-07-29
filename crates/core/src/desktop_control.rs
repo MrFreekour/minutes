@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn claim_pending_requests_is_single_claim() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let original_home = std::env::var_os("HOME");
         #[cfg(windows)]
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn desktop_app_owns_pid_requires_recent_matching_heartbeat() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let original_home = std::env::var_os("HOME");
         #[cfg(windows)]

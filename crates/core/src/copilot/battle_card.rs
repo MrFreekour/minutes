@@ -248,30 +248,8 @@ mod tests {
         CopilotRequest, CopilotUtterance, MeetingMode, StrategyRefreshReason, StrategyRequest,
         StrategyState, TranscriptUpdateKind,
     };
-    use std::ffi::OsString;
-    use std::path::Path;
 
-    struct HomeOverride {
-        previous: Option<OsString>,
-    }
-
-    impl HomeOverride {
-        fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for HomeOverride {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                std::env::set_var("HOME", previous);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
+    use crate::test_support::HomeOverride;
 
     fn meeting(title: &str, person: &str, secret: &str, restricted: bool) -> String {
         let sensitivity = if restricted {
@@ -286,7 +264,7 @@ mod tests {
 
     #[test]
     fn assembly_excludes_restricted_history_from_graph_structured_and_fts_sources() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let _home = HomeOverride::set(temp.path());
         let meetings = temp.path().join("meetings");

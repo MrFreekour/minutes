@@ -1698,7 +1698,7 @@ fn summarize_with_agent_impl_timeout(
     agent_cmd: String,
     timeout: std::time::Duration,
 ) -> Result<Summary, Box<dyn std::error::Error>> {
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     let input = prepare_agent_transcript_input(transcript, user_notes);
 
@@ -1739,22 +1739,31 @@ fn summarize_with_agent_impl_timeout(
     } else {
         std::process::Stdio::null()
     };
-    let mut child = crate::engine_process::command(&invocation.cmd)
+    let mut command = crate::engine_process::command(&invocation.cmd);
+    command
         .args(&invocation.args)
         .stdin(stdin_stdio)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if let Some(path) = cleanup_path.as_ref() {
-                let _ = std::fs::remove_file(path);
-            }
-            format!(
-                "Agent '{}' not found or failed to start: {}. \
+        .stderr(std::process::Stdio::piped());
+    // Own process group so a timeout can kill the WHOLE tree. Real agent CLIs
+    // spawn MCP servers and tool subprocesses; killing only the direct child
+    // leaves those running, and they hold the inherited stdout/stderr pipes
+    // open (#592). Mirrors run_speaker_mapping_via_agent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| {
+        if let Some(path) = cleanup_path.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+        format!(
+            "Agent '{}' not found or failed to start: {}. \
                  Install it or change [summarization] agent_command in config.toml",
-                agent_cmd, e
-            )
-        })?;
+            agent_cmd, e
+        )
+    })?;
 
     let stdout = child
         .stdout
@@ -1766,19 +1775,12 @@ fn summarize_with_agent_impl_timeout(
         .ok_or_else(|| "Agent stderr unexpectedly unavailable".to_string())?;
 
     // Drain child output while it runs so verbose CLIs like `codex exec`
-    // cannot block on full stdout/stderr pipes before they exit.
-    let stdout_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stderr);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    });
+    // cannot block on full stdout/stderr pipes before they exit. Collection is
+    // deadline-bounded (see take_agent_output): a descendant that inherited the
+    // pipe keeps it from reaching EOF, so an unconditional join would block the
+    // caller for that descendant's lifetime on every completion path (#592).
+    let (stdout_buf, stdout_handle) = spawn_agent_output_reader(stdout);
+    let (stderr_buf, stderr_handle) = spawn_agent_output_reader(stderr);
 
     if let Some(prompt_bytes) = invocation.stdin_payload.clone() {
         let mut stdin = child
@@ -1795,12 +1797,12 @@ fn summarize_with_agent_impl_timeout(
         match child.try_wait() {
             Ok(Some(status)) => {
                 let _ = child.wait();
-                let stdout = stdout_handle
-                    .join()
-                    .map_err(|_| "Failed to join agent stdout reader thread".to_string())?;
-                let stderr = stderr_handle
-                    .join()
-                    .map_err(|_| "Failed to join agent stderr reader thread".to_string())?;
+                // Bounded even on the clean-exit path: the agent can write a
+                // complete summary and exit 0 while a backgrounded descendant
+                // still holds the pipe, which would otherwise block here for
+                // that descendant's lifetime (#592).
+                let stdout = take_agent_output(&stdout_buf, stdout_handle, "stdout");
+                let stderr = take_agent_output(&stderr_buf, stderr_handle, "stderr");
                 if let Some(path) = cleanup_path.as_ref() {
                     let _ = std::fs::remove_file(path);
                 }
@@ -1828,10 +1830,14 @@ fn summarize_with_agent_impl_timeout(
             Ok(None) => {
                 // Still running
                 if start.elapsed() > timeout {
+                    // Kill the group before the direct child so descendants
+                    // holding the inherited pipes die too; otherwise the
+                    // readers below never reach EOF (#592).
+                    kill_process_group(child.id());
                     child.kill().ok();
                     let _ = child.wait();
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
+                    let _ = take_agent_output(&stdout_buf, stdout_handle, "stdout");
+                    let _ = take_agent_output(&stderr_buf, stderr_handle, "stderr");
                     if let Some(path) = cleanup_path.as_ref() {
                         let _ = std::fs::remove_file(path);
                     }
@@ -2623,18 +2629,27 @@ fn run_title_refinement_via_agent(
     } else {
         std::process::Stdio::null()
     };
-    let mut child = crate::engine_process::command(&invocation.cmd)
+    let mut command = crate::engine_process::command(&invocation.cmd);
+    command
         .args(&invocation.args)
         .stdin(stdin_stdio)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if let Some(path) = cleanup_path.as_ref() {
-                let _ = std::fs::remove_file(path);
-            }
-            format!("Agent '{}' not found or failed to start: {}", agent_cmd, e)
-        })?;
+        .stderr(std::process::Stdio::piped());
+    // Own process group so a timeout can kill the WHOLE tree. Real agent CLIs
+    // spawn MCP servers and tool subprocesses; killing only the direct child
+    // leaves those running, and they hold the inherited stdout/stderr pipes
+    // open (#592). Mirrors run_speaker_mapping_via_agent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| {
+        if let Some(path) = cleanup_path.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+        format!("Agent '{}' not found or failed to start: {}", agent_cmd, e)
+    })?;
 
     if let Some(bytes) = invocation.stdin_payload.clone() {
         let mut stdin = child
@@ -3062,6 +3077,82 @@ fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) {}
 
+/// How long to wait for an agent's output readers to reach EOF after the agent
+/// itself is done (either exited or killed).
+///
+/// A reader can outlive the agent: `read_to_end` only returns at EOF, and EOF
+/// only arrives when *every* holder of the pipe's write end is gone. A
+/// descendant that inherited the FD (an MCP server, a backgrounded tool) keeps
+/// it open, so joining unconditionally blocks for that descendant's lifetime,
+/// on the clean-exit path as well as after a timeout (#592).
+const AGENT_OUTPUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Drain `source` into a shared buffer on a helper thread.
+///
+/// Bytes are appended incrementally rather than returned at EOF, so a caller
+/// that gives up waiting can still take everything read so far. That matters
+/// for the case where the agent wrote a complete summary and exited cleanly
+/// while a surviving descendant holds the pipe open.
+fn spawn_agent_output_reader<R: std::io::Read + Send + 'static>(
+    source: R,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&shared);
+    let handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = std::io::BufReader::new(source);
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut buf) = sink.lock() {
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (shared, handle)
+}
+
+/// Take an agent reader's output, waiting at most [`AGENT_OUTPUT_DRAIN_GRACE`]
+/// for EOF.
+///
+/// If the grace expires the thread is abandoned rather than joined: it is
+/// parked in a blocking read on a pipe held open by a process we do not
+/// control, so joining it is exactly the hang this guards against. The bytes
+/// collected so far are returned, which is the complete output whenever the
+/// agent finished writing before the descendant outlived it.
+fn take_agent_output(
+    shared: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    handle: std::thread::JoinHandle<()>,
+    stream: &'static str,
+) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + AGENT_OUTPUT_DRAIN_GRACE;
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    } else {
+        tracing::debug!(
+            stream,
+            grace_secs = AGENT_OUTPUT_DRAIN_GRACE.as_secs(),
+            "agent output reader still blocked after grace; a surviving descendant holds the pipe. \
+             Returning bytes read so far rather than blocking the caller"
+        );
+    }
+    shared
+        .lock()
+        .map(|buf| buf.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+}
+
 fn parse_speaker_mapping(
     response: &str,
     valid_speakers: &[String],
@@ -3105,7 +3196,6 @@ fn parse_speaker_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
@@ -3117,7 +3207,7 @@ mod tests {
     /// private mutex here raced with crate::test_home_env_lock users and
     /// flaked parallel runs).
     fn home_env_lock_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_home_env_lock()
+        crate::test_support::home_env_lock()
     }
 
     fn api_env_lock() -> &'static Mutex<()> {
@@ -3125,27 +3215,7 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    struct HomeOverride {
-        previous: Option<OsString>,
-    }
-
-    impl HomeOverride {
-        fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for HomeOverride {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                std::env::set_var("HOME", previous);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
+    use crate::test_support::HomeOverride;
 
     fn with_temp_home<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _guard = home_env_lock_guard();
@@ -4523,6 +4593,94 @@ EOF
         assert_eq!(summary.decisions, vec!["decision ok"]);
         assert_eq!(summary.action_items, vec!["@mat: verify fix"]);
         assert_eq!(summary.participants, vec!["Mat"]);
+    }
+
+    /// Write an agent script that backgrounds a long-lived grandchild which
+    /// inherits stdout/stderr, then behaves as `body` directs. Reproduces the
+    /// shape of a real agent CLI that leaves an MCP server or tool subprocess
+    /// running (#592).
+    #[cfg(unix)]
+    fn write_grandchild_agent(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(
+            path.as_path(),
+            format!("#!/bin/sh\ncat >/dev/null 2>&1\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_timeout_is_bounded_when_a_grandchild_survives() {
+        // #592: the timeout killed only the direct child, so a grandchild that
+        // inherited the stdout pipe kept it from reaching EOF and the reader
+        // join blocked far past agent_timeout_secs.
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_grandchild_agent(dir.path(), "hang.sh", "sleep 30 &\nsleep 30");
+
+        let mut config = Config::default();
+        config.summarization.engine = "agent".into();
+
+        let start = std::time::Instant::now();
+        let result = summarize_with_agent_impl_timeout(
+            "short transcript",
+            None,
+            &[],
+            &config,
+            None,
+            script.display().to_string(),
+            std::time::Duration::from_secs(2),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "the agent never produced a summary");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "timeout must bound the call even with a surviving grandchild; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_clean_exit_is_not_blocked_by_a_surviving_grandchild() {
+        // #592 follow-up: the agent writes a complete summary and exits 0 while
+        // a backgrounded descendant still holds the pipe. The deadline is never
+        // consulted on this path, so an unconditional reader join blocked for
+        // the descendant's lifetime.
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_grandchild_agent(
+            dir.path(),
+            "clean.sh",
+            "sleep 30 &\ncat <<'EOF'\nKEY POINTS:\n- summary ok\nEOF\nexit 0",
+        );
+
+        let mut config = Config::default();
+        config.summarization.engine = "agent".into();
+
+        let start = std::time::Instant::now();
+        let summary = summarize_with_agent_impl_timeout(
+            "short transcript",
+            None,
+            &[],
+            &config,
+            None,
+            script.display().to_string(),
+            // Large timeout: this path is about the reader join, not the deadline.
+            std::time::Duration::from_secs(300),
+        )
+        .expect("a clean exit with output should produce a summary");
+        let elapsed = start.elapsed();
+
+        assert_eq!(summary.key_points, vec!["summary ok"]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "a clean exit must not block on a surviving descendant; took {elapsed:?}"
+        );
     }
 
     /// Write a fake `pi` binary (a file-arg agent: `stdin_payload` is None)

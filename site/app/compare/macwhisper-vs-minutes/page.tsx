@@ -44,7 +44,7 @@ const comparisonRows = [
   {
     label: "Agent / MCP surface",
     competitor: "CLI control and workflow automations; no MCP server we could find",
-    minutes: "MCP server (33 tools), CLI, SDK, Claude Code plugin over your local files",
+    minutes: "MCP server (34 tools), CLI, SDK, Claude Code plugin over your local files",
   },
   {
     label: "Open source",
@@ -96,7 +96,7 @@ export default function MacwhisperVsMinutesPage() {
       ]}
       minutesWins={[
         "It builds an archive, not just outputs: every meeting, memo, and dictation becomes structured markdown — attendees, action items, decisions in YAML — organized and greppable over months, not a folder of one-off exports.",
-        "It's agent-native: 33 MCP tools, a CLI, an SDK, and a Claude Code plugin let your assistant search meetings, track commitments, and build person profiles from your local files. MacWhisper automates workflows; it doesn't give agents a memory.",
+        "It's agent-native: 34 MCP tools, a CLI, an SDK, and a Claude Code plugin let your assistant search meetings, track commitments, and build person profiles from your local files. MacWhisper automates workflows; it doesn't give agents a memory.",
         "It's open source (MIT) and free — the entire pipeline is auditable Rust, which matters if 'local' is a compliance requirement rather than a preference.",
       ]}
       workflowSection={[

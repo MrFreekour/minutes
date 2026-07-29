@@ -881,7 +881,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn with_temp_home<T>(f: impl FnOnce(&TempDir) -> T) -> T {
-        let _lock = crate::test_home_env_lock();
+        let _lock = crate::test_support::home_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let original_home = std::env::var_os("HOME");
         #[cfg(windows)]

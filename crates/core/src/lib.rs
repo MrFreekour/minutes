@@ -25,6 +25,7 @@ pub mod config;
 pub mod context_store;
 pub mod copilot;
 pub mod daily_notes;
+pub mod derived;
 pub mod desktop_context;
 pub mod desktop_control;
 pub mod device_monitor;
@@ -91,6 +92,9 @@ pub mod streaming_diarize;
 pub mod summarize;
 pub mod system_audio_backend;
 pub mod template;
+/// Test scaffolding shared by unit and integration tests. Not public API.
+#[doc(hidden)]
+pub mod test_support;
 pub mod transcribe;
 pub mod transcription_coordinator;
 pub mod vault;
@@ -178,7 +182,6 @@ pub fn install_whisper_logging_hooks() {
     #[cfg(feature = "whisper")]
     whisper_rs::install_logging_hooks();
 }
-
 /// Whether a worker-capable binary sits beside the test harness, answered once.
 ///
 /// Several tests assert this as a precondition rather than skipping silently, and
@@ -209,10 +212,5 @@ pub(crate) fn test_worker_binary_is_available() -> bool {
 
 #[cfg(test)]
 pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::test_support::home_env_lock()
 }

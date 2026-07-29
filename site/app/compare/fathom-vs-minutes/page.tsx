@@ -54,7 +54,7 @@ const comparisonRows = [
   {
     label: "API / MCP",
     competitor: "Yes — public API and a first-party MCP server over its cloud",
-    minutes: "Yes — MCP (33 tools), CLI, and SDK over local files",
+    minutes: "Yes — MCP (34 tools), CLI, and SDK over local files",
   },
   {
     label: "Pricing",

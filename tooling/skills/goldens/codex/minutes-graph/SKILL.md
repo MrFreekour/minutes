@@ -5,7 +5,7 @@ description: Policy-safe relationship rankings, commitments, aliases, person pro
 
 # /minutes-graph
 
-Minutes builds relationship rankings and graph commitments from a bounded, process-private SQLite projection of stable policy-authorized Markdown. Person profiles and topic research use the separately bounded live-source search boundary. Both paths re-attest policy before returning facts. Do not fall back to a retired durable index or read meeting files directly.
+Minutes builds relationship rankings, exact person profiles, and commitments from one supervised, process-private SQLite projection of stable policy-authorized Markdown plus confirmed identity corrections. One ordered snapshot authority spans corpus and corrections, and the worker is hard-limited for memory, output, and wall time. Topic research uses the separately bounded live-source search boundary. Both paths re-attest policy before returning facts. Do not fall back to a retired durable index or read meeting files directly.
 
 ## Privacy boundary
 

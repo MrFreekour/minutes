@@ -7,8 +7,8 @@ import { existsSync, readFileSync } from "node:fs";
 // These whole-file hashes prevent dead/comment-only duplicate code from
 // satisfying the structural checks below.
 const EXPECTED_SOURCE_SHA256 = {
-  release: "ac3f0490ecbea97988e5dba47c676b2b012a4dc217a52a389946502d13013f97",
-  acceptance: "692cd6d9599020983a308992ffba1a51a8b5873fceb967b104a68dec15f222b9",
+  release: "986432ffb8697f36a026afa6e66a5bf20cd0861de5e428029edca0129088c19d",
+  acceptance: "b5afb18dd30be29a9885331ed8dd505c8ff5ffd3a632232d328fe3b6d08b8c3f",
   build: "5f6029f8e22484a55294f08de62df299e816e08f4b45278d143a008142a47ea5",
   dev: "70f7a3aa227440c5928bc51227d64fbf85176b5f966b2fcc04a15e159bbd223e",
   packageXpc: "baebd532d240fc26188c431f571d0a44f2ce1e7240c3277284c9ea9e69c1ef82",
@@ -19,7 +19,7 @@ const EXPECTED_SOURCE_SHA256 = {
   authority: "31499fdcd41a1240c3568d5ffc73801243a1432e1312a2c31a3626d0766e5786",
   helperPlist: "543617b03e757520a201bd0a7751cc6aadb48cf0d6b4a44bfc9ef4323a69850f",
   helperEntry: "0efe701412d909021d6ae784eac941e7d9b9d1a0f2ee0f3144bcb15fc2b2ba18",
-  cliCargo: "f1fc45a3359f61a343be6fb3ec872e2f84d1715864942764fa56ac59513fa2ed",
+  cliCargo: "700a45e3f342fc22965218e7f346d128c655eba973e157af1a1a730fe708bafa",
 };
 
 const sources = {

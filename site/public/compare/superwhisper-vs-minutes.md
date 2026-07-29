@@ -16,7 +16,7 @@ superwhisper and Minutes agree on the thing this category usually gets wrong: yo
 - AI formatting — superwhisper: predefined and custom modes using local or cloud models; Minutes: optional and explicit (Claude via MCP or a local LLM you configure)
 - Durable output — superwhisper: text inserted into the app you're using; Minutes: markdown files with YAML frontmatter, action items, and decisions
 - Meetings and speakers — superwhisper: meeting recording and file transcription; Minutes: diarized speakers, confidence-aware attribution, action items, meeting lifecycle
-- Agent/MCP surface — superwhisper: none we could find; Minutes: MCP server (33 tools), CLI, SDK, Claude Code plugin
+- Agent/MCP surface — superwhisper: none we could find; Minutes: MCP server (34 tools), CLI, SDK, Claude Code plugin
 - Open source — superwhisper: no; Minutes: yes, MIT
 - Platforms — superwhisper: macOS, Windows, iOS; Minutes: macOS menu bar app + CLI (open source)
 - Pricing — superwhisper: free tier, Pro subscription, lifetime and enterprise options; Minutes: open source and free
@@ -31,7 +31,7 @@ superwhisper and Minutes agree on the thing this category usually gets wrong: yo
 
 - A memory layer, not just an input method: meetings and memos become diarized, searchable markdown with action items — a record you own
 - Open source (MIT) and free: read the capture, transcription, and storage code instead of trusting a privacy page
-- Agent-native: Claude, Codex, and any MCP client query your conversation history through 33 MCP tools, a CLI, an SDK, and a Claude Code plugin
+- Agent-native: Claude, Codex, and any MCP client query your conversation history through 34 MCP tools, a CLI, an SDK, and a Claude Code plugin
 
 ## A useful test
 

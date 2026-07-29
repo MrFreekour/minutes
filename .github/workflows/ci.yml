@@ -22,8 +22,8 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -48,7 +48,7 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -79,7 +79,7 @@ jobs:
         run: echo "scope=${ImageOS:-noimage}-${ImageVersion:-noversion}" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -151,6 +151,23 @@ jobs:
         run: cargo test -p minutes-core --no-default-features --features diarize --lib -- diarize --test-threads=1
         timeout-minutes: 3
 
+      # The desktop suite was compiled by `cargo check -p minutes-app --tests`
+      # but never executed, so a test that failed 100% of the time on macOS went
+      # unnoticed until #591. Several of these tests mutate process-global state
+      # (HOME, USERPROFILE) behind a local mutex, so run single-threaded rather
+      # than relying on every test remembering to take that guard.
+      # macOS only for now. The Tauri app ships for macOS and Windows and has
+      # no Linux desktop release, so Linux would pull the whole GTK/WebKit stack
+      # into CI for a target that never ships. Windows is excluded for a
+      # different reason: enabling this suite revealed 5 pre-existing failures
+      # there (path/HOME assumptions that only hold on Unix), tracked separately.
+      # Guarding macOS today is strictly better than guarding nothing, which is
+      # what this suite had before.
+      - name: Desktop app unit tests
+        if: runner.os == 'macOS'
+        run: cargo test -p minutes-app --no-default-features -- --test-threads=1
+        timeout-minutes: 10
+
       - name: Integration tests (no whisper, macOS only)
         if: runner.os == 'macOS'
         run: cargo test -p minutes-core --no-default-features --test integration -- --test-threads=1
@@ -181,7 +198,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -199,7 +216,7 @@ jobs:
         run: echo "scope=${ImageOS:-noimage}-${ImageVersion:-noversion}" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -231,7 +248,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -261,7 +278,7 @@ jobs:
         run: echo "scope=${ImageOS:-noimage}-${ImageVersion:-noversion}" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -284,7 +301,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -298,7 +315,7 @@ jobs:
         run: echo "scope=${ImageOS:-noimage}-${ImageVersion:-noversion}" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -316,7 +333,7 @@ jobs:
             target/release/build/knf-rs-sys-*
 
       - name: Cache ONNX Runtime binaries
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/AppData/Local/dfbin
           key: ${{ runner.os }}-${{ steps.runner-image.outputs.scope }}-ort-${{ hashFiles('**/Cargo.lock') }}
@@ -348,10 +365,10 @@ jobs:
     name: MCP Server
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -405,10 +422,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -450,10 +467,10 @@ jobs:
     name: Version Sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -476,10 +493,10 @@ jobs:
     name: Design Tokens
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -511,10 +528,10 @@ jobs:
     name: Skills Compiler
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -530,10 +547,10 @@ jobs:
     name: Site Release Link Consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -544,7 +561,7 @@ jobs:
     name: Agents Skill Sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify .agents/ mirrors .claude/plugins/minutes/
         run: ./scripts/check-agents-sync.sh
@@ -553,10 +570,10 @@ jobs:
     name: Agent Docs (llms.txt) Consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -569,7 +586,7 @@ jobs:
     # privacy-, or runner-only PR must not be able to skip this gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Public fixture privacy gate
         run: python3 scripts/check_live_sidekick_fixture_privacy.py
@@ -584,7 +601,7 @@ jobs:
         run: python3 tests/eval/live_sidekick_fixture_schema.py
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 

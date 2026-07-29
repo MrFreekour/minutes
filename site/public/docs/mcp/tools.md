@@ -3,9 +3,9 @@
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts
 > Regenerate: node scripts/generate_llms_txt.mjs
-> Last generated: 2026-07-28
+> Last generated: 2026-07-29
 
-Minutes exposes 33 tools, 11 resources, and 6 prompt templates through the MCP server.
+Minutes exposes 34 tools, 11 resources, and 6 prompt templates through the MCP server.
 
 ## Install
 
@@ -267,6 +267,14 @@ Reference URL: https://useminutes.app/docs/mcp/tools#tool-process-audio
 Add a timestamped note to the current active recording; existing meeting files are not mutable from this assistant tool
 
 Reference URL: https://useminutes.app/docs/mcp/tools#tool-add-note
+
+<a id="tool-resummarize-meeting"></a>
+
+#### `resummarize_meeting`
+
+Re-run the AI pass on an edited meeting or memo, previewing by default and preserving user edits
+
+Reference URL: https://useminutes.app/docs/mcp/tools#tool-resummarize-meeting
 
 ### Voice and speaker ID
 

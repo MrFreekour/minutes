@@ -187,16 +187,22 @@ Each entry has four fields:
 | `source` | enum | ✓ | `deterministic` / `llm` / `enrollment` / `manual` / `ml-bleed-degraded` / `stem-recovery`. Tells consumers how the attribution was derived. |
 
 Produced by Minutes' diarization + attribution pipeline. Four confidence
-levels (L0-L3):
+levels (L0-L3).
 
-- **L0** (deterministic): inferred from calendar attendee + user identity with
-  no ambiguity. Highest trust.
-- **L1** (LLM-suggested): proposed by an LLM from context. Capped at `medium`
-  confidence by design, since wrong names are worse than anonymous.
-- **L2** (voice-enrolled): matched against a stored voice profile in
-  `~/.minutes/voices.db`. High when the match is strong.
-- **L3** (user-confirmed): the user explicitly confirmed this attribution.
-  Highest trust once set.
+**The L-levels below are a conceptual ladder, not the on-disk vocabulary.** The
+only values valid in `source` are the six in the table above. The parenthetical
+names here describe the level; where one differs from the on-disk value, the
+`source:` value is given explicitly.
+
+- **L0** (deterministic, `source: deterministic`): inferred from calendar
+  attendee + user identity with no ambiguity. Highest trust.
+- **L1** (LLM-suggested, `source: llm`): proposed by an LLM from context. Capped
+  at `medium` confidence by design, since wrong names are worse than anonymous.
+- **L2** (voice-enrolled, `source: enrollment`): matched against a stored voice
+  profile in `~/.minutes/voices.db`. High when the match is strong.
+- **L3** (user-confirmed, `source: manual`): the user explicitly confirmed this
+  attribution. Highest trust once set. Note the on-disk value is `manual`;
+  `user-confirmed` is not a valid value and Minutes never writes it (#595).
 - **Degraded-capture recovery** (`ml-bleed-degraded`): ML diarization over a
   voice stem after the primary system-audio stem was degraded. Confidence is
   normally low until a user confirms the attribution.

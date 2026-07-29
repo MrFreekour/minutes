@@ -192,7 +192,7 @@ pub enum Confidence {
     Low,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AttributionSource {
     Deterministic,
@@ -203,6 +203,15 @@ pub enum AttributionSource {
     MlBleedDegraded,
     #[serde(rename = "stem-recovery")]
     StemRecovery,
+    /// A provenance label this build does not know, preserved verbatim.
+    ///
+    /// Hand-edited files and `minutes import text` archives are supported
+    /// inputs, so an unrecognized label must not make a meeting unreadable
+    /// (#595). The raw string round-trips untouched rather than being
+    /// normalized away, so provenance survives a rewrite by a command that
+    /// never consumed it.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

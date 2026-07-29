@@ -35,6 +35,14 @@ pub struct AppState {
     pub processing: Arc<AtomicBool>,
     pub processing_stage: Arc<Mutex<Option<String>>>,
     pub latest_output: Arc<Mutex<Option<OutputNotice>>>,
+    /// Canonical path of the artifact currently being resummarized, if any.
+    ///
+    /// Desktop resummarize runs are serialized **globally**, not merely per
+    /// path: every successful apply rebuilds the shared graph DB and refreshes
+    /// shared indexes (`crates/core/src/derived.rs`), so two concurrent runs on
+    /// different files would contend on those and produce best-effort refresh
+    /// warnings. One at a time, app-wide.
+    pub resummarize_in_flight: Arc<Mutex<Option<PathBuf>>>,
     pub activation_progress: Arc<Mutex<ActivationProgress>>,
     pub call_capture_health: Arc<Mutex<Option<crate::call_capture::CallSourceHealth>>>,
     pub completion_notifications_enabled: Arc<AtomicBool>,
@@ -110,6 +118,42 @@ pub struct AppState {
     /// Monotonic ID source used to keep late teardown from an old cancelled
     /// reader from finishing a newer turn.
     pub(crate) recall_chat_next_turn_id: Arc<AtomicU64>,
+}
+
+/// Releases the in-flight slot on every exit path, including panic and early
+/// return. Never leave the slot set — a stuck slot disables the button until
+/// the app restarts.
+struct ResummarizeInFlightGuard {
+    slot: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl ResummarizeInFlightGuard {
+    /// Claim the slot for `path`. Returns an error naming the currently-running
+    /// artifact when another desktop resummarize is already in flight.
+    fn acquire(slot: &Arc<Mutex<Option<PathBuf>>>, path: &Path) -> Result<Self, String> {
+        let mut current = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(in_flight) = current.as_ref() {
+            return Err(format!(
+                "A resummarize is already in progress for {}. Please wait for it to finish.",
+                in_flight.display()
+            ));
+        }
+
+        *current = Some(path.to_path_buf());
+        Ok(Self {
+            slot: Arc::clone(slot),
+        })
+    }
+}
+
+impl Drop for ResummarizeInFlightGuard {
+    fn drop(&mut self) {
+        let mut current = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = None;
+    }
 }
 
 pub const DEFAULT_COPILOT_GOAL: &str =
@@ -7377,7 +7421,7 @@ pub fn cmd_open_file(app: tauri::AppHandle, path: String) -> Result<(), String> 
     open_target(&app, &path)
 }
 
-fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
+fn validate_text_file_path_common(path: &Path) -> Result<(PathBuf, u64), String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| format!("Cannot resolve {}: {}", path.display(), e))?;
     let path_str = canonical.to_string_lossy();
@@ -7397,12 +7441,18 @@ fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
         return Err(format!("Not a file: {}", path_str));
     }
 
+    Ok((canonical, meta.len()))
+}
+
+fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
+    let (canonical, size) = validate_text_file_path_common(path)?;
+    let path_str = canonical.to_string_lossy();
+
     // Cap at 1MB to prevent OOM on huge files
-    if meta.len() > 1_048_576 {
+    if size > 1_048_576 {
         return Err(format!(
             "File too large: {} ({} bytes, max 1MB)",
-            path_str,
-            meta.len()
+            path_str, size
         ));
     }
 
@@ -7415,6 +7465,45 @@ fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
         return Err(format!(
             "Unsupported text file: {} (expected .md, .markdown, .txt, or .json)",
             path_str
+        ));
+    }
+
+    Ok(canonical)
+}
+
+fn validate_resummarize_meeting_path(path: &Path, meetings_root: &Path) -> Result<PathBuf, String> {
+    let (canonical, _) = validate_text_file_path_common(path)?;
+    let path_str = canonical.to_string_lossy();
+    let is_markdown = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+    if !is_markdown {
+        return Err(format!(
+            "Unsupported artifact: {} (expected a .md file)",
+            path_str
+        ));
+    }
+
+    // This command rewrites the artifact in place, so home-containment alone is
+    // too wide a surface: it would let a direct IPC call rewrite any
+    // Minutes-shaped `.md` elsewhere under $HOME. Require the configured
+    // meetings root, matching `cmd_get_meeting_detail`'s read-side check.
+    // Containment is checked here rather than via `notes::validate_meeting_path`
+    // because that helper also re-checks the extension case-sensitively, which
+    // would reject a legitimately-named `.MD` artifact this command accepts.
+    let canonical_root = meetings_root.canonicalize().map_err(|e| {
+        format!(
+            "could not resolve meetings directory {}: {}",
+            meetings_root.display(),
+            e
+        )
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!(
+            "{} is outside the meetings directory {}",
+            path_str,
+            canonical_root.display()
         ));
     }
 
@@ -8322,6 +8411,125 @@ pub fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
             .to_string()
         }),
     })
+}
+
+fn merge_disposition_json(
+    disposition: minutes_core::resummarize::MergeDisposition,
+) -> (&'static str, Option<String>) {
+    use minutes_core::resummarize::MergeDisposition;
+
+    match disposition {
+        MergeDisposition::Carried => ("carried", None),
+        MergeDisposition::CarriedWithConflict(detail) => ("carried-with-conflict", Some(detail)),
+        MergeDisposition::KeptUnmatched => ("kept-unmatched", None),
+        MergeDisposition::Dropped => ("dropped", None),
+        MergeDisposition::Ambiguous => ("ambiguous", None),
+    }
+}
+
+/// Which AI-owned sections the regenerated pass actually wrote.
+///
+/// Core reports only `sections_replaced` — the sections that *already existed*
+/// and were overwritten. That cannot tell "the run changed nothing" apart from
+/// "the artifact had no summary at all and every section was created fresh",
+/// which is exactly what a transcript-only meeting does on its first pass. The
+/// desktop report needs the difference to describe the outcome truthfully.
+///
+/// Parses the exact block `splice_ai_sections` inserts, using core's own
+/// section finder rather than a scanner of our own. That is the whole point:
+/// an independent parser here would drift from the one that decides what the
+/// artifact actually contains. `h2_headings` skips headings inside fenced code
+/// blocks and trims after `## `, so raw summary prose carrying a fenced
+/// ```` ```\n## Commitments\n``` ```` is content (not a section) while
+/// `##   Commitments` is a section — neither of which a line-equality scan
+/// gets right, and both of which come straight out of model output.
+///
+/// `find_unique_section` fails closed on a duplicate heading; a duplicate
+/// still means the section is present, so it counts as written.
+fn resummarize_sections_written(new_ai_body: &str) -> Vec<String> {
+    let block = format!("## Summary\n\n{}\n", new_ai_body.trim_end_matches('\n'));
+    minutes_core::resummarize::AI_SECTIONS
+        .iter()
+        .filter(|name| {
+            !matches!(
+                minutes_core::markdown::find_unique_section(&block, name),
+                Ok(None)
+            )
+        })
+        .map(|name| name.to_string())
+        .collect()
+}
+
+fn resummarize_report_json(
+    report: minutes_core::resummarize::ResummarizeReport,
+) -> serde_json::Value {
+    let sections_written = resummarize_sections_written(&report.new_ai_body);
+    let merge_notes: Vec<serde_json::Value> = report
+        .merge_notes
+        .into_iter()
+        .filter_map(|note| {
+            let (disposition, detail) = merge_disposition_json(note.disposition);
+            (disposition != "carried").then(|| {
+                serde_json::json!({
+                    "kind": note.kind,
+                    "previous": note.previous,
+                    "disposition": disposition,
+                    "detail": detail,
+                })
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "path": report.path.display().to_string(),
+        "applied": report.applied,
+        "backup": report.backup.map(|path| path.display().to_string()),
+        "engine": report.engine,
+        "model": report.model,
+        "template": report.template,
+        "sectionsReplaced": report.sections_replaced,
+        "sectionsWritten": sections_written,
+        "durationMs": report.duration_ms,
+        "mergeNotes": merge_notes,
+        "refreshWarnings": report.refresh.map(|refresh| refresh.warnings).unwrap_or_default(),
+    })
+}
+
+fn resummarize_status_json(slot: &Arc<Mutex<Option<PathBuf>>>) -> serde_json::Value {
+    let in_flight = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    serde_json::json!({
+        "running": in_flight.is_some(),
+        "path": in_flight.as_ref().map(|path| path.display().to_string()),
+    })
+}
+
+#[tauri::command]
+pub async fn cmd_resummarize_meeting(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let config = Config::load();
+    let canonical = validate_resummarize_meeting_path(Path::new(&path), &config.output_dir)?;
+    let _guard = ResummarizeInFlightGuard::acquire(&state.resummarize_in_flight, &canonical)?;
+
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let opts = minutes_core::resummarize::ResummarizeOptions {
+            apply: true,
+            template_override: None,
+            refresh: Default::default(),
+        };
+        minutes_core::resummarize::resummarize_meeting(&canonical, &config, &opts)
+    })
+    .await
+    .map_err(|error| format!("resummarize task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    Ok(resummarize_report_json(report))
+}
+
+#[tauri::command]
+pub fn cmd_resummarize_status(state: tauri::State<AppState>) -> serde_json::Value {
+    resummarize_status_json(&state.resummarize_in_flight)
 }
 
 #[tauri::command]
@@ -11632,6 +11840,7 @@ mod tests {
             processing: Arc::new(AtomicBool::new(false)),
             processing_stage: Arc::new(Mutex::new(None)),
             latest_output: Arc::new(Mutex::new(None)),
+            resummarize_in_flight: Arc::new(Mutex::new(None)),
             activation_progress: Arc::new(Mutex::new(ActivationProgress::default())),
             call_capture_health: Arc::new(Mutex::new(None)),
             completion_notifications_enabled: Arc::new(AtomicBool::new(false)),
@@ -11674,6 +11883,338 @@ mod tests {
             recall_chat_turn: Arc::new(Mutex::new(None)),
             recall_chat_next_turn_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[test]
+    fn resummarize_guard_blocks_second_acquire() {
+        let slot = Arc::new(Mutex::new(None));
+        let first_path = Path::new("/tmp/first.md");
+        let second_path = Path::new("/tmp/second.md");
+        let _guard = ResummarizeInFlightGuard::acquire(&slot, first_path).unwrap();
+
+        assert!(ResummarizeInFlightGuard::acquire(&slot, first_path).is_err());
+        assert!(ResummarizeInFlightGuard::acquire(&slot, second_path).is_err());
+    }
+
+    #[test]
+    fn resummarize_guard_releases_on_drop() {
+        let slot = Arc::new(Mutex::new(None));
+        let path = Path::new("/tmp/meeting.md");
+
+        let guard = ResummarizeInFlightGuard::acquire(&slot, path).unwrap();
+        drop(guard);
+
+        assert!(ResummarizeInFlightGuard::acquire(&slot, path).is_ok());
+    }
+
+    #[test]
+    fn resummarize_guard_recovers_from_poisoned_lock() {
+        let slot = Arc::new(Mutex::new(None));
+        let poisoned_slot = Arc::clone(&slot);
+        let result = std::thread::spawn(move || {
+            let _lock = poisoned_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("poison the resummarize slot");
+        })
+        .join();
+        assert!(result.is_err());
+
+        let path = Path::new("/tmp/meeting.md");
+        let guard = ResummarizeInFlightGuard::acquire(&slot, path).unwrap();
+        drop(guard);
+
+        assert!(ResummarizeInFlightGuard::acquire(&slot, path).is_ok());
+    }
+
+    #[test]
+    fn resummarize_status_reports_in_flight_path() {
+        let slot = Arc::new(Mutex::new(None));
+        let path = Path::new("/tmp/meeting.md");
+        let guard = ResummarizeInFlightGuard::acquire(&slot, path).unwrap();
+
+        let running = resummarize_status_json(&slot);
+        assert_eq!(running["running"], true);
+        assert_eq!(running["path"], path.display().to_string());
+
+        drop(guard);
+        let idle = resummarize_status_json(&slot);
+        assert_eq!(idle["running"], false);
+        assert!(idle["path"].is_null());
+    }
+
+    /// Build the AI body with core's own renderer rather than a hand-written
+    /// literal, so `resummarize_sections_written` is checked against the real
+    /// emitter and cannot silently drift from it.
+    fn rendered_ai_body(
+        key_points: &[&str],
+        decisions: &[&str],
+        actions: &[&str],
+        open_questions: &[&str],
+        commitments: &[&str],
+    ) -> String {
+        let summary = minutes_core::summarize::Summary {
+            text: String::new(),
+            decisions: Vec::new(),
+            action_items: Vec::new(),
+            open_questions: open_questions.iter().map(|s| s.to_string()).collect(),
+            commitments: commitments.iter().map(|s| s.to_string()).collect(),
+            key_points: key_points.iter().map(|s| s.to_string()).collect(),
+            participants: Vec::new(),
+        };
+        let merged_actions: Vec<minutes_core::markdown::ActionItem> = actions
+            .iter()
+            .map(|task| minutes_core::markdown::ActionItem {
+                assignee: "unassigned".into(),
+                task: (*task).into(),
+                due: None,
+                status: "open".into(),
+            })
+            .collect();
+        let merged_decisions: Vec<minutes_core::markdown::Decision> = decisions
+            .iter()
+            .map(|text| minutes_core::markdown::Decision {
+                text: (*text).into(),
+                topic: None,
+                authority: None,
+                supersedes: None,
+            })
+            .collect();
+        minutes_core::resummarize::render_ai_body(&summary, &merged_actions, &merged_decisions)
+    }
+
+    #[test]
+    fn sections_written_reports_every_section_the_pass_produced() {
+        let body = rendered_ai_body(
+            &["a point"],
+            &["a decision"],
+            &["a task"],
+            &["a q"],
+            &["a c"],
+        );
+        assert_eq!(
+            resummarize_sections_written(&body),
+            vec![
+                "Summary",
+                "Decisions",
+                "Action Items",
+                "Open Questions",
+                "Commitments"
+            ],
+        );
+    }
+
+    #[test]
+    fn sections_written_always_includes_summary_and_omits_empty_sections() {
+        // `render_ai_body` emits a heading only for a section with content, so
+        // a summary-only pass writes exactly one section — and Summary has no
+        // heading of its own inside the block, it is implied.
+        let body = rendered_ai_body(&["only a point"], &[], &[], &[], &[]);
+        assert_eq!(resummarize_sections_written(&body), vec!["Summary"]);
+
+        let partial = rendered_ai_body(&["p"], &["d"], &[], &[], &["c"]);
+        assert_eq!(
+            resummarize_sections_written(&partial),
+            vec!["Summary", "Decisions", "Commitments"],
+        );
+    }
+
+    #[test]
+    fn sections_written_ignores_a_heading_that_is_only_list_content() {
+        // A key point whose text happens to be a heading is emitted as
+        // `- ## Decisions`, which is prose, not a section. Only a line that is
+        // exactly the heading counts.
+        let body = rendered_ai_body(&["## Decisions", "a point"], &[], &[], &[], &[]);
+        assert!(body.contains("- ## Decisions"));
+        assert_eq!(resummarize_sections_written(&body), vec!["Summary"]);
+    }
+
+    #[test]
+    fn sections_written_counts_a_repeated_heading_once() {
+        // Reachable: `render_ai_body` falls back to `summary.text` verbatim
+        // when there are no key points, so a model that writes its own
+        // `## Decisions` heading there gets it emitted alongside the
+        // renderer's canonical one. A duplicate makes core's finder fail
+        // closed, but the section IS in the artifact, so "written" is the
+        // truthful answer — and it must be listed once.
+        let body = "a point\n\n## Decisions\n\n- [x] one\n\n## Decisions\n\n- [x] two\n";
+        assert_eq!(
+            resummarize_sections_written(body),
+            vec!["Summary", "Decisions"],
+        );
+    }
+
+    #[test]
+    fn sections_written_ignores_a_heading_inside_a_fenced_block() {
+        // Raw `summary.text` is copied into the body verbatim, so a model that
+        // quotes markdown puts a fenced heading in there. Core's parser is
+        // fence-aware and does NOT create a section for it — meaning a
+        // pre-existing Commitments section is REMOVED by this run. Counting it
+        // as written would make the banner say "replaced" about a section that
+        // is gone.
+        let body = "a point\n\n```\n## Commitments\n```\n";
+        assert_eq!(resummarize_sections_written(body), vec!["Summary"]);
+    }
+
+    #[test]
+    fn sections_written_accepts_a_heading_with_extra_spacing() {
+        // Core strips `## ` and trims the rest, so this IS a real section in
+        // the written artifact. Requiring an exact `## Commitments` match would
+        // make the banner claim it was removed while it sits on disk.
+        let body = "a point\n\n##   Commitments\n\n- a commitment\n";
+        assert_eq!(
+            resummarize_sections_written(body),
+            vec!["Summary", "Commitments"],
+        );
+    }
+
+    #[test]
+    fn sections_written_matches_the_spliced_artifact() {
+        // The helper parses the new block in ISOLATION, while core parses the
+        // whole document. This drives the real splice and then asks core which
+        // AI sections the finished artifact actually has, so the two can never
+        // silently disagree — including the case this whole change exists for:
+        // a section that existed before and that the new pass did not produce.
+        let before = "## Summary\n\nold summary\n\n## Commitments\n\n- an old commitment\n\n## Notes\n\n- kept by hand\n\n## Transcript\n\n[SPEAKER_00 0:00] hi\n";
+        let new_ai_body = rendered_ai_body(&["a point"], &["a decision"], &[], &[], &[]);
+
+        let (after, replaced) =
+            minutes_core::resummarize::splice_ai_sections(before, &new_ai_body).unwrap();
+
+        let written = resummarize_sections_written(&new_ai_body);
+        let on_disk: Vec<String> = minutes_core::resummarize::AI_SECTIONS
+            .iter()
+            .filter(|name| {
+                !matches!(
+                    minutes_core::markdown::find_unique_section(&after, name),
+                    Ok(None)
+                )
+            })
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            written, on_disk,
+            "reported sections must match the finished artifact",
+        );
+
+        // And the partition the UI draws from is the interesting one: core
+        // calls Commitments "replaced" while the artifact no longer has it.
+        assert!(replaced.contains(&"Commitments".to_string()));
+        assert!(!after.contains("## Commitments"));
+        assert!(!written.contains(&"Commitments".to_string()));
+        // Untouched user content survives, which is what makes "Removed"
+        // a statement about AI sections only.
+        assert!(after.contains("- kept by hand"));
+    }
+
+    #[test]
+    fn report_json_carries_written_sections_and_conflict_details() {
+        use minutes_core::resummarize::{MergeDisposition, MergeNote};
+
+        let report = minutes_core::resummarize::ResummarizeReport {
+            path: PathBuf::from("/tmp/meeting.md"),
+            applied: true,
+            backup: Some(PathBuf::from("/tmp/.meeting.md.pre-resummarize.1.bak")),
+            engine: "agent".into(),
+            model: "test".into(),
+            template: None,
+            new_ai_body: rendered_ai_body(&["a point"], &["a decision"], &[], &[], &[]),
+            // Only Summary pre-existed: Decisions is new. The UI needs both
+            // lists to say "rewritten … created", so both must survive here.
+            sections_replaced: vec!["Summary".into()],
+            merge_notes: vec![
+                MergeNote {
+                    kind: "action_item",
+                    previous: "Ship the fix".into(),
+                    disposition: MergeDisposition::CarriedWithConflict(
+                        "assignee kept as 'Alice' (regenerated pass said 'Bob')".into(),
+                    ),
+                },
+                // A clean carry needed no decision from the user, so it must
+                // not reach the report and pad the "Review N items" count.
+                MergeNote {
+                    kind: "decision",
+                    previous: "Use Postgres".into(),
+                    disposition: MergeDisposition::Carried,
+                },
+            ],
+            action_items: Vec::new(),
+            decisions: Vec::new(),
+            duration_ms: 32_700,
+            refresh: None,
+        };
+
+        let json = resummarize_report_json(report);
+        assert_eq!(json["sectionsReplaced"], serde_json::json!(["Summary"]));
+        assert_eq!(
+            json["sectionsWritten"],
+            serde_json::json!(["Summary", "Decisions"]),
+        );
+        assert_eq!(json["durationMs"], 32_700);
+
+        let notes = json["mergeNotes"]
+            .as_array()
+            .expect("mergeNotes is an array");
+        assert_eq!(notes.len(), 1, "clean carries must be filtered out");
+        assert_eq!(notes[0]["disposition"], "carried-with-conflict");
+        // The detail is the whole point of this disposition — it names the
+        // field that conflicted and both values. Losing it leaves the user a
+        // note that says something differed but not what.
+        assert_eq!(
+            notes[0]["detail"],
+            "assignee kept as 'Alice' (regenerated pass said 'Bob')",
+        );
+    }
+
+    #[test]
+    fn resummarize_path_validation_rejects_non_markdown_and_outside_home() {
+        // `with_temp_home` swaps the process-global HOME, and this test reads it
+        // both directly and inside `validate_resummarize_meeting_path`. Without
+        // the shared guard a concurrent swap would point "inside home" at a
+        // temp dir that then gets removed, and would put the "outside home"
+        // fixture *inside* the swapped home — failing on the wrong premise.
+        let _guard = test_guard();
+        let home = dirs::home_dir().expect("home dir");
+        let meetings_root = TempDir::new_in(&home).unwrap();
+
+        let non_markdown = meetings_root.path().join("meeting.txt");
+        fs::write(&non_markdown, "not markdown").unwrap();
+        assert!(
+            validate_resummarize_meeting_path(&non_markdown, meetings_root.path())
+                .unwrap_err()
+                .contains("expected a .md file")
+        );
+
+        let outside_home = TempDir::new().unwrap();
+        let outside_markdown = outside_home.path().join("meeting.md");
+        fs::write(&outside_markdown, "---\ntitle: Outside\n---\n").unwrap();
+        assert!(
+            validate_resummarize_meeting_path(&outside_markdown, meetings_root.path())
+                .unwrap_err()
+                .contains("outside home directory")
+        );
+
+        // Inside home but outside the configured meetings root: a rewrite must
+        // not reach an unrelated Minutes-shaped artifact elsewhere in $HOME.
+        let other_home_dir = TempDir::new_in(&home).unwrap();
+        let stray_markdown = other_home_dir.path().join("meeting.md");
+        fs::write(&stray_markdown, "---\ntitle: Stray\n---\n").unwrap();
+        assert!(
+            validate_resummarize_meeting_path(&stray_markdown, meetings_root.path())
+                .unwrap_err()
+                .contains("outside the meetings directory")
+        );
+
+        // Uppercase .MD stays accepted: this command's extension check is
+        // case-insensitive, and containment must not silently narrow that.
+        let upper_markdown = meetings_root.path().join("memo.MD");
+        fs::write(&upper_markdown, "---\ntitle: Upper\n---\n").unwrap();
+        assert!(validate_resummarize_meeting_path(&upper_markdown, meetings_root.path()).is_ok());
+
+        // The happy path still resolves inside the configured root.
+        let good_markdown = meetings_root.path().join("meeting.md");
+        fs::write(&good_markdown, "---\ntitle: Good\n---\n").unwrap();
+        assert!(validate_resummarize_meeting_path(&good_markdown, meetings_root.path()).is_ok());
     }
 
     #[test]
@@ -14949,6 +15490,13 @@ mod tests {
 
     #[test]
     fn list_documents_merges_assistant_and_meeting_sources_by_recency() {
+        // This test resolves HOME and builds its fixture inside it, so it must
+        // hold the same guard the HOME-mutating helpers take. Without it,
+        // with_temp_home() can repoint HOME and then recursively delete that
+        // directory while this test is still writing into it, which showed up
+        // as a NotFound partway through setup (#591). Deterministic on macOS,
+        // invisible on Linux, and never caught because CI does not run this
+        // suite at all.
         let _guard = test_guard();
         let home = dirs::home_dir().expect("home dir");
         let temp = tempfile::Builder::new()

@@ -54,13 +54,24 @@ export interface SpeakerAttribution {
   source: AttributionSource;
 }
 
+/**
+ * How an attribution was derived.
+ *
+ * The named values are what Minutes emits. The trailing `(string & {})` keeps
+ * an unrecognized label readable instead of a type error: hand-edited files and
+ * `minutes import text` archives are supported inputs, so a provenance label
+ * must never make a meeting unparseable (#595). Mirrors the `Unknown(String)`
+ * variant on the Rust side, which round-trips the raw value verbatim.
+ */
 export type AttributionSource =
   | "deterministic"
   | "llm"
   | "enrollment"
   | "manual"
   | "ml-bleed-degraded"
-  | "stem-recovery";
+  | "stem-recovery"
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  | (string & {});
 
 export type DiagnosticConfidence = "high" | "inferred";
 export type CaptureSource = "voice" | "system" | "both" | "backend";

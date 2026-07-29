@@ -34,13 +34,13 @@ base64 = "0.22"
 futures-util = "0.3"
 minisign-verify = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-tauri-plugin-pty = "0.1"
+tauri-plugin-pty = "0.3"
 tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-window-state = "2"
 walkdir = { workspace = true }
 ureq = { workspace = true }
-window-vibrancy = "0.7"
+window-vibrancy = "0.8"
 notify = "7"
 tracing = "0.1"
 

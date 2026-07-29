@@ -34,7 +34,7 @@ const comparisonRows = [
   {
     label: "Agent surface",
     competitor: "Desktop app first",
-    minutes: "Files, 33 MCP tools, CLI, SDK, live transcript reads, Claude Code plugin",
+    minutes: "Files, 34 MCP tools, CLI, SDK, live transcript reads, Claude Code plugin",
   },
   {
     label: "Consent provenance",

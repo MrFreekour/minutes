@@ -2824,7 +2824,7 @@ mod tests {
         // Search hits the HOME-derived sqlite index; serialize with the
         // crate HOME-env lock or a concurrently HOME-swapping test yanks
         // the index mid-write (sqlite disk I/O error).
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -2853,7 +2853,7 @@ mod tests {
 
     #[test]
     fn search_returns_empty_for_no_match() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -2881,7 +2881,7 @@ mod tests {
 
     #[test]
     fn search_is_case_insensitive() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -2931,7 +2931,7 @@ mod tests {
 
     #[test]
     fn search_expands_vocabulary_aliases_with_provenance() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let home = TempDir::new().unwrap();
         unsafe {
             std::env::set_var("HOME", home.path());
@@ -3025,7 +3025,7 @@ mod tests {
         // Search hits the HOME-derived sqlite index; serialize with the
         // crate HOME-env lock or a concurrently HOME-swapping test yanks
         // the index mid-write (sqlite disk I/O error).
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3066,7 +3066,7 @@ mod tests {
 
     #[test]
     fn search_empty_directory() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -3088,7 +3088,7 @@ mod tests {
 
     #[test]
     fn split_frontmatter_works() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let content = "---\ntitle: Test\ndate: 2026-03-17\n---\n\nBody text here.";
         let (fm, body) = split_frontmatter(content);
         assert!(fm.contains("title: Test"));
@@ -3097,7 +3097,7 @@ mod tests {
 
     #[test]
     fn extract_field_finds_value() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let fm = "title: My Meeting\ndate: 2026-03-17\ntype: meeting";
         assert_eq!(extract_field(fm, "title"), Some("My Meeting".into()));
         assert_eq!(extract_field(fm, "type"), Some("meeting".into()));
@@ -3106,7 +3106,7 @@ mod tests {
 
     #[test]
     fn search_intents_returns_matching_structured_records() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3146,7 +3146,7 @@ mod tests {
 
     #[test]
     fn search_intents_filters_by_kind_and_owner() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3181,7 +3181,7 @@ mod tests {
 
     #[test]
     fn search_intents_resolves_owner_only_from_authorized_source_speaker_map() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3214,7 +3214,7 @@ mod tests {
 
     #[test]
     fn search_intents_filter_by_recorded_by() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3265,7 +3265,7 @@ mod tests {
 
     #[test]
     fn consistency_report_flags_conflicts_and_stale_commitments() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3326,7 +3326,7 @@ mod tests {
 
     #[test]
     fn consistency_report_resolves_stale_owner_from_authorized_source_speaker_map() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3351,7 +3351,7 @@ mod tests {
 
     #[test]
     fn consistency_report_marks_conflict_resolved_when_supersedes_is_set() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3381,7 +3381,7 @@ mod tests {
 
     #[test]
     fn consistency_report_leaves_resolution_none_without_supersedes() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3407,7 +3407,7 @@ mod tests {
 
     #[test]
     fn consistency_report_does_not_mark_resolution_when_other_conflicts_remain() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3439,7 +3439,7 @@ mod tests {
 
     #[test]
     fn consistency_report_requires_supersedes_to_reference_the_prior_decision() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3464,7 +3464,7 @@ mod tests {
 
     #[test]
     fn consistency_report_ignores_near_duplicate_decisions() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3488,7 +3488,7 @@ mod tests {
 
     #[test]
     fn person_profile_aggregates_recent_meetings_topics_and_open_intents() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3519,7 +3519,7 @@ mod tests {
 
     #[test]
     fn person_profile_matches_linked_people_entities() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3539,7 +3539,7 @@ mod tests {
 
     #[test]
     fn cross_meeting_research_collects_decisions_intents_and_meetings() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3580,7 +3580,7 @@ mod tests {
 
     #[test]
     fn find_open_actions_parses_frontmatter() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
         create_test_file(
             dir.path(),
@@ -3663,7 +3663,7 @@ mod tests {
 
     #[test]
     fn search_excludes_restricted_meetings_by_default() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = restricted_test_dir();
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -5198,7 +5198,7 @@ mod tests {
 
     #[test]
     fn search_intents_excludes_restricted_meetings_by_default() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = restricted_test_dir();
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -5224,7 +5224,7 @@ mod tests {
 
     #[test]
     fn find_open_actions_excludes_restricted_meetings_by_default() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = restricted_test_dir();
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -5269,7 +5269,7 @@ mod tests {
 
     #[test]
     fn cross_meeting_research_excludes_restricted_meetings_by_default() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = restricted_test_dir();
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -5303,7 +5303,7 @@ mod tests {
 
     #[test]
     fn person_profile_always_excludes_restricted_meetings() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = restricted_test_dir();
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -5320,7 +5320,7 @@ mod tests {
 
     #[test]
     fn consistency_report_always_excludes_restricted_meetings() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = restricted_test_dir();
         let config = Config {
             output_dir: dir.path().to_path_buf(),
