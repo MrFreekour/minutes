@@ -51,7 +51,8 @@ Recent commits, newest first:
 
 | SHA | What |
 |---|---|
-| `204d77cc` | track-1 gate remediation — a false "canary-tested on Windows CI" claim |
+| `f6232143` | track-1 gate-2 remediation — Windows sweep backed out, ceiling claim scoped |
+| `204d77cc` | track-1 gate-1 remediation — a false "canary-tested on Windows CI" claim |
 | `b1cc0952` | track-1 items 1, 2, 3, 4, 9 and the order-sensitive probe test |
 | `8be61da0` | track-1 items 5 and 8 — descriptor-sweep bound, README:453 |
 | `51146a17` | track-1 items 6 and 7 — WebM duration, ffmpeg guidance and health |
@@ -73,6 +74,12 @@ Rejected candidates are preserved at `rejected/block8-track1-51f040ba`,
 Last accepted checkpoint remains block 7; everything after it is unaccepted.
 
 ## Immediate next step
+
+**A fresh gate on `f6232143`.** Two gate rounds have run on this track's
+remediation; the second was three lenses (Codex read-only, a Claude platform
+lens, a Claude execution lens) and all three rejected. Every finding is
+remediated. The author has now edited this prose five times and should not be the
+one to read it a sixth.
 
 **The track-1 remediation list is worked through.** All nine items plus the tenth
 added 2026-07-27 are closed across `51146a17`, `8be61da0`, `b1cc0952` and
@@ -135,11 +142,15 @@ Known and unfixed, deliberately carried rather than dropped:
   immune (sealed memfd); Windows incidentally so (share mode). The digest
   re-check itself now has a test, `cfg(all(unix, not(linux)))`, that **this lane
   has never run**: macOS CI is the only place it executes.
-- On Windows `close_extra_descriptors()` is still a no-op, but the decode child
-  now calls `graph_worker`'s inherited-handle sweep instead. Read that as "the
-  same sweep, called from here": its canary is in
-  `crates/cli/tests/policy_graph_worker.rs`, which **no CI workflow runs**, and
-  this lane cannot compile or run Windows.
+- **On Windows the decode child can inherit ambient HANDLEs and nothing sweeps
+  them.** `close_extra_descriptors()` is a no-op there and `CreateProcessW` is
+  called with `bInheritHandles: TRUE`. Calling `graph_worker`'s sweep was tried
+  at `b1cc0952` and **backed out** at `f6232143`: it would first execute on
+  Windows CI, which nobody here can watch, in the pre-authority path of a child
+  that ungated CI tests require to be green, and the decode child does far more
+  OS work after the sweep than the graph child does. The reasoning sits where the
+  call would go. The fix is the sweep plus a decode-worker canary plus a CI
+  invocation that runs it, landed by someone who can watch it.
 
 ### Track 2 — MCP derived-record tools. Option B built, awaiting a re-gate.
 
@@ -230,13 +241,20 @@ Option A's to remove.
 - **Type-check a platform-gated test by temporarily widening its cfg**, compiling,
   then narrowing it back. That is evidence, not a repeatable gate, so say which
   one you have.
+- **Reusing tested code does not carry its evidence with it.** A sweep that is
+  canary-tested in `graph_worker` proves something about THAT caller, in THAT
+  child, doing what that child does next. Calling it from a child with a
+  different protocol is new untested code wearing an old test's name.
+- **A comment that names a portability hazard is not code that handles it.**
+  `u64::from(rlim_cur)` sat under a comment saying `rlim_t` is not guaranteed to
+  be u64, inside a cfg gate selecting two targets where it is not.
 
 ## Verification commands
 
 ```bash
 cargo build -p minutes-cli --no-default-features   # FIRST: several tests spawn this binary
-cargo test -p minutes-core --no-default-features --lib -- --test-threads=1   # 1635 pass / 1 ignored
-cargo test -p minutes-core --no-default-features --features diarize --lib -- --test-threads=1  # 1650 / 3 ignored
+cargo test -p minutes-core --no-default-features --lib -- --test-threads=1   # 1636 pass / 1 ignored
+cargo test -p minutes-core --no-default-features --features diarize --lib -- --test-threads=1  # 1651 / 3 ignored
 cargo test -p minutes-app --no-default-features                              # 272 pass
 cargo clippy -p minutes-core -p minutes-cli --no-default-features -- -D warnings
 cargo clippy -p minutes-core --no-default-features --features diarize -- -D warnings
