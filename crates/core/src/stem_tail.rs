@@ -18,6 +18,11 @@
 //! - Reads land mid-frame. A poll can stop partway through a sample or a frame,
 //!   so leftover bytes carry into the next poll rather than being dropped.
 
+// Wired into the native call-recording path in the follow-up commit on this
+// branch. Kept separate so the decode/tailing logic lands with its own tests
+// rather than inside a larger desktop change.
+#![allow(dead_code)]
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
