@@ -760,20 +760,20 @@ mod tests {
 
     #[test]
     fn is_process_alive_detects_current_process() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         assert!(is_process_alive(std::process::id()));
     }
 
     #[test]
     fn is_process_alive_returns_false_for_dead_pid() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         // PID 99999999 almost certainly doesn't exist
         assert!(!is_process_alive(99_999_999));
     }
 
     #[test]
     fn processing_status_round_trip() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         set_processing_status(
             Some("Transcribing audio"),
             Some(CaptureMode::QuickThought),
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn recording_metadata_round_trip() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         write_recording_metadata(CaptureMode::QuickThought).unwrap();
         let metadata = read_recording_metadata().unwrap();
         assert_eq!(metadata.mode, CaptureMode::QuickThought);
@@ -808,7 +808,7 @@ mod tests {
         // count and summary fields off the passed-in slice instead of going
         // back to disk. Important — this is what removes 2 of the 3 directory
         // walks per UI status poll.
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let job = crate::jobs::ProcessingJob {
             id: "job-status-check".into(),
             mode: CaptureMode::Meeting,
@@ -862,7 +862,7 @@ mod tests {
         // Locks in that the function trusts caller-provided ordering.
         // active_jobs() returns active < queued < terminal then created_at
         // desc; the active in-flight job must surface as the summary.
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let mk = |id: &str, state: crate::jobs::JobState, title: &str| crate::jobs::ProcessingJob {
             id: id.into(),
             mode: CaptureMode::Meeting,
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn sentinel_lifecycle() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         // Ensure clean state
         let _ = std::fs::remove_file(stop_sentinel_path());
         assert!(!stop_sentinel_path().exists());
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn sentinel_write_and_clear() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         // Write a sentinel and verify check_and_clear removes it
         write_stop_sentinel().unwrap();
         assert!(stop_sentinel_path().exists());
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn check_and_clear_sentinel_returns_false_when_absent() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         // Ensure no sentinel exists
         let _ = std::fs::remove_file(stop_sentinel_path());
         assert!(!check_and_clear_sentinel());
@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn create_pid_file_writes_using_locked_handle_without_reopen() {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let tempdir = tempfile::tempdir().unwrap();
         let pid_path = tempdir.path().join("recording.pid");
 

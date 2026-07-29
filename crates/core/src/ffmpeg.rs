@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn env_override_wins_over_path_and_known_locations() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let env_dir = tempfile::TempDir::new().unwrap();
         let path_dir = tempfile::TempDir::new().unwrap();
         let known_dir = tempfile::TempDir::new().unwrap();
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn errors_clearly_when_no_candidate_resolves() {
-        let _env_lock = crate::test_home_env_lock();
+        let _env_lock = crate::test_support::home_env_lock();
         let empty_path = tempfile::TempDir::new().unwrap();
         let missing_dir = tempfile::TempDir::new().unwrap();
         let old_override = std::env::var_os(FFMPEG_ENV_VAR);

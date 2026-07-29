@@ -74,6 +74,9 @@ pub mod streaming_diarize;
 pub mod summarize;
 pub mod system_audio_backend;
 pub mod template;
+/// Test scaffolding shared by unit and integration tests. Not public API.
+#[doc(hidden)]
+pub mod test_support;
 pub mod transcribe;
 pub mod transcription_coordinator;
 pub mod vault;
@@ -160,14 +163,4 @@ pub use vad::{Vad, VadEngine, VadResult};
 pub fn install_whisper_logging_hooks() {
     #[cfg(feature = "whisper")]
     whisper_rs::install_logging_hooks();
-}
-
-#[cfg(test)]
-pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

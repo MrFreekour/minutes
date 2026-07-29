@@ -1665,7 +1665,7 @@ mod tests {
     use crate::markdown::{Frontmatter, WriteResult};
 
     fn with_temp_home<T>(f: impl FnOnce(&tempfile::TempDir) -> T) -> T {
-        let _guard = crate::test_home_env_lock();
+        let _guard = crate::test_support::home_env_lock();
         let dir = tempfile::tempdir().unwrap();
         // Set HOME (Unix) and USERPROFILE (Windows) so dirs::home_dir() resolves to temp
         let original_home = std::env::var_os("HOME");
