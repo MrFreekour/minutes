@@ -623,3 +623,108 @@ NEXT: the track-1 list is worked through. A fresh gate on 204d77cc is the honest
 next step, since both reviews were of b1cc0952 and the author cannot review his
 own prose for the sixth time. After that, Mat's call on whether track 2's
 documented residuals are acceptable, and Option A as its own block if he wants it.
+
+---
+
+## 2026-07-29 GATE 2 on track 1, three lenses. Candidate 204d77cc, remediated at f6232143.
+
+Three blind reviews, all rejecting: Codex read-only BLOCK (6 P1), a Claude
+platform/containment lens REJECT (3 P1), a Claude execution lens REJECT (2 P1).
+Run concurrently with only the execution lens permitted to mutate the tree, so
+the read-only lenses could not observe deliberately broken code. Every finding
+was re-verified locally before acting. Nothing pushed.
+
+THE ONE THAT REVERSED A DECISION. The Windows inherited-handle sweep is backed
+out. I added it believing it was existing canary-tested code called from one more
+place. The platform lens established, and I confirmed both halves, that `ci.yml`
+runs the minutes-core lib tests on windows-latest with no guard while
+`bounded_worker_child_round_trips_pcm_into_a_private_file` has no cfg gate and
+spawns the real decode child, so the sweep would execute on Windows CI
+immediately; and that the two children are not equivalent afterwards, since the
+graph child only reads stdin and writes stdout while this one opens files and
+runs Symphonia container probing, which can pull delay-loaded imports, against a
+sweep that retains only the three std handles.
+
+My framing had been wrong in both directions at once: Codex said "covered by a
+test nothing currently executes" still claims coverage, and the platform lens
+said "read it as the same sweep, called from here" understates an exposure the
+change creates. Item 9's own wording offered "call graph_worker's sweep OR stop
+claiming it"; with a measured reason not to land it blind and a failure mode of
+losing compressed import on Windows entirely, stopping the claim is the correct
+half. General lesson: reusing tested code does not transfer its evidence. The
+test covered that caller, in that child, doing what that child does next.
+
+THE PROVENANCE OVERCLAIM, and it is the same shape as the two before it. I called
+the new ceiling check a provenance check. It compares two numbers to a constant.
+A foreign launcher setting exactly the worker budget is accepted and nothing can
+tell the difference. What exact equality buys over the "finite and no looser"
+form it replaced is only that an ambient `ulimit -v` under the budget no longer
+satisfies it. Third round running where a comment claimed an authentication or
+coverage property the code did not have.
+
+TWO PROVED MUTATION SURVIVORS, both mine:
+1. The `rlim_max` half of the ceiling check could be deleted with the entire
+   suite green, while its docstring called it load-bearing. Neither sibling test
+   could see it: `BoundedCommand::address_space_limit` sets both limits together,
+   so no command they can build varies them apart. The new test uses a shell to
+   lower the soft limit alone. Nothing can RAISE a hard limit, which is exactly
+   why the case is reachable.
+2. `health_and_watch_guidance_agree_about_the_unsupported_codecs` is named for
+   agreement between two producers and read only one. Replacing the whole
+   guidance body with text asserting the OPPOSITE of health left it green. Three
+   siblings caught that mutation so nothing escaped, but the test named for
+   agreement was the only one blind to a disagreement. Both mutations were
+   reproduced here before fixing.
+
+A COMPILE ERROR INSIDE MY OWN CFG GATE. `u64::from(rlim_cur)` does not compile
+where `rlim_t` is `i64` (FreeBSD family) or `uintptr_t` (Haiku), both selected by
+`cfg(all(unix, not(macos)))`, under a comment saying rlim_t is not guaranteed to
+be u64. The sibling code it was copied from uses `try_into` for exactly that
+reason. Not a shipped target, but the comment named the hazard and the code had
+it.
+
+A SILENT DEGRADATION PATH THE CHANGE WIDENED. `probe_compressed_duration` maps
+any child failure to `None`, indistinguishable to the watcher from "this
+container declares no duration", whose consequence is falling back to
+`config.watch.type`: long calls filed as memos. The containment check added a new
+way to reach it. It now logs before returning None.
+
+THREE PLATFORM COMMENTS CONTRADICTING EACH OTHER, one with my new code block
+directly underneath, and one materially misleading: `WORKER_ADDRESS_SPACE_BYTES`
+said "a growth allowance over the process baseline, never an absolute ceiling",
+which is true on macOS only. On Linux it is absolute and the ~250 MB image comes
+out of it.
+
+A MEASURED COST, MITIGATED RATHER THAN DISCLOSED. The execution lens measured the
+suite 26% slower than before the range against a CI step with a three-minute
+timeout, from per-test binds that each copy the ~250 MB debug executable. The
+precondition is now answered once per process (113 s -> 94 s locally) and the CI
+timeout goes 3 -> 5. Loosening a timeout cannot turn a passing run red, which is
+why that is safe from a lane that cannot watch the runners; ADDING invocations is
+not, so the dead CLI test files are still left for someone who can.
+
+WHAT THE LENSES CONFIRMED RATHER THAN FOUND, worth recording because it is the
+first round where the substance held: all eight declared mutations reproduce
+independently, all four declared-uncovered properties genuinely survive when
+applied simultaneously, every evidence number reproduces including 48134 to the
+digit, the fixture provenance commands reproduce a file of identical byte length
+containing two BOS pages with distinct serials, the toolchain claim is exact to
+the line and the setter that would change it is unstable and therefore unusable
+here, the CI precondition holds on all three runners, and the exact-equality
+check has no legitimate-user break under ambient ulimits, cgroups, containers,
+systemd or 32-bit. The `pre_exec` registration order was checked too: the ceiling
+closure is registered before the direct-exec closure, and had it been reversed
+the child-side check would refuse every legitimate Linux launch.
+
+NOT FIXED, RECORDED: b1cc0952's message still contains the false "canary-tested"
+sentence. Commit messages are immutable evidence, so the correction lives in
+204d77cc, f6232143 and here rather than in a rewrite of history.
+
+GATES at f6232143: core --no-default-features --lib --test-threads=1 1636 passed
+/ 0 failed / 1 ignored in 94 s; --features diarize 1651 / 0 / 3; minutes-app
+272 / 0; fmt clean; clippy clean for both documented invocations.
+
+NEXT: a fresh gate on f6232143. Three rounds of three lenses have now run on this
+track. The trend is the same one track 2 showed: findings shrinking and moving
+out of code into prose, with the code substance holding up under independent
+mutation. The author should not be the one to review this prose a seventh time.
