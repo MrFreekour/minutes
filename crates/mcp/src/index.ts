@@ -7465,8 +7465,23 @@ export type WithheldSourceReason =
  *     recognised normally, because only the tail is screened;
  *   - a corpus moved between Windows and POSIX. Here nothing is refused: `\`
  *     is a separator only on Windows, so a recorded `C:\Users\me\meetings\x.md`
- *     read on POSIX is not absolute, takes the relative branch, and yields a
- *     candidate that simply does not exist, so the read withholds it.
+ *     read on POSIX is not absolute, takes the relative branch, and yields the
+ *     candidate `<root>/C:\Users\me\meetings\x.md`. Backslash and colon are
+ *     legal POSIX filename characters, so that is a real path rather than an
+ *     impossible one; it withholds because no such file exists, not because
+ *     anything rejected it. Someone able to create a file with that literal
+ *     name inside the corpus could make it bind, which needs corpus write
+ *     access and is therefore not the weakest link.
+ *
+ * Two limits are inherent to identifying a meeting by path at all, and only
+ * Option A removes them. A path is a mutable locator, not an identity: if the
+ * recorded file is deleted and an unrelated meeting later takes its name, or a
+ * symlink is retargeted, the re-read validates the replacement and releases the
+ * old record under the new file's policy. And a relative recorded value is
+ * accepted even though today's pipeline only ever writes absolute paths, so a
+ * corrupt record naming `notes.md` binds to the live `notes.md`. Both fail in
+ * the direction of releasing something, which is why the durable fix is an
+ * identifier the pipeline writes and the reader can re-verify.
  *
  * Anchor matching is case-insensitive, which cuts both ways and is stated here
  * because only one direction is obvious. It refuses a case-variant second
@@ -7512,6 +7527,12 @@ export function resolveCorpusRelativeSourcePath(
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   if (trimmed === "" || trimmed.includes("\0")) return null;
+  // Surrounding whitespace is legal in POSIX and macOS filenames, so trimming
+  // can turn one real file's path into another real file's path: a recorded
+  // `<root>/notes.md ` would bind to `<root>/notes.md`, a different meeting
+  // judged under different policy. Trim only to detect emptiness; if it changed
+  // anything, refuse rather than guess which file was meant.
+  if (trimmed !== value) return null;
 
   // Every filesystem touch below can throw: `canonicalizeRoot` calls
   // `realpathSync`, and a record whose source is unlinked between the stat and
@@ -7587,8 +7608,14 @@ function resolveCorpusRelativeSourcePathInner(
     candidate = join(canonicalRoot, ...segments.slice(anchor + 1));
   }
 
-  // `..` in either shape, and the inactive corpus directories, are rejected
-  // here before any filesystem access.
+  // Note what this does and does not do. `join` NORMALISES first, so a `..`
+  // that cancels an earlier component is gone before the check runs: a tail of
+  // `archive/../notes.md` arrives here as `notes.md` and is allowed. That is
+  // correct, because that tail denotes `notes.md` and always did, but it means
+  // this is not a syntactic ban on the strings `..` or `archive`. What it
+  // guarantees is the property that matters: whatever file the candidate
+  // actually denotes must sit inside the live root and outside every inactive
+  // or hidden directory.
   return isActiveCorpusMeetingPath(candidate, canonicalRoot) ? candidate : null;
 }
 
@@ -8004,7 +8031,7 @@ export function registerUnavailableCompatibilityTools(
       }
       if (capped) {
         notes.push(
-          `${selected.length} record(s) matched; showing the most recent ${requested}. Raise limit for the rest.`
+          `${selected.length} releasable record(s) matched; showing the most recent ${requested}. Raise limit for the rest.`
         );
       }
       const suffix = notes.length === 0 ? "" : `\n\n${notes.join("\n")}`;
@@ -8013,7 +8040,12 @@ export function registerUnavailableCompatibilityTools(
         return {
           content: [{
             type: "text" as const,
-            text: `No meeting insights matched the filter criteria. Insights are extracted when meetings are processed with summarization enabled.${suffix}`,
+            // "Releasable" is load-bearing. Filters run only over records that
+            // already survived policy, so when everything was withheld the
+            // filter was never evaluated against them and this cannot claim
+            // they failed to match. Saying "nothing matched your filter" there
+            // would hand the agent a reason the code never established.
+            text: `No releasable meeting insights matched the filter criteria. Records withheld by policy are not filter-tested, so this is not evidence that no such insight exists. Insights are extracted when meetings are processed with summarization enabled.${suffix}`,
           }],
           structuredContent: {
             available: true,

@@ -2390,6 +2390,33 @@ describe("insight source identity survives a moved corpus", () => {
     }
   });
 
+  it("refuses a source pointer whose surrounding whitespace is significant", async () => {
+    // Trailing and leading spaces are legal in POSIX filenames, so trimming can
+    // silently convert one real file's path into another real file's path.
+    // Both files exist here, so a trim would bind the record to the wrong one.
+    const { base, root } = makeMovedCorpus();
+    try {
+      writeFileSync(join(root, "notes.md "), meetingFixture("Trailing space file"));
+      writeFileSync(join(root, "notes.md"), meetingFixture("Different meeting"));
+
+      expect(resolveCorpusRelativeSourcePath(join(root, "notes.md "), root)).toBeNull();
+      expect(resolveCorpusRelativeSourcePath(" notes.md", root)).toBeNull();
+      // The unpadded form still resolves, so this refuses the ambiguity rather
+      // than the filename.
+      expect(resolveCorpusRelativeSourcePath("notes.md", root)).toBe(join(root, "notes.md"));
+
+      const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
+        [{ content: "WHITESPACE-REBIND-CANARY", source_meeting: join(root, "notes.md ") }],
+        root,
+        false
+      );
+      expect(released).toEqual([]);
+      expect(withheld.total).toBe(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a source pointer containing a NUL byte", () => {
     const { base, root } = makeMovedCorpus();
     try {
@@ -2851,7 +2878,9 @@ describe("insight window is not shaped by the caller", () => {
       expect(
         result.structuredContent.insights.map((entry: any) => entry.content)
       ).toEqual(["record-7", "record-8", "record-9"]);
-      expect(result.content[0].text).toContain("10 record(s) matched");
+      // "releasable" is load-bearing: the count is over records that survived
+      // policy, never over the whole window.
+      expect(result.content[0].text).toContain("10 releasable record(s) matched");
     } finally {
       await harness.close();
       rmSync(base, { recursive: true, force: true });
@@ -2913,8 +2942,15 @@ describe("insight window is not shaped by the caller", () => {
         },
       ]);
       try {
-        const result = await withRestricted.call({});
+        const result = await withRestricted.call({ participant: "Alex" });
         // Nothing released, but the answer must not read as "there is nothing".
+        // The filter was never evaluated against the withheld record, so the
+        // text must not claim it failed to match.
+        expect(result.content[0].text).toContain("No releasable meeting insights");
+        expect(result.content[0].text).toContain("not filter-tested");
+        expect(result.content[0].text).not.toMatch(
+          /^No meeting insights matched the filter criteria/
+        );
         expect(result.structuredContent.count).toBe(0);
         expect(result.structuredContent.partial).toBe(true);
         expect(result.structuredContent.withheld.total).toBe(1);
