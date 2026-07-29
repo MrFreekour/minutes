@@ -1001,8 +1001,44 @@ fn configure_process_tree(
 ) {
     use std::os::unix::process::CommandExt;
 
-    // SAFETY: setpgid, setrlimit, getrlimit, and fcntl are async-signal-safe
-    // and touch no Rust-managed state. All policy values are copied in.
+    // Computed in the PARENT, where allocation and ordinary syscalls are safe,
+    // and captured by value so the child closure only reads an integer.
+    //
+    // This used to call `getrlimit(RLIMIT_NOFILE)` inside `pre_exec` and scan up
+    // to `rlim_cur`. macOS lets an unprivileged user set `ulimit -n unlimited`,
+    // which reports as `RLIM_INFINITY`, and the resulting sweep was measured at
+    // about 101 ns per iteration: roughly 217 seconds of spinning per spawn,
+    // against a 60 second duration-probe timeout. Every probe on such a machine
+    // timed out and the file was misrouted. `getdtablesize()` is the bound that
+    // is actually true of the process: XNU returns the minimum of the soft
+    // limit and the kernel's per-process maximum, so it stays finite exactly
+    // where `getrlimit` does not. Moving it out of the closure also removes a
+    // call that POSIX does not list as async-signal-safe.
+    //
+    // Known gap, stated rather than papered over: a process that LOWERS its
+    // soft limit while holding descriptors above the new value can leave those
+    // above this bound. Minutes opens its own descriptors close-on-exec, so the
+    // remaining exposure is inherited-and-then-lowered, which this does not
+    // cover.
+    //
+    // NOT TESTED, and it cannot be from Linux. Measured here, `getdtablesize()`
+    // and `rlim_cur` are the same number (524288), because Linux implements the
+    // former as the latter; the two diverge only on Darwin, where XNU caps it at
+    // the kernel's per-process maximum. Linux also takes the `close_range` path
+    // above and never reaches this loop. A test asserting this bound therefore
+    // passes on Linux whichever value is used, so no such test is written: it
+    // would be coverage in name only. Verifying this needs a macOS run with
+    // `ulimit -n unlimited` asserting the spawn completes promptly and the
+    // canary is still closed.
+    let descriptor_scan_upper: libc::c_int = if close_extra_descriptors {
+        // SAFETY: no arguments, no Rust-managed state, always succeeds.
+        unsafe { libc::getdtablesize() }
+    } else {
+        0
+    };
+
+    // SAFETY: setpgid, setrlimit, and fcntl are async-signal-safe and touch no
+    // Rust-managed state. All policy values are copied in.
     unsafe {
         command.pre_exec(move || {
             if !use_outer_group && libc::setpgid(0, 0) != 0 {
@@ -1052,15 +1088,12 @@ fn configure_process_tree(
                         return Err(error);
                     }
                 }
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let upper = limit.rlim_cur.min(i32::MAX as libc::rlim_t) as i32;
-                for descriptor in 3..upper {
+                // Bounded by the parent-computed table size. Marks
+                // close-on-exec rather than closing: Rust keeps an internal
+                // pipe to report `pre_exec` and `exec` failures to the parent,
+                // and closing that descriptor here would make a failed launch
+                // look like a successful one.
+                for descriptor in 3..descriptor_scan_upper {
                     let flags = libc::fcntl(descriptor, libc::F_GETFD);
                     if flags >= 0
                         && libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) != 0

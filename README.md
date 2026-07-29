@@ -450,7 +450,7 @@ If your phone workflow also saves a `.json` file alongside the audio (same name,
 
 This adds `device` and `captured_at` to the meeting's frontmatter. Works with any automation tool (Apple Shortcuts, Tasker, etc.).
 
-Supports `.m4a`, `.mp3`, `.wav`, `.ogg`, `.webm`. WAV is decoded in process; compressed formats require [ffmpeg](https://ffmpeg.org/) so decoding stays inside a bounded child process.
+Supports `.m4a`, `.mp3`, `.wav`, `.ogg`, `.webm`. WAV is decoded in process. Compressed formats are decoded inside a bounded child process, using [ffmpeg](https://ffmpeg.org/) when it is installed and a bundled decoder otherwise. The bundled decoder covers AAC, MP3, Vorbis and FLAC; ffmpeg is required for Opus, which is what `.webm` browser recordings and `.ogg` voice notes normally contain, and for ALAC in `.m4a`.
 
 If a desktop call capture leaves a raw file under `~/.minutes/native-captures/`, process that audio file directly with `minutes process <path> --type meeting`. For compatibility, `minutes import <audio-file>` also routes to the same meeting-processing path; `minutes import granola` remains the Granola history importer.
 
