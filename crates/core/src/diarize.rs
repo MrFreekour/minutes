@@ -4043,13 +4043,14 @@ mod tests {
         )
         .unwrap();
 
+        // Nothing between the set and the restore may panic, or every later test
+        // in this process inherits an XDG_CONFIG_HOME pointing into a TempDir
+        // that is about to be deleted. Both observations are captured first and
+        // asserted after the restore.
         let _lock = crate::test_home_env_lock();
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        assert!(
-            !Config::load().transcription.compressed_decode_fallback,
-            "the config on disk must refuse the fallback for this test to mean anything"
-        );
+        let disk_refuses_the_fallback = !Config::load().transcription.compressed_decode_fallback;
         let cancellation = DiarizationCancellation::new(Duration::from_secs(60));
         let outcome =
             preprocess_compressed_without_ffmpeg(&source, &Config::default(), &cancellation);
@@ -4058,6 +4059,10 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
+        assert!(
+            disk_refuses_the_fallback,
+            "the config on disk must refuse the fallback for this test to mean anything"
+        );
         let (effective, retained) =
             outcome.expect("the pipeline's own config permits the fallback, so it must decode");
         assert!(crate::pipeline::is_reserved_private_audio_path(&effective));

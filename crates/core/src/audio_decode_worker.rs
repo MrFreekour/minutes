@@ -34,10 +34,16 @@
 //!
 //! Ambient descriptors are closed before `exec` on Unix. On Windows the child
 //! calls `graph_worker`'s inherited-handle sweep instead, because
-//! `CreateProcessW` is invoked with `bInheritHandles: TRUE` there. That sweep is
-//! canary-tested through `graph_worker` on Windows CI; this call site is not,
-//! and has never been compiled or run on Windows, so read the Windows half as
-//! "the same sweep, called from here" rather than as a verified property.
+//! `CreateProcessW` is invoked with `bInheritHandles: TRUE` there.
+//!
+//! The Windows half is UNVERIFIED, and more weakly than an earlier version of
+//! this paragraph admitted. It claimed the sweep is "canary-tested on Windows
+//! CI". The canary exists, in `crates/cli/tests/policy_graph_worker.rs`, but no
+//! CI workflow runs it: the only `-p minutes-cli` test invocation is filtered on
+//! `copilot`, under which that file reports 0 tests. So the sweep's Windows
+//! behaviour is covered by a test nothing currently executes, this call site has
+//! no canary of its own, and neither has ever been compiled or run on Windows
+//! from this lane. Read it as "the same sweep, called from here".
 //!
 //! The worker emits the same bytes ffmpeg is asked for, raw 16 kHz mono
 //! `s16le` PCM on stdout, so both decoders share one downstream path.
@@ -416,13 +422,16 @@ pub fn maybe_run_audio_decode_worker() -> Option<i32> {
     // redirected. Checked rather than assumed, in the pinned toolchain's own
     // source: `sys::process::windows` defaults `inherit_handles: true` and
     // passes it straight to `CreateProcessW`, so the sweep is load-bearing
-    // rather than decorative. `graph_worker` already implements and canary-tests
-    // it on Windows CI; this worker parses attacker-controlled bytes with the
-    // same user authority, so it retires the same handles before it reads any.
+    // rather than decorative. This worker parses attacker-controlled bytes with
+    // the user's full authority, so it retires the same handles `graph_worker`
+    // does, before it reads any.
     //
-    // The sweep body is not exercised by this lane: nothing here can compile or
-    // run Windows. It is the identical, already-tested function, called from a
-    // second place, and the audio worker has no canary of its own.
+    // What that is NOT: tested. The sweep body cannot be compiled or run from
+    // this lane, and its canary in `crates/cli/tests/policy_graph_worker.rs` is
+    // not run by any CI workflow either, because the only `-p minutes-cli` test
+    // invocation is filtered on `copilot`. Wiring that file into CI is the fix,
+    // and it is deliberately not done blind from a lane that cannot watch the
+    // Windows runner go green.
     if let Err(error) = crate::graph_worker::close_inherited_windows_handles_before_authority() {
         eprintln!("{error}");
         return Some(71);
