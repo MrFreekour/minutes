@@ -2377,7 +2377,7 @@ describe("insight source identity survives a moved corpus", () => {
           "/home/someone/meetings/memos/2026-07-15-memo.md",
           root
         )
-      ).toBe(join(root, "memos", "2026-07-15-memo.md"));
+      ).toBe(join(realpathSync(root), "memos", "2026-07-15-memo.md"));
 
       // Released records must name the nested meeting, not the root namesake.
       const { released } = await releaseInsightsWithLiveSourcePolicy(
@@ -2464,7 +2464,7 @@ describe("insight source identity survives a moved corpus", () => {
       // The same filename without a cancelling component still resolves, so
       // this refuses the traversal rather than the meeting.
       expect(resolveCorpusRelativeSourcePath("board.md", root)).toBe(
-        join(root, "board.md")
+        join(realpathSync(root), "board.md")
       );
 
       const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
@@ -2492,7 +2492,9 @@ describe("insight source identity survives a moved corpus", () => {
       expect(resolveCorpusRelativeSourcePath(" notes.md", root)).toBeNull();
       // The unpadded form still resolves, so this refuses the ambiguity rather
       // than the filename.
-      expect(resolveCorpusRelativeSourcePath("notes.md", root)).toBe(join(root, "notes.md"));
+      expect(resolveCorpusRelativeSourcePath("notes.md", root)).toBe(
+        join(realpathSync(root), "notes.md")
+      );
 
       const { released, withheld } = await releaseInsightsWithLiveSourcePolicy(
         [{ content: "WHITESPACE-REBIND-CANARY", source_meeting: join(root, "notes.md ") }],
@@ -2535,7 +2537,7 @@ describe("insight source identity survives a moved corpus", () => {
         "/home/someone/processed/meetings/2026-06-01-board.md",
       ]) {
         expect(resolveCorpusRelativeSourcePath(recorded, root)).toBe(
-          join(root, "2026-06-01-board.md")
+          join(realpathSync(root), "2026-06-01-board.md")
         );
       }
     } finally {
@@ -2618,7 +2620,7 @@ describe("insight source identity survives a moved corpus", () => {
       // A single case-variant anchor is still recognised, so folding widens what
       // resolves rather than only refusing more.
       expect(resolveCorpusRelativeSourcePath("/elsewhere/Meetings/x.md", root)).toBe(
-        join(root, "x.md")
+        join(realpathSync(root), "x.md")
       );
     } finally {
       rmSync(base, { recursive: true, force: true });
@@ -2635,10 +2637,10 @@ describe("insight source identity survives a moved corpus", () => {
         root
       );
       if (process.platform === "win32") {
-        expect(resolved).toBe(join(root, "sub", "x.md"));
+        expect(resolved).toBe(join(realpathSync(root), "sub", "x.md"));
       } else {
-        expect(resolved).toBe(join(root, "sub\\x.md"));
-        expect(resolved).not.toBe(join(root, "sub", "x.md"));
+        expect(resolved).toBe(join(realpathSync(root), "sub\\x.md"));
+        expect(resolved).not.toBe(join(realpathSync(root), "sub", "x.md"));
       }
     } finally {
       rmSync(base, { recursive: true, force: true });
@@ -2660,7 +2662,7 @@ describe("insight source identity survives a moved corpus", () => {
       // The unambiguous single-anchor form still resolves, so the guard is not
       // simply refusing everything.
       expect(resolveCorpusRelativeSourcePath("/elsewhere/meetings/x.md", root)).toBe(
-        join(root, "x.md")
+        join(realpathSync(root), "x.md")
       );
     } finally {
       rmSync(base, { recursive: true, force: true });

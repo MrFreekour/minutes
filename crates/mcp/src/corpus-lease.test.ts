@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { realpath } from "node:fs/promises";
 
 import {
   DEFAULT_CORPUS_READ_BUDGETS,
@@ -130,7 +131,7 @@ describe("stable corpus lease", () => {
       }));
 
       expect(result.files).toEqual([["meeting.md", "stable corpus canary"]]);
-      expect(result.root).toBe(realpathSync(root));
+      expect(result.root).toBe(await realpath(root));
     });
   });
 
