@@ -733,3 +733,96 @@ NEXT: a fresh gate on f6232143. Three rounds of three lenses have now run on thi
 track. The trend is the same one track 2 showed: findings shrinking and moving
 out of code into prose, with the code substance holding up under independent
 mutation. The author should not be the one to review this prose a seventh time.
+
+---
+
+## 2026-07-29 GATE 3 on track 1, three lenses. Candidate f6232143, remediated at a9662ba4.
+
+Codex read-only BLOCK (7 P1), a Claude next-maintainer lens REJECT (3 P1), a
+Claude execution lens REJECT (3 P1, every one proved by mutation with the suite
+green). Same isolation as gate 2: only the execution lens could touch the tree.
+Every finding re-verified locally. Nothing pushed.
+
+THE FINDING THAT MATTERS MOST, because it is a fix failing the same way twice.
+Gate 2 found that the health/watch agreement test read only one of the two
+producers it is named for. The gate-2 remediation made it read both, by asserting
+each contained "Opus" and "ALAC", and the docstring said "Both sides are read
+now". The gate-3 execution lens then replaced the guidance with "The bundled
+decoder decodes Opus and ALAC perfectly well, so ffmpeg is never required for
+those": contains both words, passes, and tells a watcher user the opposite of
+what `minutes health` tells the same user, with all 1636 tests green.
+
+VOCABULARY AGREEMENT IS NOT AGREEMENT. The fix that finally held is structural
+rather than another assertion: both surfaces build their text around one shared
+sentence via a macro, so they cannot disagree without one of them dropping it,
+which a test can see. Worth generalising: when a test must check that two things
+AGREE, checking that both mention the same subject is not it. Either share the
+bytes or assert the relationship.
+
+NUMBERS I REPEATED WITHOUT MEASURING. I claimed the memoised precondition took
+the suite from 113 s to 94 s. Measured A/B by the execution lens on one box:
+102.40 s pre-range, 102.82 s as landed, 103.37 s without the memoisation. It
+saves ~0.4 s. The whole range costs ~0.4 s, not the 26% a gate-2 reviewer
+estimated and I repeated in three places. Run-to-run noise exceeds the entire
+effect. The CI timeout bump built on that number is reverted; `git diff
+8be61da0 -- .github/` is empty again. Lesson, and it is the lane's own lesson
+arriving from a new direction: a reviewer's number is a claim too, and repeating
+it without measuring makes it mine.
+
+A DEGRADE PATH CLOSED FOR ONE BRANCH OF FIVE. The next-maintainer lens walked a
+real bug report end to end and found `probe_compressed_duration` returns `None`
+down five paths while only the one gate 2 fixed logs. The worst discards the bind
+error that item 10 exists to preserve, with a real TOCTOU behind it: the watcher
+binds once for `bounded_decode_fallback_available`, the probe binds again
+immediately after. All five now report their cause.
+
+AN ORDERING CLAIM THAT SURVIVED ITS OWN CORRECTION, proved by mutation. f6232143
+added "no test here can see whether the availability probe ran"; eight lines
+below, the surviving bullet still said the test "pins the ORDER" and the probe
+"must not run". Hoisting the probe above the cancellation check while preserving
+error precedence left the suite green.
+
+macOS: THE LEAST-VERIFIED PATH CARRIED THE MOST CONFIDENT DOCS. It is the only
+platform where the child installs its own ceiling, and nothing tests it: the sole
+macOS-gated test asserts the PARENT installs nothing, and deleting the install
+call leaves that suite green. The non-macOS sibling meanwhile carried a
+per-branch TESTED BY list. Disclosure moved to where the gap is. The
+cross-reference naming a Unix-only test was being emitted on Windows, where that
+test does not compile.
+
+A FOURTH CONTRADICTING PLATFORM COMMENT, inside the block gate 2 rewrote to fix
+three. Also: the budget doc grouped Windows Job Object limits with Unix
+RLIMIT_AS, which bound committed memory versus reserved address space, so the
+image-size reasoning does not transfer; and "the strongest ordering of any
+platform" was an unmeasured superlative in the same file where "commonest state"
+had just been deleted for being one.
+
+THE STRUCTURAL OBSERVATION, and it should shape whoever gates next. Almost every
+surviving finding in gates 2 and 3 concerns macOS or Windows behaviour, the two
+platforms this lane cannot execute. That is not fixable by rewording. The right
+response is to make fewer claims about them, not better ones: state the mechanism,
+name the platform, and say plainly that it is unverified here. Where a claim
+about those platforms is load-bearing, the work belongs to someone with a runner.
+
+WHAT HELD. The three tests added at f6232143 all survive adversarial probing: the
+soft-ceiling test kills its mutation and the reviewer could not construct a
+wrong-reason green; the fixture-premise assertion fails correctly against both a
+short first stream and an unchained one; the ceiling keystone kills five tests
+when removed. The revert of the Windows sweep is complete and honestly described,
+`graph_worker` is byte-identical to its pre-range state, and the memoisation
+weakens nothing. All evidence numbers except the timings reproduce exactly.
+
+CLAIM CORRECTED: "clippy clean with -D warnings for both documented invocations"
+was true of the two crate-scoped runs but CLAUDE.md's gate also lists
+`cargo clippy --all`, which is red with 66 pre-existing errors in
+tauri/src-tauri. Verified identical at 24e3a117 with changes stashed. CI runs
+clippy on the macOS runner only, so it is not a CI break.
+
+GATES at a9662ba4: core 1636 / 0 / 1 ignored; --features diarize 1651 / 0 / 3;
+minutes-app 272 / 0; fmt clean.
+
+NEXT: gate 4 on a9662ba4. Three rounds, nine lenses, and the pattern is stable:
+the code substance holds under independent mutation every time, and what survives
+is prose about platforms nobody here can run. A fourth round should be scoped to
+that question specifically, or the lane should stop gating and hand the platform
+claims to someone with macOS and Windows runners.
