@@ -13,11 +13,15 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { readTextFileFromBoundParent } from "./secure-read.js";
+import {
+  readTextFileFromBoundParent,
+  retireBoundReadersForProcessShutdown,
+} from "./secure-read.js";
 
 const roots: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await retireBoundReadersForProcessShutdown();
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }

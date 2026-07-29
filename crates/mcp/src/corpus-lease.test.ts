@@ -22,11 +22,17 @@ import {
   DEFAULT_CORPUS_READ_BUDGETS,
   withStableCorpusLease,
 } from "./corpus-lease.js";
-import { readTextFileFromBoundParent } from "./secure-read.js";
+import {
+  readTextFileFromBoundParent,
+  retireBoundReadersForProcessShutdown,
+} from "./secure-read.js";
 
 function withCorpus(run: (root: string) => Promise<void>): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "minutes-corpus-lease-"));
-  return run(root).finally(() => rmSync(root, { recursive: true, force: true }));
+  return run(root).finally(async () => {
+    await retireBoundReadersForProcessShutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
 }
 
 function publishInterruptedSentinel(root: string): void {

@@ -423,6 +423,15 @@ class BoundParentReader {
     return this.termination;
   }
 
+  retireForProcessShutdown(): Promise<void> {
+    // Process shutdown is an unconditional ownership boundary. Test seams may
+    // simulate a failed kill while exercising admission accounting, but they
+    // must not survive beyond the process that owns the helper.
+    this.retireChildForTest = undefined;
+    this.requestRetirement(true);
+    return this.termination;
+  }
+
   read(
     expectedPath: string,
     returnContent: boolean,
@@ -577,8 +586,6 @@ class BoundParentReader {
     clearTimeout(pending.timeout);
     this.pending.delete(message.id);
     detachBoundReadAbort(pending);
-    let result: BoundReaderResult | undefined;
-    let failure: Error | undefined;
     try {
       if (
         message.ok !== true ||
@@ -591,45 +598,35 @@ class BoundParentReader {
           ? typeof message.content !== "string"
           : message.content !== undefined)
       ) {
-        failure = new Error("Access denied: file changed while it was being read");
-      } else {
-        const content = pending.returnContent
-          ? Buffer.from(message.content, "base64")
-          : undefined;
-        if (
-          content &&
-          (content.byteLength !== message.byteLength ||
-            createHash("sha256").update(content).digest("hex") !== message.sha256)
-        ) {
-          failure = new Error("Access denied: file changed while it was being read");
-        } else {
-          result = {
-            content,
-            revision: Object.freeze({
-              byteLength: message.byteLength,
-              leafFingerprint: message.leafFingerprint,
-              sha256: message.sha256,
-            }),
-          };
-        }
+        pending.reject(
+          new Error("Access denied: file changed while it was being read")
+        );
+        return;
       }
+      const content = pending.returnContent
+        ? Buffer.from(message.content, "base64")
+        : undefined;
+      if (
+        content &&
+        (content.byteLength !== message.byteLength ||
+          createHash("sha256").update(content).digest("hex") !== message.sha256)
+      ) {
+        pending.reject(
+          new Error("Access denied: file changed while it was being read")
+        );
+        return;
+      }
+      pending.resolve({
+        content,
+        revision: Object.freeze({
+          byteLength: message.byteLength,
+          leafFingerprint: message.leafFingerprint,
+          sha256: message.sha256,
+        }),
+      });
     } finally {
       releaseBoundReadAdmission(pending);
     }
-    // A Windows child whose cwd is the bound parent keeps that directory
-    // locked. Reap the last request's child before publishing its result so a
-    // successful read never leaves the user's meeting directory temporarily
-    // undeletable. Unix retains the bounded idle cache.
-    if (process.platform === "win32" && this.pending.size === 0) {
-      this.requestRetirement(true);
-      if (!(await confirmReaderTermination(this.termination))) {
-        failure = new Error("Access denied: bound reader could not be retired");
-        result = undefined;
-      }
-    }
-    if (failure) pending.reject(failure);
-    else if (result) pending.resolve(result);
-    else pending.reject(new Error("Access denied: bound reader returned no result"));
   }
 
   private poisonBoundReadAdmission(pending: PendingRead): void {
@@ -706,6 +703,22 @@ class BoundParentReader {
     if (readers.get(this.parent) === this) readers.delete(this.parent);
     liveReaders.delete(this);
     this.resolveTermination();
+  }
+}
+
+/**
+ * Reap every helper owned by this process before its filesystem scope is
+ * released. This is intentionally internal to worker/test lifecycle code.
+ */
+export async function retireBoundReadersForProcessShutdown(): Promise<void> {
+  const terminations = [...liveReaders].map((reader) =>
+    reader.retireForProcessShutdown()
+  );
+  const confirmations = await Promise.all(
+    terminations.map((termination) => confirmReaderTermination(termination))
+  );
+  if (confirmations.some((confirmed) => !confirmed)) {
+    throw new Error("Access denied: bound reader could not be retired");
   }
 }
 

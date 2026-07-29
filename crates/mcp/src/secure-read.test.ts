@@ -10,7 +10,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { readTextFileFromBoundParent } from "./secure-read.js";
+import {
+  readTextFileFromBoundParent,
+  retireBoundReadersForProcessShutdown,
+} from "./secure-read.js";
+
+async function removeTestRoots(...roots: string[]): Promise<void> {
+  await retireBoundReadersForProcessShutdown();
+  for (const root of roots) {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 describe("MCP OS-bound parent reads", () => {
   it("enforces the byte budget inside the bound reader", async () => {
@@ -29,7 +39,7 @@ describe("MCP OS-bound parent reads", () => {
         ).toString("utf8")
       ).toBe("FIVE!");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      await removeTestRoots(root);
     }
   });
 
@@ -53,8 +63,7 @@ describe("MCP OS-bound parent reads", () => {
       expect((failure as Error).message).not.toContain("OUTSIDE_HARDLINK_CANARY");
       expect((failure as Error).message).not.toContain(outside);
     } finally {
-      rmSync(root, { recursive: true, force: true });
-      rmSync(outside, { recursive: true, force: true });
+      await removeTestRoots(root, outside);
     }
   });
 
@@ -147,7 +156,7 @@ describe("MCP OS-bound parent reads", () => {
         ).toString("utf8")
       ).toBe("THIRD");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      await removeTestRoots(root);
     }
   });
 
@@ -209,7 +218,7 @@ describe("MCP OS-bound parent reads", () => {
     } finally {
       allowKill = true;
       release?.();
-      rmSync(root, { recursive: true, force: true });
+      await removeTestRoots(root);
     }
   }, 10_000);
 
@@ -287,7 +296,7 @@ describe("MCP OS-bound parent reads", () => {
     } finally {
       allowKill = true;
       release?.();
-      rmSync(root, { recursive: true, force: true });
+      await removeTestRoots(root);
     }
   }, 10_000);
 
@@ -321,7 +330,7 @@ describe("MCP OS-bound parent reads", () => {
       ).toBe("SAFE_ABORT_BYTES");
     } finally {
       release?.();
-      rmSync(root, { recursive: true, force: true });
+      await removeTestRoots(root);
     }
   }, 10_000);
 
@@ -351,7 +360,7 @@ describe("MCP OS-bound parent reads", () => {
       );
       expect(observed.equals(bytes)).toBe(true);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      await removeTestRoots(root);
     }
   }, 15_000);
 });

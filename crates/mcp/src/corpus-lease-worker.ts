@@ -6,6 +6,7 @@ import {
   type CorpusLeaseWorkerBridge,
   type CorpusLeaseWorkerRequest,
 } from "./corpus-lease.js";
+import { retireBoundReadersForProcessShutdown } from "./secure-read.js";
 
 // Content is sent in 64 KiB raw chunks, so every control line stays far below
 // this fixed ceiling and never scales with the full corpus size.
@@ -73,6 +74,7 @@ const bridge: CorpusLeaseWorkerBridge = {
   },
 };
 
+let exitCode = 0;
 try {
   const first = await nextResponse();
   if (
@@ -90,7 +92,12 @@ try {
     first.request as CorpusLeaseWorkerRequest,
     bridge
   );
-  process.exit(0);
 } catch {
-  fail();
+  exitCode = 70;
 }
+try {
+  await retireBoundReadersForProcessShutdown();
+} catch {
+  exitCode = 70;
+}
+process.exit(exitCode);
