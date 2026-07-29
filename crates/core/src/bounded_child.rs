@@ -2425,21 +2425,22 @@ mod tests {
     /// open for writing, so a snapshot that retains its setup handle cannot be
     /// launched there. Darwin permits exactly that, measured on macOS 26.6.
     ///
-    /// It constructs no `BoundExecutable` and no `BoundedCommand`: it execs a
-    /// plain script, so no production mutation can fail it. Note also that the
-    /// write-rule half is asserted on Linux and macOS only; on any other Unix
-    /// this test compiles and asserts nothing about it, and only the universal
-    /// second half, that a sealed snapshot execs once no writer is live, runs. It is a canary for
-    /// the platform rule the snapshot design rests on, not coverage OF the
-    /// snapshot. The separate Darwin measurement that descriptor execution of an
-    /// unlinked inode fails EACCES is recorded at `launch_path`; nothing here
-    /// attempts descriptor execution, so this test does not cover it.
+    /// WHAT IT COVERS, and it is less than the name suggests. It constructs no
+    /// `BoundExecutable` and no `BoundedCommand`: it execs a plain script, so no
+    /// production mutation can fail it. It is a canary for the platform rule the
+    /// snapshot design rests on, not coverage OF the snapshot.
+    ///
+    /// The two halves also have different reach. The write-rule half asserts on
+    /// Linux and macOS only; on any other Unix it compiles and asserts nothing
+    /// about the rule. The second half, that a sealed snapshot execs once no
+    /// writer is live, is universal. The separate Darwin measurement that
+    /// descriptor execution of an unlinked inode fails EACCES is recorded at
+    /// `launch_path`; nothing here attempts descriptor execution.
     ///
     /// Item 4 of the track-1 remediation list. This asserted ETXTBSY for every
-    /// Unix, so the suite was deterministically red on macOS: the prose above
-    /// had been corrected to say Darwin differs while the assertion below still
-    /// said it did not. The universal half is the second one - once no writer is
-    /// live and the mode is sealed, launch succeeds on both.
+    /// Unix, so the suite was deterministically red on macOS: the prose above had
+    /// been corrected to say Darwin differs while the assertion below still said
+    /// it did not.
     ///
     /// What actually protects Darwin from a swapped snapshot is not the exec
     /// rule but the launch-time digest re-check in `verify()`, covered by

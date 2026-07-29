@@ -15,22 +15,23 @@
 //! resource limit applies. Confining it to a child inverts that ordering, and
 //! the ceiling binds before Symphonia reads a single attacker-controlled byte.
 //!
-//! How that ceiling is installed is platform-specific, because Darwin rejects
-//! an absolute `RLIMIT_AS` below its pre-`main()` shared-cache baseline:
+//! How that ceiling is configured is platform-specific:
 //!
-//! - Unix other than macOS installs it from the parent's `pre_exec`, so it binds
-//!   before `exec`, and the child then refuses to parse anything unless it can
-//!   see that ceiling.
-//! - Windows applies process and job memory limits to an initially suspended
-//!   process, so it binds before the child runs its first instruction.
-//! - macOS is the exception the split exists for: the child installs a measured
-//!   baseline-plus-budget ceiling itself, at [`maybe_run_audio_decode_worker`],
-//!   before any decode begins. `graph_worker` binds its Darwin ceiling the same
-//!   way.
+//! - Unix other than macOS configures it from the parent's `pre_exec`, before
+//!   `exec`, and the child refuses to parse unless it sees the expected values.
+//! - Windows configures process and job memory limits on an initially suspended
+//!   process.
+//! - macOS attempts to install a measured baseline-plus-budget ceiling in the
+//!   child at [`maybe_run_audio_decode_worker`], before constructing a decoder.
 //!
-//! The child additionally gets its own process group, a wall-clock ceiling, a
-//! capped stdout streamed into a private file it has no pathname for, and a
-//! cleared environment.
+//! Verification scope for this lane: Linux was exercised through the real child
+//! path. The macOS control flow was inspected, but ceiling installation and
+//! effective kernel enforcement were not executed here. The Windows command
+//! builder was inspected and tested, but Job Object attachment, ordering, and
+//! effective enforcement were not executed here.
+//!
+//! The child additionally gets a wall-clock ceiling, capped stdout streamed
+//! into a private file it has no pathname for, and a cleared environment.
 //!
 //! Ambient descriptors are marked `FD_CLOEXEC` on Unix and therefore closed BY
 //! `exec`, not before it: closing them outright would destroy the spawn-error
@@ -53,7 +54,8 @@ use std::time::Duration;
 /// contract.
 const WORKER_MARKER: &str = "MINUTES_AUDIO_DECODE_WORKER_V1";
 
-/// Address-space growth budget for the decode child.
+/// Address-space budget for the decode child: configured as an absolute ceiling
+/// on non-macOS Unix and Windows, and as a growth allowance on macOS.
 ///
 /// A four-hour input holds roughly 921 MB of `f32` output alongside 461 MB of
 /// `s16le` bytes, so the budget must clear ~1.4 GB plus allocator slack while
@@ -83,12 +85,9 @@ const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 /// Install the child's own address-space ceiling, measured against this
 /// process's baseline.
 ///
-/// Darwin reserves a very large shared-cache virtual range before `main()`
-/// (hundreds of GiB on current macOS), so an absolute `RLIMIT_AS` is below the
-/// process's immutable baseline and the kernel rejects it outright. That is why
-/// the ceiling is installed here, by the child itself after exec, rather than
-/// from the parent's `pre_exec` as on Linux. `graph_worker` binds its Darwin
-/// ceiling the same way for the same reason.
+/// The macOS path adds the budget to the measured process baseline rather than
+/// configuring an absolute three-GiB limit from the parent. This gate inspected
+/// that control flow but did not execute the kernel behavior on macOS.
 ///
 /// Ordering is the security property and is preserved either way: this runs
 /// before the decoder is constructed and therefore before Symphonia reads a
@@ -151,7 +150,8 @@ fn process_virtual_size() -> Result<u64, String> {
     Ok(info.virtual_size)
 }
 
-/// Refuse to parse anything unless the parent bound this child's address space.
+/// Refuse to parse anything unless both `RLIMIT_AS` values equal the worker
+/// budget.
 ///
 /// On non-macOS Unix the ceiling is installed by the parent, before `exec`, so
 /// nothing inside the child would otherwise notice it missing: an unbounded
@@ -200,8 +200,8 @@ fn process_virtual_size() -> Result<u64, String> {
 ///   parent installs one;
 /// - `a_ceiling_that_is_not_the_worker_budget_is_refused`: a ceiling of a
 ///   different value;
-/// - `a_soft_ceiling_with_an_unbounded_hard_ceiling_is_refused`: the `rlim_max`
-///   half specifically, which needs a shell because
+/// - `a_soft_ceiling_the_child_could_raise_is_refused`: the `rlim_max` half
+///   specifically, which needs a shell because
 ///   `BoundedCommand::address_space_limit` always sets both limits together.
 ///
 /// Untested: the `getrlimit` failure branch, which needs the syscall to fail.
@@ -228,8 +228,8 @@ fn verify_parent_bound_address_space() -> Result<(), String> {
     let maximum = u64::try_from(limit.rlim_max).unwrap_or(u64::MAX);
     if current != WORKER_ADDRESS_SPACE_BYTES || maximum != WORKER_ADDRESS_SPACE_BYTES {
         return Err(
-            "decode worker refuses to parse input: its address-space ceiling is not the one this \
-             worker installs"
+            "decode worker refuses to parse input: its address-space ceiling values do not equal \
+             the configured worker budget"
                 .into(),
         );
     }
@@ -283,10 +283,7 @@ fn executable_handles_worker_protocol(path: &Path) -> bool {
 /// so anyone able to create a file in an adjacent directory could obtain
 /// execution with the user's full authority at a moment of their choosing.
 ///
-/// Self-exec also keeps this off the macOS signed helper path: the child is the
-/// same already-signed code, introducing no new packaging surface and no App
-/// Sandbox conflict, unlike a worker whose job is to launch a third-party
-/// engine.
+/// Self-exec also avoids introducing a separate helper executable.
 fn resolve_worker_executable() -> Result<crate::bounded_child::BoundExecutable, String> {
     let current = std::env::current_exe()
         .map_err(|_| "compressed audio decode worker host was unavailable".to_string())?;
@@ -296,10 +293,8 @@ fn resolve_worker_executable() -> Result<crate::bounded_child::BoundExecutable, 
         }
     }
     let helper_name = format!("minutes{}", std::env::consts::EXE_SUFFIX);
-    // Production searches only the current executable's own directory. That
-    // covers both real layouts: a macOS bundle keeps the CLI sidecar beside
-    // `minutes-app` in Contents/MacOS, and every other install reaches the
-    // binary through self-exec above.
+    // Production searches only the current executable's own directory for the
+    // adjacent fallback.
     #[allow(unused_mut)]
     let mut candidates = vec![current.parent().map(|parent| parent.join(&helper_name))];
     // The unit-test harness runs from target/debug/deps, one level below the
@@ -916,12 +911,11 @@ mod tests {
     /// `decode_to_private_pcm`'s own path, the next called it "the builder every
     /// launch goes through", which reads as coverage of the caller relationship
     /// in the same breath as denying it.
-    /// On non-macOS UNIX,
+    /// On non-macOS Unix,
     /// `the_production_probe_child_runs_under_an_address_space_ceiling` covers
-    /// the caller. On Windows nothing does: that test is
-    /// `cfg(all(unix, not(macos)))`, so this builder assertion is the only
-    /// ceiling coverage there, and by its own admission it does not reach a
-    /// caller.
+    /// the caller. Windows has builder-configuration coverage for both decode
+    /// and probe modes, but no mutation-sensitive caller test and no runtime
+    /// assertion that the Job Object limits were attached or effective.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_production_decode_command_carries_the_address_space_ceiling() {
