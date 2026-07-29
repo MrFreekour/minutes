@@ -2014,16 +2014,23 @@ export async function enrichWithFrontmatter(
   const boundedLimit = normalizeMcpMeetingResultLimit(limit);
   const verifiedMeetingsDir = meetingsDir ?? (await getEffectiveMeetingsDir());
   return withStableCorpusLease(verifiedMeetingsDir, (snapshot) => {
-    const liveFiles = new Map(snapshot.files.map((file) => [file.path, file.content]));
+    // Absolute canonical roots can cross a process boundary with an equivalent
+    // Windows namespace/short-path spelling. Authorization remains anchored to
+    // the canonical root and candidate below; use the snapshot's exact
+    // corpus-relative key only after those containment checks have succeeded.
+    const canonicalMeetingsDir = canonicalizeRoot(verifiedMeetingsDir);
+    const liveFiles = new Map(
+      snapshot.files.map((file) => [file.relativePath, file.content])
+    );
     const enriched: any[] = [];
     for (const r of qmdResults) {
       try {
         const candidatePath = r.source_path || r.path;
         if (!isActiveCorpusMeetingPath(candidatePath, verifiedMeetingsDir)) continue;
         const filePath = canonicalizeRoot(candidatePath);
-        const content = liveFiles.get(filePath);
-        if (content === undefined) continue;
         if (!isActiveCorpusMeetingPath(filePath, verifiedMeetingsDir)) continue;
+        const content = liveFiles.get(relative(canonicalMeetingsDir, filePath));
+        if (content === undefined) continue;
         const meeting = parsePolicyVerifiedMeeting(content, filePath);
         // Verification failure is never overridable: an operator can grant
         // access to a known restricted file, not to an unreadable or
