@@ -169,13 +169,16 @@ pub fn run_signed_transport_acceptance() -> Result<(), String> {
     validate_acceptance_response(&response, "en-US", false)?;
 
     // Force a real framework-level failure through a second authenticated
-    // worker, then prove ordinary product resolution still chooses Whisper.
+    // worker, then prove retained product configuration still resolves through
+    // the same always-compiled gate to Whisper.
     let failure = transcribe_samples(&samples, Some("zz-ZZ"), AppleSpeechMode::Speech, false)
         .map_err(|error| format!("signed Apple Speech failure-path transport failed: {error}"))?;
     validate_acceptance_response(&failure, "zz-ZZ", true)?;
     let mut config = crate::config::Config::default();
     config.live_transcript.backend = "apple-speech".to_string();
-    if crate::live_transcript::resolved_standalone_backend(&config) != "whisper" {
+    if crate::pipeline::resolved_apple_speech_backend(config.effective_live_transcript_backend())
+        != "whisper"
+    {
         return Err("Apple Speech failure did not preserve the product Whisper fallback".into());
     }
     Ok(())

@@ -170,7 +170,7 @@ if (!signingJob) {
 
 if (!signingJobFixture) {
   requirePattern(
-    /^  run-signed-runtime:\n[\s\S]*?needs:\n\s+- authorize-candidate\n\s+- sign-reviewed-artifact[\s\S]*?refs\/tags\/acceptance-\$\{\{ needs\.authorize-candidate\.outputs\.candidate_sha \}\}[\s\S]*?test_apple_speech_signed_transport\.py[\s\S]*?signed-runtime-provenance\.json/m,
+    /^  run-signed-runtime:\n[\s\S]*?needs:\n\s+- authorize-candidate\n\s+- sign-reviewed-artifact[\s\S]*?refs\/tags\/acceptance-\$\{\{ needs\.authorize-candidate\.outputs\.candidate_sha \}\}\n\s+fetch-depth: 1\n\s+persist-credentials: false[\s\S]*?test_apple_speech_signed_transport\.py[\s\S]*?signed-runtime-provenance\.json/m,
     "signed Apple Speech runtime acceptance must run in a no-secret successor job against the exact protected candidate",
   );
   if (SECRET_CONTEXT_EXPRESSION.test(afterSigningJob)) {

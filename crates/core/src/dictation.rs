@@ -1690,6 +1690,7 @@ mod tests {
             handle_utterance(
                 "hello world",
                 1.0,
+                DictationFinalBackend::Whisper,
                 &config,
                 &mut accumulated,
                 &mut on_result,
@@ -1714,6 +1715,7 @@ mod tests {
             handle_utterance(
                 "hello world",
                 1.0,
+                DictationFinalBackend::Whisper,
                 &config,
                 &mut accumulated_stdout,
                 &mut on_result,

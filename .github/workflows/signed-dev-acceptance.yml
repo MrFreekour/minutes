@@ -433,6 +433,7 @@ jobs:
         with:
           ref: refs/tags/acceptance-${{ needs.authorize-candidate.outputs.candidate_sha }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Download exact signed candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c

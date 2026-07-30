@@ -1287,6 +1287,20 @@ pub fn apple_speech_private_audio_transport_supported() -> bool {
     false
 }
 
+/// Resolve an Apple Speech preference through the product transport gate.
+///
+/// This stays in the always-compiled pipeline layer so product callers and the
+/// signed transport acceptance route exercise the same fail-closed decision.
+pub fn resolved_apple_speech_backend(requested: &str) -> &str {
+    if requested.eq_ignore_ascii_case("apple-speech")
+        && !apple_speech_private_audio_transport_supported()
+    {
+        "whisper"
+    } else {
+        requested
+    }
+}
+
 pub const fn apple_speech_unavailable_reason() -> &'static str {
     "the signed Apple Speech secure private audio byte-transport service is unavailable or untrusted"
 }
@@ -7928,6 +7942,16 @@ pub fn run_post_record_hook(config: &Config, transcript_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_speech_preference_resolves_through_closed_product_gate() {
+        assert_eq!(
+            resolved_apple_speech_backend("apple-speech"),
+            "whisper",
+            "Apple Speech must remain unselectable before signed runtime acceptance"
+        );
+        assert_eq!(resolved_apple_speech_backend("whisper"), "whisper");
+    }
 
     fn sparse_health(voice: f32, system: f32) -> markdown::RecordingHealth {
         markdown::RecordingHealth {

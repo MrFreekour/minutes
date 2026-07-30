@@ -7,12 +7,12 @@ import { readFileSync } from "node:fs";
 // Structural matches below are necessary but these goldens ensure a copied
 // comment or dead duplicate cannot silently replace the active boundary.
 const EXPECTED_SOURCE_SHA256 = {
-  worker: "578a1b5dd477ebfa1d144eee860d235a691c6a5ff4423321bcf082eefa49c86b",
+  worker: "951d4b05b826492ff00c169469d03bb80ee97e467c5ee7437b9cba24323dc528",
   xpc: "b04b0e45b0a3217f1622bf244eb880373396dbaddf6cc3150810a22e4c8c8754",
   swift: "268bd74f0d6cfea474e00fdf57c5841bf225270253b93819a4a3d4c3e5b88f5e",
   main: "771a49923937ce78471499cd5f1cbd76713cf99ba2ab035282dd4581cfe9259b",
   acceptanceWorkflow:
-    "ee2168e99fe620b8266e467d9ebc326d7f8a09d133c9965640979dd57a622c23",
+    "701960b7d3f9a8a363946a72e4e2271cc057919ea0425d4b6ad4abf25673dd13",
   acceptanceHarness:
     "9e222af973fdf93478c79c5a00bb1a3151fb230fd3b49ff2ed5750c316fa737b",
 };

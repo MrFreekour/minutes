@@ -196,12 +196,10 @@ fn live_supports_apple_speech() -> bool {
 /// use runtime truth, not the saved label.
 pub fn resolved_standalone_backend(config: &Config) -> &str {
     let requested = config.effective_live_transcript_backend();
-    if (requested.eq_ignore_ascii_case("parakeet") && !live_supports_parakeet(requested))
-        || (requested.eq_ignore_ascii_case("apple-speech") && !live_supports_apple_speech())
-    {
+    if requested.eq_ignore_ascii_case("parakeet") && !live_supports_parakeet(requested) {
         "whisper"
     } else {
-        requested
+        crate::pipeline::resolved_apple_speech_backend(requested)
     }
 }
 
