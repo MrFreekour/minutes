@@ -1848,6 +1848,34 @@ impl BoundRecoveryDirectory {
         })
     }
 
+    /// Create one new owner-private child beneath this exact retained
+    /// owner-private capability. Unlike `prepare_owner_private_child`, this
+    /// never adopts an existing pathname: callers allocating a fresh private
+    /// generation receive `AlreadyExists` and must choose another name.
+    pub(crate) fn create_new_owner_private_child(&self, name: &OsStr) -> std::io::Result<Self> {
+        validate_entry_name(name)?;
+        if !self.owner_private_namespace {
+            return Err(invalid_recovery_path(
+                "private child requires an owner-private parent capability",
+            ));
+        }
+        self.attest_location()?;
+        let display_path = self.chain.display_path.join(name);
+        let directory = create_private_directory_at(self.chain.leaf(), name, &display_path)?;
+        self.attest_location()?;
+        let chain = self.chain.with_child(name, &directory)?;
+        chain.attest()?;
+        Ok(Self {
+            chain,
+            owner_private_namespace: true,
+        })
+    }
+
+    pub(crate) fn try_clone_exact_directory_file(&self) -> std::io::Result<File> {
+        self.attest_location()?;
+        Ok(self.chain.leaf().try_clone()?.into_std_file())
+    }
+
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn bind_existing_owner_private_child(&self, name: &OsStr) -> std::io::Result<Self> {
@@ -4186,6 +4214,25 @@ mod tests {
 
         parent.remove_owned_private_empty_child(child).unwrap();
         assert!(!child_path.exists());
+    }
+
+    #[test]
+    fn new_owner_private_child_allocation_never_adopts_an_existing_name() {
+        let root = tempfile::TempDir::new().unwrap();
+        let parent =
+            BoundRecoveryDirectory::prepare_owner_private(&root.path().join("private")).unwrap();
+        let child = parent
+            .create_new_owner_private_child(OsStr::new("generation"))
+            .unwrap();
+        let child_path = child.display_path().to_path_buf();
+
+        let error = match parent.create_new_owner_private_child(OsStr::new("generation")) {
+            Ok(_) => panic!("fresh private allocation must reject an existing pathname"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(child.display_path(), child_path);
     }
 
     #[test]

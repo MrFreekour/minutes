@@ -8370,10 +8370,8 @@ fn create_para_successor(
     }
     require_para_generation_capacity(private_root, 1)?;
     let boundary = crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(private_root)?;
-    let people_file = para_open_directory_no_follow(private_root)?;
     boundary.attest_for_source_cleanup()?;
-    let people_cap = CapDir::from_std_file(people_file);
-    let path = (0..100u64)
+    let stage = (0..100u64)
         .find_map(|attempt| {
             let path = unique_para_generation_path(
                 private_root,
@@ -8382,33 +8380,16 @@ fn create_para_successor(
                 attempt,
             );
             let name = path.file_name().expect("generated PARA stage has a name");
-            match people_cap.create_dir(name) {
-                Ok(()) => Some(Ok(path)),
+            match boundary.create_new_owner_private_child(name) {
+                Ok(stage) => Some(Ok(stage)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
                 Err(error) => Some(Err(error)),
             }
         })
         .transpose()?
         .ok_or("could not allocate a private PARA successor generation")?;
-    let stage_name = path.file_name().ok_or("PARA stage has no name")?;
-    let opened = people_cap
-        .open_with(stage_name, &para_open_directory_options())?
-        .into_std();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        opened.set_permissions(fs::Permissions::from_mode(0o700))?;
-    }
-    #[cfg(windows)]
-    {
-        set_restrictive_directory_permissions(&path)?;
-        let confirmed = people_cap
-            .open_with(stage_name, &para_open_directory_options())?
-            .into_std();
-        if !qmd_file_handles_match(&opened, &confirmed) {
-            return Err("PARA stage changed while owner-private permissions were applied".into());
-        }
-    }
+    let path = stage.display_path().to_path_buf();
+    let opened = stage.try_clone_exact_directory_file()?;
     boundary.attest_for_source_cleanup()?;
     let stage_cap = CapDir::from_std_file(opened.try_clone()?);
     let expected = vec![
@@ -17529,7 +17510,7 @@ mod tests {
     fn para_journal_is_retained_when_directory_metadata_sync_fails() {
         let root = TempDir::new().unwrap();
         let people = root.path().join("people");
-        fs::create_dir(&people).unwrap();
+        drop(crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&people).unwrap());
         let proof = ParaGenerationProof {
             entry_names: vec!["items.json".to_string()],
             items: para_file_proof(b"old").unwrap(),

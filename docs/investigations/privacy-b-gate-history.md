@@ -1315,3 +1315,34 @@ canceled while the remaining native jobs were active. No focused
 validation-only workflow or independent final review counts for that SHA.
 Draft PR #604 remains unmerged; no merge, tag, signing, publication,
 deployment, or release is authorized.
+
+THE PATHFUL DIAGNOSTIC IDENTIFIED THE LEGACY WINDOWS CHILD-ALLOCATION DEFECT.
+Exact SHA `5f165cd4` passed lint run 30514380893. Full-CI run 30514380921
+made every completed short and non-Windows lane green, but native Windows
+failed with 1,496 passed, 9 failed, and 5 ignored. Eight failures named newly
+claimed `.minutes-person-capture-*` directories beneath distinct deterministic
+PARA private roots. The ninth named the private `people` root in a direct
+transaction-durability fixture. This proves the failures were neither a
+process-global HOME race nor a duplicate root rewrite.
+
+The legacy Windows PARA successor allocator created a child with a generic
+capability-relative `create_dir`, made it observable with an inherited
+descriptor, and only then attempted to tighten permissions. A later exact
+owner-private bind correctly rejected those children. The replacement adds a
+fresh-child operation to `BoundRecoveryDirectory`: it attaches the protected
+owner-only DACL atomically through the existing private-directory primitive,
+retains the exact capability chain, and returns `AlreadyExists` rather than
+adopting a planted generation name. Legacy successor creation now uses that
+operation and clones its exact retained directory handle. A regression proves
+fresh private allocation never adopts an existing name. The direct durability
+fixture now creates the directory it designates as a private journal root
+through the same production owner-private boundary.
+
+STATUS: `5f165cd4` is not accepted. Its already-failed superseded run was
+canceled while remaining native jobs were active. The replacement must pass
+local formatting, strict Clippy, Windows-target compilation, and the complete
+serial no-default core suite before a new exact SHA is pushed. Exact lint and
+complete ordinary CI must then be terminal green before guarded validation-only
+Windows execution and all three independent reviews repeat. Draft PR #604
+remains unmerged; no merge, tag, signing, publication, deployment, or release
+is authorized.
