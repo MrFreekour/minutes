@@ -523,8 +523,6 @@ fn acquire_policy_lock_at(
     directory: &Path,
     name: &str,
 ) -> Result<crate::policy_fs::BoundRecoveryLeaseFile, Box<dyn std::error::Error>> {
-    fs::create_dir_all(directory)?;
-    set_restrictive_directory_permissions(directory)?;
     let boundary = crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(directory)?;
     let lock = boundary.bind_or_create_private_lease_file(OsStr::new(name))?;
     lock.lock_exclusive()?;
@@ -545,8 +543,6 @@ fn acquire_policy_lock_at_until(
     if Instant::now() >= deadline {
         return Err(deadline_error().into());
     }
-    fs::create_dir_all(directory)?;
-    set_restrictive_directory_permissions(directory)?;
     let boundary = crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(directory)?;
     let lock = boundary.bind_or_create_private_lease_file(OsStr::new(name))?;
     loop {
@@ -2103,7 +2099,7 @@ fn inspect_windows_provenance_file(
     intended: Option<&WindowsProvenanceFileProof>,
     max_bytes: u64,
 ) -> Result<WindowsProvenanceObservation, Box<dyn std::error::Error>> {
-    let file = match directory.bind_exact_file(name) {
+    let file = match directory.bind_owner_private_exact_file(name) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(WindowsProvenanceObservation {
@@ -2133,7 +2129,8 @@ fn inspect_windows_provenance_file(
 fn windows_current_provenance_proof(
     directory: &crate::policy_fs::BoundRecoveryDirectory,
 ) -> Result<Option<WindowsProvenanceFileProof>, Box<dyn std::error::Error>> {
-    match directory.bind_exact_file(OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_MANIFEST)) {
+    match directory.bind_owner_private_exact_file(OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_MANIFEST))
+    {
         Ok(file) => {
             if file.is_empty()? {
                 return Err("private provenance manifest is unexpectedly empty".into());
@@ -2171,7 +2168,7 @@ fn ensure_windows_provenance_journal_slots(
     directory: &crate::policy_fs::BoundRecoveryDirectory,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for name in PRIVATE_KNOWLEDGE_PROVENANCE_JOURNALS {
-        match directory.bind_exact_file(OsStr::new(name)) {
+        match directory.bind_owner_private_exact_file(OsStr::new(name)) {
             Ok(file) => {
                 if file.len()? > MAX_KNOWLEDGE_PROVENANCE_JOURNAL_BYTES {
                     return Err("private provenance journal exceeds its fixed byte budget".into());
@@ -2181,7 +2178,7 @@ fn ensure_windows_provenance_journal_slots(
                 let created = directory.create_new_exact_file(OsStr::new(name))?;
                 set_restrictive_permissions_file(&created)?;
                 created.sync_all()?;
-                let bound = directory.bind_exact_file(OsStr::new(name))?;
+                let bound = directory.bind_owner_private_exact_file(OsStr::new(name))?;
                 if !qmd_file_handles_match(&created, &bound.try_clone_exact_file()?) {
                     return Err("private provenance journal changed during creation".into());
                 }
@@ -2197,7 +2194,7 @@ fn read_windows_provenance_journal(
     directory: &crate::policy_fs::BoundRecoveryDirectory,
     name: &str,
 ) -> Result<WindowsProvenanceJournalRead, Box<dyn std::error::Error>> {
-    let file = directory.bind_exact_file(OsStr::new(name))?;
+    let file = directory.bind_owner_private_exact_file(OsStr::new(name))?;
     let proof = windows_provenance_file_proof(&file, MAX_KNOWLEDGE_PROVENANCE_JOURNAL_BYTES)?;
     if file.is_empty()? {
         return Ok(WindowsProvenanceJournalRead::Empty(proof));
@@ -2252,7 +2249,7 @@ fn zero_observed_windows_provenance_residue_with_hook(
     before_rebind: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     before_rebind();
-    let file = directory.bind_exact_file(name)?;
+    let file = directory.bind_owner_private_exact_file(name)?;
     if windows_provenance_file_proof(&file, max_bytes)? != *expected {
         return Err("private provenance residue changed at the exact-zero boundary".into());
     }
@@ -2272,7 +2269,7 @@ fn remove_observed_empty_windows_provenance_residue_with_hook(
     before_rebind: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     before_rebind();
-    let file = directory.bind_exact_file(name)?;
+    let file = directory.bind_owner_private_exact_file(name)?;
     if windows_provenance_file_proof(&file, MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES)? != *expected
         || expected.len != 0
     {
@@ -2291,7 +2288,7 @@ fn rename_windows_provenance_exact_no_replace_with_hook(
     before_rebind: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     before_rebind();
-    let source = directory.bind_exact_file(source)?;
+    let source = directory.bind_owner_private_exact_file(source)?;
     if windows_provenance_file_proof(&source, MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES)? != *expected
     {
         return Err("private provenance source changed at the exact-rename boundary".into());
@@ -2374,7 +2371,7 @@ fn reset_observed_windows_provenance_slot_with_hook(
     before_rebind: impl FnOnce(),
 ) -> Result<crate::policy_fs::BoundRecoveryFile, Box<dyn std::error::Error>> {
     before_rebind();
-    let slot = directory.bind_exact_file(OsStr::new(name))?;
+    let slot = directory.bind_owner_private_exact_file(OsStr::new(name))?;
     if windows_provenance_file_proof(&slot, MAX_KNOWLEDGE_PROVENANCE_JOURNAL_BYTES)? != *expected {
         return Err("private provenance journal changed at the exact-reset boundary".into());
     }
@@ -2771,7 +2768,8 @@ fn begin_windows_provenance_publication(
     if current != terminal.intended {
         return Err("private provenance target changed after terminal recovery".into());
     }
-    let temporary = directory.bind_exact_file(OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_TEMP))?;
+    let temporary =
+        directory.bind_owner_private_exact_file(OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_TEMP))?;
     let intended =
         windows_provenance_file_proof(&temporary, MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES)?;
     if retire_equal_content_windows_provenance_temp_with_hook(
@@ -2802,7 +2800,7 @@ fn begin_windows_provenance_publication(
         previous: current,
         intended: Some(intended),
     };
-    let active_slot = directory.bind_exact_file(OsStr::new(
+    let active_slot = directory.bind_owner_private_exact_file(OsStr::new(
         PRIVATE_KNOWLEDGE_PROVENANCE_JOURNALS[active_index],
     ))?;
     if windows_provenance_file_proof(&active_slot, MAX_KNOWLEDGE_PROVENANCE_JOURNAL_BYTES)?
@@ -2852,7 +2850,7 @@ fn save_provenance_manifest_with_hook(
     #[cfg(windows)]
     recover_windows_provenance_publication(&namespace)?;
     let temporary_name = OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_TEMP);
-    let mut temporary = match private.bind_exact_file(temporary_name) {
+    let mut temporary = match private.bind_owner_private_exact_file(temporary_name) {
         Ok(existing) => {
             if existing.len()? > MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES {
                 return Err("private provenance temp exceeds its fixed byte budget".into());
@@ -2863,7 +2861,7 @@ fn save_provenance_manifest_with_hook(
             let created = private.create_new_exact_file(temporary_name)?;
             set_restrictive_permissions_file(&created)?;
             created.sync_all()?;
-            let bound = private.bind_exact_file(temporary_name)?;
+            let bound = private.bind_owner_private_exact_file(temporary_name)?;
             if !qmd_file_handles_match(&created, &bound.try_clone_exact_file()?) {
                 return Err("private provenance temp changed while it was created".into());
             }
@@ -2897,7 +2895,8 @@ fn save_provenance_manifest_with_hook(
     #[cfg(windows)]
     let windows_published_temp = begin_windows_provenance_publication(&namespace, &bytes)?;
     private.sync()?;
-    let published = private.bind_exact_file(OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_MANIFEST))?;
+    let published =
+        private.bind_owner_private_exact_file(OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_MANIFEST))?;
     let published_confirmed = namespace_cap
         .open_with(
             OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_MANIFEST),
@@ -6769,7 +6768,7 @@ fn begin_para_transaction(
     let name = path.file_name().ok_or("PARA transaction has no name")?;
     let boundary = crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(private_root)?;
     boundary.attest_for_source_cleanup()?;
-    let mut file = match boundary.bind_exact_file(name) {
+    let mut file = match boundary.bind_owner_private_exact_file(name) {
         Ok(existing) => existing.try_clone_exact_file()?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             boundary.create_new_exact_file(name)?
@@ -12018,6 +12017,7 @@ mod tests {
         let meetings = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         let mirror_parent = TempDir::new().unwrap();
+        crate::policy_fs::ensure_owner_only_directory(state.path()).unwrap();
         fs::write(
             meetings.path().join("normal.md"),
             meeting_markdown("Normal", None, "QMD-NORMAL"),
@@ -12119,6 +12119,7 @@ mod tests {
     #[test]
     fn qmd_policy_lock_wait_is_bounded_by_the_operation_deadline() {
         let directory = TempDir::new().unwrap();
+        crate::policy_fs::ensure_owner_only_directory(directory.path()).unwrap();
         let _held = acquire_policy_lock_at(directory.path(), QMD_POLICY_LOCK).unwrap();
         let started = Instant::now();
 
@@ -13672,6 +13673,16 @@ mod tests {
         );
     }
 
+    fn write_private_control_fixture(
+        directory: &crate::policy_fs::BoundRecoveryDirectory,
+        name: &str,
+        bytes: &[u8],
+    ) {
+        let mut file = directory.create_new_exact_file(OsStr::new(name)).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
     #[test]
     fn windows_provenance_action_boundaries_preserve_swapped_winners() {
         for source_name in [
@@ -13683,7 +13694,7 @@ mod tests {
             let directory =
                 crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&namespace)
                     .unwrap();
-            fs::write(namespace.join(source_name), b"OBSERVED-EXACT").unwrap();
+            write_private_control_fixture(&directory, source_name, b"OBSERVED-EXACT");
             let observed = directory.bind_exact_file(OsStr::new(source_name)).unwrap();
             let proof =
                 windows_provenance_file_proof(&observed, MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES)
@@ -13697,7 +13708,7 @@ mod tests {
                 &proof,
                 || {
                     fs::rename(namespace.join(source_name), &displaced).unwrap();
-                    fs::write(namespace.join(source_name), b"HOSTILE-WINNER").unwrap();
+                    write_private_control_fixture(&directory, source_name, b"HOSTILE-WINNER");
                 },
             )
             .expect_err("a source-name winner must not be moved");
@@ -13719,7 +13730,7 @@ mod tests {
             let directory =
                 crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&namespace)
                     .unwrap();
-            fs::write(namespace.join(source_name), b"OBSERVED-EXACT").unwrap();
+            write_private_control_fixture(&directory, source_name, b"OBSERVED-EXACT");
             let observed = directory.bind_exact_file(OsStr::new(source_name)).unwrap();
             let proof =
                 windows_provenance_file_proof(&observed, MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES)
@@ -13733,7 +13744,7 @@ mod tests {
                 MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES,
                 || {
                     fs::rename(namespace.join(source_name), &displaced).unwrap();
-                    fs::write(namespace.join(source_name), b"HOSTILE-WINNER").unwrap();
+                    write_private_control_fixture(&directory, source_name, b"HOSTILE-WINNER");
                 },
             )
             .expect_err("a residue-name winner must not be zeroed");
@@ -13750,7 +13761,7 @@ mod tests {
         let directory =
             crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&namespace).unwrap();
         let backup_name = OsStr::new(PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP);
-        fs::write(namespace.join(backup_name), b"").unwrap();
+        write_private_control_fixture(&directory, PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP, b"");
         let observed = directory.bind_exact_file(backup_name).unwrap();
         let proof =
             windows_provenance_file_proof(&observed, MAX_KNOWLEDGE_PROVENANCE_MANIFEST_BYTES)
@@ -13763,7 +13774,7 @@ mod tests {
             &proof,
             || {
                 fs::rename(namespace.join(backup_name), &displaced_empty).unwrap();
-                fs::write(namespace.join(backup_name), b"").unwrap();
+                write_private_control_fixture(&directory, PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP, b"");
             },
         )
         .expect_err("even a byte-identical empty winner must not be removed");
@@ -13776,7 +13787,7 @@ mod tests {
         let directory =
             crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&namespace).unwrap();
         let journal_name = PRIVATE_KNOWLEDGE_PROVENANCE_JOURNALS[0];
-        fs::write(namespace.join(journal_name), b"OBSERVED-JOURNAL").unwrap();
+        write_private_control_fixture(&directory, journal_name, b"OBSERVED-JOURNAL");
         let observed = directory.bind_exact_file(OsStr::new(journal_name)).unwrap();
         let proof =
             windows_provenance_file_proof(&observed, MAX_KNOWLEDGE_PROVENANCE_JOURNAL_BYTES)
@@ -13789,7 +13800,7 @@ mod tests {
             &proof,
             || {
                 fs::rename(namespace.join(journal_name), &displaced).unwrap();
-                fs::write(namespace.join(journal_name), b"HOSTILE-JOURNAL").unwrap();
+                write_private_control_fixture(&directory, journal_name, b"HOSTILE-JOURNAL");
             },
         ) {
             Ok(_) => panic!("a journal-name winner must not be reset"),
@@ -13810,8 +13821,8 @@ mod tests {
         let directory =
             crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&namespace).unwrap();
         let bytes = b"EQUAL-CONTENT";
-        fs::write(namespace.join(PRIVATE_KNOWLEDGE_PROVENANCE_MANIFEST), bytes).unwrap();
-        fs::write(namespace.join(PRIVATE_KNOWLEDGE_PROVENANCE_TEMP), bytes).unwrap();
+        write_private_control_fixture(&directory, PRIVATE_KNOWLEDGE_PROVENANCE_MANIFEST, bytes);
+        write_private_control_fixture(&directory, PRIVATE_KNOWLEDGE_PROVENANCE_TEMP, bytes);
         let current = windows_current_provenance_proof(&directory)
             .unwrap()
             .unwrap();
@@ -13835,7 +13846,7 @@ mod tests {
                     &displaced,
                 )
                 .unwrap();
-                fs::write(namespace.join(PRIVATE_KNOWLEDGE_PROVENANCE_TEMP), bytes).unwrap();
+                write_private_control_fixture(&directory, PRIVATE_KNOWLEDGE_PROVENANCE_TEMP, bytes);
             },
         )
         .expect_err("an equal-byte replacement must not inherit retirement authority");
@@ -13855,7 +13866,7 @@ mod tests {
         let directory =
             crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&namespace).unwrap();
         ensure_windows_provenance_journal_slots(&directory).unwrap();
-        fs::write(namespace.join(PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP), b"").unwrap();
+        write_private_control_fixture(&directory, PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP, b"");
         let displaced = namespace.join("initializer-backup.displaced");
 
         let error = initialize_windows_provenance_journal_with_hook(&directory, |boundary| {
@@ -13865,11 +13876,11 @@ mod tests {
                     &displaced,
                 )
                 .unwrap();
-                fs::write(
-                    namespace.join(PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP),
+                write_private_control_fixture(
+                    &directory,
+                    PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP,
                     b"BACKUP-WINNER",
-                )
-                .unwrap();
+                );
             }
         })
         .expect_err("a post-observation backup winner must fail initialization closed");
@@ -13895,7 +13906,7 @@ mod tests {
         let error = initialize_windows_provenance_journal_with_hook(&directory, |boundary| {
             if boundary == WindowsProvenanceInitializationBoundary::BaselineWrite {
                 fs::rename(namespace.join(baseline_name), &displaced).unwrap();
-                fs::write(namespace.join(baseline_name), b"").unwrap();
+                write_private_control_fixture(&directory, baseline_name, b"");
             }
         })
         .expect_err("a post-reset journal winner must not receive the baseline write");
@@ -13914,13 +13925,21 @@ mod tests {
         ensure_windows_provenance_journal_slots(&directory).unwrap();
         let journal_index = 1;
         let journal_name = PRIVATE_KNOWLEDGE_PROVENANCE_JOURNALS[journal_index];
-        fs::write(namespace.join(journal_name), b"OBSERVED-JOURNAL").unwrap();
+        let existing = directory
+            .bind_owner_private_exact_file(OsStr::new(journal_name))
+            .unwrap();
+        let existing = existing.zero_exact_for_retirement().unwrap();
+        let mut exact = existing.try_clone_exact_file().unwrap();
+        exact.write_all(b"OBSERVED-JOURNAL").unwrap();
+        exact.sync_all().unwrap();
+        drop(exact);
+        drop(existing);
         let displaced = namespace.join("initializer-journal.displaced");
 
         let error = initialize_windows_provenance_journal_with_hook(&directory, |boundary| {
             if boundary == WindowsProvenanceInitializationBoundary::JournalReset(journal_index) {
                 fs::rename(namespace.join(journal_name), &displaced).unwrap();
-                fs::write(namespace.join(journal_name), b"JOURNAL-WINNER").unwrap();
+                write_private_control_fixture(&directory, journal_name, b"JOURNAL-WINNER");
             }
         })
         .expect_err("a post-observation journal winner must not inherit reset authority");
@@ -13940,12 +13959,12 @@ mod tests {
         let directory =
             crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&namespace).unwrap();
         ensure_windows_provenance_journal_slots(&directory).unwrap();
-        fs::write(
-            namespace.join(PRIVATE_KNOWLEDGE_PROVENANCE_TEMP),
+        write_private_control_fixture(
+            &directory,
+            PRIVATE_KNOWLEDGE_PROVENANCE_TEMP,
             b"UNJOURNALED-TEMP",
-        )
-        .unwrap();
-        fs::write(namespace.join(PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP), b"").unwrap();
+        );
+        write_private_control_fixture(&directory, PRIVATE_KNOWLEDGE_PROVENANCE_BACKUP, b"");
 
         initialize_windows_provenance_journal_with_hook(&directory, |_| {}).unwrap();
 

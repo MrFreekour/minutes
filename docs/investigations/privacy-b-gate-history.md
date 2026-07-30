@@ -1231,3 +1231,36 @@ STATUS: `72334ac2` is not accepted. No focused validation-only workflow or
 independent final review runs for that SHA. The next candidate must rerun exact
 lint and complete ordinary CI first; draft PR #604 remains unmerged, and no
 merge, tag, signing, publication, deployment, or release is authorized.
+
+THE SECOND ATOMIC-DACL REPLACEMENT IS BLOCKED, BUT NATIVE WINDOWS NARROWED THE
+BOUNDARY. Hosted lint run 30511244441 was green at exact SHA `c16fcbb7`.
+Full-CI run 30511244431 made every completed short/non-Windows lane green, but
+Windows core failed with 1,442 passed, 61 failed, and 5 ignored. The
+replacement-owned access-denied failures disappeared: atomically private
+directories, new private files, random controls, executable snapshots, and the
+durability helper all executed successfully.
+
+The remaining failures exposed that exact owner-private descriptor attestation
+had been applied too broadly to generic recovery binding. Legacy cache members
+and capture members may be intentionally untrusted residue that must be bound,
+zeroed, and retired without receiving new private bytes. The replacement now
+keeps generic exact recovery binding descriptor-neutral and adds an explicit
+owner-private control-leaf binding API. Existing deterministic PARA journals,
+Windows provenance journals, provenance staging/backup leaves, and private
+leases use that verification-only API before any private write. New leaves are
+created and secured through the atomically private parent contract.
+
+The run also exposed one production pre-creation bug: policy-lock acquisition
+called ambient `create_dir_all` before binding the lock directory. It now lets
+the owner-private primitive create the final directory atomically. Controlled
+QMD test fixtures explicitly secure their already-created TempDir state before
+testing lock behavior. Windows provenance adversarial fixtures create both
+observed files and hostile pathname winners through canonical private-control
+creation so exact identity/disposition assertions, rather than a fixture-owned
+unprotected DACL, remain load-bearing.
+
+STATUS: `c16fcbb7` is not accepted. No focused validation-only or fresh final
+review runs count for that SHA. Exact lint and complete ordinary CI must be
+green on the next candidate before the guarded focused execution and all three
+independent reviews repeat. Draft PR #604 remains unmerged; no merge, tag,
+signing, publication, deployment, or release is authorized.

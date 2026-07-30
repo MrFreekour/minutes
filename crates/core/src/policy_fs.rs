@@ -1850,10 +1850,6 @@ impl BoundRecoveryDirectory {
         }
         self.attest_location()?;
         let directory = open_directory_at_no_follow(self.chain.leaf(), name)?;
-        #[cfg(windows)]
-        crate::overlays::attest_owner_only_directory_handle(
-            &directory.try_clone()?.into_std_file(),
-        )?;
         self.attest_location()?;
         let chain = self.chain.with_child(name, &directory)?;
         chain.attest()?;
@@ -1913,10 +1909,6 @@ impl BoundRecoveryDirectory {
         validate_entry_name(name)?;
         self.attest_location()?;
         let file = open_recovery_file_at(self.chain.leaf(), name)?;
-        #[cfg(windows)]
-        if self.owner_private_namespace {
-            crate::overlays::attest_owner_only_file_handle(&file)?;
-        }
         let bound = BoundRecoveryFile {
             parent_chain: self.chain.try_clone()?,
             name: name.to_os_string(),
@@ -1925,6 +1917,26 @@ impl BoundRecoveryDirectory {
             expected_digest: Cell::new(None),
         };
         bound.attest_visible_identity()?;
+        Ok(bound)
+    }
+
+    /// Bind a deterministic private control leaf that may receive private
+    /// bytes. Unlike generic recovery binding, an existing Windows leaf is
+    /// accepted only when its exact handle already carries the canonical
+    /// protected owner-only descriptor; it is never "repaired" after a
+    /// possibly hostile process retained access.
+    pub(crate) fn bind_owner_private_exact_file(
+        &self,
+        name: &OsStr,
+    ) -> std::io::Result<BoundRecoveryFile> {
+        if !self.owner_private_namespace {
+            return Err(invalid_recovery_path(
+                "private control file requires an owner-private namespace",
+            ));
+        }
+        let bound = self.bind_exact_file(name)?;
+        #[cfg(windows)]
+        crate::overlays::attest_owner_only_file_handle(&bound.file)?;
         Ok(bound)
     }
 
@@ -1938,10 +1950,6 @@ impl BoundRecoveryDirectory {
         self.attest_location()?;
         let file = open_regular_file_at_allow_links(self.chain.leaf(), name, false)?;
         let confirmed = open_regular_file_at_allow_links(self.chain.leaf(), name, false)?;
-        #[cfg(windows)]
-        if self.owner_private_namespace {
-            crate::overlays::attest_owner_only_file_handle(&file)?;
-        }
         if !open_file_identity_matches(&file, &confirmed) {
             return Err(invalid_recovery_path(
                 "capability-bound linked file changed while it was being bound",
@@ -3189,7 +3197,7 @@ fn retire_legacy_policy_caches_at(state_root: &Path) -> std::io::Result<()> {
     }
     let legacy_graph_name = OsStr::new("graph");
     if state.entry_exists(legacy_graph_name)? {
-        let legacy_graph = state.prepare_owner_private_child(legacy_graph_name)?;
+        let legacy_graph = state.bind_existing_owner_private_child(legacy_graph_name)?;
         for name in ["index.json", "index.tmp"] {
             let name = OsStr::new(name);
             if !legacy_graph.entry_exists(name)? {
@@ -4074,7 +4082,9 @@ mod tests {
             .expect("create an atomically owner-private directory");
         let planted_file = private_directory.join("planted-control.json");
         File::create(&planted_file).unwrap();
-        let file_error = match boundary.bind_exact_file(OsStr::new("planted-control.json")) {
+        let file_error = match boundary
+            .bind_owner_private_exact_file(OsStr::new("planted-control.json"))
+        {
             Ok(_) => panic!("an existing control leaf must already have the exact private DACL"),
             Err(error) => error,
         };
@@ -4090,7 +4100,7 @@ mod tests {
             .expect("new control leaves receive the canonical private DACL");
         drop(created);
         boundary
-            .bind_exact_file(OsStr::new("created-control.json"))
+            .bind_owner_private_exact_file(OsStr::new("created-control.json"))
             .expect("the canonical private leaf remains bindable");
     }
 
