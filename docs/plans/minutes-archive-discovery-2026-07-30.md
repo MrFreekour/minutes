@@ -240,6 +240,14 @@ Converters and exact retrieval are evaluated on public or synthetic legal
 documents. Every result opens the correct source location, and adversarial
 documents cannot alter system behavior.
 
+The first exact-retrieval slice is implemented with an in-memory,
+vault-scoped SQLite FTS5 index and deterministic provision-level verification.
+It has no model or persistent attorney derivative. Tests prove exact excerpts
+and anchors, same-provision concept conjunction, sentence limits, explicit
+vault denial, stale-revision withdrawal, transactional source replacement, and
+inert prompt-like source text. Format conversion, live-source resolution,
+document-level conjunction, and OCR remain unimplemented Stage 2 gates.
+
 ### Stage 3: Controlled private pilot
 
 The attorney selects a bounded copy or read-only subset after reviewing the

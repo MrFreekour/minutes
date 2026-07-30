@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
+pub mod retrieval;
+
 pub const CENSUS_SCHEMA: &str = "minutes.archive-census.v1";
 pub const MAX_APPROVED_ROOTS: usize = 32;
 

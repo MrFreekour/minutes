@@ -422,6 +422,17 @@ release gates; an ad-hoc development bundle is not a Peter handoff.
 Build a public and synthetic corpus covering confidentiality, indemnity,
 limitation of liability, assignment, governing law, and BAA language.
 
+Implementation status: the first retrieval slice is implemented in
+`minutes-archive-core` as a private in-memory SQLite FTS5 index. It normalizes
+bounded UTF-8 fixtures into legal provisions, preserves headings and stable
+section anchors, requires an explicit vault, checks current source revisions
+at query time, and returns exact evidence cards. Deterministic tests cover
+same-clause conjunction, sentence limits, exact phrases, exclusions, source
+replacement and withdrawal, malicious prompt-like source text, and wrong or
+empty scope. It does not yet ingest PDF or DOCX, persist a protected vault,
+resolve an evidence card back to a live source, or implement document-level
+conjunction and OCR; those remain Gate 2 work rather than implied capability.
+
 Evaluate:
 
 - exact phrase;
