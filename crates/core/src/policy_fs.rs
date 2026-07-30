@@ -3429,6 +3429,7 @@ mod tests {
             .unwrap();
         file.write_all(b"{\"partial\":true}").unwrap();
         file.sync_all().unwrap();
+        drop(file);
 
         let error =
             append_restricted_override_audit_at_with_hook(&audit_dir, b"{\"v\":1}\n", || {})

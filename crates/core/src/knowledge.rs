@@ -5943,7 +5943,6 @@ fn para_open_directory_no_follow(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        const DELETE: u32 = 0x0001_0000;
         const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -5953,7 +5952,11 @@ fn para_open_directory_no_follow(path: &Path) -> std::io::Result<File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
         options
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            // Parent capabilities create/sync children but are never renamed
+            // themselves. Do not request DELETE: retained policy boundaries
+            // intentionally deny delete sharing. Keep FILE_SHARE_DELETE so a
+            // later exact child rename handle can coexist with snapshots.
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
@@ -10812,13 +10815,9 @@ mod windows_private {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
     use std::ptr::{null, null_mut};
-    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT,
-    };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, RtlNtStatusToDosError, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_SUCCESS, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
+        CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
+        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, SET_ACCESS,
@@ -10835,18 +10834,17 @@ mod windows_private {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, FileAttributeTagInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ADD_FILE, FILE_ALL_ACCESS,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ADD_FILE,
+        FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+        WRITE_OWNER,
     };
-    use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     struct TokenHandle(HANDLE);
 
@@ -10976,10 +10974,6 @@ mod windows_private {
                     as *mut c_void,
                 bInheritHandle: 0,
             }
-        }
-
-        fn descriptor_ptr(&self) -> *const c_void {
-            self.descriptor.as_ref() as *const SECURITY_DESCRIPTOR as *const c_void
         }
 
         fn tighten_and_verify(&self, file: &File) -> io::Result<()> {
@@ -11200,62 +11194,59 @@ mod windows_private {
 
     pub(super) fn create_private_file_at(
         directory: &File,
+        directory_path: &Path,
         name: &std::ffi::OsStr,
     ) -> io::Result<File> {
-        let mut name_wide: Vec<u16> = name.encode_wide().collect();
+        let name_wide: Vec<u16> = name.encode_wide().collect();
         if name_wide.is_empty()
             || name_wide == [b'.' as u16]
             || name_wide == [b'.' as u16, b'.' as u16]
             || name_wide
                 .iter()
                 .any(|unit| matches!(*unit, 0 | 47 | 58 | 92))
-            || name_wide.len() > (u16::MAX as usize / 2) - 1
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "private Windows filename is not one safe relative component",
             ));
         }
-        let length = (name_wide.len() * 2) as u16;
-        name_wide.push(0);
-        let object_name = UNICODE_STRING {
-            Length: length,
-            MaximumLength: length + 2,
-            Buffer: name_wide.as_mut_ptr(),
-        };
-        let security = OwnerOnlySecurity::new(false)?;
-        let object_attributes = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: directory.as_raw_handle() as HANDLE,
-            ObjectName: &object_name,
-            Attributes: OBJ_CASE_INSENSITIVE as u32,
-            SecurityDescriptor: security.descriptor_ptr(),
-            SecurityQualityOfService: null(),
-        };
-        let mut io_status = unsafe { zeroed::<IO_STATUS_BLOCK>() };
-        let mut handle: HANDLE = null_mut();
-        let status = unsafe {
-            NtCreateFile(
-                &mut handle,
+        if !same_directory_identity(directory, directory_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private Windows directory changed before file creation",
+            ));
+        }
+
+        // The retained directory handle denies delete sharing, so its visible
+        // path cannot be renamed or replaced during this CreateFileW call.
+        // SECURITY_ATTRIBUTES applies the protected owner-only DACL atomically
+        // at CREATE_NEW time; no private bytes are written before verification.
+        let path = wide(&directory_path.join(name))?;
+        let mut security = OwnerOnlySecurity::new(false)?;
+        let attributes = security.attributes();
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
                 GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | SYNCHRONIZE,
-                &object_attributes,
-                &mut io_status,
-                null(),
-                FILE_ATTRIBUTE_NORMAL,
                 0,
-                FILE_CREATE,
-                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-                null(),
-                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
             )
         };
-        if status < 0 {
-            let win32 = unsafe { RtlNtStatusToDosError(status) };
-            return Err(io::Error::from_raw_os_error(win32 as i32));
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
         }
         let file = unsafe { File::from_raw_handle(handle as _) };
         validate_attributes(&file, false)?;
         security.tighten_and_verify(&file)?;
+        if !same_directory_identity(directory, directory_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private Windows directory changed during file creation",
+            ));
+        }
         Ok(file)
     }
 
@@ -11512,10 +11503,10 @@ fn open_private_child_dir_at(
 #[cfg(windows)]
 fn create_new_private_file_at(
     directory: &File,
-    _directory_path: &Path,
+    directory_path: &Path,
     name: &std::ffi::OsStr,
 ) -> std::io::Result<File> {
-    windows_private::create_private_file_at(directory, name)
+    windows_private::create_private_file_at(directory, directory_path, name)
 }
 
 #[cfg(windows)]
@@ -13984,7 +13975,7 @@ mod tests {
 
         preserve_file_before_retraction_with_hook(&config, &source, |namespace| {
             // Both the root and namespace descriptors deny delete-sharing, so
-            // Windows must reject either name swap before NtCreateFile runs.
+            // Windows must reject either name swap before CreateFileW runs.
             assert!(fs::rename(namespace.parent().unwrap(), &redirected_root).is_err());
             assert!(fs::rename(namespace, &redirected_namespace).is_err());
         })

@@ -1246,6 +1246,7 @@ mod tests {
         let meeting = tmp.path().join("oversized.md");
         let file = std::fs::File::create(&meeting).unwrap();
         file.set_len(MAX_OVERLAY_SOURCE_BYTES + 1).unwrap();
+        drop(file);
         let error = write_speaker_confirmation_at(
             &db,
             &meeting,

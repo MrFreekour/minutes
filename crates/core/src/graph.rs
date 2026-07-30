@@ -1273,9 +1273,8 @@ mod windows_graph_journal {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
-        FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
-        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-        FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -1381,13 +1380,16 @@ mod windows_graph_journal {
     ) {
         let directory = directory_bits as _;
         let event = event_bits as _;
+        // Graph meaning is derived from namespace and byte changes. Match the
+        // non-Windows classifier, which deliberately ignores access and
+        // metadata-only events: retained capability checks independently
+        // enforce identity and reachability, while subscribing to Windows
+        // security/attribute/creation metadata makes our own handle/DACL
+        // attestations look like source-byte mutations.
         let notify_filter = FILE_NOTIFY_CHANGE_FILE_NAME
             | FILE_NOTIFY_CHANGE_DIR_NAME
-            | FILE_NOTIFY_CHANGE_ATTRIBUTES
             | FILE_NOTIFY_CHANGE_SIZE
-            | FILE_NOTIFY_CHANGE_LAST_WRITE
-            | FILE_NOTIFY_CHANGE_CREATION
-            | FILE_NOTIFY_CHANGE_SECURITY;
+            | FILE_NOTIFY_CHANGE_LAST_WRITE;
         let mut buffer = vec![0u8; JOURNAL_BUFFER_BYTES];
         while !stop.load(Ordering::Acquire) {
             let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };

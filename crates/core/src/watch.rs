@@ -1854,8 +1854,10 @@ mod tests {
         );
         let message = error.to_string();
         assert!(message.contains("audio rollback also failed"));
-        assert!(message.contains(&destination.display().to_string()));
-        assert!(message.contains(&sidecar.display().to_string()));
+        assert!(message.contains("audio remains at"));
+        assert!(message.contains("memo.m4a"));
+        assert!(message.contains("sidecar remains at"));
+        assert!(message.contains("memo.json"));
     }
 
     #[test]

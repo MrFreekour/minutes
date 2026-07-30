@@ -1057,3 +1057,42 @@ requires ordinary CI and the focused validation-only Windows workflow to be
 green for the same exact current-main-based SHA, followed by three fresh
 independent non-blocking reviews of that SHA. The draft PR must remain
 unmerged, and no release action is authorized.
+
+THE FOURTH REPLACEMENT REMAINS BLOCKED, BUT CONFIRMED EXACT RETIREMENT.
+Hosted run 30505135719 at `869db0b1` made lint, Linux, all short
+cross-platform lanes, the Windows CLI install, and the unsigned Windows
+installer green. The Windows core result improved to 1,455 passed, 46 failed,
+and 5 ignored. Every graph fence was observed and retired, proving that the
+consuming Windows disposition lifetime and lease-specific identity
+attestation removed the prior self-conflicts.
+
+The remaining graph failures were metadata-only notifications for unchanged
+corpus and correction files. The portable watcher already ignores access and
+metadata-only events because graph meaning is derived from namespace and byte
+changes; the Windows filter now applies that same rule directly by subscribing
+only to file/directory names, size, and last-write changes. Exact capability
+and reachability attestations remain independent and fail closed.
+
+The knowledge failures exposed two shared Windows access contracts. Ordinary
+PARA parent handles incorrectly requested DELETE access while their retained
+policy boundaries intentionally denied delete sharing. Parent creation/sync
+handles now omit DELETE but continue to share delete so short-lived,
+identity-attested exact child rename handles can coexist. Private preservation
+creation no longer relies on the hosted runner's rejected relative
+`NtCreateFile` request. A retained no-delete-sharing directory capability
+prevents the visible path from moving while `CreateFileW(CREATE_NEW)` atomically
+applies the protected owner-only DACL, and the exact parent identity is
+re-attested before and after creation, before any private bytes are written.
+
+Three residual test fixtures also retained setup handles across the operation
+under test or compared a Windows long-path rendering literally. The oversized
+source and incomplete-audit fixtures now close their setup writers before
+asserting product behavior. The watcher rollback test still requires both
+explicit recovery labels and both filenames while allowing Windows' equivalent
+long/short absolute-path rendering.
+
+STATUS: `869db0b1` is not accepted. The next candidate must make the complete
+ordinary Windows suite green on its exact SHA before the focused
+validation-only Windows workflow or independent final reviews run. Draft PR
+#604 remains unmerged, and no merge, tag, signing, publication, deployment, or
+release is authorized.
