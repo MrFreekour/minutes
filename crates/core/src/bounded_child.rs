@@ -2948,6 +2948,7 @@ mod windows_tests {
         let pid_path = directory.path().join("successful-grandchild.pid");
         let script =
             child_and_grandchild_script(&pid_path, "[Console]::Out.Write('leader-output'); exit 7");
+        let started = Instant::now();
 
         let run = run(
             &mut powershell(&script),
@@ -2956,8 +2957,13 @@ mod windows_tests {
             budget(15_000),
         )
         .unwrap();
+        let elapsed = started.elapsed();
 
         assert!(!run.timed_out);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "successful leader retirement took {elapsed:?}"
+        );
         assert_eq!(run.output.status.code(), Some(7));
         assert_eq!(run.output.stdout, b"leader-output");
         assert_process_tree_retired(read_pid(&pid_path));
