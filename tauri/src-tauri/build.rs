@@ -198,8 +198,12 @@ fn compile_ui_shot_helper() {
     println!("cargo:rerun-if-changed={}", source.display());
     std::fs::create_dir_all(&bin_dir).expect("failed to create helper bin dir");
 
+    // -parse-as-library for the @main entry point, and macOS 14 because
+    // SCScreenshotManager (the supported replacement for the deprecated
+    // CGWindowListCreateImage) is only available from 14 onward.
     let output = Command::new("swiftc")
-        .args(["-target", &swift_deployment_target("11.0")])
+        .args(["-parse-as-library"])
+        .args(["-target", &swift_deployment_target("14.0")])
         .arg(&source)
         .arg("-o")
         .arg(&binary)

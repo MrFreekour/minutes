@@ -12,19 +12,27 @@
 // manager, a banking session, or private messages, because it will not look at
 // windows it does not own.
 //
+// Uses ScreenCaptureKit rather than CGWindowListCreateImage: the latter was
+// deprecated in macOS 14 and returns nil for window captures on current systems
+// even when Screen Recording is granted, which reads as a permission failure
+// when it is actually an API failure.
+//
 // Usage:
 //   ui_shot <bundle-id> <output.png> [window-index]
+//   ui_shot --check                  report whether the grant is held
 //
 // Exit codes:
-//   0  captured
+//   0  captured (or --check with the grant held)
 //   1  usage error
 //   2  no window found for that bundle
 //   3  bundle not allowlisted
-//   4  capture failed (usually Screen Recording not granted)
+//   4  capture failed
+//   5  Screen Recording not granted to this binary
 
 import AppKit
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
 
 /// Bundle identifiers this helper is willing to photograph.
 ///
@@ -42,110 +50,116 @@ func fail(_ message: String, _ code: Int32) -> Never {
     exit(code)
 }
 
-let args = CommandLine.arguments
-guard args.count >= 3 else {
-    fail("usage: ui_shot <bundle-id> <output.png> [window-index]", 1)
+@main
+struct UIShot {
+    static func main() async {
+        let args = CommandLine.arguments
+
+        // Permission probe. Separate from a capture so a caller can distinguish
+        // "not granted" from "granted but something else went wrong" without
+        // needing a window open.
+        if args.count >= 2, args[1] == "--check" {
+            let granted = CGPreflightScreenCaptureAccess()
+            print("screen-recording-granted: \(granted)")
+            print("binary: \(args[0])")
+            exit(granted ? 0 : 5)
+        }
+
+        guard args.count >= 3 else {
+            fail("usage: ui_shot <bundle-id> <output.png> [window-index] | ui_shot --check", 1)
+        }
+
+        let bundleID = args[1]
+        let outputPath = args[2]
+        let windowIndex = args.count >= 4 ? Int(args[3]) ?? 0 : 0
+
+        guard allowedBundleIDs.contains(bundleID) else {
+            fail(
+                "refusing to capture '\(bundleID)': not in the allowlist. This helper only "
+                    + "captures Minutes windows by design.",
+                3
+            )
+        }
+
+        // Check the grant before doing anything else, so a missing permission
+        // reports as itself rather than as an empty capture.
+        guard CGPreflightScreenCaptureAccess() else {
+            fail(
+                "Screen Recording is not granted to this binary (\(args[0])). Add it under "
+                    + "System Settings > Privacy & Security > Screen & System Audio Recording. "
+                    + "If it is already listed, remove the entry with the minus button and "
+                    + "re-add it: a stale record for an older build stays listed but no longer "
+                    + "matches.",
+                5
+            )
+        }
+
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(
+                true,
+                onScreenWindowsOnly: true
+            )
+        } catch {
+            fail("could not enumerate shareable content: \(error.localizedDescription)", 4)
+        }
+
+        // Filter to windows owned by the allowlisted bundle, largest first so
+        // index 0 is the main window rather than a tooltip or status item.
+        let candidates = content.windows
+            .filter { window in
+                window.owningApplication?.bundleIdentifier == bundleID
+                    && window.frame.width >= 50
+                    && window.frame.height >= 50
+            }
+            .sorted { ($0.frame.width * $0.frame.height) > ($1.frame.width * $1.frame.height) }
+
+        guard !candidates.isEmpty else {
+            fail(
+                "'\(bundleID)' has no capturable on-screen window. For a menu bar app, open "
+                    + "its window first.",
+                2
+            )
+        }
+        guard windowIndex < candidates.count else {
+            fail("window-index \(windowIndex) out of range (\(candidates.count) windows)", 1)
+        }
+
+        let target = candidates[windowIndex]
+        let filter = SCContentFilter(desktopIndependentWindow: target)
+        let config = SCStreamConfiguration()
+        // Capture at backing scale so text is legible in the result rather than
+        // downsampled to logical points.
+        config.width = Int(target.frame.width * 2)
+        config.height = Int(target.frame.height * 2)
+        config.showsCursor = false
+
+        let image: CGImage
+        do {
+            image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: config
+            )
+        } catch {
+            fail("capture failed: \(error.localizedDescription)", 4)
+        }
+
+        guard image.width > 0, image.height > 0 else {
+            fail("capture produced an empty image", 4)
+        }
+
+        let bitmap = NSBitmapImageRep(cgImage: image)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            fail("could not encode PNG", 4)
+        }
+
+        do {
+            try png.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
+        } catch {
+            fail("could not write \(outputPath): \(error.localizedDescription)", 4)
+        }
+
+        let title = target.title ?? "(untitled)"
+        print("captured \(image.width)x\(image.height) \"\(title)\" -> \(outputPath)")
+    }
 }
-
-let bundleID = args[1]
-let outputPath = args[2]
-let windowIndex = args.count >= 4 ? Int(args[3]) ?? 0 : 0
-
-guard allowedBundleIDs.contains(bundleID) else {
-    fail(
-        "refusing to capture '\(bundleID)': not in the allowlist. This helper only "
-            + "captures Minutes windows by design.",
-        3
-    )
-}
-
-// Resolve the bundle to running process ids. Matching on pid rather than window
-// title avoids capturing an unrelated window that happens to share a name.
-let pids = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-    .map { $0.processIdentifier }
-guard !pids.isEmpty else {
-    fail("no running application for bundle '\(bundleID)'", 2)
-}
-
-guard
-    let listing = CGWindowListCopyWindowInfo(
-        [.optionOnScreenOnly, .excludeDesktopElements],
-        kCGNullWindowID
-    ) as? [[String: Any]]
-else {
-    fail("could not list windows", 4)
-}
-
-// Keep only on-screen windows owned by the resolved pids, largest first, so
-// index 0 is the main window rather than a tooltip or a status item.
-struct Candidate {
-    let id: CGWindowID
-    let area: CGFloat
-}
-
-var candidates: [Candidate] = []
-for entry in listing {
-    guard
-        let ownerPID = entry[kCGWindowOwnerPID as String] as? pid_t,
-        pids.contains(ownerPID),
-        let windowNumber = entry[kCGWindowNumber as String] as? Int,
-        let bounds = entry[kCGWindowBounds as String] as? [String: Any],
-        let width = bounds["Width"] as? CGFloat,
-        let height = bounds["Height"] as? CGFloat
-    else { continue }
-    // Skip degenerate windows (menu extras, offscreen shells).
-    if width < 50 || height < 50 { continue }
-    candidates.append(Candidate(id: CGWindowID(windowNumber), area: width * height))
-}
-
-candidates.sort { $0.area > $1.area }
-
-guard !candidates.isEmpty else {
-    fail(
-        "'\(bundleID)' is running but has no capturable on-screen window. For a menu "
-            + "bar app, open its window first.",
-        2
-    )
-}
-guard windowIndex < candidates.count else {
-    fail("window-index \(windowIndex) out of range (\(candidates.count) windows)", 1)
-}
-
-let target = candidates[windowIndex].id
-
-guard
-    let image = CGWindowListCreateImage(
-        .null,
-        .optionIncludingWindow,
-        target,
-        [.boundsIgnoreFraming, .bestResolution]
-    )
-else {
-    fail(
-        "capture returned no image. This usually means Screen Recording is not granted "
-            + "to this helper: System Settings > Privacy & Security > Screen & System "
-            + "Audio Recording.",
-        4
-    )
-}
-
-// A capture with no pixels is what macOS hands back when the grant is missing
-// but the call itself succeeds, so treat it as the same failure rather than
-// writing an empty file that looks like success.
-guard image.width > 0, image.height > 0 else {
-    fail("capture produced an empty image; check the Screen Recording grant", 4)
-}
-
-let bitmap = NSBitmapImageRep(cgImage: image)
-guard let png = bitmap.representation(using: .png, properties: [:]) else {
-    fail("could not encode PNG", 4)
-}
-
-let outputURL = URL(fileURLWithPath: outputPath)
-do {
-    try png.write(to: outputURL, options: .atomic)
-} catch {
-    fail("could not write \(outputPath): \(error.localizedDescription)", 4)
-}
-
-print("captured \(image.width)x\(image.height) from \(bundleID) -> \(outputPath)")
