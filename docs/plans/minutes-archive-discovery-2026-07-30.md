@@ -1,0 +1,269 @@
+# Minutes Archive: Discovery and Security Contract
+
+Status: proposed discovery contract
+
+Date: 2026-07-30
+
+Implementation baseline: `origin/main` at
+`52a2ecfd75c63ebb1be765550855f62ccae38bc5`
+
+## Recommendation
+
+Build the first archive proof as a separate `Minutes Archive.app` Tauri target
+in the Minutes workspace. Share narrowly scoped Rust libraries and design
+tokens with Minutes, but give the archive app its own bundle identifier, data
+directory, command manifest, capabilities, release channel, and threat model.
+
+Do not put archive documents in `~/meetings`, add legal-only concepts to the
+conversation schema, expose the archive through the current Recall window, or
+fork the Minutes repository during discovery.
+
+The reusable product thesis is private, owned memory with provenance, scoped
+authority, and controlled egress. Conversation memory is one source adapter.
+Document archives are another. Legal is the first validation setting, not a
+hard-coded product identity.
+
+## Shipped Facts and Unlanded Inputs
+
+The implementation baseline already has local Markdown artifacts, a SQLite
+search index, sensitivity filtering, Tauri packaging, QMD registration and
+refresh hooks, and a shared Ollama adapter.
+
+QMD is not currently the implementation behind the public
+`minutes_core::search` path. That path opens the Minutes SQLite search index
+directly. QMD registration and refresh are integration scaffolding, not proof
+that Recall or `minutes search` performs hybrid retrieval.
+
+This contract also incorporates security invariants observed in the unlanded
+Silvercloud Conversation Trust and Sidekick branches. Those branches are design
+and test evidence, not shipped product behavior. No implementation should
+depend on their code until it is reconciled with fresh main and independently
+reviewed.
+
+The reusable unlanded invariants are:
+
+- authority and scope are established before retrieval;
+- an unscoped request fails closed rather than searching broadly;
+- inferred identity never grants access;
+- restricted, malformed, unreadable, stale, or policy-uncertain content fails
+  before prompt assembly or process or network invocation;
+- source bytes and authorization are revalidated immediately before egress;
+- derived data inherits source sensitivity and provenance;
+- a scope or policy change invalidates context assembled under the old scope;
+- local execution is claimed only after loopback is verified; and
+- provenance describes evidence actually supplied rather than implying
+  exhaustive citation coverage.
+
+## Concrete User Flow
+
+1. The attorney chooses an archive folder. The app receives only the explicit
+   folder capability; it does not scan the home directory implicitly.
+2. The app runs a metadata-only census. It reports aggregate formats, sizes,
+   age bands, packages, placeholders, symlinks, and failures. It emits no
+   filenames, paths, or document text.
+3. The app previews conversion coverage and storage requirements before
+   reading document contents.
+4. The attorney creates a vault and chooses its matter policy. Originals stay
+   read-only. The app creates private normalized sidecars with source identity,
+   hashes, page or paragraph coordinates, converter version, and sensitivity.
+5. The attorney can first run exact and Boolean searches over the normalized
+   corpus. Results are evidence cards containing an excerpt, source title,
+   source location, and an Open Original action.
+6. Hybrid semantic search is enabled only after the derivative-index gate is
+   satisfied. A local answerer may synthesize from retrieved excerpts, but
+   unsupported claims produce an explicit insufficient-evidence response.
+
+Example:
+
+> Find confidentiality provisions that are no more than three sentences and
+> also cover affiliates, compelled disclosure, and survival.
+
+The result is a ranked set of exact provisions. Each card shows why it matched,
+the three-sentence excerpt, document and page, and whether all three requested
+concepts occur in the same provision. A generated comparison is secondary to
+the evidence cards.
+
+## Architecture Boundary
+
+```text
+Minutes workspace
+|
+|-- minutes-core                 shared low-level utilities only
+|-- archive-core                 inventory, policy, provenance, corpus leases
+|-- archive-convert              isolated format conversion workers
+|-- archive-retrieve             exact, Boolean, and gated hybrid retrieval
+|-- archive-answer               evidence-constrained local synthesis
+|
+|-- Minutes.app                  conversation product
+`-- Minutes Archive.app          independent least-privilege Tauri target
+```
+
+`archive-core` owns authorization and source identity. Retrieval backends
+receive an already-authorized corpus lease rather than a raw filesystem root.
+The UI never receives unrestricted filesystem or shell access.
+
+Converters run out of process with no network, bounded time and output, and a
+fresh temporary directory. Their output is untrusted until validated.
+Documents and retrieved text are data, never instructions to an agent or
+converter orchestrator.
+
+## Source and Derivative Classes
+
+| Class | Examples | Required treatment |
+| --- | --- | --- |
+| Original | DOC, PDF, email, scan, package | Read-only; never rewritten |
+| Normalized | Markdown or text sidecar, OCR text | Same sensitivity as source |
+| Retrieval | FTS rows, chunks, embeddings, reranker cache | Same sensitivity as source; revocable |
+| Answer | excerpt card, generated comparison, export | Carries exact source provenance |
+| Operational | counts, health, converter status | Must not contain names, paths, or excerpts |
+
+Indexes, embeddings, OCR text, caches, logs, crash reports, and backups are
+confidential derivatives. Protecting only the original documents is a failed
+design.
+
+## Retrieval Contract
+
+The first proof uses exact and SQLite FTS retrieval because its membership and
+revocation behavior can be kept inside the application boundary.
+
+Hybrid retrieval may use QMD only through an application-owned, vault-specific
+database or a locked local sidecar. The global QMD collection registry is not a
+security boundary and must not contain attorney material.
+
+Before hybrid retrieval is enabled, the implementation must prove:
+
+- every query names an exact vault and authorized matter scope;
+- no unscoped fallback searches other collections;
+- the index database is private and excluded from telemetry and general
+  workspaces;
+- source removal or sensitivity change revokes the corresponding chunks;
+- source and index membership are fenced against concurrent change;
+- symlink, hard-link, root replacement, and stale-index cases fail closed;
+- model downloads are pinned and occur before confidential processing or
+  through an explicit setup-only network capability; and
+- clearing a vault removes its normalized and retrieval derivatives.
+
+If these properties cannot be established, semantic indexing remains disabled.
+
+## Tauri Security Profile
+
+The archive target must not inherit the existing all-window capability file or
+the full Minutes command registry.
+
+Its production profile has:
+
+- a restrictive CSP and no remote frontend content;
+- no devtools, PTY, shell, global shortcut, autostart, or general opener
+  capability;
+- no network capability during census, conversion, indexing, or local search;
+- explicit application commands in the Tauri manifest;
+- a file-picker-granted root narrowed to read-only backend commands;
+- no frontend access to arbitrary paths;
+- a separate updater decision and signing identity; and
+- no document content in logs, analytics, crash metadata, window titles, or
+  notifications.
+
+Opening an original is a backend action against a current authorized source
+identity, not a general `shell:open` grant to the webview.
+
+## Threat Model
+
+| Threat | Required control |
+| --- | --- |
+| Compromised frontend | Narrow command manifest, strict CSP, window-specific capability |
+| Malicious document prompt injection | Treat content as data; fixed orchestration; evidence-only generation |
+| Converter exploit or decompression bomb | Networkless child, resource ceilings, validated bounded output |
+| Cross-matter retrieval | Capability before retrieval; separate vault or matter lease; deny unscoped calls |
+| Stale semantic index | Membership manifest, policy invalidation, pre-answer revalidation |
+| Symlink or root replacement | Canonical identities, no link following, initial and final fences |
+| Another local user or backup reader | OS account boundary, encrypted device and backup, private permissions |
+| Remote-model disclosure | Cloud disabled by default; verified loopback for local inference |
+| Misleading AI answer | Exact excerpts, page anchors, claim-evidence closure, insufficient-evidence state |
+| Lost or altered source | Read-only originals, hash-backed provenance, no silent repair |
+
+## Compliance Boundary
+
+The product may be described during discovery as local-first and designed for
+confidential professional material. It must not be described as compliant,
+privilege-preserving, HIPAA compliant, or approved for a regulated industry
+until the applicable control and legal reviews are complete.
+
+Technical release gates include a documented data-flow inventory, independent
+security review, dependency and model inventory, signed builds, encrypted
+device and backup guidance, retention and deletion verification, incident
+response behavior, access-log review, and adversarial cross-vault tests.
+
+Professional-use gates include jurisdiction-specific ethics review, firm
+policy, client or engagement requirements, supervision, human verification,
+and informed consent wherever information would leave the firm or another
+rule requires it.
+
+## Discovery Gates
+
+The Peter pilot advances in four bounded stages.
+
+### Stage 0: Synthetic census
+
+The metadata-only census passes privacy tests and runs against a synthetic
+archive containing modern, legacy, package, scan, email, placeholder, and link
+cases.
+
+### Stage 1: Attorney-run aggregate census
+
+The attorney runs the census locally against an explicitly selected folder.
+Only the aggregate JSON is reviewed. No source filename, path, or content is
+transferred.
+
+Run it from a trusted local Minutes checkout and write the result outside the
+selected archive:
+
+```bash
+python3 scripts/archive_format_census.py "/explicit/archive/folder" \
+  --pretty > /tmp/minutes-archive-census.json
+```
+
+### Stage 2: Synthetic retrieval proof
+
+Converters and exact retrieval are evaluated on public or synthetic legal
+documents. Every result opens the correct source location, and adversarial
+documents cannot alter system behavior.
+
+### Stage 3: Controlled private pilot
+
+The attorney selects a bounded copy or read-only subset after reviewing the
+coverage report. Hybrid retrieval and local generation remain separately
+gated. No cloud provider receives archive content.
+
+## Pilot Success Measures
+
+- Zero modification of source documents.
+- Zero filename, path, or content disclosure from the census.
+- Zero cross-vault or restricted-source results in deterministic adversarial
+  tests.
+- Every displayed excerpt resolves to the exact current source and location.
+- Every generated factual claim identifies the excerpts that support it.
+- Exact and Boolean search handles concept conjunction within one provision,
+  not merely across a document.
+- Unsupported or stale evidence produces a refusal rather than a plausible
+  clause.
+- The observed corpus format coverage is high enough to define the private
+  pilot without guessing.
+
+## Explicit Non-Goals for Discovery
+
+- General home-directory or whole-disk scanning.
+- Automatic upload, sync, collaboration, or remote administration.
+- Autonomous legal advice, filing, drafting, or source modification.
+- Matter classification inferred solely by an LLM.
+- A shared multi-user service.
+- Marketing a regulatory certification.
+- Replacing the current Minutes conversation product or importing legal
+  material into `~/meetings`.
+
+## First Decision After the Census
+
+The aggregate format distribution determines the converter plan. A corpus
+dominated by searchable PDF and DOCX can move directly to a small synthetic
+retrieval proof. A corpus dominated by scanned PDFs, legacy Word, WordPerfect,
+Outlook containers, Apple document packages, or cloud placeholders requires a
+conversion and hydration proof before any retrieval UI work.
