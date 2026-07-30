@@ -4,6 +4,7 @@ use std::process::Command;
 
 fn main() {
     compile_mic_check_helper();
+    compile_ui_shot_helper();
     compile_system_audio_helper();
     compile_calendar_helper();
     stage_minutes_cli_sidecar();
@@ -171,6 +172,49 @@ fn compile_mic_check_helper() {
 
     std::fs::copy(&binary, &target_binary)
         .expect("failed to copy target-specific mic_check helper");
+}
+
+/// Compile the narrow UI screenshot helper (`ui_shot`).
+///
+/// Built as its own binary so a Screen Recording TCC grant can attach to it
+/// alone, rather than to sshd or to the whole app. The helper refuses to capture
+/// anything outside its compiled-in Minutes bundle allowlist, so the grant it
+/// holds cannot photograph unrelated windows.
+fn compile_ui_shot_helper() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "macos" {
+        return;
+    }
+
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set"),
+    );
+    let source = manifest_dir.join("src/ui_shot.swift");
+    let bin_dir = manifest_dir.join("bin");
+    let binary = bin_dir.join("ui_shot");
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".into());
+    let target_binary = bin_dir.join(format!("ui_shot-{}", target));
+
+    println!("cargo:rerun-if-changed={}", source.display());
+    std::fs::create_dir_all(&bin_dir).expect("failed to create helper bin dir");
+
+    let output = Command::new("swiftc")
+        .args(["-target", &swift_deployment_target("11.0")])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("failed to run swiftc for ui_shot");
+
+    if !output.status.success() {
+        panic!(
+            "failed to compile ui_shot.swift: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    std::fs::copy(&binary, &target_binary)
+        .expect("failed to copy target-specific ui_shot helper");
 }
 
 fn compile_system_audio_helper() {
