@@ -8389,21 +8389,34 @@ fn create_para_successor(
                 Err(error) => Some(Err(error)),
             }
         })
-        .transpose()?
+        .transpose()
+        .map_err(|error| format!("private PARA stage allocation failed: {error}"))?
         .ok_or("could not allocate a private PARA successor generation")?;
     let path = stage.display_path().to_path_buf();
     let stage_name = path.file_name().ok_or("PARA stage has no name")?;
-    let stage_proof = stage.recovery_directory_proof()?;
+    let stage_proof = stage
+        .recovery_directory_proof()
+        .map_err(|error| format!("private PARA stage identity proof failed: {error}"))?;
     drop(stage);
-    let people_file = para_open_directory_no_follow(private_root)?;
+    let people_file = para_open_directory_no_follow(private_root)
+        .map_err(|error| format!("private PARA parent reopen failed: {error}"))?;
     let people_cap = CapDir::from_std_file(people_file);
     let opened = people_cap
-        .open_with(stage_name, &para_open_directory_options())?
+        .open_with(stage_name, &para_open_directory_options())
+        .map_err(|error| format!("private PARA stage reopen failed: {error}"))?
         .into_std();
-    let stage = boundary.bind_existing_owner_private_child(stage_name)?;
-    stage.attest_recovery_directory_proof(&stage_proof)?;
-    stage.attest_exact_directory_file(&opened)?;
-    boundary.attest_for_source_cleanup()?;
+    let stage = boundary
+        .bind_existing_owner_private_child(stage_name)
+        .map_err(|error| format!("private PARA stage capability rebind failed: {error}"))?;
+    stage
+        .attest_recovery_directory_proof(&stage_proof)
+        .map_err(|error| format!("private PARA stage identity recheck failed: {error}"))?;
+    stage
+        .attest_exact_directory_file(&opened)
+        .map_err(|error| format!("private PARA stage handle comparison failed: {error}"))?;
+    boundary
+        .attest_for_source_cleanup()
+        .map_err(|error| format!("private PARA parent recheck failed: {error}"))?;
     let stage_cap = CapDir::from_std_file(opened.try_clone()?);
     let expected = vec![
         (OsString::from("items.json"), items),
@@ -8415,13 +8428,22 @@ fn create_para_successor(
         options.create_new(true).read(true).write(true);
         #[cfg(unix)]
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        let mut file = stage_cap.open_with(name, &options)?.into_std();
-        set_restrictive_permissions_file(&file)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        attest_visible_exact_file(&destination, &file, bytes)?;
+        let mut file = stage_cap
+            .open_with(name, &options)
+            .map_err(|error| format!("private PARA member creation failed: {error}"))?
+            .into_std();
+        set_restrictive_permissions_file(&file)
+            .map_err(|error| format!("private PARA member permission check failed: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("private PARA member write failed: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("private PARA member durability failed: {error}"))?;
+        attest_visible_exact_file(&destination, &file, bytes)
+            .map_err(|error| format!("private PARA member attestation failed: {error}"))?;
     }
-    boundary.attest_for_source_cleanup()?;
+    boundary
+        .attest_for_source_cleanup()
+        .map_err(|error| format!("private PARA parent final recheck failed: {error}"))?;
     sync_para_directory_handle(&opened)?;
     sync_para_directory(private_root)?;
     // The bound policy capability intentionally denies delete sharing while
@@ -8434,7 +8456,8 @@ fn create_para_successor(
         directory: opened,
         expected,
     };
-    attest_para_successor(&successor.path, &successor.directory, &successor.expected)?;
+    attest_para_successor(&successor.path, &successor.directory, &successor.expected)
+        .map_err(|error| format!("private PARA successor final attestation failed: {error}"))?;
     Ok(successor)
 }
 

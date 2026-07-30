@@ -1405,3 +1405,25 @@ remaining native jobs were active. No validation-only workflow or independent
 final reviews count for this SHA. A new exact candidate must repeat every local
 and hosted gate. Draft PR #604 remains unmerged; no merge, tag, signing,
 publication, deployment, or release is authorized.
+
+THE EXPLICIT GUARD DROP DID NOT RESOLVE THE RAW SHARING FAILURE. Exact SHA
+`e47b0ffe` passed lint run 30517727624, and all 16 completed short/non-native
+lanes in full-CI run 30517727611 were green. Native Windows still completed
+with 1,496 passed, 9 failed, and 5 ignored. The failures and raw sharing error
+32 matched `154cb847`; the DACL and legacy-capture regressions remained green.
+Therefore the prior handle-lifetime explanation was incomplete.
+
+The replacement adds privacy-safe operation labels around every fallible stage
+allocation, identity proof, parent/stage reopen, capability rebind/recheck,
+member create/permission/write/durability/attestation, parent recheck, and final
+successor-attestation boundary. Labels never include meeting names, person
+names, configured paths, or private bytes. The next native Windows failure must
+identify the precise operation rather than prompting another speculative
+lifetime change.
+
+STATUS: `e47b0ffe` is not accepted. Its already-failed run was canceled while
+remaining native jobs were active. No validation-only workflow or independent
+final reviews count for this SHA. The diagnostic candidate must repeat local
+gates before push and hosted lint/full CI on its exact SHA. Draft PR #604
+remains unmerged; no merge, tag, signing, publication, deployment, or release
+is authorized.
