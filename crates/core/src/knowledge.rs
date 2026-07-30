@@ -623,8 +623,21 @@ fn open_regular_file_no_follow_for_update(path: &Path) -> Result<File, Box<dyn s
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        options
+            // Every caller updates a private journal/control file that may be
+            // renamed by its exact handle after recovery. FileRenameInformation
+            // requires DELETE access on that retained source handle.
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
@@ -6764,8 +6777,20 @@ fn begin_para_transaction(
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     #[cfg(windows)]
     {
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        options
+            // The completion protocol renames this exact retained journal
+            // handle. Windows FileRenameInformation requires DELETE access.
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
     }
     let mut file = people_cap.open_with(name, &options)?.into_std();
     set_restrictive_permissions_file(&file)?;

@@ -1134,3 +1134,29 @@ content. Acceptance still requires full ordinary CI and focused
 validation-only Windows success for one exact SHA, followed by three fresh
 independent reviews. Draft PR #604 remains unmerged; no merge or release action
 is authorized.
+
+THE SIXTH REPLACEMENT REMAINS BLOCKED, BUT ISOLATED ONE FINAL SHARED AUTHORITY.
+Hosted full-CI run 30507843188 and lint run 30507843165 exercised exact SHA
+`325472fe`. Lint and Linux were green, and the complete Windows core result
+improved from 1,487 passed and 14 failed to 1,493 passed and 8 failed, with 5
+ignored. The process-tree deadline fixtures, invalid knowledge-root checks,
+pre-journal v3 migration topology, legacy crash-state assertions, and
+final-winner private-retention assertions all passed on the hosted Windows
+runner.
+
+Every remaining normal-reconciliation failure carried the same privacy-safe
+stage: active or inactive PARA retirement. The crash-recovery fixture failed
+at the same completion boundary. Windows `FileRenameInformation` renames the
+exact retained source handle and requires DELETE access on that handle.
+Generation-directory handles already requested it, but schema-1 PARA
+transaction journals were created and rebound after recovery with only
+read/write access. Their final move into a uniquely named completed receipt
+therefore returned Windows code 5 before exact cleanup could run.
+
+STATUS: `325472fe` is not accepted. The next candidate grants DELETE only to
+the private mutation-capable transaction-journal handles at initial creation
+and recovery rebind, keeps read/write/delete sharing for cooperating exact
+attestations, and uses write-through exact handles for the Windows durability
+contract. No public derivative ACL, source authorization, retirement proof, or
+failure envelope is relaxed. Draft PR #604 remains unmerged; no merge, signing,
+publication, deployment, or release is authorized.
