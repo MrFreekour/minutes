@@ -6897,6 +6897,11 @@ fn remove_owner_private_para_capture_with_hook(
     proof: &ParaGenerationProof,
     before_final_identity_check: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let root_boundary =
+        crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(private_root)?;
+    root_boundary.attest_for_source_cleanup()?;
+    let capture_name = capture.file_name().ok_or("PARA capture has no name")?;
+    let exact_capture = root_boundary.bind_existing_owner_private_child(capture_name)?;
     let expected = proof
         .entry_names
         .iter()
@@ -6908,23 +6913,21 @@ fn remove_owner_private_para_capture_with_hook(
     }
     if present.contains(&OsString::from("items.json")) {
         inspect_para_captured_member(&capture.join("items.json"), &proof.items)?;
-        remove_owner_private_para_file(&capture.join("items.json"))?;
+        let file = exact_capture.bind_file_allow_links(OsStr::new("items.json"))?;
+        exact_capture.remove_owned_private_file(file)?;
     }
     if let Some(summary) = proof.summary.as_ref() {
         if present.contains(&OsString::from("summary.md")) {
             inspect_para_captured_member(&capture.join("summary.md"), summary)?;
-            remove_owner_private_para_file(&capture.join("summary.md"))?;
+            let file = exact_capture.bind_file_allow_links(OsStr::new("summary.md"))?;
+            exact_capture.remove_owned_private_file(file)?;
         }
     }
     let capture_directory = para_open_directory_no_follow(capture)?;
     if !bounded_para_entry_names(capture, 1)?.is_empty() {
         return Err("completed PARA capture retained unexpected entries".into());
     }
-    let root_boundary =
-        crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(private_root)?;
     root_boundary.attest_for_source_cleanup()?;
-    let name = capture.file_name().ok_or("PARA capture has no name")?;
-    let exact_capture = root_boundary.bind_existing_owner_private_child(name)?;
     exact_capture.attest_exact_directory_file(&capture_directory)?;
     drop(capture_directory);
     root_boundary
@@ -8389,7 +8392,17 @@ fn create_para_successor(
         .transpose()?
         .ok_or("could not allocate a private PARA successor generation")?;
     let path = stage.display_path().to_path_buf();
-    let opened = stage.try_clone_exact_directory_file()?;
+    let stage_name = path.file_name().ok_or("PARA stage has no name")?;
+    let stage_proof = stage.recovery_directory_proof()?;
+    drop(stage);
+    let people_file = para_open_directory_no_follow(private_root)?;
+    let people_cap = CapDir::from_std_file(people_file);
+    let opened = people_cap
+        .open_with(stage_name, &para_open_directory_options())?
+        .into_std();
+    let stage = boundary.bind_existing_owner_private_child(stage_name)?;
+    stage.attest_recovery_directory_proof(&stage_proof)?;
+    stage.attest_exact_directory_file(&opened)?;
     boundary.attest_for_source_cleanup()?;
     let stage_cap = CapDir::from_std_file(opened.try_clone()?);
     let expected = vec![

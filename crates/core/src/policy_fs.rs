@@ -1871,11 +1871,6 @@ impl BoundRecoveryDirectory {
         })
     }
 
-    pub(crate) fn try_clone_exact_directory_file(&self) -> std::io::Result<File> {
-        self.attest_location()?;
-        Ok(self.chain.leaf().try_clone()?.into_std_file())
-    }
-
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn bind_existing_owner_private_child(&self, name: &OsStr) -> std::io::Result<Self> {

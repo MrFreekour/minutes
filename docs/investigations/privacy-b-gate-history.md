@@ -1346,3 +1346,36 @@ complete ordinary CI must then be terminal green before guarded validation-only
 Windows execution and all three independent reviews repeat. Draft PR #604
 remains unmerged; no merge, tag, signing, publication, deployment, or release
 is authorized.
+
+THE FIRST ATOMIC CHILD CANDIDATE EXPOSED HANDLE-AUTHORITY AND LEGACY-RESIDUE
+FOLLOW-ONS. Exact SHA `691aaf1d` passed lint run 30515439018. In full-CI run
+30515439025, native Windows again finished with 1,496 passed, 9 failed, and
+5 ignored. The new fresh-child regression and the private-journal regressions
+passed, but successor creation reached directory durability with a cloned
+policy capability that lacked the PARA path's required Windows write/delete
+authority. That access-denied error cascaded into transaction-level policy
+denials and missing expected outputs.
+
+One independently reached cleanup failure named a moved
+`.minutes-person-capture-*` directory. That old generation originated in the
+user-selected derivative tree, so moving it beneath an owner-private parent
+does not retroactively give the child an owner-only DACL. Requiring that
+untrusted legacy residue to attest as a newly private child contradicted the
+descriptor-neutral recovery contract established after `c16fcbb7`.
+
+The replacement retains the atomic fresh-child identity proof, releases the
+creation handle, reopens the same proven child with the established PARA
+write/delete/share contract, and then rebinds and re-attests the exact child
+capability before writing or syncing it. Legacy capture cleanup binds the
+already owner-private root, derives the untrusted child through that retained
+root, and removes only proof-matched exact members and the exact empty child.
+It no longer resolves the moved child as a standalone private root or weakens
+the DACL requirement for the actual private parent, journals, controls, or
+leases.
+
+STATUS: `691aaf1d` is not accepted. The already-failed run was canceled while
+remaining native jobs were active; it also contained an unrelated macOS watcher
+protocol timeout in unchanged JavaScript. No validation-only workflow or
+independent final reviews count for this SHA. A new exact candidate must repeat
+all local and hosted gates. Draft PR #604 remains unmerged; no merge, tag,
+signing, publication, deployment, or release is authorized.
