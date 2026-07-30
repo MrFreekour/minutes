@@ -607,11 +607,20 @@ fn parakeet_status_view(config: &Config) -> ParakeetStatusView {
 }
 
 fn apple_speech_status_view() -> serde_json::Value {
+    let transport_available =
+        minutes_core::pipeline::apple_speech_private_audio_transport_supported();
     match minutes_core::apple_speech::probe_capabilities() {
         Ok(report) => serde_json::json!({
             "supported": report.runtime_supported,
             "selectable": false,
-            "unavailable_reason": minutes_core::pipeline::apple_speech_unavailable_reason(),
+            "transport_available": transport_available,
+            "unavailable_reason": if transport_available && report.runtime_supported {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(
+                    minutes_core::pipeline::apple_speech_unavailable_reason().into()
+                )
+            },
             "report": report,
         }),
         Err(error) => serde_json::json!({
@@ -627,6 +636,16 @@ fn live_transcript_fallback_order_view(config: &Config) -> Vec<String> {
     let resolved = config.effective_live_transcript_backend();
     let parakeet_ready = parakeet_status_view(config).ready;
     match resolved {
+        "apple-speech"
+            if minutes_core::pipeline::apple_speech_private_audio_transport_supported() =>
+        {
+            let mut order = vec!["apple-speech".to_string()];
+            if parakeet_ready {
+                order.push("parakeet".to_string());
+            }
+            order.push("whisper".to_string());
+            order
+        }
         "apple-speech" => vec!["whisper".to_string()],
         "parakeet" => {
             if parakeet_ready {
@@ -778,6 +797,20 @@ fn standalone_live_readiness_view(config: &Config) -> SurfaceReadinessView {
             }
         }
         "apple-speech" => {
+            if minutes_core::pipeline::apple_speech_private_audio_transport_supported() {
+                return SurfaceReadinessView {
+                    configured_backend,
+                    resolved_backend: "apple-speech".into(),
+                    ready: true,
+                    model_name: String::new(),
+                    detail: format!(
+                        "Apple Speech uses the authenticated bundled byte-transport service. No named plaintext utterance file is created. Fallback order: {}.",
+                        fallback_order.join(" -> ")
+                    ),
+                    next_action: "none".into(),
+                    fallback_order,
+                };
+            }
             let (detail, next_action) = if whisper_ready {
                 (
                     format!(

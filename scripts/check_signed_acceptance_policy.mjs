@@ -7,9 +7,9 @@ import { readFileSync } from "node:fs";
 // boundary and secret-bearing job. Raw regex matches are intentionally not the
 // authority: these goldens make comment/dead-step duplication fail closed.
 const EXPECTED_SIGNING_JOB_SHA256 =
-  "f29213abf408b5e69a381bfbefef7db4896368c1369d8acc38f09f8442c41aad";
+  "4a5aa3f4aead6d336e57fa862085bffb594940923e93d8f58fab9cae962ef310";
 const EXPECTED_PRE_SIGNING_BOUNDARY_SHA256 =
-  "f532d4e841a4be222ccec24b029a4a8f413dcfe6f4688c621475dace9c54c2e6";
+  "c6fb10e1051bd745f737d4718ad949b9b1a01b585702bfecf354be752ff2e278";
 const EXPECTED_TRIGGER_BLOCK = `on:
   workflow_dispatch:
     inputs:
@@ -82,6 +82,26 @@ if (!signingJobFixture) {
   requirePattern(
     /signed parent is not bound to the exact graph worker/,
     "signed acceptance must verify the final parent-to-helper binding",
+  );
+  requirePattern(
+    /apple_speech_worker_bundle="\$app\/Contents\/XPCServices\/com\.useminutes\.apple-speech-worker\.xpc"[\s\S]*?test ! -e "\$app\/Contents\/MacOS\/minutes-apple-speech-worker"[\s\S]*?--entitlements payload\/apple-speech-worker-entitlements\.plist[\s\S]*?--identifier com\.useminutes\.apple-speech-worker[\s\S]*?--sign "\$MINUTES_DEV_SIGNING_IDENTITY" "\$apple_speech_worker_bundle"/,
+    "the nested Apple Speech XPC service must receive only its dedicated App Sandbox identity",
+  );
+  requirePattern(
+    /apple-speech-worker-entitlements\.actual\.plist[\s\S]*?expected = \{"com\.apple\.security\.app-sandbox": True\}[\s\S]*?actual != expected/,
+    "signed acceptance must enforce the Apple Speech worker's exact one-key entitlement allowlist",
+  );
+  requirePattern(
+    /minutes-apple-speech-worker\.cdhash[\s\S]*?observed_apple_cdhash[\s\S]*?test "\$expected_apple_cdhash" = "\$observed_apple_cdhash"/,
+    "signed acceptance must seal and verify the Apple Speech worker's exact CodeDirectory hash",
+  );
+  requirePattern(
+    /MINUTES_APPLE_SPEECH_WORKER_CDHASH_V1=[\s\S]*?contents\.count\(marker\) != 1[\s\S]*?invalid prior parent Apple Speech worker seal[\s\S]*?os\.fsync/,
+    "signed acceptance must bind one exact Apple Speech worker hash into the parent before outer signing",
+  );
+  requirePattern(
+    /signed parent is not bound to the exact Apple Speech worker/,
+    "signed acceptance must verify the final parent-to-Apple-Speech-worker binding",
   );
 }
 

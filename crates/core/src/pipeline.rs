@@ -1278,18 +1278,17 @@ pub const fn parakeet_private_audio_transport_supported() -> bool {
     false
 }
 
-/// Whether the pathname-only Apple Speech helper can receive private audio
-/// without publishing a named plaintext WAV.
-///
-/// It cannot today: the helper accepts only `--audio-path`. Keep retained
-/// Apple Speech preferences on the sealed in-process Whisper path until the
-/// helper has an exact byte/fd transport (minutes-hueo).
-pub const fn apple_speech_private_audio_transport_supported() -> bool {
+/// Whether this exact running app can authenticate the bundled one-purpose
+/// Apple Speech XPC service before sending private utterance bytes.
+pub fn apple_speech_private_audio_transport_supported() -> bool {
+    // The service implementation and packaging are present, but product
+    // selection remains fail-closed until the exact reviewed SHA passes the
+    // separately authorized signed-macOS hostile-holder/runtime gate.
     false
 }
 
 pub const fn apple_speech_unavailable_reason() -> &'static str {
-    "the Apple Speech helper cannot receive secure private audio yet"
+    "the signed Apple Speech secure private audio byte-transport service is unavailable or untrusted"
 }
 
 /// One cross-surface answer to whether Parakeet can actually be selected.

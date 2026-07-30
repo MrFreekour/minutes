@@ -1453,6 +1453,22 @@ fn main() {
     {
         let _ = minutes_core::graph_worker::install_policy_projection_worker_executable(sidecar);
     }
+    #[cfg(target_os = "macos")]
+    if let Some(service) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| {
+            executable.parent().and_then(|macos| {
+                macos.parent().map(|contents| {
+                    contents
+                        .join("XPCServices")
+                        .join("com.useminutes.apple-speech-worker.xpc")
+                })
+            })
+        })
+        .filter(|candidate| candidate.is_dir())
+    {
+        let _ = minutes_core::apple_speech_worker::install_apple_speech_worker_service(service);
+    }
     // Route whisper.cpp + ggml C-level logs through Rust `tracing` so they
     // do not leak to raw stderr. The Tauri menu-bar app records audio in
     // process and runs the same VAD path the CLI does, so the

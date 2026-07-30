@@ -461,8 +461,7 @@ pub(crate) fn effective_batch_engine(config: &Config) -> &str {
     let requested = config.transcription.engine.as_str();
     if (requested.eq_ignore_ascii_case("parakeet")
         && !crate::pipeline::parakeet_capability(cfg!(feature = "parakeet")).selectable)
-        || (requested.eq_ignore_ascii_case("apple-speech")
-            && !crate::pipeline::apple_speech_private_audio_transport_supported())
+        || requested.eq_ignore_ascii_case("apple-speech")
     {
         "whisper"
     } else {

@@ -7,19 +7,19 @@ import { existsSync, readFileSync } from "node:fs";
 // These whole-file hashes prevent dead/comment-only duplicate code from
 // satisfying the structural checks below.
 const EXPECTED_SOURCE_SHA256 = {
-  release: "986432ffb8697f36a026afa6e66a5bf20cd0861de5e428029edca0129088c19d",
-  acceptance: "b5afb18dd30be29a9885331ed8dd505c8ff5ffd3a632232d328fe3b6d08b8c3f",
-  build: "5f6029f8e22484a55294f08de62df299e816e08f4b45278d143a008142a47ea5",
-  dev: "70f7a3aa227440c5928bc51227d64fbf85176b5f966b2fcc04a15e159bbd223e",
+  release: "564b8401767f9390e3f3502eecd562711df7d10e4790178bbb6099eebe6c0ed5",
+  acceptance: "df1447a6239649d9d8b3c9f6f0a45c86b02764d28489fa2645f894946ad7546d",
+  build: "6a1933306c99ccbfc6c5cb35a577389fbe79f08333e855661dc1994f0f9718b1",
+  dev: "b308c3088597f154a247cbfb299cd8b4da432378b4a41b3309fb0a2a15beff3c",
   packageXpc: "baebd532d240fc26188c431f571d0a44f2ce1e7240c3277284c9ea9e69c1ef82",
-  tauri: "8b338a848edfb2e5e07eca0f5e79761be67b1f03ada34343ef3556b21c069e40",
+  tauri: "f127e92a1a2a635326d13dd766b3e6cc841655bce30ea2d01d67d9f12c15502c",
   entitlements: "7971da95784f3bdeb3ea257b5c1a31317731b513b16c47e2c4e588fc0ac40bae",
-  xpc: "f3a48db2c10a14d69f074bc6671d05c715c93d1d39344005bf0a7851236fff24",
+  xpc: "8a226ce7b5120c792b22bc1cb9d07d966177944ad069aac1bc5b4df5b061664f",
   graphWorker: "804b6bb314b314b8cf61d6f8cd5bfb7f2374ceaa355fc4d12b92fe39c009230e",
-  authority: "31499fdcd41a1240c3568d5ffc73801243a1432e1312a2c31a3626d0766e5786",
+  authority: "d16834a0d607266feb888c8958b6b40794eebe5bde50ca0b259f8041764d96c9",
   helperPlist: "543617b03e757520a201bd0a7751cc6aadb48cf0d6b4a44bfc9ef4323a69850f",
   helperEntry: "0efe701412d909021d6ae784eac941e7d9b9d1a0f2ee0f3144bcb15fc2b2ba18",
-  cliCargo: "700a45e3f342fc22965218e7f346d128c655eba973e157af1a1a730fe708bafa",
+  cliCargo: "599b573b8ecb27685857541eaf375d51012001f3af46a9878f36e919508f67a4",
 };
 
 const sources = {
@@ -72,6 +72,39 @@ function validate(candidate, checkGoldens = true) {
       cursor = next + fragment.length;
     }
   };
+  const section = (source, start, end, message) => {
+    const begin = source.indexOf(start);
+    const finish = source.indexOf(end, begin + start.length);
+    if (begin < 0 || finish < 0) {
+      errors.push(message);
+      return "";
+    }
+    return source.slice(begin, finish);
+  };
+  const graphParentXpc = section(
+    candidate.xpc,
+    "fn open_authenticated_connection(",
+    "fn open_apple_speech_authenticated_connection(",
+    "the graph parent XPC boundary must remain independently inspectable",
+  );
+  const graphServiceXpc = section(
+    candidate.xpc,
+    "pub fn run_service_main()",
+    "pub fn run_apple_speech_service_main()",
+    "the graph service XPC boundary must remain independently inspectable",
+  );
+  const graphRunXpc = section(
+    candidate.xpc,
+    "pub(crate) fn run(",
+    "pub(crate) fn run_apple_speech(",
+    "the graph request XPC boundary must remain independently inspectable",
+  );
+  const graphHandlerXpc = section(
+    candidate.xpc,
+    "fn handle_service_message(",
+    "enum AppleSpeechServicePhase",
+    "the graph service handler must remain independently inspectable",
+  );
 
   if (checkGoldens) {
     for (const [name, expected] of Object.entries(EXPECTED_SOURCE_SHA256)) {
@@ -179,25 +212,31 @@ function validate(candidate, checkGoldens = true) {
   );
 
   ordered(
-    candidate.xpc,
+    graphParentXpc,
     [
-      "xpc_connection_set_peer_code_signing_requirement",
       "set_peer_requirement(connection.object, &requirement)?",
       "xpc_connection_set_event_handler(connection.object, &events)",
       "xpc_connection_resume(connection.object)",
       "set_command(begin.0, COMMAND_BEGIN)",
       "connection.send_with_reply(begin.0, deadline)?",
-      "set_command(chunk.0, COMMAND_CHUNK)",
     ],
-    "the parent must install the exact peer requirement and complete a content-free handshake before any private chunk",
+    "the graph parent must install the exact peer requirement before its content-free handshake",
   );
   requirePattern(
-    candidate.xpc,
+    graphParentXpc,
     /format!\("identifier \\"com\.useminutes\.graph-worker\\" and cdhash H\\"\{encoded\}\\"[\s\S]*?certificate leaf\[subject\.OU\] = \\"63TMLKT8HN\\"/,
     "trusted distribution must require the exact graph service CDHash and Team",
   );
   ordered(
-    candidate.xpc,
+    graphRunXpc,
+    [
+      "open_authenticated_connection(",
+      "set_command(chunk.0, COMMAND_CHUNK)",
+    ],
+    "graph content chunks must follow the authenticated connection handshake",
+  );
+  ordered(
+    graphServiceXpc,
     [
       "service_parent_requirement()",
       "set_peer_requirement(peer, &requirement)",
@@ -256,7 +295,7 @@ function validate(candidate, checkGoldens = true) {
     "the XPC worker must install process, address-space, and wall-clock ceilings",
   );
   ordered(
-    candidate.xpc,
+    graphServiceXpc,
     [
       "pub fn run_service_main()",
       "prepare_macos_graph_xpc_worker()",
@@ -272,7 +311,7 @@ function validate(candidate, checkGoldens = true) {
     "the XPC service must install immutable ceilings once, admit one authenticated request, and exit after its terminal reply",
   );
   requirePattern(
-    candidate.xpc,
+    graphRunXpc,
     /let outcome = \(\|\|[\s\S]*?let settlement = connection\.settle\(outcome\.is_err\(\), deadline\);[\s\S]*?XPC_SETTLEMENT_FAILED\.store\(true, Ordering::Release\)/,
     "every acquired parent connection must settle the one-shot service before publishing success, returning an error, or admitting a successor",
   );
@@ -287,7 +326,7 @@ function validate(candidate, checkGoldens = true) {
     "failed parent operations must send a terminal abort and then observe service exit",
   );
   requirePattern(
-    candidate.xpc,
+    graphParentXpc,
     /match begin_result \{[\s\S]*?terminal_acknowledged\.load\(Ordering::Acquire\)[\s\S]*?connection\.settle\(false, deadline\)[\s\S]*?XPC_SETTLEMENT_FAILED\.store\(true, Ordering::Release\)/,
     "a failed content-free handshake must settle or poison the one-shot transport",
   );
@@ -297,7 +336,7 @@ function validate(candidate, checkGoldens = true) {
     "an unconfirmed service exit must fail closed against every later request",
   );
   requirePattern(
-    candidate.xpc,
+    graphHandlerXpc,
     /if command == "abort" \{\s*return service_reply\(message, phase\.abort\(\)\);/,
     "the service must turn the authenticated abort command into a terminal reply",
   );
@@ -332,7 +371,7 @@ function validate(candidate, checkGoldens = true) {
     "terminal acknowledgement and later connection end must be bound to one service generation",
   );
   requirePattern(
-    candidate.xpc,
+    graphParentXpc,
     /if xpc_is_connection_end\(event\) \{\s*transport_failed\.store\(true, Ordering::Release\)/,
     "every connection interruption must immediately poison transport before any relaunching request",
   );
@@ -342,19 +381,29 @@ function validate(candidate, checkGoldens = true) {
     "a transport failure or service-generation mismatch must poison rather than auto-launch an abort helper",
   );
   requirePattern(
-    candidate.xpc,
+    graphServiceXpc,
     /classify_service_peer_event\([\s\S]*?ServicePeerEvent::CancelPeer[\s\S]*?ServicePeerEvent::ExitProcess[\s\S]*?message_peer_was_rejected\.store\(true, Ordering::Release\)[\s\S]*?BUSY_KEY[\s\S]*?TERMINAL_KEY[\s\S]*?return;/,
     "a losing overlap must receive an authenticated nonterminal busy response and its teardown must not kill the owner",
   );
   requirePattern(
-    candidate.xpc,
+    graphServiceXpc,
     /ServicePeerEvent::CancelPeer => \{\s*unsafe \{ xpc_connection_cancel\(peer_address as XpcObject\) \};\s*return;\s*\}/,
     "an unclaimed or rejected peer teardown must cancel only that peer",
   );
   requirePattern(
     candidate.xpc,
-    /fn awaiting_command_can_claim\(command: Option<&str>\) -> bool \{\s*command == Some\("begin"\)\s*\}[\s\S]*?awaiting_begin && !awaiting_command_can_claim\(command\)[\s\S]*?TERMINAL_KEY[\s\S]*?return;[\s\S]*?service_request_nonce_matches\(message, &message_service_nonce\)/,
-    "only begin may claim a fresh service and every later request must carry the bound process nonce",
+    /fn awaiting_command_can_claim\(command: Option<&str>\) -> bool \{\s*command == Some\("begin"\)\s*\}/,
+    "only begin may claim a fresh service process",
+  );
+  ordered(
+    graphServiceXpc,
+    [
+      "awaiting_begin && !awaiting_command_can_claim(command)",
+      "TERMINAL_KEY",
+      "return;",
+      "service_request_nonce_matches(message, &message_service_nonce)",
+    ],
+    "every graph request after begin must carry the bound process nonce",
   );
 
   for (const source of Object.values(candidate)) {
@@ -378,7 +427,7 @@ if (process.argv.includes("--self-test")) {
       value.replaceAll('    "$XPC_BUNDLE"', '    "$XPC_EXECUTABLE"')],
     ["parent requirement installed after resume", "xpc", (value) => {
       const line = "    set_peer_requirement(connection.object, &requirement)?;\n";
-      return value.replace(line, "").replace(
+      return value.replaceAll(line, "").replace(
         "        xpc_connection_resume(connection.object);\n",
         `        xpc_connection_resume(connection.object);\n${line}`,
       );
@@ -389,7 +438,7 @@ if (process.argv.includes("--self-test")) {
         "set_command(begin.0, COMMAND_CHUNK)",
       )],
     ["service parent unauthenticated", "xpc", (value) =>
-      value.replace(
+      value.replaceAll(
         "if set_peer_requirement(peer, &requirement).is_err()",
         "if requirement.as_bytes().is_empty()",
       )],

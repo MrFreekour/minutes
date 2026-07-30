@@ -128,3 +128,21 @@ public func minutesValidateGraphAuthorityBundle(
         }
     }
 }
+
+/// Apple Speech uses the same sealed-parent validation as the graph service,
+/// but keeps a separate exported symbol so Rust cannot accidentally validate
+/// one authority while connecting to the other service name.
+@_cdecl("minutes_validate_apple_speech_authority_bundle")
+public func minutesValidateAppleSpeechAuthorityBundle(
+    _ authorityBundlePath: UnsafePointer<CChar>,
+    _ currentExecutablePath: UnsafePointer<CChar>,
+    _ runningParentCodeDirectoryHash: UnsafePointer<UInt8>,
+    _ runningParentCodeDirectoryHashLength: Int
+) -> Int32 {
+    minutesValidateGraphAuthorityBundle(
+        authorityBundlePath,
+        currentExecutablePath,
+        runningParentCodeDirectoryHash,
+        runningParentCodeDirectoryHashLength
+    )
+}
