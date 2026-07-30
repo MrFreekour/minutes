@@ -1706,7 +1706,8 @@ fn run_with_stdin_completion(
     let mut stderr_result: Option<std::io::Result<Vec<u8>>> = None;
     let mut stdin_result: Option<std::io::Result<()>> = stdin_thread.is_none().then_some(Ok(()));
     let mut failure: Option<std::io::Error> = None;
-    let mut terminated = false;
+    let mut tree_retired = false;
+    let mut failure_cleanup_started = false;
     let mut cleanup_deadline: Option<Instant> = None;
     let mut timed_out = false;
 
@@ -1717,7 +1718,17 @@ fn run_with_stdin_completion(
     {
         if !leader_exited {
             match observe_child_exit(&mut child) {
-                Ok(exited) => leader_exited = exited,
+                Ok(exited) => {
+                    leader_exited = exited;
+                    if leader_exited && failure.is_none() && !tree_retired {
+                        // Descendants may inherit the leader's supervisor
+                        // pipes. Retire the tree before waiting for EOF so a
+                        // successful leader cannot be misclassified as a
+                        // timeout merely because its descendant kept a handle.
+                        tree.terminate(&mut child);
+                        tree_retired = true;
+                    }
+                }
                 Err(error) => {
                     if failure.is_none() {
                         failure = Some(error);
@@ -1734,10 +1745,13 @@ fn run_with_stdin_completion(
                 "child process tree exceeded its wall-clock budget",
             ));
         }
-        if failure.is_some() && !terminated {
+        if failure.is_some() && !failure_cleanup_started {
             cancel.store(true, Ordering::Release);
-            tree.terminate(&mut child);
-            terminated = true;
+            if !tree_retired {
+                tree.terminate(&mut child);
+                tree_retired = true;
+            }
+            failure_cleanup_started = true;
             cleanup_deadline = Some(Instant::now() + Duration::from_secs(5));
         }
         if cleanup_deadline.is_some_and(|cleanup| Instant::now() >= cleanup) {
@@ -1798,10 +1812,9 @@ fn run_with_stdin_completion(
         }
     }
 
-    // A successful leader is not permission for a detached engine descendant
-    // to survive Minutes. The pipes may already be closed/redirected, so make
-    // tree retirement unconditional before returning the leader's status.
-    if !terminated {
+    // Tree retirement normally happens as soon as the leader exits above. Keep
+    // this fallback for paths that completed only through a pipe-side failure.
+    if !tree_retired {
         cancel.store(true, Ordering::Release);
         tree.terminate(&mut child);
     }
@@ -2131,16 +2144,18 @@ mod tests {
     }
 
     #[test]
-    fn descendant_retaining_pipes_cannot_outlive_the_deadline() {
+    fn successful_leader_retires_descendant_retaining_pipes_without_timeout() {
         let started = Instant::now();
         let run = run(
-            &mut sh("(sleep 30) & exit 0"),
+            &mut sh("(sleep 30) & printf output; exit 7"),
             None,
             StdoutTarget::Capture { max_bytes: 1024 },
-            budget(150),
+            budget(10_000),
         )
         .unwrap();
-        assert!(run.timed_out);
+        assert!(!run.timed_out);
+        assert_eq!(run.output.status.code(), Some(7));
+        assert_eq!(run.output.stdout, b"output");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -2689,19 +2704,15 @@ mod windows_tests {
     }
 
     fn child_and_grandchild_script(pid_path: &std::path::Path, leader_tail: &str) -> String {
-        let grandchild_stdout = pid_path.with_extension("stdout");
-        let grandchild_stderr = pid_path.with_extension("stderr");
-        // These tests exercise Job retirement, not the separate contract where
-        // a descendant retaining supervisor pipes keeps the tree alive. Make
-        // the fixture explicit instead of depending on Start-Process handle
-        // inheritance, which varies across Windows runner launches.
+        // `-NoNewWindow` deliberately gives the grandchild the leader's
+        // standard handles. A successful leader must still return promptly
+        // with its own buffered output after Job retirement closes them.
         format!(
-            "$grandchild = Start-Process -FilePath \"$env:SystemRoot\\System32\\ping.exe\" \
-             -ArgumentList @('-n','30','127.0.0.1') -WindowStyle Hidden \
-             -RedirectStandardOutput '{}' -RedirectStandardError '{}' -PassThru; \
+            "$grandchild = Start-Process \
+             -FilePath \"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" \
+             -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command',\
+             'Start-Sleep -Seconds 30') -NoNewWindow -PassThru; \
              [IO.File]::WriteAllText('{}', [string]$grandchild.Id); {leader_tail}",
-            quote_powershell_literal(&grandchild_stdout),
-            quote_powershell_literal(&grandchild_stderr),
             quote_powershell_literal(pid_path)
         )
     }
