@@ -2761,6 +2761,29 @@
       gap: 8px;
       justify-content: flex-end;
       padding-right: 28px;
+      /* This row declares no `flex` shorthand, so it is `flex: 0 1 auto` and its
+         flex base size is its MAX-CONTENT width — every button on one line,
+         even though flex-wrap then wraps them onto two. Space is distributed
+         from those base sizes, so when a fifth button pushed the row's base
+         past what the header had, the header stopped handing leftovers to
+         .detail-header-copy and started shrinking it instead, until the copy
+         froze on its 16.5ch min-width while the wrapped row sat half empty.
+         Measured at the normal 762px card: 33 title characters with four
+         buttons, 21 with five.
+         max-width does not change the base size — the base is computed first,
+         then clamped — but clamping the row's hypothetical size is enough to
+         put the header back into "distribute the leftovers", and the leftovers
+         go to the title. The 22rem term is a floor on the cap, not on the row:
+         on narrow cards the row already needs more than half the header, and
+         capping it there would only force another wrapped line and a taller
+         header. So the effective rule is "half the header, but never less than
+         22rem" — above ~44rem of header the 50% term wins, below it the 22rem
+         term does. rem, not px, because UI zoom drives :root font-size.
+         Known cost, measured: at zoom >= 20 with a window wide enough that all
+         five buttons would have fitted on one line, the cap wraps them onto two
+         and the header grows 3-5px. At the default zoom there is no such width
+         — the row never fits on one line there. */
+      max-width: max(50%, 22rem);
     }
 
     .detail-scroll {
@@ -9485,7 +9508,16 @@
 
     function renderDetailSections(detail) {
       currentMeetingDetail = detail;
-      detailTitle.textContent = detail.title || 'Untitled';
+      const detailTitleText = detail.title || 'Untitled';
+      detailTitle.textContent = detailTitleText;
+      // .detail-title is `white-space: nowrap; text-overflow: ellipsis`, so a
+      // long title is only ever readable in full on hover. The native tooltip
+      // is the whole mechanism — same one .dictation-recent-text already uses
+      // for the same reason. It adds no font, colour or radius, so DESIGN.md
+      // has nothing to say about it. Set unconditionally rather than only when
+      // truncated: whether it truncates depends on the card width at the moment
+      // of measurement, and the window is resizable.
+      detailTitle.title = detailTitleText;
       detailMeta.replaceChildren();
       detailScroll.replaceChildren();
       currentMeetingPath = detail.path;
