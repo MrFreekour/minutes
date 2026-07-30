@@ -6768,32 +6768,14 @@ fn begin_para_transaction(
     let path = para_transaction_path(private_root, &manifest.target_name);
     let name = path.file_name().ok_or("PARA transaction has no name")?;
     let boundary = crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(private_root)?;
-    let people_file = para_open_directory_no_follow(private_root)?;
     boundary.attest_for_source_cleanup()?;
-    let people_cap = CapDir::from_std_file(people_file);
-    let mut options = CapOpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    #[cfg(windows)]
-    {
-        const DELETE: u32 = 0x0001_0000;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
-        options
-            // The completion protocol renames this exact retained journal
-            // handle. Windows FileRenameInformation requires DELETE access.
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
-    }
-    let mut file = people_cap.open_with(name, &options)?.into_std();
-    set_restrictive_permissions_file(&file)?;
+    let mut file = match boundary.bind_exact_file(name) {
+        Ok(existing) => existing.try_clone_exact_file()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            boundary.create_new_exact_file(name)?
+        }
+        Err(error) => return Err(error.into()),
+    };
     if qmd_file_identity_and_links(&file).is_none_or(|(_, links)| links != 1) {
         return Err("PARA transaction manifest is not a single-link regular file".into());
     }
@@ -17566,6 +17548,48 @@ mod tests {
         assert!(error.to_string().contains("unsupported Windows"));
         assert_eq!(fs::read(&transaction.path).unwrap(), before);
         assert!(!before.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn para_journal_rejects_an_existing_leaf_without_the_private_dacl() {
+        let root = TempDir::new().unwrap();
+        let private_root = root.path().join("private");
+        let boundary =
+            crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&private_root).unwrap();
+        let manifest = ParaTransactionManifest {
+            schema: 1,
+            target_name: "planted".to_string(),
+            stage_name: None,
+            capture_name: format!("{PARA_PERSON_CAPTURE_PREFIX}planted"),
+            old: ParaGenerationProof {
+                entry_names: vec!["items.json".to_string()],
+                items: para_file_proof(b"old").unwrap(),
+                summary: None,
+            },
+            intended: None,
+            slot_directory_identity: None,
+            slot_items_identity: None,
+            slot_summary_identity: None,
+            sequence: 0,
+            journal_state: None,
+            baseline_deleted: false,
+            baseline_parked: false,
+            prior_sequence: None,
+        };
+        let path = para_transaction_path(&private_root, &manifest.target_name);
+        File::create(&path).unwrap();
+
+        let error = match begin_para_transaction(&private_root, manifest) {
+            Ok(_) => panic!("a planted journal without the exact private DACL must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("DACL"),
+            "unexpected journal denial: {error}"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        drop(boundary);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

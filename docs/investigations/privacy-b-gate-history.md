@@ -1160,3 +1160,45 @@ attestations, and uses write-through exact handles for the Windows durability
 contract. No public derivative ACL, source authorization, retirement proof, or
 failure envelope is relaxed. Draft PR #604 remains unmerged; no merge, signing,
 publication, deployment, or release is authorized.
+
+THE TERMINAL-GREEN WINDOWS CANDIDATE WAS INVALIDATED BY AN INDEPENDENT SECURITY
+REVIEW. Exact SHA `4819df1d` made lint run 30508829032 and complete ordinary CI
+run 30508829066 green, including 1,501 passed Windows core tests, 5 ignored, and
+zero failed. Focused validation-only run 30509795399 passed the exact Job Object
+memory regression while release readiness and installer construction were
+skipped. Test-integrity review returned GO with no P0/P1/P2. Workflow-safety
+review returned GO-with-nits with no P0/P1 and one stale-receipt P2.
+
+Windows security review nevertheless BLOCKED with one P1. The policy filesystem
+created an owner-private directory beneath its retained parent before applying
+the protected DACL. A different local principal able to add children to that
+public parent could open and retain add-file authority during the interval;
+later DACL replacement would not revoke the retained handle. Deterministic PARA
+transaction journals also accepted an existing empty exact file without first
+proving its owner-private security descriptor.
+
+The replacement attaches the protected current-user-only DACL in the original
+`CreateDirectoryW` call before the directory becomes visible. It verifies the
+new exact directory handle without rewriting the descriptor, and pre-existing
+Windows private directories are accepted only if their retained handles already
+attest the canonical protected owner-only descriptor. New private files are
+tightened through their exact handles while their atomically private parent
+prevents another principal from opening them; existing private control and
+lease leaves are verification-only and fail closed if their exact handles do
+not already attest the expected descriptor. PARA journal creation now uses the
+same bound create-or-verify contract rather than ambient `create(true)`.
+Windows-only regressions reject an ordinary pre-existing directory, an
+ordinary empty private control leaf, and an ordinary empty PARA journal before
+private bytes are written.
+
+LOCAL REPLACEMENT EVIDENCE: formatting and diff checks are green; strict
+no-default production-library Clippy is green; the Windows GNU-target
+production library cross-checks with the same 11 known unrelated cfg warnings,
+and the complete no-default test surface cross-checks with 23 known test/cfg
+warnings; all 34 policy-filesystem tests and both focused PARA durability/race
+tests are green; the complete serial no-default core library command exits zero
+across 1,648 tests. The replacement is not accepted until exact-SHA lint,
+complete ordinary CI, and validation-only Windows execution are terminal green
+and all three independent reviews are repeated. Draft PR #604 must remain
+unmerged. No merge, tag, signing, publication, deployment, or release is
+authorized.

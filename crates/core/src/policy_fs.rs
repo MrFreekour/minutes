@@ -1,7 +1,6 @@
-use cap_std::fs::{
-    Dir, DirBuilder as CapDirBuilder, OpenOptions as CapOpenOptions,
-    OpenOptionsExt as CapOpenOptionsExt,
-};
+#[cfg(not(windows))]
+use cap_std::fs::DirBuilder as CapDirBuilder;
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions, OpenOptionsExt as CapOpenOptionsExt};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
@@ -1686,9 +1685,12 @@ fn create_private_directory_at(
         builder.mode(0o700);
         builder
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let builder = CapDirBuilder::new();
+    #[cfg(not(windows))]
     parent.create_dir_with(name, &builder)?;
+    #[cfg(windows)]
+    crate::overlays::create_owner_only_directory(_display_path)?;
     let directory = open_directory_at_no_follow(parent, name)?;
     #[cfg(unix)]
     {
@@ -1704,15 +1706,14 @@ fn create_private_directory_at(
     }
     #[cfg(windows)]
     {
-        // The parent and exact child handles both deny FILE_SHARE_DELETE.
-        // Apply the protected DACL through the visible name, then prove that
-        // the name still denotes the retained child capability.
-        ensure_owner_only_directory(_display_path)?;
+        // The parent and exact child handles both deny FILE_SHARE_DELETE. The
+        // protected DACL was attached atomically in CreateDirectoryW, before
+        // the child became visible; verify it through the retained capability
+        // without rewriting an already-observable security descriptor.
+        let exact = directory.try_clone()?.into_std_file();
+        crate::overlays::attest_owner_only_directory_handle(&exact)?;
         let confirmed = open_directory_at_no_follow(parent, name)?;
-        if !open_file_identity_matches(
-            &directory.try_clone()?.into_std_file(),
-            &confirmed.into_std_file(),
-        ) {
+        if !open_file_identity_matches(&exact, &confirmed.into_std_file()) {
             return Err(invalid_recovery_path(
                 "private recovery directory changed during DACL attestation",
             ));
@@ -1777,7 +1778,9 @@ impl BoundRecoveryDirectory {
             }
         }
         #[cfg(windows)]
-        ensure_owner_only_directory(&normalized)?;
+        crate::overlays::attest_owner_only_directory_handle(
+            &directory.try_clone()?.into_std_file(),
+        )?;
         let chain = parent.with_child(name, &directory)?;
         chain.attest()?;
         Ok(Self {
@@ -1824,7 +1827,9 @@ impl BoundRecoveryDirectory {
             }
         }
         #[cfg(windows)]
-        ensure_owner_only_directory(&display_path)?;
+        crate::overlays::attest_owner_only_directory_handle(
+            &directory.try_clone()?.into_std_file(),
+        )?;
         self.attest_location()?;
         let chain = self.chain.with_child(name, &directory)?;
         chain.attest()?;
@@ -1845,6 +1850,10 @@ impl BoundRecoveryDirectory {
         }
         self.attest_location()?;
         let directory = open_directory_at_no_follow(self.chain.leaf(), name)?;
+        #[cfg(windows)]
+        crate::overlays::attest_owner_only_directory_handle(
+            &directory.try_clone()?.into_std_file(),
+        )?;
         self.attest_location()?;
         let chain = self.chain.with_child(name, &directory)?;
         chain.attest()?;
@@ -1904,6 +1913,10 @@ impl BoundRecoveryDirectory {
         validate_entry_name(name)?;
         self.attest_location()?;
         let file = open_recovery_file_at(self.chain.leaf(), name)?;
+        #[cfg(windows)]
+        if self.owner_private_namespace {
+            crate::overlays::attest_owner_only_file_handle(&file)?;
+        }
         let bound = BoundRecoveryFile {
             parent_chain: self.chain.try_clone()?,
             name: name.to_os_string(),
@@ -1925,6 +1938,10 @@ impl BoundRecoveryDirectory {
         self.attest_location()?;
         let file = open_regular_file_at_allow_links(self.chain.leaf(), name, false)?;
         let confirmed = open_regular_file_at_allow_links(self.chain.leaf(), name, false)?;
+        #[cfg(windows)]
+        if self.owner_private_namespace {
+            crate::overlays::attest_owner_only_file_handle(&file)?;
+        }
         if !open_file_identity_matches(&file, &confirmed) {
             return Err(invalid_recovery_path(
                 "capability-bound linked file changed while it was being bound",
@@ -1956,6 +1973,14 @@ impl BoundRecoveryDirectory {
             return Err(invalid_recovery_path(
                 "new capability-bound file is not a single-link regular file",
             ));
+        }
+        #[cfg(windows)]
+        if self.owner_private_namespace {
+            // The directory was created atomically owner-only and its exact
+            // retained handle has just been re-attested. No other principal
+            // can open this newly created child before its exact handle is
+            // given the canonical protected file DACL.
+            crate::overlays::secure_private_file_handle(&file)?;
         }
         self.attest_location()?;
         let confirmed = open_recovery_file_at(self.chain.leaf(), name)?;
@@ -2141,12 +2166,12 @@ impl BoundRecoveryDirectory {
             ));
         }
         self.attest_location()?;
-        let file = match self
+        let (file, created) = match self
             .chain
             .leaf()
             .open_with(name, &private_lease_file_open_options(true))
         {
-            Ok(file) => file.into_std(),
+            Ok(file) => (file.into_std(), true),
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists
                     || cfg!(windows) && error.raw_os_error() == Some(32) =>
@@ -2156,10 +2181,18 @@ impl BoundRecoveryDirectory {
                 // deliberately denies delete sharing. Re-open the existing
                 // read/write identity and prove it below; the retained
                 // no-delete-sharing peer prevents a name swap meanwhile.
-                open_private_lease_file_at(self.chain.leaf(), name)?
+                (open_private_lease_file_at(self.chain.leaf(), name)?, false)
             }
             Err(error) => return Err(error),
         };
+        #[cfg(windows)]
+        if created {
+            crate::overlays::secure_private_file_handle(&file)?;
+        } else {
+            crate::overlays::attest_owner_only_file_handle(&file)?;
+        }
+        #[cfg(not(windows))]
+        let _ = created;
         let lexical = self.chain.leaf().symlink_metadata(name)?;
         if !cap_lexical_regular_file_is_safe(&lexical)
             || !cap_metadata_identity_matches_opened(&lexical, &file)
@@ -4016,6 +4049,47 @@ mod tests {
             .expect_err("private publication must never replace an existing file");
         assert_eq!(duplicate.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&private_file).unwrap(), b"PRIVATE_DACL_CANARY");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_private_boundary_rejects_preexisting_unprotected_objects() {
+        let root = tempfile::TempDir::new().unwrap();
+        let planted_directory = root.path().join("planted-directory");
+        fs::create_dir(&planted_directory).unwrap();
+        let directory_error =
+            match BoundRecoveryDirectory::prepare_owner_private(&planted_directory) {
+                Ok(_) => panic!("an existing directory must already have the exact private DACL"),
+                Err(error) => error,
+            };
+        assert!(
+            directory_error.to_string().contains("DACL"),
+            "unexpected directory denial: {directory_error}"
+        );
+
+        let private_directory = root.path().join("private-directory");
+        let boundary = BoundRecoveryDirectory::prepare_owner_private(&private_directory)
+            .expect("create an atomically owner-private directory");
+        let planted_file = private_directory.join("planted-control.json");
+        File::create(&planted_file).unwrap();
+        let file_error = match boundary.bind_exact_file(OsStr::new("planted-control.json")) {
+            Ok(_) => panic!("an existing control leaf must already have the exact private DACL"),
+            Err(error) => error,
+        };
+        assert!(
+            file_error.to_string().contains("DACL"),
+            "unexpected file denial: {file_error}"
+        );
+        assert_eq!(fs::metadata(&planted_file).unwrap().len(), 0);
+
+        fs::remove_file(&planted_file).unwrap();
+        let created = boundary
+            .create_new_exact_file(OsStr::new("created-control.json"))
+            .expect("new control leaves receive the canonical private DACL");
+        drop(created);
+        boundary
+            .bind_exact_file(OsStr::new("created-control.json"))
+            .expect("the canonical private leaf remains bindable");
     }
 
     #[cfg(unix)]

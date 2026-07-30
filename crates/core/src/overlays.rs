@@ -418,6 +418,10 @@ mod windows_private {
             if status != ERROR_SUCCESS {
                 return Err(io::Error::from_raw_os_error(status as i32));
             }
+            self.verify(file)
+        }
+
+        fn verify(&self, file: &File) -> io::Result<()> {
             let mut owner: PSID = null_mut();
             let mut dacl: *mut ACL = null_mut();
             let mut descriptor = null_mut();
@@ -581,6 +585,37 @@ mod windows_private {
         security.tighten_and_verify(&file)
     }
 
+    pub(super) fn create_directory(path: &Path) -> io::Result<()> {
+        let wide = wide(path)?;
+        let mut security = OwnerOnlySecurity::new(true)?;
+        let attributes = security.attributes();
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_handle(handle as _) };
+        validate_type(&file, true)?;
+        security.verify(&file)
+    }
+
+    pub(super) fn attest_handle(file: &File, directory: bool) -> io::Result<()> {
+        validate_type(file, directory)?;
+        OwnerOnlySecurity::new(directory)?.verify(file)
+    }
+
     pub(super) fn secure_file_handle(file: &File) -> io::Result<()> {
         validate_type(file, false)?;
         OwnerOnlySecurity::new(false)?.tighten_and_verify(file)
@@ -627,6 +662,21 @@ pub(crate) fn secure_private_file(path: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn secure_private_file_handle(file: &File) -> std::io::Result<()> {
     windows_private::secure_file_handle(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    windows_private::create_directory(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn attest_owner_only_directory_handle(file: &File) -> std::io::Result<()> {
+    windows_private::attest_handle(file, true)
+}
+
+#[cfg(windows)]
+pub(crate) fn attest_owner_only_file_handle(file: &File) -> std::io::Result<()> {
+    windows_private::attest_handle(file, false)
 }
 
 #[cfg(not(any(unix, windows)))]
