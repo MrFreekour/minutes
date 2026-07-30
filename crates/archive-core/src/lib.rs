@@ -994,7 +994,7 @@ mod tests {
             fs::write(root.join(format!("synthetic-{index}.txt")), b"synthetic").expect("file");
         }
         let bounded = scan_roots(
-            &[root.clone()],
+            std::slice::from_ref(&root),
             CensusLimits {
                 max_artifacts: 2,
                 ..CensusLimits::default()

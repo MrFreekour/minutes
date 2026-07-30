@@ -17,6 +17,7 @@ pub const MAX_PROVISIONS_PER_DOCUMENT: usize = 20_000;
 pub const MAX_QUERY_CHARS: usize = 2_000;
 pub const MAX_EVIDENCE_RESULTS: usize = 100;
 const MAX_FTS_CANDIDATES: usize = 2_000;
+const MAX_DOCUMENT_EVIDENCE_PROVISIONS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -34,6 +35,8 @@ pub enum RetrievalError {
     InvalidQuery,
     #[error("query requested a different vault")]
     ScopeMismatch,
+    #[error("the lexical candidate budget was exceeded; narrow the query")]
+    CandidateBudgetExceeded,
     #[error("the private lexical index is unavailable")]
     IndexUnavailable,
 }
@@ -415,10 +418,17 @@ pub fn interpret_legal_query(raw: impl Into<String>) -> Result<LegalQuery, Retri
         scope,
         required_concepts,
         excluded_concepts: Vec::new(),
-        exact_phrase: None,
+        exact_phrase: first_quoted_phrase(trimmed),
         max_sentences,
         limit: 20,
     })
+}
+
+fn first_quoted_phrase(query: &str) -> Option<String> {
+    let (_, after_opening_quote) = query.split_once('"')?;
+    let (phrase, _) = after_opening_quote.split_once('"')?;
+    let phrase = phrase.trim();
+    (!phrase.is_empty()).then(|| phrase.to_string())
 }
 
 fn sentence_limit_from_query(query: &str) -> Option<u32> {
@@ -496,7 +506,80 @@ pub struct EvidenceCard {
 pub struct LegalSearchResponse {
     pub query: LegalQuery,
     pub evidence: Vec<EvidenceCard>,
+    pub documents: Vec<DocumentEvidenceCard>,
+    pub lexical_candidates_considered: usize,
     pub stale_evidence_withdrawn: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DocumentEvidenceCard {
+    pub vault_id: VaultId,
+    pub document_id: DocumentId,
+    pub document_title: String,
+    pub source_revision: SourceRevision,
+    pub matched_concepts: Vec<LegalConcept>,
+    pub exact_phrase_matched: bool,
+    pub criterion_evidence: Vec<EvidenceCard>,
+    pub criterion_evidence_truncated: bool,
+    pub why_matched: String,
+    pub lexical_rank: f64,
+    pub index_fresh: bool,
+}
+
+#[derive(Debug)]
+struct CandidateRow {
+    document_id: DocumentId,
+    document_title: String,
+    provision_heading: Option<String>,
+    source_anchor: String,
+    body: String,
+    source_revision: SourceRevision,
+    lexical_rank: f64,
+}
+
+impl CandidateRow {
+    fn searchable_text(&self) -> String {
+        match &self.provision_heading {
+            Some(heading) => format!("{heading}\n{}", self.body),
+            None => self.body.clone(),
+        }
+    }
+
+    fn evidence_card(
+        &self,
+        vault_id: &VaultId,
+        matched_concepts: Vec<LegalConcept>,
+        sentence_limit: Option<u32>,
+    ) -> EvidenceCard {
+        let sentence_count = sentence_count(&self.body);
+        EvidenceCard {
+            vault_id: vault_id.clone(),
+            document_id: self.document_id.clone(),
+            document_title: self.document_title.clone(),
+            provision_heading: self.provision_heading.clone(),
+            source_anchor: self.source_anchor.clone(),
+            exact_excerpt: self.body.clone(),
+            sentence_count,
+            source_revision: self.source_revision.clone(),
+            why_matched: why_matched(&matched_concepts, sentence_limit, sentence_count),
+            matched_concepts,
+            lexical_rank: self.lexical_rank,
+            index_fresh: true,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DocumentAccumulator {
+    document_id: DocumentId,
+    document_title: String,
+    source_revision: SourceRevision,
+    matched_concepts: BTreeSet<LegalConcept>,
+    exact_phrase_matched: bool,
+    excluded_concept_matched: bool,
+    criterion_evidence: Vec<EvidenceCard>,
+    criterion_evidence_truncated: bool,
+    lexical_rank: f64,
 }
 
 pub struct LegalIndex {
@@ -598,9 +681,29 @@ impl LegalIndex {
         }
         validate_query(&query)?;
 
+        let candidates = self.load_candidates(&query)?;
+        let lexical_candidates_considered = candidates.len();
+        match query.scope {
+            MatchScope::SameProvision => self.search_same_provision(
+                query,
+                candidates,
+                current_revisions,
+                lexical_candidates_considered,
+            ),
+            MatchScope::AnywhereInDocument => self.search_documents(
+                query,
+                candidates,
+                current_revisions,
+                lexical_candidates_considered,
+            ),
+        }
+    }
+
+    fn load_candidates(&self, query: &LegalQuery) -> Result<Vec<CandidateRow>, RetrievalError> {
         let candidate_query =
-            build_fts_candidate_query(&query).ok_or(RetrievalError::InvalidQuery)?;
-        let candidate_limit = MAX_FTS_CANDIDATES as i64;
+            build_fts_candidate_query(query).ok_or(RetrievalError::InvalidQuery)?;
+        let candidate_limit =
+            i64::try_from(MAX_FTS_CANDIDATES + 1).map_err(|_| RetrievalError::IndexUnavailable)?;
         let sql = "
             SELECT
                 p.document_id,
@@ -626,8 +729,7 @@ impl LegalIndex {
             .query(params![candidate_query, candidate_limit])
             .map_err(|_| RetrievalError::IndexUnavailable)?;
 
-        let mut evidence = Vec::new();
-        let mut stale_documents = BTreeSet::new();
+        let mut candidates = Vec::new();
         while let Some(row) = rows.next().map_err(|_| RetrievalError::IndexUnavailable)? {
             let document_id = DocumentId::parse(
                 row.get::<_, String>(0)
@@ -642,17 +744,37 @@ impl LegalIndex {
                     .try_into()
                     .map_err(|_| RetrievalError::IndexUnavailable)?,
             };
-            if !current_revisions.matches(&document_id, &revision) {
-                stale_documents.insert(document_id);
+            candidates.push(CandidateRow {
+                document_id,
+                document_title: row.get(6).map_err(|_| RetrievalError::IndexUnavailable)?,
+                provision_heading: row.get(3).map_err(|_| RetrievalError::IndexUnavailable)?,
+                source_anchor: row.get(2).map_err(|_| RetrievalError::IndexUnavailable)?,
+                body: row.get(4).map_err(|_| RetrievalError::IndexUnavailable)?,
+                source_revision: revision,
+                lexical_rank: row.get(5).map_err(|_| RetrievalError::IndexUnavailable)?,
+            });
+        }
+        if candidates.len() > MAX_FTS_CANDIDATES {
+            return Err(RetrievalError::CandidateBudgetExceeded);
+        }
+        Ok(candidates)
+    }
+
+    fn search_same_provision(
+        &self,
+        query: LegalQuery,
+        candidates: Vec<CandidateRow>,
+        current_revisions: &CurrentRevisionSet,
+        lexical_candidates_considered: usize,
+    ) -> Result<LegalSearchResponse, RetrievalError> {
+        let mut evidence = Vec::new();
+        let mut stale_documents = BTreeSet::new();
+        for candidate in candidates {
+            if !current_revisions.matches(&candidate.document_id, &candidate.source_revision) {
+                stale_documents.insert(candidate.document_id);
                 continue;
             }
-            let heading: Option<String> =
-                row.get(3).map_err(|_| RetrievalError::IndexUnavailable)?;
-            let body: String = row.get(4).map_err(|_| RetrievalError::IndexUnavailable)?;
-            let searchable = match &heading {
-                Some(heading) => format!("{heading}\n{body}"),
-                None => body.clone(),
-            };
+            let searchable = candidate.searchable_text();
             let matched = matched_concepts(&searchable, &query.required_concepts);
             if matched.len() != query.required_concepts.len()
                 || contains_any_concept(&searchable, &query.excluded_concepts)
@@ -663,7 +785,7 @@ impl LegalIndex {
             {
                 continue;
             }
-            let sentences = sentence_count(&body);
+            let sentences = sentence_count(&candidate.body);
             if query
                 .max_sentences
                 .is_some_and(|maximum| sentences > maximum)
@@ -671,21 +793,7 @@ impl LegalIndex {
                 continue;
             }
 
-            let why_matched = why_matched(&matched, query.max_sentences, sentences);
-            evidence.push(EvidenceCard {
-                vault_id: self.vault_id.clone(),
-                document_id,
-                document_title: row.get(6).map_err(|_| RetrievalError::IndexUnavailable)?,
-                provision_heading: heading,
-                source_anchor: row.get(2).map_err(|_| RetrievalError::IndexUnavailable)?,
-                exact_excerpt: body,
-                sentence_count: sentences,
-                source_revision: revision,
-                matched_concepts: matched,
-                why_matched,
-                lexical_rank: row.get(5).map_err(|_| RetrievalError::IndexUnavailable)?,
-                index_fresh: true,
-            });
+            evidence.push(candidate.evidence_card(&self.vault_id, matched, query.max_sentences));
             if evidence.len() >= query.limit {
                 break;
             }
@@ -694,6 +802,120 @@ impl LegalIndex {
         Ok(LegalSearchResponse {
             query,
             evidence,
+            documents: Vec::new(),
+            lexical_candidates_considered,
+            stale_evidence_withdrawn: stale_documents.len() as u64,
+        })
+    }
+
+    fn search_documents(
+        &self,
+        query: LegalQuery,
+        candidates: Vec<CandidateRow>,
+        current_revisions: &CurrentRevisionSet,
+        lexical_candidates_considered: usize,
+    ) -> Result<LegalSearchResponse, RetrievalError> {
+        let mut documents = BTreeMap::<DocumentId, DocumentAccumulator>::new();
+        let mut stale_documents = BTreeSet::new();
+
+        for candidate in candidates {
+            if !current_revisions.matches(&candidate.document_id, &candidate.source_revision) {
+                stale_documents.insert(candidate.document_id);
+                continue;
+            }
+            let searchable = candidate.searchable_text();
+            let matched = matched_concepts(&searchable, &query.required_concepts);
+            let exact_phrase_matched = query
+                .exact_phrase
+                .as_ref()
+                .is_some_and(|phrase| contains_case_insensitive(&searchable, phrase));
+            let excluded_concept_matched =
+                contains_any_concept(&searchable, &query.excluded_concepts);
+            let positive_evidence = !matched.is_empty() || exact_phrase_matched;
+
+            let entry = documents
+                .entry(candidate.document_id.clone())
+                .or_insert_with(|| DocumentAccumulator {
+                    document_id: candidate.document_id.clone(),
+                    document_title: candidate.document_title.clone(),
+                    source_revision: candidate.source_revision.clone(),
+                    matched_concepts: BTreeSet::new(),
+                    exact_phrase_matched: false,
+                    excluded_concept_matched: false,
+                    criterion_evidence: Vec::new(),
+                    criterion_evidence_truncated: false,
+                    lexical_rank: candidate.lexical_rank,
+                });
+            entry.lexical_rank = entry.lexical_rank.min(candidate.lexical_rank);
+            entry.matched_concepts.extend(matched.iter().copied());
+            entry.exact_phrase_matched |= exact_phrase_matched;
+            entry.excluded_concept_matched |= excluded_concept_matched;
+            if positive_evidence {
+                if entry.criterion_evidence.len() < MAX_DOCUMENT_EVIDENCE_PROVISIONS {
+                    entry.criterion_evidence.push(candidate.evidence_card(
+                        &self.vault_id,
+                        matched,
+                        None,
+                    ));
+                } else {
+                    entry.criterion_evidence_truncated = true;
+                }
+            }
+        }
+
+        let required_concepts = query
+            .required_concepts
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let requires_exact_phrase = query.exact_phrase.is_some();
+        let mut document_evidence = documents
+            .into_values()
+            .filter(|document| {
+                document.matched_concepts == required_concepts
+                    && (!requires_exact_phrase || document.exact_phrase_matched)
+                    && !document.excluded_concept_matched
+            })
+            .map(|mut document| {
+                document.criterion_evidence.sort_by(|left, right| {
+                    left.lexical_rank
+                        .total_cmp(&right.lexical_rank)
+                        .then_with(|| left.source_anchor.cmp(&right.source_anchor))
+                });
+                let provision_count = document.criterion_evidence.len();
+                let matched_concepts = document.matched_concepts.into_iter().collect::<Vec<_>>();
+                let why_matched = document_why_matched(
+                    &matched_concepts,
+                    document.exact_phrase_matched,
+                    provision_count,
+                );
+                DocumentEvidenceCard {
+                    vault_id: self.vault_id.clone(),
+                    document_id: document.document_id,
+                    document_title: document.document_title,
+                    source_revision: document.source_revision,
+                    matched_concepts,
+                    exact_phrase_matched: document.exact_phrase_matched,
+                    criterion_evidence: document.criterion_evidence,
+                    criterion_evidence_truncated: document.criterion_evidence_truncated,
+                    why_matched,
+                    lexical_rank: document.lexical_rank,
+                    index_fresh: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        document_evidence.sort_by(|left, right| {
+            left.lexical_rank
+                .total_cmp(&right.lexical_rank)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+        });
+        document_evidence.truncate(query.limit);
+
+        Ok(LegalSearchResponse {
+            query,
+            evidence: Vec::new(),
+            documents: document_evidence,
+            lexical_candidates_considered,
             stale_evidence_withdrawn: stale_documents.len() as u64,
         })
     }
@@ -784,10 +1006,8 @@ fn validate_query(query: &LegalQuery) -> Result<(), RetrievalError> {
             phrase.trim().is_empty() || phrase.chars().count() > MAX_QUERY_CHARS
         })
         || (query.required_concepts.is_empty() && query.exact_phrase.is_none())
+        || (query.scope == MatchScope::AnywhereInDocument && query.max_sentences.is_some())
     {
-        return Err(RetrievalError::InvalidQuery);
-    }
-    if query.scope != MatchScope::SameProvision {
         return Err(RetrievalError::InvalidQuery);
     }
     Ok(())
@@ -795,7 +1015,11 @@ fn validate_query(query: &LegalQuery) -> Result<(), RetrievalError> {
 
 fn build_fts_candidate_query(query: &LegalQuery) -> Option<String> {
     let mut phrases = BTreeSet::new();
-    for concept in &query.required_concepts {
+    for concept in query
+        .required_concepts
+        .iter()
+        .chain(query.excluded_concepts.iter())
+    {
         for alias in concept.aliases() {
             phrases.insert(fts_quote(alias));
         }
@@ -858,6 +1082,26 @@ fn why_matched(
     )
 }
 
+fn document_why_matched(
+    concepts: &[LegalConcept],
+    exact_phrase_matched: bool,
+    provision_count: usize,
+) -> String {
+    let mut criteria = concepts
+        .iter()
+        .map(|concept| concept.label())
+        .collect::<Vec<_>>();
+    if exact_phrase_matched {
+        criteria.push("exact phrase");
+    }
+    format!(
+        "Matched {} across {} provision{} in this document.",
+        criteria.join(", "),
+        provision_count,
+        if provision_count == 1 { "" } else { "s" }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,6 +1126,23 @@ mod tests {
         .expect("query")
     }
 
+    fn document_query() -> LegalQuery {
+        LegalQuery {
+            raw: "Find documents containing confidentiality, assignment, and governing law."
+                .to_string(),
+            scope: MatchScope::AnywhereInDocument,
+            required_concepts: vec![
+                LegalConcept::Confidentiality,
+                LegalConcept::Assignment,
+                LegalConcept::GoverningLaw,
+            ],
+            excluded_concepts: Vec::new(),
+            exact_phrase: None,
+            max_sentences: None,
+            limit: 20,
+        }
+    }
+
     #[test]
     fn interprets_peter_query_into_visible_constraints() {
         let query = sample_query();
@@ -896,6 +1157,20 @@ mod tests {
                 LegalConcept::Survival,
             ]
         );
+    }
+
+    #[test]
+    fn interprets_document_scope_and_exact_remembered_language() {
+        let query = interpret_legal_query(
+            "Find documents containing \"prior written consent\", assignment, and governing law.",
+        )
+        .expect("query");
+        assert_eq!(query.scope, MatchScope::AnywhereInDocument);
+        assert_eq!(
+            query.required_concepts,
+            vec![LegalConcept::Assignment, LegalConcept::GoverningLaw]
+        );
+        assert_eq!(query.exact_phrase.as_deref(), Some("prior written consent"));
     }
 
     #[test]
@@ -943,6 +1218,90 @@ mod tests {
         assert_eq!(response.evidence[0].sentence_count, 3);
         assert!(response.evidence[0].why_matched.contains("same provision"));
         assert!(!response.evidence[0].exact_excerpt.contains("LEGAL PROCESS"));
+    }
+
+    #[test]
+    fn document_level_conjunction_is_proved_within_one_document() {
+        let matching = document(
+            "complete-agreement",
+            "Complete Agreement",
+            "CONFIDENTIALITY\nEach party shall protect Confidential Information.\n\nASSIGNMENT\nNeither party may assign this Agreement.\n\nGOVERNING LAW\nThis Agreement is governed by the laws of New York.",
+        );
+        let partial_one = document(
+            "partial-one",
+            "Partial One",
+            "CONFIDENTIALITY\nEach party shall protect Confidential Information.\n\nASSIGNMENT\nNeither party may assign this Agreement.",
+        );
+        let partial_two = document(
+            "partial-two",
+            "Partial Two",
+            "GOVERNING LAW\nThis Agreement is governed by the laws of New York.",
+        );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        for source in [&matching, &partial_one, &partial_two] {
+            index.replace_document(source).expect("ingest");
+        }
+        let revisions = CurrentRevisionSet::from_documents([&matching, &partial_one, &partial_two]);
+
+        let response = index
+            .search(&vault(), document_query(), &revisions)
+            .expect("search");
+        assert!(response.evidence.is_empty());
+        assert_eq!(response.documents.len(), 1);
+        let result = &response.documents[0];
+        assert_eq!(result.document_id, matching.document_id);
+        assert_eq!(result.criterion_evidence.len(), 3);
+        assert!(result.why_matched.contains("across 3 provisions"));
+        assert_eq!(
+            result.matched_concepts,
+            vec![
+                LegalConcept::Confidentiality,
+                LegalConcept::Assignment,
+                LegalConcept::GoverningLaw,
+            ]
+        );
+    }
+
+    #[test]
+    fn document_level_exclusion_applies_across_separate_provisions() {
+        let excluded = document(
+            "excluded-agreement",
+            "Excluded Agreement",
+            "ASSIGNMENT\nNeither party may assign this Agreement.\n\nCHANGE OF CONTROL\nA change of control is deemed an assignment.",
+        );
+        let allowed = document(
+            "allowed-agreement",
+            "Allowed Agreement",
+            "ASSIGNMENT\nNeither party may assign this Agreement.",
+        );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&excluded).expect("excluded");
+        index.replace_document(&allowed).expect("allowed");
+        let revisions = CurrentRevisionSet::from_documents([&excluded, &allowed]);
+        let query = LegalQuery {
+            raw: "Find documents with assignment but without change of control.".to_string(),
+            scope: MatchScope::AnywhereInDocument,
+            required_concepts: vec![LegalConcept::Assignment],
+            excluded_concepts: vec![LegalConcept::ChangeOfControl],
+            exact_phrase: None,
+            max_sentences: None,
+            limit: 20,
+        };
+
+        let response = index.search(&vault(), query, &revisions).expect("search");
+        assert_eq!(response.documents.len(), 1);
+        assert_eq!(response.documents[0].document_id, allowed.document_id);
+    }
+
+    #[test]
+    fn sentence_limits_are_not_silently_reinterpreted_for_document_scope() {
+        let mut query = document_query();
+        query.max_sentences = Some(3);
+        let index = LegalIndex::new(vault()).expect("index");
+        assert_eq!(
+            index.search(&vault(), query, &CurrentRevisionSet::default()),
+            Err(RetrievalError::InvalidQuery)
+        );
     }
 
     #[test]
@@ -1101,6 +1460,33 @@ mod tests {
         assert_eq!(
             index.search(&vault(), query, &revisions),
             Err(RetrievalError::InvalidQuery)
+        );
+    }
+
+    #[test]
+    fn candidate_budget_fails_closed_instead_of_returning_incomplete_results() {
+        let mut text = String::new();
+        for ordinal in 1..=(MAX_FTS_CANDIDATES + 1) {
+            text.push_str(&format!(
+                "{ordinal}. ASSIGNMENT\nNeither party may assign this Agreement.\n\n"
+            ));
+        }
+        let source = document("large-agreement", "Large Agreement", &text);
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&source).expect("ingest");
+        let revisions = CurrentRevisionSet::from_documents([&source]);
+        let query = LegalQuery {
+            raw: "Find assignment provisions.".to_string(),
+            scope: MatchScope::SameProvision,
+            required_concepts: vec![LegalConcept::Assignment],
+            excluded_concepts: Vec::new(),
+            exact_phrase: None,
+            max_sentences: None,
+            limit: 20,
+        };
+        assert_eq!(
+            index.search(&vault(), query, &revisions),
+            Err(RetrievalError::CandidateBudgetExceeded)
         );
     }
 }

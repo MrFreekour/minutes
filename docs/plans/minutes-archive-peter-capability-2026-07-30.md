@@ -429,9 +429,15 @@ section anchors, requires an explicit vault, checks current source revisions
 at query time, and returns exact evidence cards. Deterministic tests cover
 same-clause conjunction, sentence limits, exact phrases, exclusions, source
 replacement and withdrawal, malicious prompt-like source text, and wrong or
-empty scope. It does not yet ingest PDF or DOCX, persist a protected vault,
-resolve an evidence card back to a live source, or implement document-level
-conjunction and OCR; those remain Gate 2 work rather than implied capability.
+empty scope. A committed synthetic benchmark now covers confidentiality,
+indemnity and defense control, limitation of liability, assignment, governing
+law, BAA language, remembered phrases, and prompt-like source text.
+Document-level conjunction is a separate result type with criterion evidence;
+criteria are grouped inside one document and exclusions apply across its
+provisions. Candidate-budget overflow fails closed rather than returning an
+apparently complete answer. The proof does not yet ingest PDF or DOCX, persist
+a protected vault, resolve an evidence card back to a live source, or
+implement OCR; those remain Gate 2 work rather than implied capability.
 
 Evaluate:
 

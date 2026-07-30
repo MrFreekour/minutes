@@ -245,8 +245,13 @@ vault-scoped SQLite FTS5 index and deterministic provision-level verification.
 It has no model or persistent attorney derivative. Tests prove exact excerpts
 and anchors, same-provision concept conjunction, sentence limits, explicit
 vault denial, stale-revision withdrawal, transactional source replacement, and
-inert prompt-like source text. Format conversion, live-source resolution,
-document-level conjunction, and OCR remain unimplemented Stage 2 gates.
+inert prompt-like source text. Document-level conjunction is now implemented
+as a separate evidence type that groups criteria inside one document, applies
+exclusions across its provisions, and never assembles a match across documents.
+A committed legal fixture exercises the provision and document modes, and an
+overflowing lexical candidate set fails closed. Format conversion,
+live-source resolution, protected persistence, and OCR remain unimplemented
+Stage 2 gates.
 
 ### Stage 3: Controlled private pilot
 
