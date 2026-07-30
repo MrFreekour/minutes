@@ -96,6 +96,8 @@ echo "=== Staging CLI as Tauri sidecar ==="
 HOST_TARGET="$(rustc -Vv | awk '/host:/ {print $2}')"
 mkdir -p tauri/src-tauri/bin
 cp -f target/release/minutes "tauri/src-tauri/bin/minutes-${HOST_TARGET}"
+cp -f target/release/minutes-graph-worker \
+  "tauri/src-tauri/bin/minutes-graph-worker-${HOST_TARGET}"
 
 echo "=== Building ${DEV_PRODUCT_NAME}.app ==="
 # The calendar-events Swift helper is compiled and staged into
@@ -122,6 +124,10 @@ if [[ "$SIGN_MODE" == "identity" ]]; then
         "$nested_executable"
     fi
   done < <(find "$BUILD_APP/Contents/MacOS" -maxdepth 1 -type f \( -perm -100 -o -perm -010 -o -perm -001 \))
+  ./scripts/package-graph-xpc.sh \
+    "$BUILD_APP" \
+    "$SIGNING_IDENTITY" \
+    tauri/src-tauri/minutes-graph-worker.entitlements
 
   echo "=== Signing ${DEV_PRODUCT_NAME}.app (outer, no --deep) ==="
   codesign --force --options runtime --timestamp \
@@ -142,6 +148,10 @@ else
       codesign --force --sign - "$nested_executable"
     fi
   done < <(find "$BUILD_APP/Contents/MacOS" -maxdepth 1 -type f \( -perm -100 -o -perm -010 -o -perm -001 \))
+  ./scripts/package-graph-xpc.sh \
+    "$BUILD_APP" \
+    - \
+    tauri/src-tauri/minutes-graph-worker.entitlements
   codesign --force --sign - "$BUILD_APP"
 fi
 

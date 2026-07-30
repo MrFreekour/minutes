@@ -15,7 +15,7 @@ const posts = [
     date: "2026-07-11",
     title: "whisper.cpp vs parakeet.cpp for local transcription",
     summary:
-      "We ship both engines in production. Real numbers on accuracy and Apple Silicon speed, why Whisper is still the default, and the build friction nobody mentions.",
+      "Real numbers on accuracy and Apple Silicon speed, plus why Minutes currently selects sealed Whisper and safety-gates Parakeet's pathname-only transport.",
   },
   {
     slug: "governance-built-in-not-retrofitted",

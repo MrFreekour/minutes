@@ -134,8 +134,12 @@ jobs:
         run: cargo build --no-default-features
 
       - name: Unit tests (no whisper)
-        run: cargo test -p minutes-core --no-default-features --lib -- --test-threads=1
-        timeout-minutes: 3
+        # Keep libtest output visible on hosted Windows so a platform-only
+        # assertion is diagnosable even if a later test reaches the job
+        # deadline. Privacy-B also substantially expanded this suite; three
+        # minutes no longer covers its bounded two-worker/QMD regressions.
+        run: cargo test -p minutes-core --no-default-features --lib -- --test-threads=1 --nocapture
+        timeout-minutes: 15
 
       - name: Copilot attach, routing, and window-contract tests
         # On Windows this executes the real named-pipe connect/reconnect path.
@@ -384,6 +388,10 @@ jobs:
         working-directory: crates/mcp
         run: npx vitest run src/captureRelay.test.ts
 
+      - name: MCP full unit suite
+        working-directory: crates/mcp
+        run: npm run test:unit
+
       # Regression guard for issue #149: v0.13.0 shipped an MCPB bundle
       # that Claude Desktop 1.3109.0 refused to unzip because the bundle
       # contained Next.js chunks with `..` in their filenames. Pack the
@@ -411,7 +419,7 @@ jobs:
   # The lockfile is generated from a clean tree with Node 22/npm 10 so its v3
   # package graph retains every platform-specific optional dependency.
   mcp_lockfile_check:
-    name: MCP Lockfile (${{ matrix.os }})
+    name: Agent Corpus + MCP Lockfile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -425,6 +433,21 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install SDK dependencies
+        working-directory: crates/sdk
+        run: npm ci
+
+      - name: SDK corpus policy tests
+        working-directory: crates/sdk
+        run: npx vitest run src/corpus-lease.test.ts src/secure-read.test.ts
+
+      - name: Build SDK production module
+        working-directory: crates/sdk
+        run: npm run build
+
+      - name: Gate SDK production recursive watcher protocol
+        run: node scripts/check_corpus_watch_fence.mjs crates/sdk/dist/corpus-lease.js
+
       - name: Install MCP dependencies
         working-directory: crates/mcp
         run: npm ci
@@ -432,6 +455,22 @@ jobs:
       - name: TypeScript check
         working-directory: crates/mcp
         run: npx tsc --noEmit
+
+      - name: MCP corpus policy tests
+        working-directory: crates/mcp
+        run: >-
+          npx vitest run
+          src/index.test.ts
+          src/corpus-lease.test.ts
+          src/secure-read.test.ts
+          src/paths.test.ts
+
+      - name: Build MCP production module
+        working-directory: crates/mcp
+        run: npm run build
+
+      - name: Gate MCP production recursive watcher protocol
+        run: node scripts/check_corpus_watch_fence.mjs crates/mcp/dist/corpus-lease.js
 
   version_sync:
     name: Version Sync

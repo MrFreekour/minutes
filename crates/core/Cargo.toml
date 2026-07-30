@@ -12,8 +12,10 @@ categories = ["multimedia::audio", "command-line-utilities"]
 [features]
 default = ["whisper"]
 whisper = ["dep:whisper-rs", "whisper-guard/whisper"]
-parakeet = []  # subprocess-based, uses tempfile for concurrent safety
-diarize = ["dep:pyannote-rs", "dep:ort", "dep:ndarray"]
+# Retained Parakeet preferences currently resolve to Whisper on every platform.
+# Keep that fallback executable even in `--no-default-features --features parakeet` builds.
+parakeet = ["whisper"]  # dormant subprocess contract; runtime selection stays gated until secure byte transport exists
+diarize = ["dep:pyannote-rs", "dep:knf-rs", "dep:ort", "dep:ndarray"]
 # Live speaker attribution via the external minutes-diarize-sidecar process.
 # Pure subprocess IPC on this side -> intentionally NO parakeet-rs/ort dep, so it
 # never collides with `diarize`'s pyannote-rs (ort rc.10 / ndarray 0.16).
@@ -49,9 +51,9 @@ which = { workspace = true }
 tracing = { workspace = true }
 cpal = { workspace = true }
 hound = { workspace = true }
+symphonia = { workspace = true }
 notify = { workspace = true }
 whisper-rs = { workspace = true, optional = true }
-symphonia = { workspace = true }
 ureq = { workspace = true }
 fs2 = { workspace = true }
 schemars = { workspace = true }
@@ -60,6 +62,7 @@ crossbeam-queue = { workspace = true }
 getrandom = { workspace = true }
 interprocess = { workspace = true }
 pyannote-rs = { workspace = true, optional = true }
+knf-rs = { version = "0.3.2", optional = true }
 ort = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 whisper-guard = { path = "../whisper-guard", version = "0.3.0" }
@@ -67,15 +70,21 @@ nnnoiseless = { workspace = true, optional = true }
 base64 = "0.22"
 rusqlite = { workspace = true }
 tempfile = "3"
+sha2 = "0.10"
+cap-std = { workspace = true }
+chacha20poly1305 = "0.10.1"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 cidre = { version = "0.15.0", default-features = false, features = ["at", "av", "cat", "cf", "cm", "core_audio", "macos_14_4", "ns"] }
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "NSWorkspace", "libc"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["AVCaptureDevice", "AVMediaFormat"] }
+mach2 = "0.6"
 # Static sherpa-onnx on macOS so opt-in engine-sherpa builds produce apps/CLIs
 # with no dangling @rpath dylib refs (the #369 packaging blocker; verified by
 # real launch + transcription). `default-features = false` drops upstream `tts`.
@@ -91,7 +100,7 @@ sherpa-rs = { version = "0.6.8", default-features = false, features = ["download
 # The macOS frameworks are linked automatically via #[link(name = "...")]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 # Dynamic on Windows, as before the macOS static fix (CI builds this gate on
 # all three platforms; static archives are only wired up for macOS).
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"], optional = true }

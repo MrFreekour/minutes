@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 mod dashboard;
 mod demo_data;
 mod voice;
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -77,11 +77,15 @@ struct ContextSummaryOutput {
     top_apps: Vec<ContextCount>,
     top_windows: Vec<ContextCount>,
     window: ContextWindow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_authorization: Option<ContextSourceAuthorization>,
 }
 
 #[derive(Serialize)]
 struct ContextSearchOutput {
     results: Vec<minutes_core::context_store::ContextEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_authorization: Option<ContextSourceAuthorization>,
 }
 
 #[derive(Serialize)]
@@ -90,6 +94,23 @@ struct ContextMomentOutput {
     links: Vec<minutes_core::context_store::ContextLink>,
     events: Vec<minutes_core::context_store::ContextEvent>,
     window: ContextWindow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_authorization: Option<ContextSourceAuthorization>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextSourceAuthorization {
+    session_id: String,
+    path: String,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct ContextScreenOutput {
+    #[serde(flatten)]
+    result: minutes_core::context_store::ScreenContextResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_authorization: Option<ContextSourceAuthorization>,
 }
 
 #[derive(Serialize)]
@@ -282,7 +303,7 @@ fn prompt_for_recording_consent() -> Result<bool> {
 }
 
 /// minutes — conversation memory for AI assistants.
-/// Every meeting, every idea, every voice note — searchable by your AI.
+/// Your meetings, ideas, and voice notes — locally owned, with policy-aware AI search.
 #[derive(Parser)]
 #[command(
     name = "minutes",
@@ -413,6 +434,10 @@ enum Commands {
     #[command(hide = true)]
     ProcessQueue,
 
+    /// Hidden capability bridge for one bounded restricted-override audit line.
+    #[command(hide = true)]
+    PolicyAudit,
+
     /// Hidden structured Parakeet helper used by Minutes internals.
     #[command(hide = true)]
     ParakeetHelper {
@@ -475,6 +500,27 @@ enum Commands {
         #[arg(long)]
         allow_degraded: bool,
 
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Hidden, atomic fail-closed status bridge for trusted consumers.
+    #[command(hide = true)]
+    KnowledgeStatus {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Hidden, strict startup bridge for Recall/MCP agent readiness.
+    #[command(hide = true)]
+    AgentReadiness {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Hidden, strict bridge for the authoritative live meeting root.
+    #[command(hide = true)]
+    MeetingsRoot {
         #[arg(long)]
         json: bool,
     },
@@ -590,9 +636,8 @@ enum Commands {
         #[arg(long, conflicts_with = "no_sync")]
         sync: bool,
 
-        /// Skip filesystem sync entirely; query the index as-is. Useful for
-        /// piped or scripted CLI calls where freshness doesn't matter and
-        /// every millisecond counts.
+        /// Avoid a forced rebuild. Minutes still scans stable live sources
+        /// into a private, non-persistent search projection for this command.
         #[arg(long, conflicts_with = "sync")]
         no_sync: bool,
 
@@ -602,7 +647,7 @@ enum Commands {
         include_restricted: bool,
     },
 
-    /// Show open action items across all meetings
+    /// Show open action items across normal meetings (or an explicit audited restricted override)
     Actions {
         /// Filter by assignee name
         #[arg(short, long)]
@@ -614,7 +659,7 @@ enum Commands {
         include_restricted: bool,
     },
 
-    /// Flag conflicting decisions and stale commitments across meetings
+    /// Flag conflicting decisions and stale commitments across normal meetings
     Consistency {
         /// Filter stale commitments by owner / person
         #[arg(long)]
@@ -625,19 +670,19 @@ enum Commands {
         stale_after_days: i64,
     },
 
-    /// Build a first-pass profile for a person across meetings
+    /// Build a bounded live-source profile across normal meetings
     Person {
         /// Person / attendee name to profile
         name: String,
     },
 
-    /// Show relationship overview: top contacts, commitments, losing-touch alerts
+    /// Rank relationships from a bounded, process-private projection of authorized meetings
     People {
-        /// Subcommand (e.g. `merge`); omit to list the relationship graph
+        /// Confirm that multiple names identify one person
         #[command(subcommand)]
         action: Option<PeopleAction>,
 
-        /// Force full index rebuild from markdown files
+        /// Rebuild and report projection statistics before listing people
         #[arg(long)]
         rebuild: bool,
 
@@ -656,7 +701,7 @@ enum Commands {
         action: VocabularyAction,
     },
 
-    /// List open and stale commitments from the conversation graph
+    /// Show commitments from a bounded, process-private projection of authorized meetings
     Commitments {
         /// Filter by person name or slug
         #[arg(short, long)]
@@ -665,6 +710,10 @@ enum Commands {
         /// Output raw JSON
         #[arg(long)]
         json: bool,
+
+        /// Maximum number of commitments to return
+        #[arg(short, long, default_value = "10000")]
+        limit: usize,
     },
 
     /// Research a topic across meetings, decisions, and open follow-ups
@@ -704,7 +753,8 @@ enum Commands {
         #[arg(long, conflicts_with = "no_sync")]
         sync: bool,
 
-        /// Skip filesystem sync entirely; query the index as-is.
+        /// Avoid a forced rebuild while still building a private live-source
+        /// projection for this command.
         #[arg(long, conflicts_with = "sync")]
         no_sync: bool,
 
@@ -727,10 +777,10 @@ enum Commands {
 
     /// Ingest meetings into the knowledge base (extract facts, update person profiles)
     Ingest {
-        /// Path to a meeting .md file, or omit to process all meetings
+        /// Path to a normal meeting .md file, or omit to process all normal meetings
         path: Option<PathBuf>,
 
-        /// Process all meetings in the output directory
+        /// Process all policy-authorized normal meetings in the output directory
         #[arg(long)]
         all: bool,
 
@@ -818,6 +868,30 @@ enum Commands {
         /// Use `minutes template list` to see available templates.
         #[arg(long)]
         template: Option<String>,
+
+        /// Inherited descriptor carrying the exact MCP-authorized source revision.
+        #[arg(
+            long,
+            hide = true,
+            requires_all = ["authorized_input_bytes", "authorized_input_format"]
+        )]
+        authorized_input_fd: Option<i32>,
+
+        /// Exact staged-byte length supplied by the trusted MCP bridge.
+        #[arg(
+            long,
+            hide = true,
+            requires_all = ["authorized_input_fd", "authorized_input_format"]
+        )]
+        authorized_input_bytes: Option<u64>,
+
+        /// Original extension used only for descriptor-backed decoder selection.
+        #[arg(
+            long,
+            hide = true,
+            requires_all = ["authorized_input_fd", "authorized_input_bytes"]
+        )]
+        authorized_input_format: Option<String>,
     },
 
     /// Transcribe an audio file to text without writing meeting files or summarizing.
@@ -869,11 +943,11 @@ enum Commands {
         #[arg(long)]
         diarization: bool,
 
-        /// Download parakeet.cpp model for alternative transcription engine
+        /// Compatibility flag: reports that secure Parakeet transport is unavailable; installs nothing
         #[arg(long)]
         parakeet: bool,
 
-        /// Parakeet model to download: tdt-ctc-110m, tdt-600m
+        /// Historical Parakeet model identifier retained for compatibility; currently no download occurs
         #[arg(long, default_value = "tdt-600m")]
         parakeet_model: String,
 
@@ -886,13 +960,12 @@ enum Commands {
         demo: bool,
     },
 
-    /// Inspect or register the meetings directory as a QMD collection
+    /// Inspect and clean up legacy persistent QMD state
     Qmd {
-        /// Action: status or register
-        #[arg(value_parser = ["status", "register"])]
+        /// Action: status or cleanup
         action: String,
 
-        /// Collection name to use in QMD
+        /// Legacy Minutes-owned collection name to audit and remove
         #[arg(long, default_value = "minutes")]
         collection: String,
     },
@@ -1001,6 +1074,11 @@ enum Commands {
         /// When used with --json, omit raw_markdown to keep payloads small
         #[arg(long)]
         compact_json: bool,
+
+        /// Include a meeting designated `sensitivity: restricted`. The
+        /// override is recorded on the event bus before any bytes are read.
+        #[arg(long)]
+        include_restricted: bool,
     },
 
     /// Show recent events from the event log
@@ -1245,20 +1323,14 @@ enum SensitiveAction {
 
 #[derive(Subcommand)]
 enum PeopleAction {
-    /// Confirm that several people are the same person and collapse them.
-    ///
-    /// Records a durable person alias (in the local vocabulary) so future
-    /// transcripts, search, and graph rebuilds resolve every variant spelling to
-    /// the canonical one. The first argument is the surviving canonical name; the
-    /// rest are its variants. Accepts slugs (from the "Possible name variants"
-    /// suggestions) or exact names.
+    /// Confirm a canonical name and its variants for future projections.
     Merge {
         /// Canonical (surviving) person: a slug or exact name.
         canonical: String,
         /// Variant people to fold into the canonical: slugs or exact names.
         #[arg(required = true)]
         aliases: Vec<String>,
-        /// Skip the automatic graph rebuild (run `minutes people --rebuild` later).
+        /// Save the correction without immediately rebuilding the projection.
         #[arg(long)]
         no_rebuild: bool,
         /// Output raw JSON instead of formatted text
@@ -1444,7 +1516,11 @@ enum CopilotAction {
         live: bool,
     },
     /// Show what Coach is doing in plain language
-    Status,
+    Status {
+        /// Print the strict, content-free status contract as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Pause suggestions without affecting the recording
     Pause,
     /// Resume suggestions
@@ -1575,6 +1651,10 @@ enum ContextAction {
         /// Text query
         query: String,
 
+        /// Linked meeting path. Required for assistant-policy context reads.
+        #[arg(long)]
+        path: Option<PathBuf>,
+
         /// Maximum number of results
         #[arg(short, long, default_value = "20")]
         limit: usize,
@@ -1612,9 +1692,194 @@ enum ContextAction {
     },
 }
 
+fn command_requires_strict_config_bridge(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::KnowledgeStatus { .. }
+            | Commands::AgentReadiness { .. }
+            | Commands::MeetingsRoot { .. }
+            | Commands::PolicyAudit
+            | Commands::Qmd { .. }
+    )
+}
+
+fn command_requires_agent_trust_readiness(command: &Commands) -> bool {
+    matches!(command, Commands::AgentReadiness { .. })
+        || matches!(command, Commands::Copilot { action } if copilot_action_hosts_agent_provider(action))
+}
+
+/// Claim the MCP bridge descriptor before any CLI startup work can spawn a
+/// subprocess. The descriptor has to be inheritable for the initial exec into
+/// `minutes`; leaving it that way during any startup work would disclose raw
+/// audio to an unrelated child. Ownership and CLOEXEC are established here,
+/// then the exact `File` capability is carried to command dispatch.
+fn claim_authorized_process_input(command: &mut Commands) -> Result<Option<std::fs::File>> {
+    let fd = match command {
+        Commands::Process {
+            authorized_input_fd,
+            ..
+        } => authorized_input_fd.take(),
+        _ => None,
+    };
+    let Some(fd) = fd else {
+        return Ok(None);
+    };
+    if fd != 3 {
+        anyhow::bail!("authorized process input descriptor must be fd 3");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let current = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if current < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: the MCP bridge transfers ownership of exactly fd 3. The
+        // value was removed from the parsed command, so no later path can take
+        // ownership of or close the raw descriptor a second time.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, current | libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Some(file))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        anyhow::bail!("inherited authorized process input is unavailable");
+    }
+}
+
+#[cfg(unix)]
+fn claim_authorized_process_supervisor() -> Result<std::fs::File> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::FileTypeExt;
+
+    const SUPERVISOR_FD: i32 = 4;
+    let current = unsafe { libc::fcntl(SUPERVISOR_FD, libc::F_GETFD) };
+    if current < 0 {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    // SAFETY: the process-audio helper transfers ownership of exactly fd 4.
+    // The returned File is moved into the lifecycle watcher below, so the raw
+    // descriptor cannot be closed or claimed a second time.
+    let mut supervisor = unsafe { std::fs::File::from_raw_fd(SUPERVISOR_FD) };
+    if unsafe {
+        libc::fcntl(
+            supervisor.as_raw_fd(),
+            libc::F_SETFD,
+            current | libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    let file_type = supervisor.metadata()?.file_type();
+    if !file_type.is_fifo() && !file_type.is_socket() {
+        anyhow::bail!("outer process supervisor capability was invalid");
+    }
+
+    // A pipe/socket object is not enough: its peer must still be alive when
+    // containment is installed. Probe without blocking, then restore the
+    // original status flags before the watcher takes ownership.
+    let status_flags = unsafe { libc::fcntl(supervisor.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0
+        || unsafe {
+            libc::fcntl(
+                supervisor.as_raw_fd(),
+                libc::F_SETFL,
+                status_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+    {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    let mut probe = [0_u8; 1];
+    let probe_result = supervisor.read(&mut probe);
+    if unsafe { libc::fcntl(supervisor.as_raw_fd(), libc::F_SETFL, status_flags) } < 0 {
+        anyhow::bail!("outer process supervisor capability was unavailable");
+    }
+    match probe_result {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(supervisor),
+        _ => anyhow::bail!("outer process supervisor capability was not live"),
+    }
+}
+
+#[cfg(unix)]
+fn watch_authorized_process_supervisor(mut supervisor: std::fs::File) -> Result<()> {
+    use std::io::Read;
+
+    std::thread::Builder::new()
+        .name("minutes-process-audio-supervisor".into())
+        .spawn(move || {
+            let mut byte = [0_u8; 1];
+            loop {
+                match supervisor.read(&mut byte) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // The helper never sends data. EOF or any protocol/error
+                    // transition means the outer supervisor was lost, so the
+                    // shared group must fail closed instead of being orphaned.
+                    _ => unsafe {
+                        libc::kill(-libc::getpgrp(), libc::SIGKILL);
+                        return;
+                    },
+                }
+            }
+        })?;
+    Ok(())
+}
+
+fn install_authorized_process_containment(has_authorized_input: bool) -> Result<()> {
+    const MARKER: &str = "MINUTES_MCP_OUTER_PROCESS_GROUP";
+    let marker = std::env::var_os(MARKER);
+    std::env::remove_var(MARKER);
+    match (has_authorized_input, marker) {
+        (false, None) => Ok(()),
+        (false, Some(_)) => anyhow::bail!("outer process containment requires authorized input"),
+        (true, None) => anyhow::bail!("authorized process input requires outer containment"),
+        (true, Some(raw)) => {
+            #[cfg(unix)]
+            {
+                let process_group = raw
+                    .to_str()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("outer process containment marker was invalid")
+                    })?;
+                let supervisor = claim_authorized_process_supervisor()?;
+                minutes_core::install_validated_outer_process_group(process_group)?;
+                watch_authorized_process_supervisor(supervisor)?;
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = raw;
+                anyhow::bail!("outer process containment is unavailable")
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    if let Some(code) = minutes_core::graph_worker::maybe_run_policy_projection_worker() {
+        std::process::exit(code);
+    }
+    // Must stay ahead of argument parsing: a decode child is re-executed with
+    // this binary and must never run a user command line.
+    if let Some(code) = minutes_core::audio_decode_worker::maybe_run_audio_decode_worker() {
+        std::process::exit(code);
+    }
+    let mut cli = Cli::parse();
     let verbose = cli.verbose;
+    // This must remain the first action after parsing. In particular, do not
+    // move logging, config loading, readiness checks, or any subprocess work
+    // above the fd claim.
+    let mut claimed_authorized_process_input = claim_authorized_process_input(&mut cli.command)?;
+    install_authorized_process_containment(claimed_authorized_process_input.is_some())?;
 
     // Initialize logging.
     //
@@ -1633,12 +1898,29 @@ fn main() -> Result<()> {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+
+    // Upgrade cleanup is best-effort here so an unsafe legacy cache entry
+    // cannot block unrelated recording/export commands. Native graph/search
+    // boundaries repeat the retirement check and fail closed before answering.
+    if let Err(error) = minutes_core::policy_fs::retire_legacy_policy_caches() {
+        tracing::warn!(
+            error = %error,
+            "legacy policy caches could not be retired at CLI startup"
+        );
+    }
     // Route whisper.cpp + ggml stderr through the tracing subscriber we just
     // installed. Safe to call multiple times; only the first call has effect.
     // Without this, the C-level logs leak to raw stderr and bypass the filter.
     minutes_core::install_whisper_logging_hooks();
 
-    let mut config = Config::load();
+    let strict_bridge = command_requires_strict_config_bridge(&cli.command);
+    // QMD registry inspection is an agent-host boundary, not generic CLI
+    // startup work. Recording, stop, processing, and other basic commands must
+    // never execute QMD merely because the CLI was launched.
+    let agent_trust_readiness = command_requires_agent_trust_readiness(&cli.command)
+        .then(minutes_core::knowledge::establish_agent_trust_readiness_from_strict_config);
+    let mut config = load_cli_config(strict_bridge)?;
+    apply_agent_policy_graph_corpus(&cli.command, &mut config)?;
     install_parakeet_panic_hook();
 
     // Rotate old log files at startup
@@ -1741,6 +2023,7 @@ fn main() -> Result<()> {
         }
         Commands::MicToggle { state } => cmd_mic_toggle(state.as_deref()),
         Commands::ProcessQueue => cmd_process_queue(&config),
+        Commands::PolicyAudit => cmd_policy_audit(),
         Commands::ParakeetHelper {
             binary,
             model_path,
@@ -1789,6 +2072,14 @@ fn main() -> Result<()> {
             allow_degraded,
             json,
         } => cmd_preflight_record(&mode, &intent, allow_degraded, json, &config),
+        Commands::KnowledgeStatus { json } => cmd_knowledge_status(json),
+        Commands::AgentReadiness { json } => cmd_agent_readiness(
+            json,
+            agent_trust_readiness
+                .as_ref()
+                .expect("agent readiness command establishes its boundary"),
+        ),
+        Commands::MeetingsRoot { json } => cmd_meetings_root(json),
         Commands::Status => cmd_status(),
         Commands::Jobs { all, json, limit } => cmd_jobs(all, json, limit),
         Commands::Paths { json } => cmd_paths(json, &config),
@@ -1879,7 +2170,11 @@ fn main() -> Result<()> {
             None => cmd_people(rebuild, json, limit, &config),
         },
         Commands::Vocabulary { action } => cmd_vocabulary(action, &config),
-        Commands::Commitments { person, json } => cmd_commitments(person.as_deref(), json, &config),
+        Commands::Commitments {
+            person,
+            json,
+            limit,
+        } => cmd_commitments(person.as_deref(), json, limit, &config),
         Commands::Research {
             query,
             content_type,
@@ -1934,7 +2229,11 @@ fn main() -> Result<()> {
             title,
             language,
             template,
+            authorized_input_fd,
+            authorized_input_bytes,
+            authorized_input_format,
         } => {
+            debug_assert!(authorized_input_fd.is_none());
             if let Some(lang) = language {
                 config.transcription.language = Some(lang);
             }
@@ -1942,6 +2241,31 @@ fn main() -> Result<()> {
                 "meeting" => ContentType::Meeting,
                 "memo" => ContentType::Memo,
                 other => anyhow::bail!("unknown content type: {}. Use 'meeting' or 'memo'.", other),
+            };
+            let authorized_input = match (
+                claimed_authorized_process_input.take(),
+                authorized_input_bytes,
+                authorized_input_format.as_deref(),
+            ) {
+                (Some(file), Some(byte_length), Some(format)) => {
+                    #[cfg(unix)]
+                    {
+                        Some(
+                            minutes_core::pipeline::AuthorizedProcessAudioInput::from_claimed_inherited_file(
+                                file,
+                                byte_length,
+                                format,
+                            )?,
+                        )
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (file, byte_length, format);
+                        anyhow::bail!("inherited authorized process input is unavailable");
+                    }
+                }
+                (None, None, None) => None,
+                _ => anyhow::bail!("incomplete authorized process input proof"),
             };
             let _trace_guard = minutes_core::process_trace::start_process_trace(
                 &path,
@@ -1968,6 +2292,7 @@ fn main() -> Result<()> {
                     &content_type,
                     title.as_deref(),
                     resolved_template.as_ref(),
+                    authorized_input.as_ref(),
                     &config,
                 );
                 if note.is_some() {
@@ -2043,7 +2368,7 @@ fn main() -> Result<()> {
                 cmd_setup(&model, list, diarization)
             }
         }
-        Commands::Qmd { action, collection } => cmd_qmd(&action, &collection, &config),
+        Commands::Qmd { action, collection } => cmd_qmd(&action, &collection),
         Commands::Automate {
             kind,
             output,
@@ -2100,7 +2425,8 @@ fn main() -> Result<()> {
             slug,
             json,
             compact_json,
-        } => cmd_get(&slug, json, compact_json, &config),
+            include_restricted,
+        } => cmd_get(&slug, json, compact_json, include_restricted, &config),
         Commands::Events {
             limit,
             event_type,
@@ -2108,7 +2434,9 @@ fn main() -> Result<()> {
             follow,
             since_seq,
         } => cmd_events(limit, event_type, since, follow, since_seq, &config),
-        Commands::Copilot { action } => cmd_copilot(action, &mut config),
+        Commands::Copilot { action } => {
+            cmd_copilot(action, &mut config, agent_trust_readiness.as_ref())
+        }
         Commands::AgentAnnotate {
             agent_id,
             tools,
@@ -2142,7 +2470,7 @@ fn main() -> Result<()> {
             limit,
             actionable,
         } => cmd_insights(kind, confidence, participant, since, limit, actionable),
-        Commands::Context { action } => cmd_context(action),
+        Commands::Context { action } => cmd_context(action, &config),
         Commands::Import { from, dir, dry_run } => {
             cmd_import(&from, dir.as_deref(), dry_run, verbose, &config)
         }
@@ -2199,15 +2527,27 @@ fn main() -> Result<()> {
 
 fn cmd_note(text: &str, meeting: Option<&Path>, config: &Config) -> Result<()> {
     if let Some(meeting_path) = meeting {
+        if !assistant_policy_allows_restricted_content() {
+            anyhow::bail!("meeting mutation is unavailable under the active assistant policy");
+        }
         // Post-meeting annotation
-        minutes_core::notes::validate_meeting_path(meeting_path, &config.output_dir)
+        let authorized = read_direct_meeting(meeting_path, config)?;
+        // Keep the path-based legacy writer behind an exact sink-time check.
+        // The central snapshot already rejects links/escapes/malformed policy.
+        reauthorize_direct_meeting_exact(&authorized, config)?;
+        minutes_core::notes::annotate_meeting(&authorized.path, text)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        minutes_core::notes::annotate_meeting(meeting_path, text)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        eprintln!("Note added to {}", meeting_path.display());
+        eprintln!("Note added to {}", authorized.path.display());
     } else {
-        // Note during active recording
-        match minutes_core::notes::add_note(text) {
+        // An assistant note has a narrower sink than the human CLI: it may
+        // annotate a live captured recording but can never become a typed
+        // marker in a no-capture sensitive session.
+        let result = if assistant_policy_allows_restricted_content() {
+            minutes_core::notes::add_note(text)
+        } else {
+            minutes_core::notes::add_recording_note(text)
+        };
+        match result {
             Ok(line) => eprintln!("{}", line),
             Err(e) => anyhow::bail!("{}", e),
         }
@@ -2802,7 +3142,7 @@ fn cmd_mic_toggle(force_state: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stop(config: &Config) -> Result<()> {
+fn cmd_stop(_config: &Config) -> Result<()> {
     match minutes_core::pid::check_recording() {
         Ok(Some(pid)) => {
             let capture_mode = minutes_core::pid::read_recording_metadata()
@@ -2858,10 +3198,7 @@ fn cmd_stop(config: &Config) -> Result<()> {
                 println!("{}", result);
                 std::fs::remove_file(&result_path).ok();
 
-                // Update relationship graph index
-                if let Err(e) = minutes_core::graph::rebuild_index(config) {
-                    tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-                }
+                // Graph consumers project the newly written Markdown on use.
             } else {
                 let active_jobs = minutes_core::jobs::active_jobs();
                 if let Some(job) = active_jobs.first() {
@@ -2930,15 +3267,80 @@ fn cmd_process_queue(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn cmd_policy_audit() -> Result<()> {
+    const MAX_RECORD_BYTES: u64 = 16 * 1024;
+    let mut record = Vec::new();
+    std::io::stdin()
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut record)?;
+    if record.len() as u64 > MAX_RECORD_BYTES {
+        anyhow::bail!("restricted override audit record exceeded its bounded size");
+    }
+    minutes_core::policy_fs::append_restricted_override_audit(&record)
+        .map_err(|_| anyhow::anyhow!("restricted override audit append failed"))
+}
+
 fn cmd_status() -> Result<()> {
     let status = minutes_core::pid::status();
-    let json = serde_json::to_string_pretty(&status)?;
+    let json = if assistant_policy_allows_restricted_content() {
+        serde_json::to_string_pretty(&status)?
+    } else {
+        serde_json::to_string_pretty(&assistant_safe_status(&status))?
+    };
     println!("{}", json);
     Ok(())
 }
 
+fn assistant_safe_status(status: &minutes_core::pid::RecordingStatus) -> serde_json::Value {
+    serde_json::json!({
+        "recording": status.recording,
+        "processing": status.processing,
+        "processing_stage": assistant_safe_processing_stage(status.processing_stage.as_deref()),
+        "recording_mode": status.recording_mode,
+        "processing_job_count": status.processing_job_count,
+    })
+}
+
+fn assistant_safe_processing_stage(value: Option<&str>) -> Option<&'static str> {
+    let normalized = value?
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    match normalized.as_str() {
+        "queuedforprocessing" => Some("Queued for processing"),
+        "transcribing" | "transcribingaudio" | "transcribingmeeting" => Some("Transcribing"),
+        "transcriptready" | "transcriptreadyenrichingartifact" => Some("Transcript ready"),
+        "separatingspeakers" => Some("Separating speakers"),
+        "generatingsummary" => Some("Generating summary"),
+        "saving" | "savingartifact" => Some("Saving"),
+        "needsreview" | "needsreviewrawcapturepreserved" => Some("Needs review"),
+        "processingfailed" => Some("Failed"),
+        _ => None,
+    }
+}
+
 fn cmd_jobs(include_terminal: bool, json_mode: bool, limit: usize) -> Result<()> {
     let jobs = minutes_core::jobs::display_jobs(Some(limit), include_terminal);
+
+    if !assistant_policy_allows_restricted_content() {
+        let jobs = assistant_safe_jobs(&jobs);
+        if json_mode {
+            println!("{}", serde_json::to_string_pretty(&jobs)?);
+        } else if jobs.is_empty() {
+            println!("No processing jobs.");
+        } else {
+            for job in jobs {
+                println!(
+                    "{}  {}  {}",
+                    job["id"].as_str().unwrap_or("job"),
+                    job["state"].as_str().unwrap_or("unknown"),
+                    job["stage"].as_str().unwrap_or("Processing")
+                );
+            }
+        }
+        return Ok(());
+    }
 
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
@@ -2995,6 +3397,33 @@ fn cmd_jobs(include_terminal: bool, json_mode: bool, limit: usize) -> Result<()>
     }
 
     Ok(())
+}
+
+fn assistant_safe_jobs(jobs: &[minutes_core::jobs::ProcessingJob]) -> Vec<serde_json::Value> {
+    jobs.iter()
+        .enumerate()
+        .map(|(index, job)| {
+            let id = if assistant_safe_job_id(&job.id) {
+                job.id.clone()
+            } else {
+                format!("job-{}", index + 1)
+            };
+            serde_json::json!({
+                "id": id,
+                "state": job.state,
+                "stage": job.state.default_stage(),
+            })
+        })
+        .collect()
+}
+
+fn assistant_safe_job_id(value: &str) -> bool {
+    let mut parts = value.split('-');
+    matches!(parts.next(), Some("job"))
+        && matches!(parts.next(), Some(timestamp) if timestamp.len() == 17 && timestamp.bytes().all(|byte| byte.is_ascii_digit()))
+        && matches!(parts.next(), Some(pid) if !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        && matches!(parts.next(), Some(counter) if !counter.is_empty() && counter.bytes().all(|byte| byte.is_ascii_digit()))
+        && parts.next().is_none()
 }
 
 fn automation_runs_dir() -> PathBuf {
@@ -3242,7 +3671,30 @@ struct PathsReport {
     output_dir: PathBuf,
 }
 
+#[derive(Serialize)]
+struct MeetingsRootReport {
+    schema_version: u32,
+    output_dir: PathBuf,
+}
+
+fn cmd_meetings_root(json: bool) -> Result<()> {
+    let config = Config::load_strict().map_err(anyhow::Error::msg)?;
+    let report = MeetingsRootReport {
+        schema_version: 1,
+        output_dir: config.output_dir,
+    };
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("{}", report.output_dir.display());
+    }
+    Ok(())
+}
+
 fn cmd_paths(json: bool, config: &Config) -> Result<()> {
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("local path inventory is unavailable under the active assistant policy");
+    }
     let report = PathsReport {
         config_path: Config::config_path(),
         minutes_dir: Config::minutes_dir(),
@@ -3276,6 +3728,9 @@ struct CleanupReport {
 }
 
 fn cmd_storage(json: bool, config: &Config) -> Result<()> {
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("storage inventory is unavailable under the active assistant policy");
+    }
     let plan = minutes_core::retention::preview_audio_retention(config, Local::now());
     if json {
         let envelope = json_envelope("minutes storage", plan);
@@ -3287,6 +3742,9 @@ fn cmd_storage(json: bool, config: &Config) -> Result<()> {
 }
 
 fn cmd_cleanup(apply: bool, older_than: Option<&str>, json: bool, config: &Config) -> Result<()> {
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("storage cleanup is unavailable under the active assistant policy");
+    }
     let mut effective_config = config.clone();
     if let Some(value) = older_than {
         effective_config.retention.successful_audio_days = parse_retention_days(value)?;
@@ -3415,28 +3873,31 @@ fn owner_display(
 
 #[allow(clippy::too_many_arguments)]
 /// Resolve `--sync` / `--no-sync` clap flags into a `SyncMode`. Both flags
-/// have `conflicts_with` so clap rejects passing both; the unset case falls
-/// through to `Auto` (per-file mtime+size scan), which is the right default
-/// for a CLI invocation that wants fresh data without forcing a full rebuild.
-fn resolve_sync_mode(sync: bool, no_sync: bool) -> minutes_core::search_index::SyncMode {
+/// have `conflicts_with` so clap rejects passing both. All modes populate a
+/// process-private live-source projection; Force additionally clears it
+/// before the scan.
+fn resolve_sync_mode(sync: bool, no_sync: bool) -> minutes_core::search::SyncMode {
     if sync {
-        minutes_core::search_index::SyncMode::Force
+        minutes_core::search::SyncMode::Force
     } else if no_sync {
-        minutes_core::search_index::SyncMode::Skip
+        minutes_core::search::SyncMode::Skip
     } else {
-        minutes_core::search_index::SyncMode::Auto
+        minutes_core::search::SyncMode::Auto
     }
 }
 
-/// Record an explicit `--include-restricted` override on the event bus
-/// before any results are returned, so the bypass is never silent (consent
-/// layer Wave 2). Best-effort by design: a failed append warns on stderr but
-/// never blocks the caller (headless/hook discipline).
-fn record_sensitivity_override(surface: &str, query: Option<&str>) {
+/// Record an explicit `--include-restricted` override on the event bus before
+/// any results are returned, so the bypass is never silent (consent layer
+/// Wave 2). Search text, assignee names, and research questions are themselves
+/// potentially sensitive and must not be copied into the durable event log;
+/// the MCP boundary keeps its separate privacy-safe scope hash. Best-effort by
+/// design: a failed append warns on stderr but never blocks the caller
+/// (headless/hook discipline).
+fn record_sensitivity_override(surface: &str, _query: Option<&str>) {
     if let Err(error) = minutes_core::events::append_event_strict(
         minutes_core::events::MinutesEvent::SensitivityOverride {
             surface: surface.to_string(),
-            query: query.map(|q| q.to_string()),
+            query: None,
         },
     ) {
         eprintln!(
@@ -3444,6 +3905,107 @@ fn record_sensitivity_override(surface: &str, query: Option<&str>) {
             error
         );
     }
+}
+
+fn restricted_content_policy_allows_override(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("deny"))
+}
+
+fn assistant_policy_allows_restricted_content() -> bool {
+    restricted_content_policy_allows_override(
+        std::env::var("MINUTES_CLI_RESTRICTED_POLICY")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn load_cli_config(strict_bridge: bool) -> Result<Config> {
+    if strict_bridge {
+        Ok(Config::default())
+    } else if !assistant_policy_allows_restricted_content() {
+        Config::load_strict().map_err(anyhow::Error::msg)
+    } else {
+        Ok(Config::load())
+    }
+}
+
+const POLICY_GRAPH_CORPUS_ROOT_ENV: &str = "MINUTES_POLICY_GRAPH_CORPUS_ROOT";
+
+fn apply_agent_policy_graph_corpus(command: &Commands, config: &mut Config) -> Result<()> {
+    let root = std::env::var_os(POLICY_GRAPH_CORPUS_ROOT_ENV);
+    std::env::remove_var(POLICY_GRAPH_CORPUS_ROOT_ENV);
+    let Some(root) = root else {
+        return Ok(());
+    };
+    if assistant_policy_allows_restricted_content()
+        || !matches!(
+            command,
+            Commands::Person { .. } | Commands::People { .. } | Commands::Commitments { .. }
+        )
+    {
+        return Ok(());
+    }
+    let root = PathBuf::from(root);
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        anyhow::bail!("policy graph corpus root was invalid");
+    }
+    let canonical = root
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("policy graph corpus root could not be verified"))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("policy graph corpus root was not a directory");
+    }
+    config.output_dir = canonical;
+    Ok(())
+}
+
+/// One descriptor-stable authorization boundary for every CLI command that
+/// accepts an exact meeting path. Human CLI sessions retain their historical
+/// ability to operate on explicitly restricted meetings; assistant children
+/// inheriting `MINUTES_CLI_RESTRICTED_POLICY=deny` are normal-only.
+fn read_direct_meeting(
+    path: &Path,
+    config: &Config,
+) -> Result<minutes_core::search::AuthorizedMeetingSnapshot> {
+    minutes_core::search::read_authorized_meeting(
+        path,
+        config,
+        assistant_policy_allows_restricted_content(),
+    )
+    .map_err(|_| anyhow::anyhow!("meeting is unavailable under the active assistant policy"))
+}
+
+fn reauthorize_direct_meeting_exact(
+    snapshot: &minutes_core::search::AuthorizedMeetingSnapshot,
+    config: &Config,
+) -> Result<()> {
+    snapshot
+        .reauthorize_exact(config, assistant_policy_allows_restricted_content())
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "meeting changed or became unavailable under the active assistant policy"
+            )
+        })
+}
+
+fn authorize_restricted_override(requested: bool, surface: &str) -> Result<()> {
+    if !requested {
+        return Ok(());
+    }
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!(
+            "restricted meeting access is unavailable in this assistant session ({surface})"
+        );
+    }
+    record_sensitivity_override(surface, None);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3456,14 +4018,12 @@ fn cmd_search(
     intent_kind: Option<String>,
     owner: Option<String>,
     format: &str,
-    sync_mode: minutes_core::search_index::SyncMode,
+    sync_mode: minutes_core::search::SyncMode,
     include_restricted: bool,
     config: &Config,
 ) -> Result<()> {
     let json_mode = format == "json";
-    if include_restricted {
-        record_sensitivity_override("cli.search", Some(query));
-    }
+    authorize_restricted_override(include_restricted, "cli.search")?;
     let filters = minutes_core::search::SearchFilters {
         content_type,
         since,
@@ -3557,9 +4117,7 @@ fn cmd_search(
 }
 
 fn cmd_actions(assignee: Option<&str>, include_restricted: bool, config: &Config) -> Result<()> {
-    if include_restricted {
-        record_sensitivity_override("cli.actions", assignee);
-    }
+    authorize_restricted_override(include_restricted, "cli.actions")?;
     let results = minutes_core::search::find_open_actions(config, assignee, include_restricted)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -3584,7 +4142,7 @@ fn cmd_actions(assignee: Option<&str>, include_restricted: bool, config: &Config
 fn cmd_list(
     limit: usize,
     content_type: Option<String>,
-    sync_mode: minutes_core::search_index::SyncMode,
+    sync_mode: minutes_core::search::SyncMode,
     include_restricted: bool,
     config: &Config,
 ) -> Result<()> {
@@ -3609,6 +4167,18 @@ fn cmd_export(
     output: Option<PathBuf>,
     config: &Config,
 ) -> Result<()> {
+    cmd_export_with_hook(content_type, output, config, |_, _| {})
+}
+
+fn cmd_export_with_hook<F>(
+    content_type: Option<String>,
+    output: Option<PathBuf>,
+    config: &Config,
+    mut before_row_write: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &minutes_core::search::AuthorizedMeetingSnapshot),
+{
     let filters = minutes_core::search::SearchFilters {
         content_type,
         since: None,
@@ -3616,11 +4186,19 @@ fn cmd_export(
         intent_kind: None,
         owner: None,
         recorded_by: None,
-        include_restricted: true,
+        include_restricted: assistant_policy_allows_restricted_content(),
     };
 
     // Reuse search with empty query to get all meetings
     let results = minutes_core::search::search("", config, &filters)?;
+
+    // Bind every row to one descriptor-stable source before opening or
+    // truncating the destination. A restricted/malformed member therefore
+    // fails the batch without leaving a partially-created export file.
+    let authorized = results
+        .iter()
+        .map(|result| read_direct_meeting(&result.path, config))
+        .collect::<Result<Vec<_>>>()?;
 
     // Build CSV writer (to file or stdout)
     let mut wtr: Box<dyn std::io::Write> = if let Some(ref path) = output {
@@ -3632,25 +4210,31 @@ fn cmd_export(
     let mut csv_wtr = csv::Writer::from_writer(&mut wtr);
     csv_wtr.write_record(["date", "title", "type", "duration", "path"])?;
 
-    for result in &results {
-        // Parse frontmatter to get duration
-        let content = std::fs::read_to_string(&result.path).unwrap_or_default();
-        let (fm_str, _) = minutes_core::markdown::split_frontmatter(&content);
-        let duration =
-            minutes_core::markdown::extract_field(fm_str, "duration").unwrap_or_default();
-
+    for (index, snapshot) in authorized.iter().enumerate() {
+        let frontmatter = &snapshot.frontmatter;
+        let content_type = match frontmatter.r#type {
+            ContentType::Meeting => "meeting",
+            ContentType::Memo => "memo",
+            ContentType::Dictation => "dictation",
+        };
+        let date = frontmatter.date.to_rfc3339();
+        let path = snapshot.path.display().to_string();
+        // This is the final source-policy action before the row sink. Never
+        // reopen the ambient pathname for one extra field after authorization.
+        before_row_write(index, snapshot);
+        reauthorize_direct_meeting_exact(snapshot, config)?;
         csv_wtr.write_record([
-            &result.date,
-            &result.title,
-            &result.content_type,
-            &duration,
-            &result.path.display().to_string(),
+            date.as_str(),
+            frontmatter.title.as_str(),
+            content_type,
+            frontmatter.duration.as_str(),
+            path.as_str(),
         ])?;
     }
 
     csv_wtr.flush()?;
 
-    let count = results.len();
+    let count = authorized.len();
     if let Some(ref path) = output {
         eprintln!("Exported {} meetings to {}", count, path.display());
     } else {
@@ -3716,8 +4300,17 @@ fn cmd_consistency(owner: Option<&str>, stale_after_days: i64, config: &Config) 
 }
 
 fn cmd_person(name: &str, config: &Config) -> Result<()> {
-    let profile =
-        minutes_core::search::person_profile(config, name).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let profile = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        minutes_core::graph::PolicyProjectionRequest::PersonProfile {
+            selector: name.to_string(),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        minutes_core::graph::PolicyProjectionResponse::PersonProfile(profile) => profile,
+        _ => anyhow::bail!("policy graph worker returned the wrong person-profile response"),
+    };
 
     if profile.recent_meetings.is_empty()
         && profile.open_intents.is_empty()
@@ -3755,6 +4348,18 @@ fn cmd_person(name: &str, config: &Config) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&profile)?);
     Ok(())
+}
+
+fn run_graph_rebuild_worker(config: &Config) -> Result<minutes_core::graph::GraphStats> {
+    match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        minutes_core::graph::PolicyProjectionRequest::RebuildStats,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        minutes_core::graph::PolicyProjectionResponse::RebuildStats(stats) => Ok(stats),
+        _ => anyhow::bail!("policy graph worker returned the wrong rebuild response"),
+    }
 }
 
 /// Shell-quote a token for a copy-pasteable command (slugs rarely need it).
@@ -3819,9 +4424,17 @@ fn cmd_people_merge(
     use minutes_core::graph;
     use minutes_core::vocabulary;
 
-    // Best-effort: resolve slugs/names against the current graph. If the graph
-    // isn't built yet, fall back to treating every token as a literal name.
-    let people = graph::relationship_map(config).unwrap_or_default();
+    // Resolve from the same policy-authorized, process-private projection used
+    // by every other graph command. No durable graph cache is trusted here.
+    let people = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        graph::PolicyProjectionRequest::RelationshipMap { limit: 10_000 },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        graph::PolicyProjectionResponse::RelationshipMap(people) => people,
+        _ => anyhow::bail!("policy graph worker returned the wrong relationship response"),
+    };
 
     let (canonical_name, canonical_resolved) = resolve_person_token(canonical, &people);
     let mut unresolved: Vec<String> = Vec::new();
@@ -3860,7 +4473,8 @@ fn cmd_people_merge(
 
     // Persist the confirmed merge as a Person vocabulary entry (canonical +
     // variant aliases). On rebuild the canonicalizer routes every variant to the
-    // canonical slug; the vocabulary survives the graph.db wipe.
+    // canonical slug; vocabulary remains durable while graph projections are
+    // rebuilt in process-private temporary storage.
     let path = vocabulary::default_path();
     let mut store = vocabulary::load().map_err(|e| anyhow::anyhow!("{}", e))?;
     let now = Local::now().to_rfc3339();
@@ -3911,15 +4525,15 @@ fn cmd_people_merge(
     let mut rebuilt = false;
     let mut people_after = None;
     if !no_rebuild {
-        match graph::rebuild_index(config) {
+        match run_graph_rebuild_worker(config) {
             Ok(stats) => {
                 rebuilt = true;
                 people_after = Some(stats.people_count);
             }
             Err(e) => {
                 eprintln!(
-                    "  Saved the merge, but the graph rebuild failed ({e}). \
-                     Run `minutes people --rebuild` to apply it."
+                    "  Saved the merge, but its live projection could not be verified ({e}). \
+                     The correction will be read automatically by future graph commands."
                 );
             }
         }
@@ -3945,10 +4559,12 @@ fn cmd_people_merge(
         );
         if rebuilt {
             if let (Some(b), Some(a)) = (people_before, people_after) {
-                eprintln!("  Graph rebuilt: {b} → {a} people.");
+                eprintln!("  Correction verified: {b} → {a} people in the current projection.");
             }
         } else if no_rebuild {
-            eprintln!("  Not rebuilt (--no-rebuild). Run `minutes people --rebuild` to apply.");
+            eprintln!(
+                "  Saved without validation (--no-rebuild); future graph commands read it automatically."
+            );
         }
     }
     Ok(())
@@ -3957,11 +4573,24 @@ fn cmd_people_merge(
 fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Result<()> {
     use minutes_core::graph;
 
-    if rebuild || !graph::db_path().exists() {
-        eprintln!("Building relationship index...");
-        let stats = graph::rebuild_index(config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let projection = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        graph::PolicyProjectionRequest::People {
+            limit,
+            include_commitments: !json,
+            include_stats: rebuild,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        graph::PolicyProjectionResponse::People(projection) => projection,
+        _ => anyhow::bail!("policy graph worker returned the wrong people response"),
+    };
+
+    if let Some(stats) = &projection.stats {
+        eprintln!("Verifying relationship projection...");
         eprintln!(
-            "Index rebuilt: {} people, {} meetings, {} commitments in {}ms",
+            "Projection verified: {} people, {} meetings, {} commitments in {}ms",
             stats.people_count, stats.meeting_count, stats.commitment_count, stats.rebuild_ms
         );
         if !stats.alias_clusters.is_empty() {
@@ -3989,10 +4618,8 @@ fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Resul
         }
         eprintln!();
     }
-
-    let all_people = graph::relationship_map(config).map_err(|e| anyhow::anyhow!("{}", e))?;
-    // Apply limit to all output modes (JSON and formatted)
-    let people: Vec<_> = all_people.into_iter().take(limit).collect();
+    let people = projection.people;
+    let commitments = projection.commitments;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&people)?);
@@ -4001,7 +4628,7 @@ fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Resul
 
     if people.is_empty() {
         eprintln!(
-            "No people found. Record some meetings first, then run: minutes people --rebuild"
+            "No relationship contacts found yet. Record a meeting with verified attendees or speakers first."
         );
         return Ok(());
     }
@@ -4044,8 +4671,6 @@ fn cmd_people(rebuild: bool, json: bool, limit: usize, config: &Config) -> Resul
     }
 
     // Stale commitments
-    let commitments =
-        graph::query_commitments(config, None).map_err(|e| anyhow::anyhow!("{}", e))?;
     let stale: Vec<_> = commitments.iter().filter(|c| c.status == "stale").collect();
     if !stale.is_empty() {
         eprintln!("\nSTALE COMMITMENTS");
@@ -4110,7 +4735,9 @@ fn cmd_vocabulary(action: VocabularyAction, config: &Config) -> Result<()> {
             json,
         } => cmd_vocabulary_add(&kind, &canonical, aliases, json),
         VocabularyAction::Remove { id, json } => cmd_vocabulary_remove(&id, json),
-        VocabularyAction::Suggest { meeting, json } => cmd_vocabulary_suggest(&meeting, json),
+        VocabularyAction::Suggest { meeting, json } => {
+            cmd_vocabulary_suggest(&meeting, json, config)
+        }
         VocabularyAction::Rebuild { json } => cmd_vocabulary_rebuild(json, config),
     }
 }
@@ -4173,13 +4800,13 @@ fn cmd_vocabulary_add(kind: &str, canonical: &str, aliases: Vec<String>, json: b
     let output = VocabularyMutationOutput {
         path: path.display().to_string(),
         entries: store.entries,
-        note: "Saved. Future transcripts, search, and graph rebuilds can use this vocabulary; existing raw transcripts stay unchanged.".into(),
+        note: "Saved. Future transcripts, search, and live graph answers can use this vocabulary; existing raw transcripts stay unchanged.".into(),
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         eprintln!("Saved vocabulary entry for \"{}\".", canonical.trim());
-        eprintln!("Future transcripts/search/graph rebuilds can use it.");
+        eprintln!("Future transcripts, search, and live graph answers can use it.");
         eprintln!("Existing raw transcripts stay unchanged.");
     }
     Ok(())
@@ -4215,12 +4842,14 @@ fn cmd_vocabulary_remove(id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_vocabulary_suggest(meeting: &Path, json: bool) -> Result<()> {
-    let content = std::fs::read_to_string(meeting)
-        .map_err(|e| anyhow::anyhow!("could not read {}: {}", meeting.display(), e))?;
-    let (frontmatter, body) = minutes_core::markdown::split_frontmatter(&content);
+fn cmd_vocabulary_suggest(meeting: &Path, json: bool, config: &Config) -> Result<()> {
+    let authorized = read_direct_meeting(meeting, config)?;
+    let meeting = &authorized.path;
+    let content = &authorized.content;
+    let (frontmatter, body) = minutes_core::markdown::split_frontmatter(content);
     let store = minutes_core::vocabulary::load().unwrap_or_default();
     let suggestions = vocabulary_suggestions_from_meeting(frontmatter, body, &store);
+    reauthorize_direct_meeting_exact(&authorized, config)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&suggestions)?);
@@ -4245,12 +4874,12 @@ fn cmd_vocabulary_suggest(meeting: &Path, json: bool) -> Result<()> {
 }
 
 fn cmd_vocabulary_rebuild(json: bool, config: &Config) -> Result<()> {
-    let stats = minutes_core::graph::rebuild_index(config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let stats = run_graph_rebuild_worker(config)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
         eprintln!(
-            "Rebuilt graph with vocabulary context: {} people, {} meetings, {} commitments in {}ms",
+            "Verified vocabulary against a live graph projection: {} people, {} meetings, {} commitments in {}ms",
             stats.people_count, stats.meeting_count, stats.commitment_count, stats.rebuild_ms
         );
         eprintln!("Existing raw transcripts stay unchanged.");
@@ -4488,17 +5117,21 @@ fn vocabulary_key(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn cmd_commitments(person: Option<&str>, json: bool, config: &Config) -> Result<()> {
+fn cmd_commitments(person: Option<&str>, json: bool, limit: usize, config: &Config) -> Result<()> {
     use minutes_core::graph;
 
-    // Auto-rebuild if index doesn't exist
-    if !graph::db_path().exists() {
-        eprintln!("Building relationship index...");
-        graph::rebuild_index(config).map_err(|e| anyhow::anyhow!("{}", e))?;
-    }
-
-    let commitments =
-        graph::query_commitments(config, person).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let commitments = match minutes_core::graph_worker::run_policy_projection_worker(
+        config,
+        graph::PolicyProjectionRequest::Commitments {
+            selector: person.map(str::to_string),
+            limit,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?
+    {
+        graph::PolicyProjectionResponse::Commitments(commitments) => commitments,
+        _ => anyhow::bail!("policy graph worker returned the wrong commitment response"),
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&commitments)?);
@@ -4554,9 +5187,7 @@ fn cmd_research(
     include_restricted: bool,
     config: &Config,
 ) -> Result<()> {
-    if include_restricted {
-        record_sensitivity_override("cli.research", Some(query));
-    }
+    authorize_restricted_override(include_restricted, "cli.research")?;
     let filters = minutes_core::search::SearchFilters {
         content_type,
         since,
@@ -4636,15 +5267,21 @@ fn parse_intent_kind(kind: &str) -> Result<minutes_core::markdown::IntentKind> {
     }
 }
 
-/// True when the meeting file at `path` carries `sensitivity: restricted`
-/// frontmatter (consent layer Wave 2). Unreadable files are treated as not
-/// restricted; downstream ingest surfaces its own read errors.
-fn meeting_is_restricted(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
+fn knowledge_ingest_failure_message(
+    source_scope: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> String {
+    let reason = if error.to_string().contains("restricted") {
+        "restricted"
+    } else {
+        "unreadable, malformed, or outside the configured corpus"
     };
-    let (fm_str, _) = minutes_core::markdown::split_frontmatter(&content);
-    minutes_core::markdown::extract_field(fm_str, "sensitivity").as_deref() == Some("restricted")
+    let cleanup = if minutes_core::knowledge::knowledge_failure_cleanup_confirmed(error) {
+        "derivatives retracted"
+    } else {
+        "derivative cleanup/revalidation was not confirmed"
+    };
+    format!("  SKIP {}: {} ({})", source_scope, reason, cleanup)
 }
 
 fn cmd_ingest(path: Option<PathBuf>, all: bool, dry_run: bool, config: &Config) -> Result<()> {
@@ -4659,47 +5296,25 @@ fn cmd_ingest(path: Option<PathBuf>, all: bool, dry_run: bool, config: &Config) 
     }
 
     let files: Vec<PathBuf> = if all {
-        let mut found = Vec::new();
-        for entry_result in walkdir::WalkDir::new(&config.output_dir)
-            .max_depth(2)
-            .into_iter()
-        {
-            let entry = match entry_result {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("  WARN: {}", e);
-                    continue;
-                }
-            };
-            let p = entry.path();
-            if p.extension().is_some_and(|ext| ext == "md")
-                && !p.starts_with(config.output_dir.join("memos"))
-            {
-                found.push(p.to_path_buf());
-            }
-        }
+        let mut found = minutes_core::knowledge::live_corpus_markdown_paths(config);
+        found.retain(|path| !path.starts_with(config.output_dir.join("memos")));
         found.sort();
-        // Sensitivity enforcement (consent layer Wave 2): restricted meetings
-        // never enter the knowledge base via batch ingest. There is no
-        // override for knowledge ingest in this wave.
-        let before = found.len();
-        found.retain(|p| !meeting_is_restricted(p));
-        let skipped_restricted = before - found.len();
-        if skipped_restricted > 0 {
-            eprintln!(
-                "  skipping {} meeting(s) designated `sensitivity: restricted` (excluded from knowledge ingest)",
-                skipped_restricted
-            );
+        if !dry_run {
+            let reconciled = minutes_core::knowledge::reconcile_knowledge_derivatives(config)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if reconciled.facts_removed > 0 || reconciled.log_entries_removed > 0 {
+                eprintln!(
+                    "  retracted {} stale fact(s) and {} stale log entry/entries whose sources are no longer policy-authorized",
+                    reconciled.facts_removed, reconciled.log_entries_removed
+                );
+            }
         }
         found
     } else if let Some(ref p) = path {
-        if !p.exists() {
-            anyhow::bail!("File not found: {}", p.display());
-        }
-        if meeting_is_restricted(p) {
-            anyhow::bail!(
-                "{} is designated `sensitivity: restricted`; it is excluded from knowledge ingest by default and was not written to the knowledge base",
-                p.display()
+        if p.exists() && std::fs::symlink_metadata(p)?.file_type().is_symlink() {
+            eprintln!(
+                "meeting source {} is policy-ineligible; any tracked derivatives will be retracted",
+                minutes_core::knowledge::privacy_safe_source_scope(p)
             );
         }
         vec![p.clone()]
@@ -4723,41 +5338,23 @@ fn cmd_ingest(path: Option<PathBuf>, all: bool, dry_run: bool, config: &Config) 
     let mut errors = 0usize;
 
     for file in &files {
-        let filename = file.file_name().unwrap_or_default().to_string_lossy();
+        let source_scope = minutes_core::knowledge::privacy_safe_source_scope(file);
 
         if dry_run {
-            // Read and extract but don't write
-            let content = match std::fs::read_to_string(file) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("  SKIP {}: {}", filename, e);
+            let facts = match minutes_core::knowledge::preview_ingest_file(file, config) {
+                Ok(facts) => facts,
+                Err(_) => {
+                    eprintln!("  SKIP {}: policy-ineligible source", source_scope);
                     errors += 1;
                     continue;
                 }
             };
-            let (fm_str, _body) = minutes_core::markdown::split_frontmatter(&content);
-            if fm_str.is_empty() {
-                eprintln!("  SKIP {}: no frontmatter", filename);
-                continue;
-            }
-            let fm: minutes_core::markdown::Frontmatter = match serde_yaml::from_str(fm_str) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("  SKIP {}: {}", filename, e);
-                    errors += 1;
-                    continue;
-                }
-            };
-            let facts = minutes_core::knowledge_extract::extract_from_frontmatter(
-                &fm,
-                &file.display().to_string(),
-            );
             let fact_count: usize = facts.iter().map(|pf| pf.facts.len()).sum();
             let people: Vec<&str> = facts.iter().map(|pf| pf.name.as_str()).collect();
             if fact_count > 0 {
                 eprintln!(
                     "  {} — {} fact(s) for: {}",
-                    filename,
+                    source_scope,
                     fact_count,
                     people.join(", ")
                 );
@@ -4769,7 +5366,7 @@ fn cmd_ingest(path: Option<PathBuf>, all: bool, dry_run: bool, config: &Config) 
                     if result.facts_written > 0 {
                         eprintln!(
                             "  {} — {} written, {} skipped — {}",
-                            filename,
+                            source_scope,
                             result.facts_written,
                             result.facts_skipped,
                             result.people_updated.join(", ")
@@ -4781,8 +5378,11 @@ fn cmd_ingest(path: Option<PathBuf>, all: bool, dry_run: bool, config: &Config) 
                         total_people.insert(p);
                     }
                 }
-                Err(e) => {
-                    eprintln!("  SKIP {}: {}", filename, e);
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        knowledge_ingest_failure_message(&source_scope, error.as_ref())
+                    );
                     errors += 1;
                 }
             }
@@ -4797,6 +5397,47 @@ fn cmd_ingest(path: Option<PathBuf>, all: bool, dry_run: bool, config: &Config) 
         total_people.len()
     );
 
+    Ok(())
+}
+
+fn cmd_agent_readiness(
+    json: bool,
+    readiness: &minutes_core::knowledge::AgentTrustReadiness,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(&readiness)?);
+    } else if readiness.ready {
+        println!("Agent readiness: ready ({:?})", readiness.qmd_retirement);
+    } else {
+        println!("Agent readiness: blocked");
+        println!(
+            "{}",
+            readiness
+                .remediation
+                .as_deref()
+                .unwrap_or(minutes_core::knowledge::AGENT_TRUST_READINESS_REMEDIATION)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_knowledge_status(json: bool) -> Result<()> {
+    // Do not use main's compatibility `Config::load()` value here. This is a
+    // trust boundary: an existing unreadable/malformed policy must never be
+    // interpreted as disabled/default configuration.
+    let config = Config::load_strict().map_err(anyhow::Error::msg)?;
+    let status = minutes_core::knowledge::knowledge_status_snapshot(&config)
+        .map_err(|_| anyhow::anyhow!("Persistent meeting derivatives could not be safely read."))?;
+    if json {
+        println!("{}", serde_json::to_string(&status)?);
+    } else if status.enabled && status.configured {
+        println!(
+            "Knowledge base enabled ({} profiles, {} log entries).",
+            status.people_count, status.log_entries
+        );
+    } else {
+        println!("Knowledge base not configured or disabled.");
+    }
     Ok(())
 }
 
@@ -4845,15 +5486,13 @@ fn resolve_artifact_path(
         intent_kind: None,
         owner: None,
         recorded_by: None,
-        include_restricted: true,
+        include_restricted: assistant_policy_allows_restricted_content(),
     };
     let results = minutes_core::search::search(query, config, &filters)?;
     if results.is_empty() {
         anyhow::bail!("no {kind_desc} found matching: {query}");
     }
-    let canonical = ensure_contained(results[0].path.canonicalize()?)?;
-    eprintln!("  Matched: {}", canonical.display());
-    Ok(canonical)
+    ensure_contained(results[0].path.canonicalize()?)
 }
 
 /// Extract the body of the `## Transcript` section. Scans line-by-line so a
@@ -4919,17 +5558,14 @@ fn cmd_redo_speaker_mapping(
     json: bool,
     config: &Config,
 ) -> Result<()> {
-    let path = resolve_single_meeting(meeting, config)?;
-    let content = std::fs::read_to_string(&path)?;
-    let (fm_str, body) = minutes_core::markdown::split_frontmatter(&content);
-    if fm_str.is_empty() {
-        anyhow::bail!(
-            "{} is not a meeting file (no YAML frontmatter)",
-            path.display()
-        );
+    if apply && !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("speaker-map mutation is unavailable under the active assistant policy");
     }
-    let fm: minutes_core::markdown::Frontmatter = serde_yaml::from_str(fm_str)
-        .map_err(|e| anyhow::anyhow!("could not parse frontmatter in {}: {e}", path.display()))?;
+    let resolved = resolve_single_meeting(meeting, config)?;
+    let authorized = read_direct_meeting(&resolved, config)?;
+    let path = authorized.path.clone();
+    let (_, body) = minutes_core::markdown::split_frontmatter(&authorized.content);
+    let fm = authorized.frontmatter.clone();
 
     // Only meetings carry diarized speaker labels. Refuse memos/dictation so we
     // never write a speaker map (or call the LLM) on a non-meeting file.
@@ -4980,6 +5616,7 @@ fn cmd_redo_speaker_mapping(
             reason: Some(reason.to_string()),
             last_run: Some(Local::now().to_rfc3339()),
         };
+        reauthorize_direct_meeting_exact(&authorized, config)?;
         report_redo_result(
             &path,
             apply,
@@ -4994,7 +5631,14 @@ fn cmd_redo_speaker_mapping(
 
     let transcript = transcript.expect("transcript present past contract check");
     let started = std::time::Instant::now();
-    let fresh = minutes_core::summarize::map_speakers(&transcript, &attendees, &cfg, None);
+    let fresh = minutes_core::summarize::map_speakers_with_pre_egress(
+        &transcript,
+        &attendees,
+        &cfg,
+        None,
+        || reauthorize_direct_meeting_exact(&authorized, config).map_err(|error| error.to_string()),
+    )
+    .map_err(anyhow::Error::msg)?;
     let duration_ms = started.elapsed().as_millis() as u64;
     let merged = merge_speaker_map(&fm.speaker_map, &fresh);
 
@@ -5017,6 +5661,9 @@ fn cmd_redo_speaker_mapping(
         last_run: Some(Local::now().to_rfc3339()),
     };
 
+    // A source that changes while the provider is answering invalidates both
+    // the returned names and any health/frontmatter write.
+    reauthorize_direct_meeting_exact(&authorized, config)?;
     report_redo_result(
         &path,
         apply,
@@ -5243,6 +5890,8 @@ fn cmd_resummarize(
                 serde_json::json!({
                     "graph_rebuilt": refresh.graph.is_some(),
                     "meetings_indexed": refresh.graph.as_ref().map(|g| g.meeting_count),
+                    "search_indexed": refresh.search_indexed,
+                    "policy_projections_fresh_on_read": true,
                     "vault_path": refresh.vault.as_ref().map(|p| p.display().to_string()),
                     "qmd_refreshed": refresh.qmd_refreshed,
                     "knowledge_ingested": refresh.knowledge.is_some(),
@@ -5342,6 +5991,9 @@ fn cmd_resummarize(
 }
 
 fn cmd_clean(meeting: &str, apply: bool, config: &Config) -> Result<()> {
+    if apply && !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("meeting cleanup mutation is unavailable under the active assistant policy");
+    }
     let meetings_dir = &config.output_dir;
 
     // Resolve which files to clean
@@ -5395,13 +6047,12 @@ fn cmd_clean(meeting: &str, apply: bool, config: &Config) -> Result<()> {
                 intent_kind: None,
                 owner: None,
                 recorded_by: None,
-                include_restricted: true,
+                include_restricted: assistant_policy_allows_restricted_content(),
             };
             let results = minutes_core::search::search(meeting, config, &filters)?;
             if results.is_empty() {
                 anyhow::bail!("no meeting found matching: {}", meeting);
             }
-            eprintln!("  Matched: {}", results[0].path.display());
             vec![results[0].path.clone()]
         }
     };
@@ -5411,14 +6062,23 @@ fn cmd_clean(meeting: &str, apply: bool, config: &Config) -> Result<()> {
         return Ok(());
     }
 
+    // Authorize the entire batch before the first backup or source mutation.
+    // In assistant-deny mode, one restricted/ambiguous entry therefore fails
+    // the operation without partially cleaning earlier files.
+    let authorized_files: Vec<_> = files
+        .iter()
+        .map(|path| read_direct_meeting(path, config))
+        .collect::<Result<_>>()?;
+
     let mut total_cleaned = 0;
     let mut total_lines_removed = 0;
 
-    for path in &files {
-        let content = std::fs::read_to_string(path)?;
+    for authorized in &authorized_files {
+        let path = &authorized.path;
+        let content = &authorized.content;
 
         // Split into frontmatter + body, find the transcript section
-        let (fm, body) = minutes_core::markdown::split_frontmatter(&content);
+        let (fm, body) = minutes_core::markdown::split_frontmatter(content);
 
         // Find the "## Transcript" section — must be at start of line to avoid
         // matching "## Transcript" appearing in body text or notes
@@ -5446,6 +6106,7 @@ fn cmd_clean(meeting: &str, apply: bool, config: &Config) -> Result<()> {
             let (cleaned, stats) = minutes_core::transcribe::clean_transcript(transcript_part);
 
             if stats.lines_removed > 0 {
+                reauthorize_direct_meeting_exact(authorized, config)?;
                 let filename = path.file_name().unwrap_or_default().to_string_lossy();
                 if apply {
                     // Rebuild the file
@@ -5508,7 +6169,7 @@ fn cmd_clean(meeting: &str, apply: bool, config: &Config) -> Result<()> {
     if total_cleaned == 0 {
         eprintln!(
             "All {} meetings are clean — no hallucination loops detected.",
-            files.len()
+            authorized_files.len()
         );
     } else if apply {
         eprintln!(
@@ -5648,6 +6309,7 @@ fn cmd_process(
     content_type: &str,
     title: Option<&str>,
     template: Option<&minutes_core::Template>,
+    authorized_input: Option<&minutes_core::pipeline::AuthorizedProcessAudioInput>,
     config: &Config,
 ) -> Result<()> {
     let ct = match content_type {
@@ -5662,26 +6324,32 @@ fn cmd_process(
         minutes_core::process_trace::start_process_trace(path, ct, config)
     };
     let result = (|| -> Result<()> {
-        if !path.exists() {
+        if authorized_input.is_none() && !path.exists() {
             anyhow::bail!("file not found: {}", path.display());
         }
 
         config.ensure_dirs()?;
-        let result = minutes_core::pipeline::process_with_template(
-            path,
-            ct,
-            title,
-            config,
-            None,
-            template,
-            |_| {},
-        )?;
+        let result = if let Some(input) = authorized_input {
+            minutes_core::pipeline::process_with_template_authorized(
+                input,
+                ct,
+                title,
+                config,
+                template,
+                |_| {},
+            )?
+        } else {
+            minutes_core::pipeline::process_with_template(
+                path,
+                ct,
+                title,
+                config,
+                None,
+                template,
+                |_| {},
+            )?
+        };
         eprintln!("Saved: {}", result.path.display());
-
-        // Update relationship graph index
-        if let Err(e) = minutes_core::graph::rebuild_index(config) {
-            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-        }
 
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "status": "done",
@@ -5888,6 +6556,7 @@ fn cmd_parakeet_helper(
     vad_threshold: f32,
     config: &Config,
 ) -> Result<()> {
+    ensure_parakeet_cli_selectable()?;
     let resolved_binary = minutes_core::parakeet::resolve_parakeet_binary(
         binary,
         minutes_core::parakeet::ResolveParakeetBinaryMode::WarnAndFallback,
@@ -5940,9 +6609,7 @@ fn cmd_parakeet_helper(
     _vad_threshold: f32,
     _config: &Config,
 ) -> Result<()> {
-    anyhow::bail!(
-        "Parakeet helper is not compiled in. Rebuild with `cargo build --features parakeet`."
-    );
+    ensure_parakeet_cli_selectable()
 }
 
 #[cfg(feature = "parakeet")]
@@ -5958,6 +6625,7 @@ fn cmd_parakeet_benchmark(
     vad_threshold: f32,
     config: &Config,
 ) -> Result<()> {
+    ensure_parakeet_cli_selectable()?;
     let helper_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minutes"));
     let report = minutes_core::transcription_coordinator::benchmark_parakeet(
         &helper_bin,
@@ -5990,9 +6658,19 @@ fn cmd_parakeet_benchmark(
     _vad_threshold: f32,
     _config: &Config,
 ) -> Result<()> {
-    anyhow::bail!(
-        "Parakeet benchmark is not compiled in. Rebuild with `cargo build --features parakeet`."
-    );
+    ensure_parakeet_cli_selectable()
+}
+
+fn ensure_parakeet_cli_selectable() -> Result<()> {
+    let capability = minutes_core::pipeline::parakeet_capability(cfg!(feature = "parakeet"));
+    if capability.selectable {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Parakeet cannot receive secure private audio with the installed pathname-only helper ({}). Whisper remains active; rebuilding or installing model assets does not bypass the secure private-audio transport requirement.",
+            capability.unavailable_reason()
+        )
+    }
 }
 
 fn cmd_autoresearch_decode_hints(
@@ -6206,6 +6884,14 @@ struct CapabilityReport {
 }
 
 fn build_capability_report() -> CapabilityReport {
+    build_capability_report_with_parakeet(minutes_core::pipeline::parakeet_capability(cfg!(
+        feature = "parakeet"
+    )))
+}
+
+fn build_capability_report_with_parakeet(
+    parakeet_capability: minutes_core::pipeline::ParakeetCapability,
+) -> CapabilityReport {
     // Seed the map with every feature this CLI build supports. The MCP
     // server reads missing keys as "not supported", so adding a key here
     // is additive and safe.
@@ -6241,11 +6927,17 @@ fn build_capability_report() -> CapabilityReport {
     features.insert("list_processing_jobs".into(), true);
     features.insert("list_voices".into(), true);
     features.insert("open_dashboard".into(), true);
-    features.insert("process_audio".into(), true);
-    features.insert("qmd_collection_status".into(), true);
+    features.insert(
+        "process_audio".into(),
+        minutes_core::pipeline::private_audio_processing_available(),
+    );
+    features.insert("qmd_collection_status".into(), false);
     features.insert("read_live_transcript".into(), true);
-    features.insert("register_qmd_collection".into(), true);
+    features.insert("register_qmd_collection".into(), false);
     features.insert("relationship_map".into(), true);
+    features.insert("relationship_map_policy_fresh_v1".into(), true);
+    features.insert("policy_projection_worker_v1".into(), true);
+    features.insert("person_profile_policy_fresh_v1".into(), true);
     features.insert("research_topic".into(), true);
     features.insert("search_meetings".into(), true);
     features.insert("start_dictation".into(), true);
@@ -6257,7 +6949,20 @@ fn build_capability_report() -> CapabilityReport {
 
     // Cargo-feature-gated capabilities. Some are surfaced through the
     // feature flags so consumers know the build's runtime support.
-    features.insert("parakeet".into(), cfg!(feature = "parakeet"));
+    features.insert("parakeet".into(), parakeet_capability.selectable);
+    features.insert("parakeet_compiled".into(), parakeet_capability.compiled);
+    features.insert(
+        "parakeet_platform_supported".into(),
+        parakeet_capability.platform_supported,
+    );
+    features.insert(
+        "parakeet_transport_supported".into(),
+        parakeet_capability.transport_supported,
+    );
+    features.insert(
+        "parakeet_runtime_available".into(),
+        parakeet_capability.runtime_available,
+    );
     features.insert("diarize".into(), cfg!(feature = "diarize"));
 
     // Setup demo fixtures (new in 0.13.3).
@@ -6575,9 +7280,9 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
             "  parakeet-tdt-0.6b-v3-int8  ~670 MB   (in-process, no Python; `minutes setup --sherpa` downloads + enables it)"
         );
         eprintln!();
-        eprintln!("Parakeet.cpp models (alternative subprocess engine, --parakeet):");
-        eprintln!("  tdt-ctc-110m  ~220 MB   (English, fast)");
-        eprintln!("  tdt-600m      ~1.2 GB   (multilingual v3, 25 EU languages, best quality)");
+        eprintln!("Parakeet.cpp (currently unavailable in Minutes):");
+        eprintln!("  --parakeet is retained for CLI compatibility but installs nothing until");
+        eprintln!("  the subprocess supports Minutes' sealed private-audio transport.");
         return Ok(());
     }
 
@@ -6821,11 +7526,9 @@ fn cmd_setup_diarization() -> Result<()> {
     Ok(())
 }
 
-/// Set up a parakeet.cpp model for alternative transcription.
-///
-/// Parakeet models are distributed as .nemo files on HuggingFace and must be
-/// converted to safetensors format using parakeet.cpp's convert_nemo.py script.
-/// This command prints the steps needed and checks for existing files.
+/// Reject the retained Parakeet setup command until a secure byte transport
+/// exists. The historical installer remains below the shared gate so a future
+/// transport can re-enable it without silently changing the CLI contract.
 fn cmd_setup_parakeet(model: &str) -> Result<()> {
     let valid_models = VALID_PARAKEET_MODELS;
     if !valid_models.contains(&model) {
@@ -6835,6 +7538,11 @@ fn cmd_setup_parakeet(model: &str) -> Result<()> {
             valid_models.join(", ")
         );
     }
+
+    // Reject before creating install directories or writing metadata. The
+    // pathname-only Parakeet process cannot consume Minutes' private-audio
+    // capability, so installing assets cannot make the backend selectable.
+    ensure_parakeet_cli_selectable()?;
 
     let config = Config::default();
     let model_dir = parakeet::install_dir(&config, model);
@@ -6958,24 +7666,20 @@ fn cmd_setup_parakeet(model: &str) -> Result<()> {
         }
     }
 
-    // Verify the warm-sidecar binary (#295). Without it, live transcription
-    // pays a full model load per utterance and will lag badly on real meetings.
+    // Report warm-server discovery honestly. The current pathname-only
+    // server cannot receive Minutes' anonymous private-audio capability,
+    // so discovery is informational until exact descriptor transport exists.
     match minutes_core::parakeet_sidecar::resolve_server_binary("parakeet") {
         Some(path) => {
+            eprintln!("Detected optional example-server: {}", path.display());
             eprintln!(
-                "Resolved example-server (warm live sidecar): {}",
-                path.display()
+                "Parakeet remains unavailable: no retained subprocess transport can safely receive Minutes' sealed private audio."
             );
-            eprintln!("Live transcription will auto-use the warm sidecar.");
         }
         None => {
-            eprintln!("Note: `example-server` (warm live sidecar) was not found.");
-            eprintln!("Live transcription will fall back to slow cold per-utterance runs.");
             eprintln!(
-                "To build it, configure parakeet.cpp with -DPARAKEET_BUILD_SERVER_EXAMPLE=ON"
+                "Optional `example-server` not found; Parakeet would remain unavailable even if installed until a sealed byte transport exists."
             );
-            eprintln!("and copy build/**/example-server next to your parakeet binary.");
-            eprintln!("Details: https://github.com/silverstein/minutes/blob/main/docs/architecture/parakeet.md");
         }
     }
 
@@ -6992,38 +7696,8 @@ fn cmd_setup_parakeet(model: &str) -> Result<()> {
     // the config footer prevents the "minutes works in terminal, app
     // says binary-not-found" class of issue.
     eprintln!(
-        "  parakeet_binary = \"<absolute path to parakeet, e.g. /Users/you/.local/bin/parakeet>\""
+        "  parakeet_binary = \"<absolute path to parakeet, e.g. /home/you/.local/bin/parakeet>\""
     );
-
-    // Feature-flag visibility check. If this binary was compiled without
-    // `--features parakeet`, every config key above is silently inert at
-    // runtime and the engine falls back to whisper. The setup command
-    // itself runs to completion because download + binary resolution don't
-    // require the feature, so without this warning a user can follow every
-    // step successfully and still wonder why parakeet isn't transcribing.
-    //
-    // Tagged release artifacts (the DMG and the per-platform CLI binaries
-    // built by .github/workflows/release-{macos,cli}.yml) ship WITH the
-    // feature. The paths that don't are the Homebrew Formula CLI
-    // (`brew install silverstein/tap/minutes`, which runs bare
-    // `cargo install --path crates/cli`) and any source `cargo install`
-    // without `--features parakeet`.
-    //
-    // Confirmed reachable: this function is not feature-gated, so the
-    // warning fires correctly on a whisper-only binary.
-    if !cfg!(feature = "parakeet") {
-        eprintln!();
-        eprintln!("WARNING: this minutes binary was compiled WITHOUT the parakeet feature.");
-        eprintln!("The model and helper binary above are installed, but the runtime will fall");
-        eprintln!("back to whisper regardless of the config keys you just set. To actually use");
-        eprintln!("parakeet, rebuild the CLI with the feature enabled, e.g.:");
-        eprintln!();
-        eprintln!("  cargo install --path crates/cli --features parakeet --root ~/.cargo --force");
-        eprintln!();
-        eprintln!("The downloadable DMG and tagged CLI release binaries do include parakeet.");
-        eprintln!("The Homebrew Formula CLI (`brew install silverstein/tap/minutes`) and bare");
-        eprintln!("`cargo install minutes-cli` runs are the install paths that omit it.");
-    }
 
     Ok(())
 }
@@ -7146,37 +7820,115 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
 #[derive(Debug, Clone, Serialize)]
 struct QmdCollectionInfo {
     name: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct QmdStatusReport {
+    schema_version: u32,
+    persistence_enabled: bool,
+    cleanup_only: bool,
+    cleanup_confirmed: bool,
     qmd_available: bool,
     output_dir: PathBuf,
+    policy_mirror: PathBuf,
     target_collection: String,
     registered: bool,
+    physically_registered: bool,
+    attested: bool,
     matching_collections: Vec<QmdCollectionInfo>,
+    unsafe_registrations: Vec<QmdCollectionInfo>,
+    preserved_uninspectable_registrations: Vec<QmdCollectionInfo>,
     config_engine: String,
     config_collection: Option<String>,
 }
 
-fn parse_qmd_collection_names(stdout: &str) -> Vec<String> {
+fn parse_qmd_collection_names(stdout: &str) -> Result<Vec<String>> {
     let mut collections = Vec::new();
+    let mut declared_count = None;
+    let mut upstream_zero_found = false;
+    let mut upstream_zero_hint = false;
 
     for line in stdout.lines() {
-        if let Some((name, _)) = line.split_once(" (qmd://") {
-            collections.push(name.trim().to_string());
+        let trimmed = line.trim();
+        if !line.chars().next().is_some_and(char::is_whitespace) {
+            if let Some((name, suffix)) = trimmed.split_once(" (qmd://") {
+                if declared_count.is_none() || upstream_zero_found {
+                    anyhow::bail!("QMD registry list output was malformed");
+                }
+                let name = name.trim();
+                if name.is_empty() || !suffix.contains(')') {
+                    anyhow::bail!("QMD registry list output was malformed");
+                }
+                collections.push(name.to_string());
+                continue;
+            }
         }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(count) = trimmed
+            .strip_prefix("Collections (")
+            .and_then(|value| value.strip_suffix("):"))
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            if declared_count.replace(count).is_some() {
+                anyhow::bail!("QMD registry list output was malformed");
+            }
+            continue;
+        }
+        if line == "No collections" {
+            if declared_count.replace(0).is_some() {
+                anyhow::bail!("QMD registry list output was malformed");
+            }
+            continue;
+        }
+        if line == "No collections found." {
+            if declared_count.replace(0).is_some() {
+                anyhow::bail!("QMD registry list output was malformed");
+            }
+            upstream_zero_found = true;
+            continue;
+        }
+        if line == "Run 'qmd collection add .' to create one." {
+            if !upstream_zero_found || upstream_zero_hint {
+                anyhow::bail!("QMD registry list output was malformed");
+            }
+            upstream_zero_hint = true;
+            continue;
+        }
+        if line.chars().next().is_some_and(char::is_whitespace)
+            && [
+                "Pattern:",
+                "Ignore:",
+                "Files:",
+                "Updated:",
+                "Index:",
+                "Description:",
+            ]
+            .iter()
+            .any(|label| trimmed.starts_with(label))
+            || (line.chars().next().is_some_and(char::is_whitespace) && trimmed == "[excluded]")
+        {
+            if declared_count.is_none() || declared_count == Some(0) {
+                anyhow::bail!("QMD registry list output was malformed");
+            }
+            continue;
+        }
+        anyhow::bail!("QMD registry list output was malformed");
+    }
+    if declared_count.is_none()
+        || declared_count.is_some_and(|count| count != collections.len())
+        || upstream_zero_found != upstream_zero_hint
+    {
+        anyhow::bail!("QMD registry list output was malformed");
     }
 
-    collections
+    Ok(collections)
 }
 
 fn parse_qmd_collection_path(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix("Path:"))
-        .map(|path| PathBuf::from(path.trim()))
+    minutes_core::knowledge::parse_qmd_collection_path(stdout)
 }
 
 fn normalize_path_for_compare(path: &Path) -> PathBuf {
@@ -7187,12 +7939,38 @@ fn normalize_path_for_compare(path: &Path) -> PathBuf {
     }
 }
 
-fn content_type_path_matches(output_dir: &Path, candidate: &Path) -> bool {
-    normalize_path_for_compare(output_dir) == normalize_path_for_compare(candidate)
+fn remove_qmd_collection_confirmed(name: &str) -> Result<()> {
+    let _ = std::process::Command::new("qmd")
+        .args(["collection", "remove", name])
+        .output();
+    let confirmation = std::process::Command::new("qmd")
+        .args(["collection", "show", name])
+        .output()
+        .map_err(|_| anyhow::anyhow!("QMD removal could not be confirmed"))?;
+    let list = std::process::Command::new("qmd")
+        .args(["collection", "list"])
+        .output()
+        .map_err(|_| anyhow::anyhow!("QMD removal could not be confirmed"))?;
+    let absent_from_list = list.status.success()
+        && parse_qmd_collection_names(&String::from_utf8_lossy(&list.stdout))
+            .is_ok_and(|names| !names.iter().any(|candidate| candidate == name));
+    if confirmation.status.success() || !absent_from_list {
+        anyhow::bail!("QMD removal could not be confirmed");
+    }
+    Ok(())
 }
 
-fn qmd_status_report(collection: &str, config: &Config) -> Result<QmdStatusReport> {
+fn qmd_status_report(
+    collection: &str,
+    config: &Config,
+    cleanup_owned: bool,
+) -> Result<QmdStatusReport> {
+    let remediate_owned = cleanup_owned;
+    let _lock = minutes_core::knowledge::acquire_qmd_policy_lock()
+        .map_err(|_| anyhow::anyhow!("QMD policy lock failed"))?;
     let output_dir = normalize_path_for_compare(&config.output_dir);
+    let policy_mirror =
+        normalize_path_for_compare(&minutes_core::knowledge::qmd_policy_mirror_path());
     let output = match std::process::Command::new("qmd")
         .args(["collection", "list"])
         .output()
@@ -7200,11 +7978,20 @@ fn qmd_status_report(collection: &str, config: &Config) -> Result<QmdStatusRepor
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(QmdStatusReport {
+                schema_version: 2,
+                persistence_enabled: false,
+                cleanup_only: true,
+                cleanup_confirmed: false,
                 qmd_available: false,
                 output_dir,
+                policy_mirror,
                 target_collection: collection.to_string(),
                 registered: false,
+                physically_registered: false,
+                attested: false,
                 matching_collections: Vec::new(),
+                unsafe_registrations: Vec::new(),
+                preserved_uninspectable_registrations: Vec::new(),
                 config_engine: config.search.engine.clone(),
                 config_collection: config.search.qmd_collection.clone(),
             });
@@ -7213,149 +8000,219 @@ fn qmd_status_report(collection: &str, config: &Config) -> Result<QmdStatusRepor
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        anyhow::bail!("{}", if !stderr.is_empty() { stderr } else { stdout });
+        anyhow::bail!("QMD registry could not be safely listed");
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut matching_collections = Vec::new();
-    for candidate_name in parse_qmd_collection_names(&stdout) {
-        let show_output = std::process::Command::new("qmd")
+    let mut unsafe_registrations = Vec::new();
+    let mut preserved_uninspectable_registrations = Vec::new();
+    for candidate_name in parse_qmd_collection_names(&stdout)? {
+        let show_output = match std::process::Command::new("qmd")
             .args(["collection", "show", &candidate_name])
-            .output()?;
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => {
+                let candidate = QmdCollectionInfo {
+                    name: candidate_name,
+                    path: None,
+                };
+                if remediate_owned && candidate.name == collection {
+                    remove_qmd_collection_confirmed(&candidate.name)?;
+                    unsafe_registrations.push(candidate);
+                } else {
+                    preserved_uninspectable_registrations.push(candidate);
+                }
+                continue;
+            }
+        };
         if !show_output.status.success() {
+            let candidate = QmdCollectionInfo {
+                name: candidate_name,
+                path: None,
+            };
+            if remediate_owned && candidate.name == collection {
+                remove_qmd_collection_confirmed(&candidate.name)?;
+                unsafe_registrations.push(candidate);
+            } else {
+                preserved_uninspectable_registrations.push(candidate);
+            }
             continue;
         }
 
         let show_stdout = String::from_utf8_lossy(&show_output.stdout);
-        if let Some(path) = parse_qmd_collection_path(&show_stdout) {
+        let Some(path) = parse_qmd_collection_path(&show_stdout) else {
             let candidate = QmdCollectionInfo {
                 name: candidate_name,
-                path,
+                path: None,
             };
-            if content_type_path_matches(&output_dir, &candidate.path) {
-                matching_collections.push(candidate);
+            if remediate_owned && candidate.name == collection {
+                remove_qmd_collection_confirmed(&candidate.name)?;
+                unsafe_registrations.push(candidate);
+            } else {
+                preserved_uninspectable_registrations.push(candidate);
             }
+            continue;
+        };
+        let candidate = QmdCollectionInfo {
+            name: candidate_name,
+            path: Some(path),
+        };
+        let candidate_path = candidate.path.as_deref().expect("known QMD path");
+        if minutes_core::knowledge::qmd_path_is_exact_policy_mirror(candidate_path) {
+            matching_collections.push(candidate);
+        } else if remediate_owned
+            && (minutes_core::knowledge::qmd_path_is_provable_raw_alias(candidate_path, config)
+                || candidate.name == collection)
+        {
+            remove_qmd_collection_confirmed(&candidate.name)?;
+            unsafe_registrations.push(candidate);
+        } else if minutes_core::knowledge::qmd_path_is_uninspectable(candidate_path) {
+            preserved_uninspectable_registrations.push(candidate);
         }
     }
-    let registered = matching_collections
+    let mut retained_safe = Vec::new();
+    for candidate in matching_collections {
+        if !remediate_owned {
+            retained_safe.push(candidate);
+        } else {
+            remove_qmd_collection_confirmed(&candidate.name)?;
+            unsafe_registrations.push(candidate);
+        }
+    }
+    if remediate_owned
+        && !preserved_uninspectable_registrations.is_empty()
+        && !unsafe_registrations
+            .iter()
+            .any(|candidate| candidate.name == collection)
+    {
+        remove_qmd_collection_confirmed(collection)?;
+    }
+    let matching_collections = retained_safe;
+    let physically_registered = matching_collections
         .iter()
         .any(|candidate| candidate.name == collection);
+    let attested = preserved_uninspectable_registrations.is_empty();
+    let registered = physically_registered && attested;
 
     Ok(QmdStatusReport {
+        schema_version: 2,
+        persistence_enabled: false,
+        cleanup_only: true,
+        cleanup_confirmed: false,
         qmd_available: true,
         output_dir,
+        policy_mirror,
         target_collection: collection.to_string(),
         registered,
+        physically_registered,
+        attested,
         matching_collections,
+        unsafe_registrations,
+        preserved_uninspectable_registrations,
         config_engine: config.search.engine.clone(),
         config_collection: config.search.qmd_collection.clone(),
     })
 }
 
-fn cmd_qmd(action: &str, collection: &str, config: &Config) -> Result<()> {
-    match action {
-        "status" => {
-            let report = qmd_status_report(collection, config)?;
+fn qmd_cleanup_status_report(collection: &str, config: &Config) -> Result<QmdStatusReport> {
+    config.ensure_dirs()?;
+    let persistent_cleanup = minutes_core::knowledge::ensure_qmd_persistence_disabled(config);
+    // The configured/persisted target is retracted by the core transaction.
+    // Audit the explicitly requested legacy name as well, removing it if it
+    // was created by an older CLI configuration.
+    let mut report = qmd_status_report(collection, config, true)?;
+    let mirror_absent = matches!(
+        std::fs::symlink_metadata(&report.policy_mirror),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    report.cleanup_confirmed = persistent_cleanup.is_ok()
+        && report.qmd_available
+        && !report.registered
+        && !report.physically_registered
+        && report.matching_collections.is_empty()
+        && !report
+            .preserved_uninspectable_registrations
+            .iter()
+            .any(|candidate| candidate.name == collection)
+        && mirror_absent;
+    Ok(report)
+}
 
-            if !report.qmd_available {
-                eprintln!("QMD is not installed or not on PATH.");
+fn cmd_qmd(action: &str, collection: &str) -> Result<()> {
+    if !minutes_core::knowledge::qmd_collection_name_is_valid(collection) {
+        anyhow::bail!("QMD collection target is invalid");
+    }
+    // QMD is a persistent derivative trust boundary. Never inherit main's
+    // compatibility fallback when an authoritative config exists but is
+    // malformed or unreadable.
+    let config = Config::load_strict().map_err(anyhow::Error::msg)?;
+    match action {
+        "status" | "cleanup" => {
+            let report = qmd_cleanup_status_report(collection, &config)?;
+            eprintln!(
+                "Persistent QMD indexing is disabled; Minutes search uses a process-private live projection."
+            );
+            if report.cleanup_confirmed {
+                eprintln!("Legacy Minutes-owned QMD registration and mirror cleanup is confirmed.");
+            } else if !report.qmd_available {
                 eprintln!(
-                    "Install qmd, then run: minutes qmd register --collection {}",
-                    collection
+                    "Legacy QMD registry cleanup could not be attested because qmd is unavailable."
                 );
-            } else if report.registered {
-                eprintln!(
-                    "QMD collection '{}' already indexes {}",
-                    collection,
-                    report.output_dir.display()
-                );
-            } else if report.matching_collections.is_empty() {
-                eprintln!("{} is not indexed in QMD yet.", report.output_dir.display());
-                eprintln!("Run: minutes qmd register --collection {}", collection);
             } else {
+                eprintln!("Legacy Minutes-owned QMD cleanup could not be fully confirmed.");
+            }
+            if !report.unsafe_registrations.is_empty() {
                 eprintln!(
-                    "{} is already indexed in QMD under: {}",
-                    report.output_dir.display(),
+                    "Remediation removed legacy Minutes-owned registration(s): {}.",
                     report
-                        .matching_collections
+                        .unsafe_registrations
                         .iter()
                         .map(|candidate| candidate.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                eprintln!("Run: minutes qmd register --collection {}", collection);
+            }
+            if !report.preserved_uninspectable_registrations.is_empty() {
+                eprintln!(
+                    "WARNING: unrelated uninspectable QMD collection(s) were preserved: {}.",
+                    report
+                        .preserved_uninspectable_registrations
+                        .iter()
+                        .map(|candidate| candidate.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
 
-            if report.config_engine != "qmd"
-                || report.config_collection.as_deref() != Some(collection)
-            {
-                eprintln!("\nTo opt into QMD search, add to ~/.config/minutes/config.toml:");
-                eprintln!("  [search]");
-                eprintln!("  engine = \"qmd\"");
-                eprintln!("  qmd_collection = \"{}\"", collection);
+            if report.config_engine == "qmd" || report.config_collection.is_some() {
+                eprintln!(
+                    "Legacy QMD search configuration is ignored and may be removed from config.toml."
+                );
             }
 
             println!("{}", serde_json::to_string_pretty(&report)?);
+            if action == "cleanup" && !report.cleanup_confirmed {
+                anyhow::bail!(
+                    "Persistent QMD indexing is disabled, but legacy cleanup could not be fully confirmed"
+                );
+            }
         }
         "register" => {
-            config.ensure_dirs()?;
-            let initial = qmd_status_report(collection, config)?;
-
-            if !initial.qmd_available {
+            let report = qmd_cleanup_status_report(collection, &config)?;
+            if !report.cleanup_confirmed {
                 anyhow::bail!(
-                    "qmd is not installed or not on PATH. Install qmd, then rerun this command."
+                    "{}; legacy cleanup could not be fully confirmed",
+                    minutes_core::knowledge::QMD_PERSISTENCE_DISABLED_REASON
                 );
             }
-
-            if initial.registered {
-                eprintln!(
-                    "QMD collection '{}' already indexes {}",
-                    collection,
-                    initial.output_dir.display()
-                );
-                println!("{}", serde_json::to_string_pretty(&initial)?);
-                return Ok(());
-            }
-
-            let output = std::process::Command::new("qmd")
-                .arg("collection")
-                .arg("add")
-                .arg(&config.output_dir)
-                .arg("--name")
-                .arg(collection)
-                .output()?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                anyhow::bail!("{}", if !stderr.is_empty() { stderr } else { stdout });
-            }
-
-            let report = qmd_status_report(collection, config)?;
-            eprintln!(
-                "Registered {} as QMD collection '{}'.",
-                report.output_dir.display(),
-                collection
+            anyhow::bail!(
+                "{}",
+                minutes_core::knowledge::QMD_PERSISTENCE_DISABLED_REASON
             );
-            eprintln!(
-                "Run `qmd update -c {}` or `qmd embed` as needed to refresh the collection.",
-                collection
-            );
-
-            if report.config_engine != "qmd"
-                || report.config_collection.as_deref() != Some(collection)
-            {
-                eprintln!("\nTo opt into QMD search, add to ~/.config/minutes/config.toml:");
-                eprintln!("  [search]");
-                eprintln!("  engine = \"qmd\"");
-                eprintln!("  qmd_collection = \"{}\"", collection);
-            }
-
-            println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        _ => anyhow::bail!("Unknown qmd action: {}. Use status or register.", action),
+        _ => anyhow::bail!("Unknown qmd action: {}. Use status or cleanup.", action),
     }
 
     Ok(())
@@ -7790,6 +8647,9 @@ fn cmd_service_linux(action: &str) -> Result<()> {
 }
 
 fn cmd_logs(errors: bool, lines: usize) -> Result<()> {
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("local logs are unavailable under the active assistant policy");
+    }
     let log_path = Config::minutes_dir().join("logs").join("minutes.log");
     if !log_path.exists() {
         eprintln!("No log file found at {}", log_path.display());
@@ -7849,6 +8709,10 @@ mod tests {
 
     fn with_temp_home<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _guard = test_guard();
+        with_temp_home_unlocked(f)
+    }
+
+    fn with_temp_home_unlocked<T>(f: impl FnOnce(&Path) -> T) -> T {
         let dir = std::env::temp_dir().join(format!(
             "minutes-cli-test-{}-{}",
             std::process::id(),
@@ -7858,23 +8722,98 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let original_home = std::env::var_os("HOME");
-        let original_userprofile = std::env::var_os("USERPROFILE");
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_userprofile = EnvRestore::capture("USERPROFILE");
+        let _restore_xdg_config_home = EnvRestore::capture("XDG_CONFIG_HOME");
+        let _cleanup = TempDirCleanup(dir.clone());
         std::env::set_var("HOME", &dir);
         std::env::set_var("USERPROFILE", &dir);
-        let result = f(&dir);
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
+        f(&dir)
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                prior: std::env::var_os(key),
+            }
         }
-        if let Some(userprofile) = original_userprofile {
-            std::env::set_var("USERPROFILE", userprofile);
-        } else {
-            std::env::remove_var("USERPROFILE");
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.prior.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
         }
-        std::fs::remove_dir_all(&dir).ok();
-        result
+    }
+
+    struct TempDirCleanup(PathBuf);
+
+    impl Drop for TempDirCleanup {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn set_cli_restricted_policy(value: Option<&str>) -> EnvRestore {
+        const KEY: &str = "MINUTES_CLI_RESTRICTED_POLICY";
+        let restore = EnvRestore::capture(KEY);
+        if let Some(value) = value {
+            std::env::set_var(KEY, value);
+        } else {
+            std::env::remove_var(KEY);
+        }
+        restore
+    }
+
+    #[test]
+    fn temp_home_restores_all_process_state_after_unwind() {
+        let _guard = test_guard();
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_userprofile = EnvRestore::capture("USERPROFILE");
+        let _restore_xdg = EnvRestore::capture("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", "/minutes-test-original-home");
+        std::env::set_var("USERPROFILE", "/minutes-test-original-profile");
+        std::env::set_var("XDG_CONFIG_HOME", "/minutes-test-original-xdg");
+        let temporary = Arc::new(Mutex::new(None::<PathBuf>));
+        let captured = temporary.clone();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_temp_home_unlocked(|path| {
+                *captured.lock().unwrap() = Some(path.to_path_buf());
+                panic!("forced temp-home unwind");
+            });
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(
+            std::env::var_os("HOME").as_deref(),
+            Some(std::ffi::OsStr::new("/minutes-test-original-home"))
+        );
+        assert_eq!(
+            std::env::var_os("USERPROFILE").as_deref(),
+            Some(std::ffi::OsStr::new("/minutes-test-original-profile"))
+        );
+        assert_eq!(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            Some(std::ffi::OsStr::new("/minutes-test-original-xdg"))
+        );
+        assert!(!temporary.lock().unwrap().as_ref().unwrap().exists());
+    }
+
+    fn direct_policy_meeting(title: &str, sensitivity: &str) -> String {
+        format!(
+            "---\ntitle: {title}\ntype: meeting\ndate: 2026-07-15T12:00:00Z\nduration: 30m\nstatus: complete\nsensitivity: {sensitivity}\nattendees: [Private Person]\nspeaker_map:\n  - speaker_label: SPEAKER_1\n    name: Private Person\n    confidence: medium\n    source: llm\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] DIRECT_POLICY_CANARY\n"
+        )
     }
 
     #[cfg(feature = "whisper")]
@@ -7913,6 +8852,22 @@ mod tests {
         assert_eq!(shell_quote_arg("junrei_v2"), "junrei_v2");
         assert_eq!(shell_quote_arg("Jun Rei"), "\"Jun Rei\"");
         assert_eq!(shell_quote_arg("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn parakeet_setup_and_hidden_tools_report_transport_unavailable() {
+        let helper_error = ensure_parakeet_cli_selectable()
+            .expect_err("Parakeet must not be exposed without secure transport");
+        assert!(helper_error
+            .to_string()
+            .contains("cannot receive secure private audio"));
+        assert!(helper_error.to_string().contains("Whisper remains active"));
+
+        let setup_error = cmd_setup_parakeet("tdt-ctc-110m")
+            .expect_err("setup must refuse before writing install assets");
+        assert!(setup_error
+            .to_string()
+            .contains("installing model assets does not bypass"));
     }
 
     #[test]
@@ -7984,6 +8939,16 @@ mod tests {
             .find(|a| a.speaker_label == "SPEAKER_01")
             .unwrap();
         assert_eq!(s1.name, "Dan", "fresh fills in unmapped labels");
+    }
+
+    #[test]
+    fn assistant_restricted_policy_is_fail_closed_only_for_explicit_deny() {
+        assert!(!restricted_content_policy_allows_override(Some("deny")));
+        assert!(!restricted_content_policy_allows_override(Some(" DENY ")));
+        assert!(restricted_content_policy_allows_override(None));
+        assert!(restricted_content_policy_allows_override(Some(
+            "logged-override"
+        )));
     }
 
     #[test]
@@ -8251,8 +9216,222 @@ life (qmd://life/)
   Updated:  2d ago
 "#;
 
-        let collections = parse_qmd_collection_names(output);
+        let collections = parse_qmd_collection_names(output).unwrap();
         assert_eq!(collections, vec!["minutes".to_string(), "life".to_string()]);
+
+        assert_eq!(
+            parse_qmd_collection_names(
+                "No collections found.\nRun 'qmd collection add .' to create one.\n"
+            )
+            .unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(parse_qmd_collection_names("No collections found.\n").is_err());
+        assert_eq!(
+            parse_qmd_collection_names(
+                "Collections (1):\n\nminutes (qmd://minutes/)\n  Ignore: archive/**\n  [excluded]\n  Files: 3\n"
+            )
+            .unwrap(),
+            vec!["minutes".to_string()]
+        );
+    }
+
+    #[test]
+    fn qmd_capabilities_and_help_do_not_advertise_persistence() {
+        let report = build_capability_report();
+        assert_eq!(report.features.get("qmd_collection_status"), Some(&false));
+        assert_eq!(report.features.get("register_qmd_collection"), Some(&false));
+
+        let help = Cli::try_parse_from(["minutes", "qmd", "--help"])
+            .err()
+            .expect("qmd help exits through clap")
+            .to_string();
+        assert!(help.contains("status or cleanup"));
+        assert!(!help.to_lowercase().contains("register"));
+
+        let parsed = Cli::try_parse_from(["minutes", "qmd", "cleanup"])
+            .expect("cleanup must be the advertised persistent-QMD remediation");
+        assert!(matches!(
+            parsed.command,
+            Commands::Qmd { action, .. } if action == "cleanup"
+        ));
+    }
+
+    #[test]
+    fn graph_cli_help_advertises_the_restored_bounded_projection() {
+        assert_eq!(
+            build_capability_report()
+                .features
+                .get("relationship_map_policy_fresh_v1"),
+            Some(&true)
+        );
+        assert_eq!(
+            build_capability_report()
+                .features
+                .get("policy_projection_worker_v1"),
+            Some(&true)
+        );
+        for args in [
+            ["minutes", "people", "--help"].as_slice(),
+            ["minutes", "people", "merge", "--help"].as_slice(),
+            ["minutes", "commitments", "--help"].as_slice(),
+        ] {
+            let help = Cli::try_parse_from(args)
+                .err()
+                .expect("graph help exits through clap")
+                .to_string()
+                .to_lowercase();
+            assert!(!help.contains("temporarily unavailable"), "{help}");
+            assert!(!help.contains("#513"), "{help}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn qmd_status_is_explicitly_disabled_and_legacy_register_only_cleans_up() {
+        with_temp_home(|dir| {
+            let empty_bin = dir.join("empty-bin");
+            std::fs::create_dir_all(&empty_bin).unwrap();
+            let original_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", &empty_bin);
+
+            let config = Config::default();
+            let report = qmd_cleanup_status_report("minutes", &config).unwrap();
+            assert_eq!(report.schema_version, 2);
+            assert!(!report.persistence_enabled);
+            assert!(report.cleanup_only);
+            assert!(!report.cleanup_confirmed);
+            assert!(!report.qmd_available);
+            assert!(!report.registered);
+
+            let cleanup_error = cmd_qmd("cleanup", "minutes").unwrap_err().to_string();
+            assert!(cleanup_error.contains("cleanup could not be fully confirmed"));
+            assert!(!cleanup_error.contains("engine ="));
+            assert!(!cleanup_error.contains("qmd_collection"));
+
+            let error = cmd_qmd("register", "minutes").unwrap_err().to_string();
+            assert!(error.contains("Persistent QMD collections are disabled"));
+            assert!(error.contains("cleanup could not be fully confirmed"));
+            assert!(!error.contains("engine ="));
+            assert!(!error.contains("qmd_collection"));
+
+            if let Some(path) = original_path {
+                std::env::set_var("PATH", path);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn qmd_cli_removal_confirmation_rejects_malformed_or_indented_presence() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home(|dir| {
+            let bin = dir.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let qmd = bin.join("qmd");
+            let original_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", &bin);
+            for (target, list_line) in [
+                ("minutes", "minutes"),
+                ("minutes", " minutes (qmd://minutes/)"),
+                ("Files: private", "Files: private (qmd://files-private/)"),
+            ] {
+                std::fs::write(
+                    &qmd,
+                    format!(
+                        "#!/bin/sh\nif [ \"$1 $2\" = \"collection list\" ]; then printf '%s\\n' '{}'; exit 0; fi\nexit 1\n",
+                        list_line
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&qmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(remove_qmd_collection_confirmed(target).is_err());
+            }
+            if let Some(path) = original_path {
+                std::env::set_var("PATH", path);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn qmd_strict_config_and_helper_errors_are_privacy_safe() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home(|dir| {
+            let bin = dir.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let qmd = bin.join("qmd");
+            let marker = dir.join("qmd-was-invoked");
+            std::fs::write(
+                &qmd,
+                format!(
+                    "#!/bin/sh\n: > '{}'\necho 'PRIVATE-PATH-CANARY' >&2\nexit 1\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&qmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let original_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", &bin);
+
+            let config_dir = dir.join(".config/minutes");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(
+                config_dir.join("config.toml"),
+                "[search\nPRIVATE-CONFIG-CANARY",
+            )
+            .unwrap();
+            let strict = cmd_qmd("status", "minutes").unwrap_err().to_string();
+            assert!(strict.contains("malformed"));
+            assert!(!strict.contains("PRIVATE-CONFIG-CANARY"));
+            assert!(!marker.exists());
+
+            std::fs::remove_file(config_dir.join("config.toml")).unwrap();
+            let report = qmd_status_report("minutes", &Config::default(), false)
+                .unwrap_err()
+                .to_string();
+            assert!(report.contains("could not be safely listed"));
+            assert!(!report.contains("PRIVATE-PATH-CANARY"));
+            if let Some(path) = original_path {
+                std::env::set_var("PATH", path);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn qmd_preconfiguration_status_is_read_only_and_reports_physical_attestation() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home(|dir| {
+            let mirror = minutes_core::knowledge::qmd_policy_mirror_path();
+            std::fs::create_dir_all(&mirror).unwrap();
+            let bin = dir.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let remove_marker = dir.join("remove-called");
+            let qmd = bin.join("qmd");
+            std::fs::write(
+                &qmd,
+                format!(
+                    "#!/bin/sh\ncase \"$1 $2\" in\n  'collection list') printf 'Collections (1):\\n\\nminutes (qmd://minutes/)\\n' ;;\n  'collection show') printf 'Name: minutes\\nPath: {}\\n' ;;\n  'collection remove') : > '{}' ; exit 1 ;;\nesac\n",
+                    mirror.display(),
+                    remove_marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&qmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let original_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", &bin);
+            let report = qmd_status_report("minutes", &Config::default(), false).unwrap();
+            assert!(report.physically_registered);
+            assert!(report.attested);
+            assert!(report.registered);
+            assert!(!remove_marker.exists());
+            if let Some(path) = original_path {
+                std::env::set_var("PATH", path);
+            }
+        });
     }
 
     #[test]
@@ -8264,6 +9443,55 @@ life (qmd://life/)
         assert_eq!(value["meta"]["schemaVersion"], 1);
         assert_eq!(value["data"]["engine"], "parakeet");
         assert!(value["meta"]["generatedAt"].is_string());
+    }
+
+    #[test]
+    fn knowledge_status_bridge_is_hidden_strict_and_privacy_safe() {
+        let parsed = Cli::try_parse_from(["minutes", "knowledge-status", "--json"])
+            .expect("trusted MCP bridge must remain callable");
+        assert!(matches!(
+            parsed.command,
+            Commands::KnowledgeStatus { json: true }
+        ));
+        let readiness = Cli::try_parse_from(["minutes", "agent-readiness", "--json"])
+            .expect("trusted agent-readiness bridge must remain callable");
+        assert!(matches!(
+            readiness.command,
+            Commands::AgentReadiness { json: true }
+        ));
+        assert!(command_requires_strict_config_bridge(&readiness.command));
+        let root = Cli::try_parse_from(["minutes", "meetings-root", "--json"])
+            .expect("trusted meeting-root bridge must remain callable");
+        assert!(matches!(
+            root.command,
+            Commands::MeetingsRoot { json: true }
+        ));
+
+        with_temp_home(|dir| {
+            let config_dir = dir.join(".config/minutes");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(
+                config_dir.join("config.toml"),
+                "[knowledge\nenabled = true\nPRIVATE-PERSON-CANARY",
+            )
+            .unwrap();
+            let error = cmd_knowledge_status(true).unwrap_err();
+            let rendered = error.to_string();
+            assert!(rendered.contains("malformed"));
+            assert!(!rendered.contains("PRIVATE-PERSON-CANARY"));
+        });
+    }
+
+    #[test]
+    fn ingest_cleanup_failure_is_honest_and_privacy_safe() {
+        let error = std::io::Error::other(
+            "permission failure at /PRIVATE/PATH/CANARY containing SECRET-CONTENT-CANARY",
+        );
+        let rendered = knowledge_ingest_failure_message("src-deadbeef", &error);
+        assert!(rendered.contains("cleanup/revalidation was not confirmed"));
+        assert!(!rendered.contains("derivatives retracted"));
+        assert!(!rendered.contains("PRIVATE"));
+        assert!(!rendered.contains("SECRET-CONTENT-CANARY"));
     }
 
     #[test]
@@ -8847,7 +10075,11 @@ life (qmd://life/)
             let meetings = dir.join("meetings");
             std::fs::create_dir_all(&meetings).unwrap();
             let md = meetings.join("2026-04-01-test.md");
-            std::fs::write(&md, "---\ntitle: Test\n---\nContent").unwrap();
+            std::fs::write(
+                &md,
+                "---\ntitle: Test\ntype: meeting\ndate: 2026-04-01T12:00:00Z\nsensitivity: normal\n---\nContent",
+            )
+            .unwrap();
             let wav = meetings.join("2026-04-01-test.wav");
             std::fs::write(&wav, b"fake audio").unwrap();
 
@@ -8868,12 +10100,141 @@ life (qmd://life/)
     }
 
     #[test]
+    fn cmd_delete_slug_can_archive_restricted_meeting() {
+        with_temp_home(|dir| {
+            let _policy = set_cli_restricted_policy(None);
+            let meetings = dir.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let md = meetings.join("2026-04-01-private.md");
+            std::fs::write(
+                &md,
+                "---\ntitle: Private\ntype: meeting\ndate: 2026-04-01T12:00:00Z\nsensitivity: restricted\n---\nPrivate content",
+            )
+            .unwrap();
+            let config = Config {
+                output_dir: meetings.clone(),
+                ..Config::default()
+            };
+
+            cmd_delete("2026-04-01-private", false, false, &config).unwrap();
+
+            assert!(!md.exists());
+            assert!(meetings.join("archive/2026-04-01-private.md").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_delete_force_rejects_in_root_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        with_temp_home(|dir| {
+            let meetings = dir.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let target = meetings.join("real.md");
+            std::fs::write(
+                &target,
+                "---\ntitle: Real\ntype: meeting\ndate: 2026-04-01T12:00:00Z\n---\nDO-NOT-DELETE-CANARY",
+            )
+            .unwrap();
+            let alias = meetings.join("alias.md");
+            symlink(&target, &alias).unwrap();
+            let config = Config {
+                output_dir: meetings,
+                ..Config::default()
+            };
+
+            assert!(cmd_delete(alias.to_str().unwrap(), false, true, &config).is_err());
+            assert!(target.exists());
+            assert!(std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("DO-NOT-DELETE-CANARY"));
+            assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
+        });
+    }
+
+    #[test]
+    fn cmd_delete_archive_collision_leaves_source_group_intact() {
+        with_temp_home(|dir| {
+            let meetings = dir.join("meetings");
+            let archive = meetings.join("archive");
+            std::fs::create_dir_all(&archive).unwrap();
+            let meeting = meetings.join("collision.md");
+            let audio = meetings.join("collision.wav");
+            std::fs::write(
+                &meeting,
+                "---\ntitle: Collision\ntype: meeting\ndate: 2026-04-01T12:00:00Z\n---\nSOURCE-CANARY",
+            )
+            .unwrap();
+            std::fs::write(&audio, b"SOURCE-AUDIO-CANARY").unwrap();
+            std::fs::write(archive.join("collision.wav"), b"ARCHIVE-CANARY").unwrap();
+            let config = Config {
+                output_dir: meetings.clone(),
+                ..Config::default()
+            };
+
+            assert!(cmd_delete("collision", true, false, &config).is_err());
+            assert!(meeting.exists());
+            assert_eq!(std::fs::read(&audio).unwrap(), b"SOURCE-AUDIO-CANARY");
+            assert!(!archive.join("collision.md").exists());
+            assert_eq!(
+                std::fs::read(archive.join("collision.wav")).unwrap(),
+                b"ARCHIVE-CANARY"
+            );
+        });
+    }
+
+    #[test]
+    fn cmd_delete_retracts_knowledge_without_waiting_for_another_ingest() {
+        with_temp_home(|dir| {
+            let meetings = dir.join("meetings");
+            let knowledge = dir.join("knowledge");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let md = meetings.join("2026-04-01-derived.md");
+            std::fs::write(
+                &md,
+                "---\ntitle: Derived\ntype: meeting\ndate: 2026-04-01T12:00:00Z\nduration: 30m\nattendees: [Alex Kim]\naction_items:\n  - assignee: Alex Kim\n    task: DELETE-DERIVATIVE-CANARY\n    status: open\ndecisions: []\nintents: []\n---\n\nNotes\n",
+            )
+            .unwrap();
+            let config = Config {
+                output_dir: meetings.clone(),
+                knowledge: minutes_core::config::KnowledgeConfig {
+                    enabled: true,
+                    path: knowledge.clone(),
+                    adapter: "wiki".into(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            };
+            minutes_core::knowledge::ingest_file(&md, &config).unwrap();
+            let profile = knowledge.join("people/alex-kim.md");
+            assert!(std::fs::read_to_string(&profile)
+                .unwrap()
+                .contains("DELETE-DERIVATIVE-CANARY"));
+
+            cmd_delete("2026-04-01-derived", false, false, &config).unwrap();
+            let remaining = std::fs::read_to_string(&profile).unwrap_or_default();
+            assert!(!remaining.contains("DELETE-DERIVATIVE-CANARY"));
+            assert!(
+                !knowledge.join("log.md").exists()
+                    || !std::fs::read_to_string(knowledge.join("log.md"))
+                        .unwrap()
+                        .contains("Derived")
+            );
+        });
+    }
+
+    #[test]
     fn cmd_delete_archives_all_audio_artifacts_with_with_audio() {
         with_temp_home(|dir| {
             let meetings = dir.join("meetings");
             std::fs::create_dir_all(&meetings).unwrap();
             let md = meetings.join("2026-04-01-artifacts.md");
-            std::fs::write(&md, "---\ntitle: Artifacts\n---\nContent").unwrap();
+            std::fs::write(
+                &md,
+                "---\ntitle: Artifacts\ntype: meeting\ndate: 2026-04-01T12:00:00Z\nsensitivity: normal\n---\nContent",
+            )
+            .unwrap();
             let wav = meetings.join("2026-04-01-artifacts.wav");
             std::fs::write(&wav, b"fake audio").unwrap();
             let voice = meetings.join("2026-04-01-artifacts.voice.wav");
@@ -8929,7 +10290,11 @@ life (qmd://life/)
             let meetings = dir.join("meetings");
             std::fs::create_dir_all(&meetings).unwrap();
             let md = meetings.join("2026-04-01-force.md");
-            std::fs::write(&md, "---\ntitle: Force\n---\nContent").unwrap();
+            std::fs::write(
+                &md,
+                "---\ntitle: Force\ntype: meeting\ndate: 2026-04-01T12:00:00Z\nsensitivity: normal\n---\nContent",
+            )
+            .unwrap();
             let wav = meetings.join("2026-04-01-force.wav");
             std::fs::write(&wav, b"fake audio").unwrap();
             let voice = meetings.join("2026-04-01-force.voice.wav");
@@ -9073,6 +10438,82 @@ life (qmd://life/)
     }
 
     #[test]
+    fn process_authorized_proof_is_hidden_atomic_and_does_not_change_visible_args() {
+        use clap::CommandFactory;
+
+        let help = Cli::try_parse_from(["minutes", "process", "--help"])
+            .err()
+            .expect("process help exits through clap")
+            .to_string();
+        assert!(!help.contains("authorized-input"));
+
+        let command = Cli::command();
+        let process = command
+            .find_subcommand("process")
+            .expect("process subcommand exists");
+        let visible_ids: Vec<String> = process
+            .get_arguments()
+            .filter(|argument| !argument.is_hide_set() && argument.get_id() != "help")
+            .map(|argument| argument.get_id().to_string())
+            .collect();
+        assert_eq!(visible_ids.len(), 6);
+        assert_eq!(
+            visible_ids,
+            [
+                "path",
+                "content_type",
+                "note",
+                "title",
+                "language",
+                "template"
+            ]
+        );
+
+        let minimal = Cli::try_parse_from(["minutes", "process", "/tmp/audio.wav"])
+            .expect("ordinary process invocation remains unchanged");
+        assert!(matches!(
+            minimal.command,
+            Commands::Process {
+                authorized_input_fd: None,
+                authorized_input_bytes: None,
+                authorized_input_format: None,
+                ..
+            }
+        ));
+
+        assert!(Cli::try_parse_from([
+            "minutes",
+            "process",
+            "/tmp/audio.wav",
+            "--authorized-input-fd",
+            "3"
+        ])
+        .is_err());
+
+        let authorized = Cli::try_parse_from([
+            "minutes",
+            "process",
+            "authorized-input.wav",
+            "--authorized-input-fd",
+            "3",
+            "--authorized-input-bytes",
+            "42",
+            "--authorized-input-format",
+            "wav",
+        ])
+        .expect("complete hidden proof must parse");
+        assert!(matches!(
+            authorized.command,
+            Commands::Process {
+                authorized_input_fd: Some(3),
+                authorized_input_bytes: Some(42),
+                authorized_input_format: Some(ref format),
+                ..
+            } if format == "wav"
+        ));
+    }
+
+    #[test]
     fn copilot_start_parses_goal_and_surface() {
         let parsed = Cli::try_parse_from([
             "minutes",
@@ -9108,6 +10549,61 @@ life (qmd://life/)
     #[test]
     fn copilot_start_requires_goal() {
         assert!(Cli::try_parse_from(["minutes", "copilot", "start"]).is_err());
+    }
+
+    #[test]
+    fn direct_copilot_provider_hosts_require_agent_readiness() {
+        assert!(copilot_action_hosts_agent_provider(&CopilotAction::Start {
+            goal: "land the decision".into(),
+            surface: None,
+            mode: None,
+            live: false,
+        }));
+        assert!(copilot_action_hosts_agent_provider(&CopilotAction::Eval {
+            fixtures: None,
+            model: Some("qwen3.5:4b-mlx".into()),
+            accelerated: true,
+            json: true,
+        }));
+        assert!(!copilot_action_hosts_agent_provider(&CopilotAction::Eval {
+            fixtures: None,
+            model: None,
+            accelerated: true,
+            json: true,
+        }));
+        assert!(copilot_action_hosts_agent_provider(&CopilotAction::Resume));
+        assert!(copilot_action_hosts_agent_provider(&CopilotAction::Setup {
+            model: None,
+            retune: false,
+        }));
+        assert!(!copilot_action_hosts_agent_provider(
+            &CopilotAction::Status { json: true }
+        ));
+        assert!(!copilot_action_hosts_agent_provider(&CopilotAction::Stop));
+        assert!(!copilot_action_hosts_agent_provider(&CopilotAction::Pause));
+
+        let provider_invoked = std::cell::Cell::new(false);
+        let error = activate_agent_provider_if_ready(
+            || Err("PATH-FREE-READINESS-BLOCK".into()),
+            || {
+                provider_invoked.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!provider_invoked.get());
+        assert_eq!(error.to_string(), "PATH-FREE-READINESS-BLOCK");
+    }
+
+    #[test]
+    fn copilot_status_json_flag_parses_without_hosting_a_provider() {
+        let parsed = Cli::try_parse_from(["minutes", "copilot", "status", "--json"])
+            .expect("copilot status JSON bridge must remain callable");
+        let Commands::Copilot { action } = parsed.command else {
+            panic!("expected copilot command");
+        };
+        assert!(matches!(&action, CopilotAction::Status { json: true }));
+        assert!(!copilot_action_hosts_agent_provider(&action));
     }
 
     #[test]
@@ -9197,8 +10693,9 @@ life (qmd://life/)
         assert_eq!(match_model_eval_opportunity(&labels, 2_500, &draft), None);
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
-    fn copilot_external_attach_and_non_streaming_backends_are_final_only() {
+    fn copilot_evidence_mode_uses_runtime_resolved_live_backend() {
         let mut config = Config::default();
         assert_eq!(
             copilot_evidence_mode(true, true, &config),
@@ -9208,13 +10705,30 @@ life (qmd://life/)
         config.live_transcript.backend = "parakeet".into();
         assert_eq!(
             copilot_evidence_mode(true, false, &config),
-            minutes_core::copilot::CopilotEvidenceMode::FinalOnly
+            minutes_core::copilot::CopilotEvidenceMode::InProcessPartials
+        );
+
+        config.live_transcript.backend = "apple-speech".into();
+        assert_eq!(
+            copilot_evidence_mode(true, false, &config),
+            minutes_core::copilot::CopilotEvidenceMode::InProcessPartials
         );
 
         config.live_transcript.backend = "whisper".into();
         assert_eq!(
             copilot_evidence_mode(true, false, &config),
             minutes_core::copilot::CopilotEvidenceMode::InProcessPartials
+        );
+    }
+
+    #[cfg(not(feature = "whisper"))]
+    #[test]
+    fn copilot_evidence_mode_is_final_only_without_compiled_live_backend() {
+        let mut config = Config::default();
+        config.live_transcript.backend = "whisper".into();
+        assert_eq!(
+            copilot_evidence_mode(true, false, &config),
+            minutes_core::copilot::CopilotEvidenceMode::FinalOnly
         );
     }
 
@@ -9231,6 +10745,574 @@ life (qmd://life/)
                 }
             }
         ));
+    }
+
+    #[test]
+    fn assistant_deny_blocks_every_direct_meeting_command_before_side_effects() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let restricted = meetings.join("restricted.md");
+            let original = direct_policy_meeting("Private Direct Path", "restricted");
+            std::fs::write(&restricted, &original).unwrap();
+            let normal = meetings.join("normal.md");
+            let normal_original = direct_policy_meeting("Normal Batch Peer", "normal").replace(
+                "[SPEAKER_1 0:00] DIRECT_POLICY_CANARY",
+                "[0:00] Repeated clean-all canary\n[0:03] Repeated clean-all canary\n[0:06] Repeated clean-all canary\n[0:09] Distinct content",
+            );
+            std::fs::write(&normal, &normal_original).unwrap();
+            let config = Config {
+                output_dir: meetings.clone(),
+                ..Config::default()
+            };
+
+            for error in [
+                cmd_note("injected note", Some(&restricted), &config).unwrap_err(),
+                cmd_clean(restricted.to_str().unwrap(), true, &config).unwrap_err(),
+                cmd_redo_speaker_mapping(
+                    restricted.to_str().unwrap(),
+                    true,
+                    Some("none".into()),
+                    true,
+                    &config,
+                )
+                .unwrap_err(),
+                cmd_vocabulary_suggest(&restricted, true, &config).unwrap_err(),
+                cmd_confirm(
+                    &restricted,
+                    Some("SPEAKER_1"),
+                    Some("Injected"),
+                    false,
+                    &config,
+                )
+                .unwrap_err(),
+                cmd_delete(restricted.to_str().unwrap(), true, true, &config).unwrap_err(),
+                cmd_paths(true, &config).unwrap_err(),
+                cmd_storage(true, &config).unwrap_err(),
+                cmd_cleanup(true, None, true, &config).unwrap_err(),
+                cmd_logs(false, 10).unwrap_err(),
+                cmd_enroll(Some(&restricted), 1, &config).unwrap_err(),
+                cmd_voices(true, true).unwrap_err(),
+            ] {
+                let rendered = error.to_string();
+                assert!(rendered.contains("active assistant policy"));
+                assert!(!rendered.contains("DIRECT_POLICY_CANARY"));
+                assert!(!rendered.contains("Private Person"));
+            }
+
+            assert_eq!(std::fs::read_to_string(&restricted).unwrap(), original);
+            assert!(!restricted.with_extension("md.bak").exists());
+            assert!(!meetings.join("archive").join("restricted.md").exists());
+
+            let batch_error = cmd_clean("all", true, &config).unwrap_err();
+            assert!(batch_error.to_string().contains("active assistant policy"));
+            assert_eq!(std::fs::read_to_string(&normal).unwrap(), normal_original);
+            assert!(!normal.with_extension("md.bak").exists());
+        });
+    }
+
+    #[test]
+    fn assistant_note_never_mutates_an_active_sensitive_session() {
+        with_temp_home(|_home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let session = minutes_core::sensitive::start(Some("Private session")).unwrap();
+            assert!(session.markers.is_empty());
+            let events_path = Config::minutes_dir().join("events.jsonl");
+            assert!(!events_path.exists());
+
+            let error =
+                cmd_note("AGENT_SENSITIVE_MARKER_CANARY", None, &Config::default()).unwrap_err();
+            assert!(error.to_string().contains("user-authored markers only"));
+            let after = minutes_core::sensitive::active_session().unwrap();
+            assert_eq!(after.id, session.id);
+            assert!(after.markers.is_empty());
+            assert!(!events_path.exists());
+            assert!(
+                !std::fs::read_to_string(minutes_core::sensitive::session_path())
+                    .unwrap()
+                    .contains("AGENT_SENSITIVE_MARKER_CANARY")
+            );
+        });
+    }
+
+    #[test]
+    fn assistant_operational_projections_never_serialize_content_or_paths() {
+        let status = minutes_core::pid::RecordingStatus {
+            recording: true,
+            processing: true,
+            processing_stage: Some("PRIVATE_STATUS_STAGE_CANARY".into()),
+            recording_mode: Some(CaptureMode::Meeting),
+            processing_title: Some("PRIVATE_STATUS_TITLE_CANARY".into()),
+            processing_job_id: Some("PRIVATE_STATUS_JOB_CANARY".into()),
+            processing_job_count: 1,
+            pid: Some(123),
+            duration_secs: Some(42.0),
+            wav_path: Some("/private/PRIVATE_STATUS_WAV_CANARY.wav".into()),
+        };
+        let status_wire = assistant_safe_status(&status).to_string();
+        assert_eq!(
+            assistant_safe_processing_stage(Some("Transcribing meeting")),
+            Some("Transcribing")
+        );
+        for canary in [
+            "PRIVATE_STATUS_TITLE_CANARY",
+            "PRIVATE_STATUS_JOB_CANARY",
+            "PRIVATE_STATUS_STAGE_CANARY",
+            "PRIVATE_STATUS_WAV_CANARY",
+            "/private/",
+        ] {
+            assert!(!status_wire.contains(canary));
+        }
+
+        let mut job: minutes_core::jobs::ProcessingJob = serde_json::from_value(json!({
+            "id": "job-20260721010101001-123-0",
+            "mode": "meeting",
+            "content_type": "meeting",
+            "title": "PRIVATE_JOB_TITLE_CANARY",
+            "audio_path": "/private/PRIVATE_JOB_AUDIO_CANARY.wav",
+            "output_path": "/private/PRIVATE_JOB_OUTPUT_CANARY.md",
+            "state": "transcribing",
+            "created_at": "2026-07-21T01:01:01Z",
+            "user_notes": "PRIVATE_JOB_NOTE_CANARY",
+            "error": "PRIVATE_JOB_ERROR_CANARY"
+        }))
+        .unwrap();
+        let job_wire = serde_json::to_string(&assistant_safe_jobs(&[job.clone()])).unwrap();
+        assert!(job_wire.contains("job-20260721010101001-123-0"));
+        for canary in [
+            "PRIVATE_JOB_TITLE_CANARY",
+            "PRIVATE_JOB_AUDIO_CANARY",
+            "PRIVATE_JOB_OUTPUT_CANARY",
+            "PRIVATE_JOB_NOTE_CANARY",
+            "PRIVATE_JOB_ERROR_CANARY",
+            "/private/",
+        ] {
+            assert!(!job_wire.contains(canary));
+        }
+
+        job.id = "job-PRIVATE_JOB_ID_CANARY".into();
+        let malformed_job_wire = serde_json::to_string(&assistant_safe_jobs(&[job])).unwrap();
+        assert!(malformed_job_wire.contains("\"id\":\"job-1\""));
+        assert!(!malformed_job_wire.contains("PRIVATE_JOB_ID_CANARY"));
+    }
+
+    #[test]
+    fn assistant_event_stream_never_observes_sensitive_activity() {
+        with_temp_home(|_home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let error_before = cmd_events(10, None, None, false, None, &Config::default())
+                .unwrap_err()
+                .to_string();
+
+            minutes_core::events::append_event_strict(
+                minutes_core::events::MinutesEvent::SensitiveMarker {
+                    session_id: "FILTER_ORACLE_SESSION_CANARY".into(),
+                    text: "FILTER_ORACLE_TEXT_CANARY".into(),
+                },
+            )
+            .unwrap();
+            minutes_core::events::append_event_strict(
+                minutes_core::events::MinutesEvent::SensitivityOverride {
+                    surface: "FILTER_ORACLE_OVERRIDE_CANARY".into(),
+                    query: None,
+                },
+            )
+            .unwrap();
+
+            for result in [
+                cmd_events(10, None, None, false, None, &Config::default()),
+                cmd_events(
+                    10,
+                    Some("sensitive.marker".into()),
+                    None,
+                    false,
+                    None,
+                    &Config::default(),
+                ),
+                cmd_events(10, None, Some("1h".into()), false, None, &Config::default()),
+                cmd_events(
+                    10,
+                    None,
+                    Some("1h".into()),
+                    false,
+                    Some(42),
+                    &Config::default(),
+                ),
+                cmd_events(10, None, None, true, None, &Config::default()),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert_eq!(error, error_before);
+                assert!(error.contains("unavailable under the active assistant policy"));
+            }
+        });
+    }
+
+    #[test]
+    fn direct_meeting_boundary_preserves_human_restricted_access() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(None);
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let restricted = meetings.join("restricted.md");
+            std::fs::write(
+                &restricted,
+                direct_policy_meeting("Human Restricted Access", "restricted"),
+            )
+            .unwrap();
+            let config = Config {
+                output_dir: meetings,
+                ..Config::default()
+            };
+
+            assert!(read_direct_meeting(&restricted, &config).is_ok());
+            cmd_note("human-authored restricted note", Some(&restricted), &config).unwrap();
+            assert!(std::fs::read_to_string(&restricted)
+                .unwrap()
+                .contains("human-authored restricted note"));
+        });
+    }
+
+    #[test]
+    fn confirm_save_voice_refuses_legacy_unbound_embedding_sidecars() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(None);
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let meeting = meetings.join("normal.md");
+            std::fs::write(&meeting, direct_policy_meeting("Normal Voice", "normal")).unwrap();
+            let sidecar = minutes_core::voice::meeting_embeddings_sidecar_path(&meeting);
+            std::fs::write(&sidecar, "PRIVATE_UNBOUND_EMBEDDING_CANARY").unwrap();
+            let config = Config {
+                output_dir: meetings,
+                ..Config::default()
+            };
+
+            let error = cmd_confirm(
+                &meeting,
+                Some("SPEAKER_1"),
+                Some("Synthetic Person"),
+                true,
+                &config,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("cannot trust legacy"));
+            assert_eq!(
+                std::fs::read_to_string(&sidecar).unwrap(),
+                "PRIVATE_UNBOUND_EMBEDDING_CANARY"
+            );
+        });
+    }
+
+    fn linked_context_session(
+        meeting: &Path,
+        started_at: chrono::DateTime<Local>,
+    ) -> minutes_core::context_store::ContextSession {
+        let session = minutes_core::context_store::start_capture_session(
+            minutes_core::pid::CaptureMode::Meeting,
+            Some("Context policy test".into()),
+            started_at,
+        )
+        .unwrap();
+        minutes_core::context_store::mark_capture_session_complete(
+            &session.id,
+            meeting,
+            None,
+            ContentType::Meeting,
+            Some(started_at),
+            json!({}),
+        )
+        .unwrap();
+        minutes_core::context_store::get_session(&session.id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn assistant_context_requires_one_normal_exact_markdown_link() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let normal = meetings.join("normal.md");
+            let restricted = meetings.join("restricted.md");
+            let second = meetings.join("second.md");
+            std::fs::write(
+                &normal,
+                direct_policy_meeting("Normal Context", "normal")
+                    .replace("DIRECT_POLICY_CANARY", "normal context canary"),
+            )
+            .unwrap();
+            std::fs::write(
+                &restricted,
+                direct_policy_meeting("Restricted Context", "restricted"),
+            )
+            .unwrap();
+            std::fs::write(&second, direct_policy_meeting("Second Context", "normal")).unwrap();
+            let normal = normal.canonicalize().unwrap();
+            let restricted = restricted.canonicalize().unwrap();
+            let second = second.canonicalize().unwrap();
+            let config = Config {
+                output_dir: meetings,
+                ..Config::default()
+            };
+
+            let started_at = Local::now();
+            let normal_session = linked_context_session(&normal, started_at);
+            let restricted_session =
+                linked_context_session(&restricted, started_at + chrono::Duration::seconds(1));
+
+            let authorized = authorize_context_source(&normal_session, Some(&normal), &config)
+                .unwrap()
+                .unwrap();
+            assert_eq!(authorized.session_id, normal_session.id);
+            assert_eq!(authorized.receipt.path, normal.display().to_string());
+            assert_eq!(
+                authorized.receipt.sha256,
+                minutes_core::policy_fs::content_sha256_hex(authorized.source.content.as_bytes())
+            );
+
+            let restricted_error =
+                authorize_context_source(&restricted_session, Some(&restricted), &config)
+                    .err()
+                    .expect("restricted context source must fail closed");
+            assert!(restricted_error
+                .to_string()
+                .contains("active assistant policy"));
+
+            let mismatched =
+                resolve_context_session(Some(&normal_session.id), Some(&restricted)).unwrap_err();
+            assert!(mismatched
+                .to_string()
+                .contains("does not match the linked meeting path"));
+
+            let missing_path = cmd_context_search("canary", None, 10, true, &config).unwrap_err();
+            assert!(missing_path.to_string().contains("require an exact linked"));
+
+            minutes_core::context_store::mark_capture_session_complete(
+                &normal_session.id,
+                &second,
+                None,
+                ContentType::Meeting,
+                Some(started_at + chrono::Duration::seconds(2)),
+                json!({}),
+            )
+            .unwrap();
+            let ambiguous = authorize_context_source(&normal_session, Some(&normal), &config)
+                .err()
+                .expect("a context session with two meeting links must fail closed");
+            assert!(ambiguous
+                .to_string()
+                .contains("exactly one authorized meeting source"));
+        });
+    }
+
+    #[test]
+    fn context_search_parses_an_explicit_source_path() {
+        let parsed = Cli::try_parse_from([
+            "minutes",
+            "context",
+            "search",
+            "pricing",
+            "--path",
+            "/tmp/meeting.md",
+            "--json",
+        ])
+        .expect("context search must accept the exact linked meeting path");
+        assert!(matches!(
+            parsed.command,
+            Commands::Context {
+                action: ContextAction::Search {
+                    query,
+                    path: Some(path),
+                    json: true,
+                    ..
+                }
+            } if query == "pricing" && path.as_path() == Path::new("/tmp/meeting.md")
+        ));
+    }
+
+    #[test]
+    fn assistant_context_final_fence_rejects_normal_to_restricted_transition() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let meeting = meetings.join("normal.md");
+            std::fs::write(&meeting, direct_policy_meeting("Context Fence", "normal")).unwrap();
+            let meeting = meeting.canonicalize().unwrap();
+            let config = Config {
+                output_dir: meetings,
+                ..Config::default()
+            };
+            let session = linked_context_session(&meeting, Local::now());
+            let authorized = authorize_context_source(&session, Some(&meeting), &config)
+                .unwrap()
+                .unwrap();
+
+            std::fs::write(
+                &meeting,
+                direct_policy_meeting("Context Fence", "restricted"),
+            )
+            .unwrap();
+            let error = reauthorize_context_source_exact(Some(&authorized), &config).unwrap_err();
+            assert!(error.to_string().contains("active assistant policy"));
+        });
+    }
+
+    #[test]
+    fn assistant_context_rejects_same_path_replacement_after_session_link() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let meeting = meetings.join("same-path.md");
+            let linked_content = direct_policy_meeting("Linked revision", "restricted");
+            std::fs::write(&meeting, &linked_content).unwrap();
+            let meeting = meeting.canonicalize().unwrap();
+            let config = Config {
+                output_dir: meetings,
+                ..Config::default()
+            };
+            let session = linked_context_session(&meeting, Local::now());
+
+            std::fs::write(
+                &meeting,
+                direct_policy_meeting("Replacement revision", "normal")
+                    .replace("DIRECT_POLICY_CANARY", "replacement normal content"),
+            )
+            .unwrap();
+
+            let errors = [
+                cmd_context_status(Some(&session.id), Some(&meeting), true, &config).unwrap_err(),
+                cmd_context_activity_summary(
+                    Some(&session.id),
+                    Some(&meeting),
+                    None,
+                    None,
+                    true,
+                    &config,
+                )
+                .unwrap_err(),
+                cmd_context_search("replacement", Some(&meeting), 10, true, &config).unwrap_err(),
+                cmd_context_get_moment(
+                    Some(&session.id),
+                    Some(&meeting),
+                    None,
+                    5,
+                    5,
+                    true,
+                    &config,
+                )
+                .unwrap_err(),
+                cmd_context_screen(Some(&session.id), Some(&meeting), None, 1, true, &config)
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                let rendered = error.to_string();
+                assert!(rendered.contains("exactly one authorized meeting source"));
+                assert!(!rendered.contains("DIRECT_POLICY_CANARY"));
+            }
+
+            let legacy_session = minutes_core::context_store::start_capture_session(
+                minutes_core::pid::CaptureMode::Meeting,
+                Some("Legacy hashless context".into()),
+                Local::now(),
+            )
+            .unwrap();
+            minutes_core::context_store::upsert_link(
+                &legacy_session.id,
+                minutes_core::context_store::ContextLinkKind::MarkdownArtifact,
+                &meeting.display().to_string(),
+                json!({ "content_type": "meeting" }),
+            )
+            .unwrap();
+            let error = authorize_context_source(&legacy_session, Some(&meeting), &config)
+                .err()
+                .expect("hashless legacy links must fail closed in assistant deny mode");
+            assert!(error.to_string().contains("no trusted revision"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assistant_context_rejects_same_path_symlink_redirect() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let meeting = meetings.join("linked.md");
+            let linked_content = direct_policy_meeting("Linked context", "normal")
+                .replace("DIRECT_POLICY_CANARY", "same bytes at a different path");
+            std::fs::write(&meeting, &linked_content).unwrap();
+            let meeting = meeting.canonicalize().unwrap();
+            let config = Config {
+                output_dir: meetings.clone(),
+                ..Config::default()
+            };
+            let session = linked_context_session(&meeting, Local::now());
+
+            let displaced = meetings.join("linked-original.md");
+            let replacement = meetings.join("replacement.md");
+            std::fs::rename(&meeting, &displaced).unwrap();
+            std::fs::write(&replacement, linked_content).unwrap();
+            std::os::unix::fs::symlink(&replacement, &meeting).unwrap();
+
+            let revision_error = markdown_source_revisions_for_session(&session.id).unwrap_err();
+            assert!(revision_error
+                .to_string()
+                .contains("revision does not match its artifact"));
+            let error = authorize_context_source(&session, Some(&meeting), &config)
+                .err()
+                .expect("a symlink redirect must not rewrite capture-time provenance");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("unavailable under the active assistant policy"),
+                "unexpected denial: {rendered}"
+            );
+        });
+    }
+
+    #[test]
+    fn export_never_reopens_a_source_after_its_final_policy_fence() {
+        with_temp_home(|home| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let meetings = home.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let meeting = meetings.join("normal.md");
+            std::fs::write(&meeting, direct_policy_meeting("Export Fence", "normal")).unwrap();
+            let output = home.join("export.csv");
+            let config = Config {
+                output_dir: meetings,
+                ..Config::default()
+            };
+
+            let error = cmd_export_with_hook(None, Some(output.clone()), &config, |_, snapshot| {
+                std::fs::write(
+                    &snapshot.path,
+                    direct_policy_meeting("Export Fence", "restricted")
+                        .replace("duration: 30m", "duration: RESTRICTED_DURATION_CANARY"),
+                )
+                .unwrap();
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("active assistant policy"));
+            let emitted = std::fs::read_to_string(output).unwrap_or_default();
+            assert!(!emitted.contains("RESTRICTED_DURATION_CANARY"));
+            assert!(!emitted.contains("DIRECT_POLICY_CANARY"));
+        });
+    }
+
+    #[test]
+    fn assistant_deny_loads_existing_config_strictly() {
+        with_temp_home(|_| {
+            let _policy = set_cli_restricted_policy(Some("deny"));
+            let path = Config::config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "[malformed").unwrap();
+
+            assert!(load_cli_config(false).is_err());
+        });
     }
 
     #[test]
@@ -9811,11 +11893,13 @@ life (qmd://life/)
 
         let setup_output =
             format_copilot_setup_needed(&minutes_core::copilot::CopilotSetupNeeded::private_ai());
-        let mut status = CopilotSessionStatus::default();
-        status.active = true;
-        status.goal = "Agree on next steps".into();
-        status.capture_attachment = "Coach is listening to the current recording.".into();
-        status.input_mode = CopilotInputMode::FinalOnly;
+        let mut status = CopilotSessionStatus {
+            active: true,
+            goal: "Agree on next steps".into(),
+            capture_attachment: "Coach is listening to the current recording.".into(),
+            input_mode: CopilotInputMode::FinalOnly,
+            ..Default::default()
+        };
         status.health.state = CopilotState::Degraded;
         status.health.provider = "apple-fm".into();
         status.health.last_error = Some(
@@ -9867,6 +11951,68 @@ life (qmd://life/)
         assert!(status_output.contains("Coach will keep trying"));
         assert!(status_output.contains("Using your local AI model."));
         assert!(status_output.contains("Coaching on completed sentences (a bit slower)."));
+    }
+
+    #[test]
+    fn copilot_status_json_is_versioned_and_content_free() {
+        use minutes_core::copilot::{CopilotInputMode, CopilotSessionStatus, CopilotState};
+
+        let mut status = CopilotSessionStatus {
+            active: true,
+            pid: Some(4321),
+            goal: "PRIVATE-GOAL-CANARY".into(),
+            surface: "stdout".into(),
+            cursor: 42,
+            capture_attachment: "/private/capture/PATH-CANARY".into(),
+            provider_selection: "PRIVATE-PROVIDER-CANARY".into(),
+            input_mode: CopilotInputMode::Realtime,
+            ..Default::default()
+        };
+        status.health.state = CopilotState::Listening;
+        status.health.provider = "PRIVATE-PROVIDER-CANARY".into();
+        status.health.model = "PRIVATE-MODEL-CANARY".into();
+        status.health.last_error = Some("PRIVATE-ERROR-CANARY".into());
+
+        let value = serde_json::to_value(copilot_status_json(&status)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schema_version": 1,
+                "active": true,
+                "state": "Listening",
+                "pid": 4321,
+                "surface": "stdout",
+                "evidence_cursor": 42,
+                "input_mode": "realtime",
+                "setup_needed": false,
+            })
+        );
+        let serialized = value.to_string();
+        for canary in ["PRIVATE-", "PATH-CANARY", "capture"] {
+            assert!(!serialized.contains(canary), "leaked canary: {canary}");
+        }
+    }
+
+    #[test]
+    fn active_copilot_stop_control_precedes_status_read() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let active = request_copilot_stop_before_status(
+            || {
+                order.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("status");
+                minutes_core::copilot::CopilotSessionStatus {
+                    active: true,
+                    ..Default::default()
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(active, "the active-engine path must still issue stop");
+        assert_eq!(order.borrow().as_slice(), ["stop", "status"]);
     }
 
     #[test]
@@ -9938,13 +12084,22 @@ life (qmd://life/)
 // Frontmatter parsing is in minutes_core::markdown::{split_frontmatter, extract_field}
 
 fn cmd_delete(meeting: &str, with_audio: bool, force: bool, config: &Config) -> Result<()> {
-    // Resolve the slug to a file path
-    let md_path = if Path::new(meeting).exists() {
+    // Human CLI sessions retain restricted archive/delete access, while
+    // assistant children bind sensitivity and exact source bytes into the
+    // same capability used for the destructive mutation.
+    let candidate = if Path::new(meeting).exists() {
         PathBuf::from(meeting)
     } else {
         minutes_core::search::resolve_slug(meeting, config)
             .ok_or_else(|| anyhow::anyhow!("no meeting found matching: {}", meeting))?
     };
+    let mutation = minutes_core::search::open_authorized_meeting_mutation(
+        &candidate,
+        config,
+        assistant_policy_allows_restricted_content(),
+    )
+    .map_err(|_| anyhow::anyhow!("meeting is unavailable under the active assistant policy"))?;
+    let md_path = mutation.path().to_path_buf();
 
     let title = md_path
         .file_stem()
@@ -9953,36 +12108,53 @@ fn cmd_delete(meeting: &str, with_audio: bool, force: bool, config: &Config) -> 
         .to_string();
 
     let audio_artifacts = minutes_core::capture::meeting_audio_artifact_paths(&md_path);
-    let has_audio = audio_artifacts.iter().any(|path| path.exists());
-
-    if force {
-        // Permanent delete
-        std::fs::remove_file(&md_path)?;
-        eprintln!("Deleted: {}", md_path.display());
-
-        if with_audio && has_audio {
-            for path in audio_artifacts.iter().filter(|path| path.exists()) {
-                std::fs::remove_file(path)?;
-                eprintln!("Deleted audio artifact: {}", path.display());
-            }
-        }
+    let has_audio = audio_artifacts
+        .iter()
+        .any(|path| mutation.sibling_exists(path));
+    let selected_audio = if with_audio {
+        audio_artifacts
+            .iter()
+            .filter(|path| mutation.sibling_exists(path))
+            .cloned()
+            .collect::<Vec<_>>()
     } else {
-        // Soft delete: move to archive directory
-        let archive_dir = config.output_dir.join("archive");
-        std::fs::create_dir_all(&archive_dir)?;
+        Vec::new()
+    };
 
-        let dest_md = archive_dir.join(md_path.file_name().unwrap());
-        std::fs::rename(&md_path, &dest_md)?;
-        eprintln!("Archived: {} → {}", title, dest_md.display());
-
-        if with_audio && has_audio {
-            for path in audio_artifacts.iter().filter(|path| path.exists()) {
-                let dest_audio = archive_dir.join(path.file_name().unwrap());
-                std::fs::rename(path, &dest_audio)?;
-                eprintln!("Archived audio artifact: {}", dest_audio.display());
-            }
+    let completion = if force {
+        // Move the whole selected group into one inactive capability-bound
+        // staging directory before any physical deletion. This makes source
+        // retraction atomic from every live/agent-facing corpus surface.
+        let staged = mutation.stage_delete_group(&selected_audio)?;
+        let refresh = minutes_core::knowledge::refresh_after_source_change(&md_path, config);
+        let finalize = staged.finalize();
+        if refresh.is_err() {
+            return Err(anyhow::anyhow!(
+                "meeting source changed, but derived stores could not be safely refreshed ({})",
+                minutes_core::knowledge::privacy_safe_source_scope(&md_path)
+            ));
         }
-    }
+        finalize?;
+        for path in &selected_audio {
+            eprintln!("Deleted audio artifact: {}", path.display());
+        }
+        format!("Deleted: {}", md_path.display())
+    } else {
+        // Preflight and move Markdown + selected audio as one rollback-capable
+        // group, then retract derivatives exactly once.
+        let (dest_md, dest_audio) = mutation.archive_group(&selected_audio)?;
+        minutes_core::knowledge::refresh_after_source_change(&md_path, config).map_err(|_| {
+            anyhow::anyhow!(
+                "meeting source changed, but derived stores could not be safely refreshed ({})",
+                minutes_core::knowledge::privacy_safe_source_scope(&md_path)
+            )
+        })?;
+        for path in dest_audio {
+            eprintln!("Archived audio artifact: {}", path.display());
+        }
+        format!("Archived: {} → {}", title, dest_md.display())
+    };
+    eprintln!("{completion}");
 
     if has_audio && !with_audio {
         eprintln!(
@@ -10001,7 +12173,13 @@ fn cmd_schema() -> Result<()> {
     Ok(())
 }
 
-fn cmd_get(slug_or_path: &str, json: bool, compact_json: bool, config: &Config) -> Result<()> {
+fn cmd_get(
+    slug_or_path: &str,
+    json: bool,
+    compact_json: bool,
+    include_restricted: bool,
+    config: &Config,
+) -> Result<()> {
     // Accept either a slug ("2026-03-17-advisor-call") or a path to the
     // meeting markdown. MCP and Tauri pass paths; humans pass slugs. Paths —
     // whether absolute or relative to cwd — must resolve to a .md file
@@ -10013,17 +12191,18 @@ fn cmd_get(slug_or_path: &str, json: bool, compact_json: bool, config: &Config) 
         p
     } else {
         let candidate = std::path::PathBuf::from(slug_or_path);
-        if !candidate.exists() || candidate.extension().and_then(|s| s.to_str()) != Some("md") {
+        if !candidate.exists() {
             anyhow::bail!("no meeting found matching slug or path: {}", slug_or_path);
-        }
-        if let Err(msg) = minutes_core::notes::validate_meeting_path(&candidate, &config.output_dir)
-        {
-            anyhow::bail!("{}", msg);
         }
         candidate
     };
 
-    let content = std::fs::read_to_string(&path)?;
+    authorize_restricted_override(include_restricted, "cli.get")?;
+    let authorized =
+        minutes_core::search::read_authorized_meeting(&path, config, include_restricted)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let path = authorized.path;
+    let content = authorized.content;
 
     if !json {
         println!("{}", content);
@@ -10034,28 +12213,39 @@ fn cmd_get(slug_or_path: &str, json: bool, compact_json: bool, config: &Config) 
     // only speaker_map is rewritten to reflect sidecar confirmations. Agents
     // and UIs can apply the renaming to body lines themselves if they want to,
     // but the markdown on disk stays untouched.
-    let (frontmatter_str, body) = minutes_core::markdown::split_frontmatter(&content);
-    let mut frontmatter: minutes_core::markdown::Frontmatter = if frontmatter_str.is_empty() {
-        anyhow::bail!("meeting has no frontmatter: {}", path.display());
-    } else {
-        serde_yaml::from_str(frontmatter_str.trim())?
-    };
+    let (_, body) = minutes_core::markdown::split_frontmatter(&content);
+    let mut frontmatter = authorized.frontmatter;
 
     let overlay_db = minutes_core::overlays::default_db_path();
-    let confirmations =
-        minutes_core::overlays::load_speaker_confirmations_for_meeting_at(&overlay_db, &path)
-            .unwrap_or_default();
+    let confirmations = minutes_core::overlays::load_speaker_confirmations_for_source_at(
+        &overlay_db,
+        &path,
+        content.as_bytes(),
+    )
+    .unwrap_or_default();
     let overlay_applied = !confirmations.is_empty();
+    let overlay_source_sha256 = overlay_applied
+        .then(|| minutes_core::overlays::speaker_overlay_source_sha256(content.as_bytes()));
     minutes_core::overlays::apply_speaker_confirmations(
         &mut frontmatter.speaker_map,
         &confirmations,
     );
+
+    // Overlay enrichment is only publishable if the exact source bytes and
+    // policy are still the snapshot that authorized this response.
+    let reverified =
+        minutes_core::search::read_authorized_meeting(&path, config, include_restricted)
+            .map_err(|_| anyhow::anyhow!("meeting changed while preparing the response"))?;
+    if reverified.path != path || reverified.content != content {
+        anyhow::bail!("meeting changed while preparing the response");
+    }
 
     let payload = serde_json::json!({
         "path": path.to_string_lossy(),
         "frontmatter": frontmatter,
         "body": body,
         "overlay_applied": overlay_applied,
+        "overlay_source_sha256": overlay_source_sha256,
     });
     let payload = if compact_json {
         payload
@@ -10068,7 +12258,41 @@ fn cmd_get(slug_or_path: &str, json: bool, compact_json: bool, config: &Config) 
     Ok(())
 }
 
-fn cmd_copilot(action: CopilotAction, config: &mut Config) -> Result<()> {
+fn copilot_action_hosts_agent_provider(action: &CopilotAction) -> bool {
+    matches!(
+        action,
+        CopilotAction::Start { .. } | CopilotAction::Resume | CopilotAction::Setup { .. }
+    ) || matches!(
+        action,
+        CopilotAction::Eval { model: Some(model), .. } if !model.trim().is_empty()
+    )
+}
+
+fn activate_agent_provider_if_ready<T>(
+    readiness_check: impl FnOnce() -> std::result::Result<(), String>,
+    activate: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    readiness_check().map_err(anyhow::Error::msg)?;
+    activate()
+}
+
+fn cmd_copilot(
+    action: CopilotAction,
+    config: &mut Config,
+    agent_trust_readiness: Option<&minutes_core::knowledge::AgentTrustReadiness>,
+) -> Result<()> {
+    if copilot_action_hosts_agent_provider(&action) {
+        let readiness = agent_trust_readiness
+            .ok_or_else(|| anyhow::anyhow!("agent trust readiness was not established"))?;
+        return activate_agent_provider_if_ready(
+            || readiness.require_ready(),
+            || cmd_copilot_ready(action, config),
+        );
+    }
+    cmd_copilot_ready(action, config)
+}
+
+fn cmd_copilot_ready(action: CopilotAction, config: &mut Config) -> Result<()> {
     match action {
         CopilotAction::Start {
             goal,
@@ -10076,7 +12300,7 @@ fn cmd_copilot(action: CopilotAction, config: &mut Config) -> Result<()> {
             mode,
             live,
         } => cmd_copilot_start(&goal, surface.as_deref(), mode.as_deref(), live, config),
-        CopilotAction::Status => cmd_copilot_status(),
+        CopilotAction::Status { json } => cmd_copilot_status(json),
         CopilotAction::Pause => cmd_copilot_pause(),
         CopilotAction::Resume => cmd_copilot_resume(),
         CopilotAction::Stop => cmd_copilot_stop(),
@@ -11253,14 +13477,23 @@ fn copilot_evidence_mode(
     if own_live_capture
         && !external_capture
         && config.copilot.live_partials
-        && config
-            .effective_live_transcript_backend()
-            .eq_ignore_ascii_case("whisper")
+        && copilot_runtime_has_live_partials(config)
     {
         minutes_core::copilot::CopilotEvidenceMode::InProcessPartials
     } else {
         minutes_core::copilot::CopilotEvidenceMode::FinalOnly
     }
+}
+
+#[cfg(feature = "whisper")]
+fn copilot_runtime_has_live_partials(config: &Config) -> bool {
+    minutes_core::live_transcript::resolved_standalone_backend(config)
+        .eq_ignore_ascii_case("whisper")
+}
+
+#[cfg(not(feature = "whisper"))]
+fn copilot_runtime_has_live_partials(_config: &Config) -> bool {
+    false
 }
 
 fn copilot_nudge_label(kind: minutes_core::copilot::NudgeKind) -> &'static str {
@@ -11308,8 +13541,70 @@ fn copilot_capture_attachment() -> String {
     COACH_WAITING_FOR_RECORDING.into()
 }
 
-fn cmd_copilot_status() -> Result<()> {
+#[derive(Debug, Serialize)]
+struct CopilotStatusJson {
+    schema_version: u32,
+    active: bool,
+    state: &'static str,
+    pid: Option<u32>,
+    surface: Option<&'static str>,
+    evidence_cursor: u64,
+    input_mode: &'static str,
+    setup_needed: bool,
+}
+
+fn copilot_status_state(status: &minutes_core::copilot::CopilotSessionStatus) -> &'static str {
+    use minutes_core::copilot::CopilotState;
+
+    if !status.active {
+        return "Off";
+    }
+    match status.health.state {
+        // A live PID with a not-yet-published health sidecar is still an
+        // active engine. Report the closed operational startup state.
+        CopilotState::Off => "Arming",
+        CopilotState::Arming => "Arming",
+        CopilotState::Listening => "Listening",
+        CopilotState::Thinking => "Thinking",
+        CopilotState::Nudge => "Nudge",
+        CopilotState::Paused => "Paused",
+        CopilotState::Degraded => "Degraded",
+    }
+}
+
+fn copilot_status_json(status: &minutes_core::copilot::CopilotSessionStatus) -> CopilotStatusJson {
+    let surface = if status.active {
+        match status.surface.as_str() {
+            "stdout" => Some("stdout"),
+            "tui" => Some("tui"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let input_mode = match status.input_mode {
+        minutes_core::copilot::CopilotInputMode::Realtime => "realtime",
+        minutes_core::copilot::CopilotInputMode::FinalOnly => "final_only",
+    };
+
+    CopilotStatusJson {
+        schema_version: 1,
+        active: status.active,
+        state: copilot_status_state(status),
+        pid: if status.active { status.pid } else { None },
+        surface,
+        evidence_cursor: status.cursor,
+        input_mode,
+        setup_needed: status.setup_needed.is_some(),
+    }
+}
+
+fn cmd_copilot_status(json: bool) -> Result<()> {
     let mut status = minutes_core::copilot::read_session_status();
+    if json {
+        println!("{}", serde_json::to_string(&copilot_status_json(&status))?);
+        return Ok(());
+    }
     if status.active {
         status.capture_attachment = copilot_capture_attachment();
     }
@@ -11360,12 +13655,25 @@ fn cmd_copilot_resume() -> Result<()> {
     Ok(())
 }
 
+fn request_copilot_stop_before_status(
+    request_stop: impl FnOnce() -> std::io::Result<()>,
+    read_status: impl FnOnce() -> minutes_core::copilot::CopilotSessionStatus,
+) -> Result<bool> {
+    request_stop()?;
+    Ok(read_status().active)
+}
+
 fn cmd_copilot_stop() -> Result<()> {
-    if !minutes_core::copilot::read_session_status().active {
+    // The stop marker is idempotent and must be written before inspecting any
+    // session sidecar. Terminal control cannot depend on a successful read.
+    let active = request_copilot_stop_before_status(
+        minutes_core::copilot::request_stop,
+        minutes_core::copilot::read_session_status,
+    )?;
+    if !active {
         eprintln!("Coach is already off.");
         return Ok(());
     }
-    minutes_core::copilot::request_stop()?;
     eprintln!("Coach will stop. Your recording continues.");
     Ok(())
 }
@@ -12192,6 +14500,11 @@ fn cmd_events(
     since_seq: Option<u64>,
     _config: &Config,
 ) -> Result<()> {
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!(
+            "event reads and subscriptions are unavailable under the active assistant policy"
+        );
+    }
     if since.is_some() && since_seq.is_some() {
         anyhow::bail!("use either --since or --since-seq, not both");
     }
@@ -12234,6 +14547,11 @@ fn cmd_events_follow(
     since: Option<String>,
     since_seq: Option<u64>,
 ) -> Result<()> {
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!(
+            "event reads and subscriptions are unavailable under the active assistant policy"
+        );
+    }
     let since_dt = parse_events_since(since.as_deref())?;
     let mut cursor = since_seq.unwrap_or(0);
 
@@ -12495,13 +14813,13 @@ fn cmd_insights(
     Ok(())
 }
 
-fn cmd_context(action: ContextAction) -> Result<()> {
+fn cmd_context(action: ContextAction, config: &Config) -> Result<()> {
     match action {
         ContextAction::Status {
             session,
             path,
             json,
-        } => cmd_context_status(session.as_deref(), path.as_deref(), json),
+        } => cmd_context_status(session.as_deref(), path.as_deref(), json, config),
         ContextAction::Screen {
             session,
             path,
@@ -12514,6 +14832,7 @@ fn cmd_context(action: ContextAction) -> Result<()> {
             at.as_deref(),
             limit,
             json,
+            config,
         ),
         ContextAction::ActivitySummary {
             session,
@@ -12527,8 +14846,14 @@ fn cmd_context(action: ContextAction) -> Result<()> {
             start.as_deref(),
             end.as_deref(),
             json,
+            config,
         ),
-        ContextAction::Search { query, limit, json } => cmd_context_search(&query, limit, json),
+        ContextAction::Search {
+            query,
+            path,
+            limit,
+            json,
+        } => cmd_context_search(&query, path.as_deref(), limit, json, config),
         ContextAction::GetMoment {
             session,
             path,
@@ -12543,6 +14868,7 @@ fn cmd_context(action: ContextAction) -> Result<()> {
             before_minutes,
             after_minutes,
             json,
+            config,
         ),
     }
 }
@@ -12556,24 +14882,137 @@ fn resolve_context_session(
     session: Option<&str>,
     path: Option<&Path>,
 ) -> Result<Option<minutes_core::context_store::ContextSession>> {
-    if let Some(session_id) = session {
-        return Ok(minutes_core::context_store::get_session(session_id)?);
-    }
-    if let Some(path) = path {
+    let by_session = session
+        .map(minutes_core::context_store::get_session)
+        .transpose()?
+        .flatten();
+    let by_path = if let Some(path) = path {
         let canonical = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())
             .display()
             .to_string();
         if let Some(session) = minutes_core::context_store::get_session_for_artifact(&canonical)? {
-            return Ok(Some(session));
+            Some(session)
+        } else {
+            let original = path.display().to_string();
+            minutes_core::context_store::get_session_for_artifact(&original)?
         }
-        let original = path.display().to_string();
-        return Ok(minutes_core::context_store::get_session_for_artifact(
-            &original,
-        )?);
+    } else {
+        None
+    };
+
+    if let (Some(by_session), Some(by_path)) = (&by_session, &by_path) {
+        if by_session.id != by_path.id {
+            anyhow::bail!("the requested context session does not match the linked meeting path");
+        }
     }
-    Ok(None)
+
+    Ok(by_session.or(by_path))
+}
+
+struct AuthorizedContextSource {
+    session_id: String,
+    source: minutes_core::search::AuthorizedMeetingSnapshot,
+    receipt: ContextSourceAuthorization,
+}
+
+#[derive(Debug)]
+struct ContextMarkdownSourceRevision {
+    path: PathBuf,
+    sha256: String,
+}
+
+fn require_assistant_context_path(path: Option<&Path>) -> Result<()> {
+    if !assistant_policy_allows_restricted_content() && path.is_none() {
+        anyhow::bail!("assistant context reads require an exact linked normal meeting path");
+    }
+    Ok(())
+}
+
+fn markdown_source_revisions_for_session(
+    session_id: &str,
+) -> Result<Vec<ContextMarkdownSourceRevision>> {
+    let mut revisions = Vec::new();
+    for link in minutes_core::context_store::list_links_for_session(session_id)? {
+        if link.kind != minutes_core::context_store::ContextLinkKind::MarkdownArtifact {
+            continue;
+        }
+        let target_path = PathBuf::from(link.target)
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("linked meeting source is unavailable"))?;
+        let source_path = link
+            .metadata
+            .get("source_path")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("linked meeting source has no trusted revision"))?;
+        // `source_path` was canonical at link time. Do not canonicalize it
+        // again here: a same-path symlink replacement must not rewrite the
+        // persisted association to a different live inode/path.
+        let source_path = PathBuf::from(source_path);
+        let source_sha256 = link
+            .metadata
+            .get("source_sha256")
+            .and_then(|value| value.as_str())
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| anyhow::anyhow!("linked meeting source has no trusted revision"))?;
+        if target_path != source_path {
+            anyhow::bail!("linked meeting source revision does not match its artifact");
+        }
+        revisions.push(ContextMarkdownSourceRevision {
+            path: source_path,
+            sha256: source_sha256.to_ascii_lowercase(),
+        });
+    }
+    Ok(revisions)
+}
+
+fn authorize_context_source(
+    session: &minutes_core::context_store::ContextSession,
+    requested_path: Option<&Path>,
+    config: &Config,
+) -> Result<Option<AuthorizedContextSource>> {
+    if assistant_policy_allows_restricted_content() {
+        return Ok(None);
+    }
+    let requested_path = requested_path.ok_or_else(|| {
+        anyhow::anyhow!("assistant context reads require an exact linked normal meeting path")
+    })?;
+    let source = read_direct_meeting(requested_path, config)?;
+    let linked = markdown_source_revisions_for_session(&session.id)?;
+    let current_sha256 = minutes_core::policy_fs::content_sha256_hex(source.content.as_bytes());
+    if linked.len() != 1 || linked[0].path != source.path || linked[0].sha256 != current_sha256 {
+        anyhow::bail!("context session is not bound to exactly one authorized meeting source");
+    }
+    let receipt = ContextSourceAuthorization {
+        session_id: session.id.clone(),
+        path: minutes_core::policy_fs::canonical_path_wire(&source.path),
+        sha256: linked[0].sha256.clone(),
+    };
+    Ok(Some(AuthorizedContextSource {
+        session_id: session.id.clone(),
+        source,
+        receipt,
+    }))
+}
+
+fn reauthorize_context_source_exact(
+    authorized: Option<&AuthorizedContextSource>,
+    config: &Config,
+) -> Result<()> {
+    let Some(authorized) = authorized else {
+        return Ok(());
+    };
+    reauthorize_direct_meeting_exact(&authorized.source, config)?;
+    let linked = markdown_source_revisions_for_session(&authorized.session_id)?;
+    if linked.len() != 1
+        || linked[0].path != authorized.source.path
+        || linked[0].sha256 != authorized.receipt.sha256
+    {
+        anyhow::bail!("context source association changed before output");
+    }
+    Ok(())
 }
 
 fn resolve_context_session_or_latest(
@@ -12589,15 +15028,26 @@ fn resolve_context_session_or_latest(
     }
 }
 
-fn cmd_context_status(session: Option<&str>, path: Option<&Path>, json: bool) -> Result<()> {
+fn cmd_context_status(
+    session: Option<&str>,
+    path: Option<&Path>,
+    json: bool,
+    config: &Config,
+) -> Result<()> {
+    require_assistant_context_path(path)?;
     let session = resolve_context_session_or_latest(session, path)?;
+    let authorized = session
+        .as_ref()
+        .map(|session| authorize_context_source(session, path, config))
+        .transpose()?
+        .flatten();
     let status = if let Some(session) = &session {
         minutes_core::context_store::screen_context_status_for_session(&session.id)?
             .unwrap_or_default()
     } else {
         minutes_core::context_store::ScreenContextStatus::default()
     };
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
         "session": session,
         "screen_context": status,
         "desktop_context": {
@@ -12605,6 +15055,11 @@ fn cmd_context_status(session: Option<&str>, path: Option<&Path>, json: bool) ->
             "note": "Desktop context contains app/window metadata, not screen pixels."
         }
     });
+    if let Some(authorized) = &authorized {
+        output["source_authorization"] = serde_json::to_value(&authorized.receipt)?;
+    }
+    let rendered = serde_json::to_string_pretty(&output)?;
+    reauthorize_context_source_exact(authorized.as_ref(), config)?;
     if !json {
         eprintln!(
             "Screen context: {} ({} successful captures)",
@@ -12612,7 +15067,7 @@ fn cmd_context_status(session: Option<&str>, path: Option<&Path>, json: bool) ->
             status.successful_capture_count
         );
     }
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    println!("{}", rendered);
     Ok(())
 }
 
@@ -12622,7 +15077,9 @@ fn cmd_context_screen(
     at: Option<&str>,
     limit: usize,
     json: bool,
+    config: &Config,
 ) -> Result<()> {
+    require_assistant_context_path(path)?;
     let anchor = at.map(parse_rfc3339_local).transpose()?;
     let explicitly_selected = session.is_some() || path.is_some();
     let resolved = if let Some(session) = resolve_context_session(session, path)? {
@@ -12637,18 +15094,27 @@ fn cmd_context_screen(
     let Some(session) = resolved else {
         anyhow::bail!("no context session is available");
     };
-    let output = minutes_core::context_store::get_screen_context(&session.id, anchor, limit)?;
+    let authorized = authorize_context_source(&session, path, config)?;
+    let result = minutes_core::context_store::get_screen_context(&session.id, anchor, limit)?;
+    let output = ContextScreenOutput {
+        result,
+        source_authorization: authorized
+            .as_ref()
+            .map(|authorized| authorized.receipt.clone()),
+    };
+    let rendered = serde_json::to_string_pretty(&output)?;
+    reauthorize_context_source_exact(authorized.as_ref(), config)?;
     if !json {
         eprintln!(
             "Screen context: {} — {} verified image(s)",
-            serde_json::to_string(&output.status.state)?.trim_matches('"'),
-            output.images.len()
+            serde_json::to_string(&output.result.status.state)?.trim_matches('"'),
+            output.result.images.len()
         );
-        if let Some(reason) = &output.reason {
+        if let Some(reason) = &output.result.reason {
             eprintln!("  {reason}");
         }
     }
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    println!("{}", rendered);
     Ok(())
 }
 
@@ -12670,19 +15136,48 @@ fn summarize_counts(values: impl Iterator<Item = Option<String>>) -> Vec<Context
     pairs
 }
 
+fn assistant_safe_context_links(
+    links: Vec<minutes_core::context_store::ContextLink>,
+) -> Vec<minutes_core::context_store::ContextLink> {
+    if assistant_policy_allows_restricted_content() {
+        return links;
+    }
+    links
+        .into_iter()
+        .filter(|link| {
+            matches!(
+                link.kind,
+                minutes_core::context_store::ContextLinkKind::MarkdownArtifact
+            )
+        })
+        .collect()
+}
+
 fn cmd_context_activity_summary(
     session: Option<&str>,
     path: Option<&Path>,
     start: Option<&str>,
     end: Option<&str>,
     json: bool,
+    config: &Config,
 ) -> Result<()> {
+    require_assistant_context_path(path)?;
     let resolved_session = resolve_context_session(session, path)?;
+    if resolved_session.is_none() && (session.is_some() || path.is_some()) {
+        anyhow::bail!("the requested context session or linked path was not found");
+    }
+    let authorized = resolved_session
+        .as_ref()
+        .map(|session| authorize_context_source(session, path, config))
+        .transpose()?
+        .flatten();
 
     let (events, links, window_start, window_end) = if let Some(session_row) = &resolved_session {
         let events =
             minutes_core::context_store::list_events_for_session(&session_row.id, None, None)?;
-        let links = minutes_core::context_store::list_links_for_session(&session_row.id)?;
+        let links = assistant_safe_context_links(
+            minutes_core::context_store::list_links_for_session(&session_row.id)?,
+        );
         let start = session_row.started_at;
         let end = session_row.ended_at.unwrap_or_else(Local::now);
         (events, links, start, end)
@@ -12707,10 +15202,15 @@ fn cmd_context_activity_summary(
             start: window_start.to_rfc3339(),
             end: window_end.to_rfc3339(),
         },
+        source_authorization: authorized
+            .as_ref()
+            .map(|authorized| authorized.receipt.clone()),
     };
+    let rendered = serde_json::to_string_pretty(&output)?;
+    reauthorize_context_source_exact(authorized.as_ref(), config)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        println!("{}", rendered);
         return Ok(());
     }
 
@@ -12748,22 +15248,69 @@ fn cmd_context_activity_summary(
                 .join(", ")
         );
     }
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    println!("{}", rendered);
     Ok(())
 }
 
-fn cmd_context_search(query: &str, limit: usize, json: bool) -> Result<()> {
-    let results = minutes_core::context_store::search_events(query, limit)?;
-    let output = ContextSearchOutput { results };
+fn context_event_matches_query(
+    event: &minutes_core::context_store::ContextEvent,
+    query: &str,
+) -> bool {
+    let needle = query.to_ascii_lowercase();
+    [
+        event.app_name.as_deref(),
+        event.bundle_id.as_deref(),
+        event.window_title.as_deref(),
+        event.url.as_deref(),
+        event.domain.as_deref(),
+        event.artifact_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.to_ascii_lowercase().contains(&needle))
+}
+
+fn cmd_context_search(
+    query: &str,
+    path: Option<&Path>,
+    limit: usize,
+    json: bool,
+    config: &Config,
+) -> Result<()> {
+    require_assistant_context_path(path)?;
+    let (results, authorized) = if let Some(path) = path {
+        let session = resolve_context_session(None, Some(path))?
+            .ok_or_else(|| anyhow::anyhow!("the linked meeting path was not found"))?;
+        let authorized = authorize_context_source(&session, Some(path), config)?;
+        let mut results =
+            minutes_core::context_store::list_events_for_session(&session.id, None, None)?;
+        results.retain(|event| context_event_matches_query(event, query));
+        results.sort_by_key(|event| std::cmp::Reverse((event.observed_at, event.id)));
+        results.truncate(limit);
+        (results, authorized)
+    } else {
+        (
+            minutes_core::context_store::search_events(query, limit)?,
+            None,
+        )
+    };
+    let output = ContextSearchOutput {
+        results,
+        source_authorization: authorized
+            .as_ref()
+            .map(|authorized| authorized.receipt.clone()),
+    };
+    let rendered = serde_json::to_string_pretty(&output)?;
+    reauthorize_context_source_exact(authorized.as_ref(), config)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        println!("{}", rendered);
         return Ok(());
     }
 
     if output.results.is_empty() {
         eprintln!("No desktop-context events found for \"{}\".", query);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        println!("{}", rendered);
         return Ok(());
     }
 
@@ -12789,7 +15336,7 @@ fn cmd_context_search(query: &str, limit: usize, json: bool) -> Result<()> {
                 .unwrap_or_default()
         );
     }
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    println!("{}", rendered);
     Ok(())
 }
 
@@ -12800,8 +15347,18 @@ fn cmd_context_get_moment(
     before_minutes: i64,
     after_minutes: i64,
     json: bool,
+    config: &Config,
 ) -> Result<()> {
+    require_assistant_context_path(path)?;
     let resolved_session = resolve_context_session(session, path)?;
+    if resolved_session.is_none() && (session.is_some() || path.is_some()) {
+        anyhow::bail!("the requested context session or linked path was not found");
+    }
+    let authorized = resolved_session
+        .as_ref()
+        .map(|session| authorize_context_source(session, path, config))
+        .transpose()?
+        .flatten();
     let anchor = if let Some(session_row) = &resolved_session {
         session_row.started_at
     } else if let Some(raw) = at {
@@ -12822,7 +15379,9 @@ fn cmd_context_get_moment(
         minutes_core::context_store::list_events_in_window(window_start, window_end)?
     };
     let links = if let Some(session_row) = &resolved_session {
-        minutes_core::context_store::list_links_for_session(&session_row.id)?
+        assistant_safe_context_links(minutes_core::context_store::list_links_for_session(
+            &session_row.id,
+        )?)
     } else {
         vec![]
     };
@@ -12835,10 +15394,15 @@ fn cmd_context_get_moment(
             start: window_start.to_rfc3339(),
             end: window_end.to_rfc3339(),
         },
+        source_authorization: authorized
+            .as_ref()
+            .map(|authorized| authorized.receipt.clone()),
     };
+    let rendered = serde_json::to_string_pretty(&output)?;
+    reauthorize_context_source_exact(authorized.as_ref(), config)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        println!("{}", rendered);
         return Ok(());
     }
 
@@ -12861,7 +15425,7 @@ fn cmd_context_get_moment(
                 .unwrap_or_default()
         );
     }
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    println!("{}", rendered);
     Ok(())
 }
 
@@ -12897,7 +15461,7 @@ fn cmd_import(
             "Processing audio file via import compatibility path. Preferred command: minutes process \"{}\" --type meeting",
             path.display()
         );
-        return cmd_process(path, "meeting", None, None, config);
+        return cmd_process(path, "meeting", None, None, None, config);
     }
 
     match from {
@@ -12940,12 +15504,6 @@ struct TextImportSummary {
 
 fn import_text(source_dir: &Path, dry_run: bool, verbose: bool, config: &Config) -> Result<()> {
     let summary = import_text_files(source_dir, dry_run, verbose, config)?;
-
-    if !dry_run && summary.imported > 0 {
-        if let Err(e) = minutes_core::graph::rebuild_index(config) {
-            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-        }
-    }
 
     let action = if dry_run { "Would import" } else { "Imported" };
     let json = serde_json::json!({
@@ -13567,13 +16125,6 @@ fn import_granola(dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<
         imported += 1;
     }
 
-    // Update relationship graph index after batch import
-    if !dry_run && imported > 0 {
-        if let Err(e) = minutes_core::graph::rebuild_index(config) {
-            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
-        }
-    }
-
     let action = if dry_run { "Would import" } else { "Imported" };
     let json = serde_json::json!({
         "imported": imported,
@@ -13936,17 +16487,6 @@ fn cmd_demo_full(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // Rebuild the relationship graph silently (suppress tracing for clean animation)
-    {
-        let quiet = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_target(false)
-            .finish();
-        tracing::subscriber::with_default(quiet, || {
-            minutes_core::graph::rebuild_index(config).ok();
-        });
-    }
-
     // Demo has a fixed cast of 6 characters
     demo_data::present_demo(paths.len(), 6, &config.output_dir);
 
@@ -14153,11 +16693,8 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
                     raw_text: result.raw_text.clone(),
                     cleaned_text: result.text.clone(),
                     duration_secs: result.duration_secs,
-                    engine_id: match config.dictation.backend.as_str() {
-                        "whisper" | "" => format!("whisper:{}", config.dictation.model),
-                        backend => backend.to_string(),
-                    },
-                    engine_descriptor_version: Some(config.dictation.model.clone()),
+                    engine_id: result.engine_id.clone(),
+                    engine_descriptor_version: result.engine_descriptor_version.clone(),
                     vocabulary_mode: None,
                     vocabulary_used: Vec::new(),
                     destination: result.destination.clone(),
@@ -14191,6 +16728,10 @@ fn cmd_dictate(_stdout: bool, _note_only: bool, _config: &Config) -> Result<()> 
 
 fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()> {
     use minutes_core::voice;
+
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("voice enrollment is unavailable under the active assistant policy");
+    }
 
     // Step 1: Check name — offer to set it if missing
     let my_name = match config.identity.name.as_ref() {
@@ -14376,6 +16917,9 @@ fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()>
 
 fn cmd_voices(delete: bool, json: bool) -> Result<()> {
     use minutes_core::voice;
+    if delete && !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("voice deletion is unavailable under the active assistant policy");
+    }
     let conn = voice::open_db().map_err(|e| anyhow::anyhow!("{}", e))?;
     if delete {
         let profiles = voice::list_profiles(&conn).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -14422,26 +16966,19 @@ fn cmd_confirm(
 ) -> Result<()> {
     use minutes_core::diarize::{AttributionSource, Confidence};
     use minutes_core::overlays;
-    use minutes_core::voice;
 
-    if !meeting_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Meeting not found: {}",
-            meeting_path.display()
-        ));
+    if !assistant_policy_allows_restricted_content() {
+        anyhow::bail!("speaker confirmation is unavailable under the active assistant policy");
+    }
+    if save_voice {
+        anyhow::bail!(
+            "--save-voice cannot trust legacy meeting embedding sidecars; omit it and use provenance-bound voice enrollment"
+        );
     }
 
-    // Read the meeting file
-    let content = std::fs::read_to_string(meeting_path)?;
-    let (yaml_str, _body) = minutes_core::markdown::split_frontmatter(&content);
-
-    if yaml_str.is_empty() {
-        return Err(anyhow::anyhow!("Meeting has no YAML frontmatter"));
-    }
-
-    // Parse existing frontmatter
-    let mut frontmatter: minutes_core::markdown::Frontmatter = serde_yaml::from_str(yaml_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse frontmatter: {}", e))?;
+    let authorized = read_direct_meeting(meeting_path, config)?;
+    let meeting_path = &authorized.path;
+    let mut frontmatter = authorized.frontmatter.clone();
 
     if frontmatter.speaker_map.is_empty() {
         eprintln!("No speaker attributions found in this meeting.");
@@ -14449,8 +16986,6 @@ fn cmd_confirm(
         return Ok(());
     }
 
-    // Load meeting embeddings (for optional voice save)
-    let meeting_embeddings = voice::load_meeting_embeddings(meeting_path);
     let mut overlay_writes: Vec<(String, String, String)> = Vec::new();
 
     // Non-interactive mode: confirm a specific speaker
@@ -14467,46 +17002,11 @@ fn cmd_confirm(
             attr.confidence = Confidence::High;
             attr.source = AttributionSource::Manual;
             overlay_writes.push((speaker_label.to_string(), new_name.to_string(), old_name));
+            reauthorize_direct_meeting_exact(&authorized, config)?;
             eprintln!(
                 "Confirmed: {} = {} (was {:?} → High)",
                 speaker_label, new_name, old_confidence
             );
-
-            // Optionally save voice profile
-            if save_voice {
-                if let Some(ref embeddings) = meeting_embeddings {
-                    if let Some(embedding) = embeddings.get(speaker_label) {
-                        let conn = voice::open_db().map_err(|e| anyhow::anyhow!("{}", e))?;
-                        let slug: String = new_name
-                            .to_lowercase()
-                            .chars()
-                            .map(|c: char| if c.is_alphanumeric() { c } else { '-' })
-                            .collect::<String>()
-                            .trim_matches('-')
-                            .to_string();
-                        voice::save_profile_blended(
-                            &conn,
-                            &slug,
-                            new_name,
-                            embedding,
-                            "confirmed",
-                            voice::model_version(config),
-                        )
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-                        eprintln!(
-                            "Voice profile saved for {} (from confirmed meeting)",
-                            new_name
-                        );
-                    } else {
-                        eprintln!(
-                            "Warning: no embedding found for {} in meeting sidecar",
-                            speaker_label
-                        );
-                    }
-                } else {
-                    eprintln!("Warning: no meeting embeddings sidecar found (meeting was processed before Level 3)");
-                }
-            }
         } else {
             return Err(anyhow::anyhow!(
                 "Speaker '{}' not found in speaker_map. Available: {}",
@@ -14521,10 +17021,12 @@ fn cmd_confirm(
         }
     } else {
         // Interactive mode: walk through all attributions
+        reauthorize_direct_meeting_exact(&authorized, config)?;
         eprintln!("Speaker attributions for: {}", frontmatter.title);
         eprintln!();
 
         for attr in &mut frontmatter.speaker_map {
+            reauthorize_direct_meeting_exact(&authorized, config)?;
             if attr.confidence == Confidence::High {
                 eprintln!(
                     "  {} = {} (high, {:?}) ✓",
@@ -14541,6 +17043,7 @@ fn cmd_confirm(
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             let input = input.trim();
+            reauthorize_direct_meeting_exact(&authorized, config)?;
 
             if input.is_empty()
                 || input.eq_ignore_ascii_case("y")
@@ -14563,43 +17066,11 @@ fn cmd_confirm(
                 eprintln!("    → Updated: {} = {}", attr.speaker_label, attr.name);
             }
         }
-
-        // Ask about saving voice profiles for confirmed speakers
-        if save_voice {
-            if let Some(ref embeddings) = meeting_embeddings {
-                let conn = voice::open_db().map_err(|e| anyhow::anyhow!("{}", e))?;
-                for attr in &frontmatter.speaker_map {
-                    if attr.confidence == Confidence::High
-                        && attr.source == AttributionSource::Manual
-                    {
-                        if let Some(embedding) = embeddings.get(&attr.speaker_label) {
-                            let slug: String = attr
-                                .name
-                                .to_lowercase()
-                                .chars()
-                                .map(|c: char| if c.is_alphanumeric() { c } else { '-' })
-                                .collect::<String>()
-                                .trim_matches('-')
-                                .to_string();
-                            voice::save_profile_blended(
-                                &conn,
-                                &slug,
-                                &attr.name,
-                                embedding,
-                                "confirmed",
-                                voice::model_version(config),
-                            )
-                            .map_err(|e| anyhow::anyhow!("{}", e))?;
-                            eprintln!("  Voice profile saved for {}", attr.name);
-                        }
-                    }
-                }
-            } else {
-                eprintln!("No meeting embeddings sidecar — voice profiles not saved");
-            }
-        }
     }
 
+    if !overlay_writes.is_empty() {
+        reauthorize_direct_meeting_exact(&authorized, config)?;
+    }
     for (speaker_label, confirmed_name, previous_name) in &overlay_writes {
         overlays::write_speaker_confirmation(
             meeting_path,
@@ -14611,20 +17082,12 @@ fn cmd_confirm(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 
-    if !overlay_writes.is_empty() {
-        if let Err(error) = minutes_core::graph::rebuild_index(config) {
-            eprintln!(
-                "Warning: speaker overlay saved, but graph rebuild failed: {}",
-                error
-            );
-        }
-    }
-
     let confirmed_count = frontmatter
         .speaker_map
         .iter()
         .filter(|a| a.confidence == Confidence::High)
         .count();
+    reauthorize_direct_meeting_exact(&authorized, config)?;
     eprintln!(
         "\nSpeaker overlay updated: {}/{} speakers confirmed. Meeting markdown was not rewritten.",
         confirmed_count,
@@ -14648,11 +17111,6 @@ fn cmd_live(config: &Config) -> Result<()> {
     }
 
     eprintln!("Starting live transcript session...");
-    if config.transcription.engine == "apple-speech" {
-        eprintln!(
-            "[minutes] Apple Speech experimental live path selected. If unavailable or weak, Minutes will fall back to Parakeet or Whisper for this session."
-        );
-    }
     eprintln!("Press Ctrl-C or run `minutes stop` to end.\n");
 
     let stop = Arc::new(AtomicBool::new(false));

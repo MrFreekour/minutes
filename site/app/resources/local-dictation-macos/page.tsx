@@ -33,7 +33,7 @@ const options = [
     name: "Minutes",
     bestFor: "Dictation as part of a conversation-memory system",
     detail:
-      "Open source (MIT) and free. Dictation is one of four capture modes: speak, and the text is typed at your cursor (or lands in your clipboard via the CLI), with a timestamped copy in your daily note — alongside meeting recording, voice memos, and live transcription, all on-device, all searchable by your AI agents via MCP. Full disclosure: Minutes is our tool.",
+      "Open source (MIT) and free. Dictation is one of four capture modes: speak, and the text is typed at your cursor (or lands in your clipboard via the CLI), with a timestamped copy in your daily note — alongside meeting recording, voice memos, and live transcription, all on-device. Policy-authorized normal entries are searchable by your AI agents via MCP; restricted meetings are excluded by default. Full disclosure: Minutes is our tool.",
   },
 ] as const;
 
@@ -175,8 +175,8 @@ export default function LocalDictationMacosPage() {
             superwhisper earns its subscription. Mostly transcribing files, occasionally
             dictating: MacWhisper covers both with one one-time purchase. And if dictation is one
             piece of a bigger habit — capturing meetings, memos, and ideas into a private archive
-            your assistant can search — Minutes does all four modes, free, with the code open for
-            inspection.
+            with policy-authorized agent search — Minutes does all four modes, free, with the code
+            open for inspection.
           </p>
         </div>
       </section>

@@ -4,7 +4,8 @@
       "bin/mic_check",
       "bin/system_audio_record",
       "bin/calendar-events",
-      "bin/minutes"
+      "bin/minutes",
+      "bin/minutes-graph-worker"
     ],
     "resources": [
       "resources/assistant-skill-bundle/**/*"

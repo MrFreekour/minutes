@@ -51,6 +51,7 @@ anyhow = "1"
 dirs = "6"
 walkdir = "2"
 which = "4"
+cap-std = "4.0.2"
 
 # Logging
 tracing = "0.1"
@@ -68,7 +69,10 @@ fs2 = "0.4"
 # JSON Schema generation
 schemars = { version = "1", features = ["derive", "chrono04"] }
 
-# Audio format conversion
+# Compressed-audio decoding fallback used only when ffmpeg is unavailable.
+# Never linked into a decode that runs in this process: container probing can
+# allocate attacker-declared tables, so it is confined to the bounded
+# audio-decode worker child, which installs RLIMIT_AS before exec.
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "wav", "isomp4"] }
 
 # Noise reduction (pure Rust RNNoise port)
@@ -95,4 +99,4 @@ ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
 ndarray = "0.16"
 
 # SQLite (relationship graph index)
-rusqlite = { version = "0.33", features = ["bundled"] }
+rusqlite = { version = "0.33", features = ["bundled", "hooks", "limits"] }

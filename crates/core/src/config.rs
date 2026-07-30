@@ -198,8 +198,10 @@ impl Default for VoiceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TranscriptionConfig {
-    /// Transcription engine: "whisper" (default), "parakeet", or
-    /// "apple-speech" (experimental live-transcript-only path on macOS 26+).
+    /// Transcription engine preference: "whisper" (default), "parakeet", or
+    /// "apple-speech". Retained Parakeet and Apple Speech values currently
+    /// resolve to Whisper on every platform because their pathname-only
+    /// helpers cannot receive Minutes' secure private-audio capability.
     pub engine: String,
     pub model: String,
     pub model_path: PathBuf,
@@ -249,6 +251,16 @@ pub struct TranscriptionConfig {
     /// Enable noise reduction via nnnoiseless (RNNoise) before transcription.
     /// Requires the `denoise` feature flag. Default: true.
     pub noise_reduction: bool,
+    /// Allow compressed imports (m4a/mp3/ogg and friends) to fall back to the
+    /// bounded Symphonia decode worker when ffmpeg is not installed.
+    ///
+    /// Default: true. ffmpeg stays preferred whenever it is available because
+    /// its AAC decoder avoids the non-English hallucination loops in issue #21.
+    /// This exists so a user who never installed ffmpeg keeps the behaviour
+    /// they had before the conversation-trust work, notably `minutes watch`
+    /// over iPhone voice memos, which are `.m4a`. Set false to refuse the
+    /// extra decoder and require ffmpeg.
+    pub compressed_decode_fallback: bool,
     /// Path or name of the parakeet.cpp binary (resolved via PATH if not absolute).
     pub parakeet_binary: String,
     /// Parakeet model type: "tdt-ctc-110m", "tdt-600m".
@@ -270,10 +282,15 @@ pub struct TranscriptionConfig {
     pub parakeet_fp16: bool,
     /// Warm Parakeet example-server sidecar: `None` (default) = auto.
     ///
-    /// Auto enables the sidecar when parakeet is the selected engine (batch or
-    /// live) AND the `example-server` binary resolves; otherwise the cold
-    /// per-utterance subprocess path is used. Explicit `true`/`false` in
-    /// config.toml overrides auto in either direction (#295). Use
+    /// Auto can enable the sidecar when parakeet is selected and the
+    /// `example-server` binary resolves, but the current pathname-only server
+    /// protocol cannot receive Minutes' anonymous/sealed private-audio
+    /// capability. Linux descriptor inheritance is also unavailable because
+    /// ordinary exec resets child dumpability and exposes a race through
+    /// `/proc/<pid>/fd`. Every platform therefore reports Parakeet unavailable
+    /// and falls back to Whisper until the CLI can receive sealed bytes/stdin
+    /// or acknowledges a post-exec descriptor-isolation protocol. Explicit `true`
+    /// records intent but cannot bypass that safety gate (#295). Use
     /// `parakeet_sidecar::sidecar_enabled_effective()` to read the decision;
     /// never branch on this raw field.
     ///
@@ -1084,8 +1101,10 @@ pub struct LiveTranscriptConfig {
     ///
     /// - `"inherit"` (default): follow `transcription.engine`
     /// - `"whisper"`: force Whisper for standalone live transcript
-    /// - `"parakeet"`: force Parakeet for standalone live transcript
-    /// - `"apple-speech"`: experimental macOS standalone-live-only path
+    /// - `"parakeet"`: retain Parakeet intent; currently resolves to Whisper
+    ///   because no secure private-audio process transport is available
+    /// - `"apple-speech"`: retain Apple Speech intent; currently resolves to
+    ///   Whisper because no secure private-audio process transport is available
     pub backend: String,
     /// Whisper model to use for live transcription.
     /// Empty string means "use the dictation model".
@@ -1296,12 +1315,16 @@ impl Default for TranscriptionConfig {
             vad_model: "silero-v6.2.0".into(),
             vad_engine: "ort-silero".into(),
             noise_reduction: true,
+            compressed_decode_fallback: true,
             parakeet_binary: "parakeet".into(),
             parakeet_model: "tdt-600m".into(),
             sherpa_model_dir: String::new(),
             parakeet_boost_limit: 0,
             parakeet_boost_score: 2.0,
-            parakeet_fp16: true,
+            // Reserved for a future supported GPU transport. Current Linux
+            // Parakeet dispatch never forwards --fp16, and macOS Parakeet is
+            // safety-gated off until it can receive sealed audio directly.
+            parakeet_fp16: false,
             parakeet_sidecar_enabled: None,
             parakeet_fp16_blacklist_reset: false,
             parakeet_vocab: "tdt-600m.tokenizer.vocab".into(),
@@ -1417,8 +1440,9 @@ impl Config {
     /// `live_transcript.backend = "inherit"` follows `transcription.engine`,
     /// except for the legacy `transcription.engine = "apple-speech"` case,
     /// which older configs used to express the standalone-live-only Apple
-    /// experiment. We keep honoring that value here so non-Tauri consumers
-    /// preserve behavior even before the migration has rewritten the file.
+    /// experiment. We retain that preference here so non-Tauri consumers keep
+    /// the user's intent even though runtime selection currently resolves it to
+    /// sealed Whisper.
     pub fn effective_live_transcript_backend(&self) -> &str {
         let backend = self.live_transcript.backend.trim();
         // Case-insensitive: engine/backend matching is case-insensitive
@@ -1461,6 +1485,27 @@ impl Config {
         Self::load_from(&path)
     }
 
+    /// Load the authoritative config without treating an unreadable or
+    /// malformed existing file as an empty/default policy. Security-sensitive
+    /// bridges use this before reading persistent derivatives so a syntax
+    /// error cannot silently disable enforcement while another parser still
+    /// recovers a knowledge path from the same bytes.
+    pub fn load_strict() -> Result<Self, String> {
+        Self::load_strict_from(&Self::config_path())
+    }
+
+    pub fn load_strict_from(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = std::fs::read_to_string(path)
+            .map_err(|_| "Minutes config exists but could not be read safely.".to_string())?;
+        let mut config: Self = toml::from_str(&contents)
+            .map_err(|_| "Minutes config exists but is malformed.".to_string())?;
+        apply_raw_toml_compat(&mut config, inspect_raw_toml_compat(&contents));
+        Ok(config)
+    }
+
     /// Load the config file with first-run and upgrade migrations applied.
     ///
     /// This is the entry point the Tauri desktop app uses at startup. The
@@ -1492,6 +1537,16 @@ impl Config {
     /// create the config later via `cmd_set_setting` if the user
     /// changes anything.
     pub fn load_with_migrations() -> Self {
+        // Retire durable search/graph projections from versions that predate
+        // process-private policy views. Answer-time graph/search boundaries
+        // repeat this check and fail closed; startup cleanup is deliberately
+        // best-effort so an unsafe legacy entry cannot brick recording.
+        if let Err(error) = crate::policy_fs::retire_legacy_policy_caches() {
+            tracing::warn!(
+                error = %error,
+                "legacy policy caches could not be retired at desktop startup"
+            );
+        }
         let path = Self::config_path();
         Self::load_with_migrations_from(&path)
     }
@@ -1617,26 +1672,13 @@ impl Config {
             return Self::default();
         }
 
-        match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(mut config) => {
-                    apply_raw_toml_compat(&mut config, inspect_raw_toml_compat(&contents));
-                    config
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "invalid config at {}: {}. Using defaults.",
-                        path.display(),
-                        e
-                    );
-                    Self::default()
-                }
-            },
-            Err(e) => {
+        match Self::load_strict_from(path) {
+            Ok(config) => config,
+            Err(error) => {
                 tracing::warn!(
-                    "could not read config at {}: {}. Using defaults.",
+                    "could not safely load config at {}: {}. Using defaults.",
                     path.display(),
-                    e
+                    error
                 );
                 Self::default()
             }
@@ -1740,13 +1782,11 @@ pub fn openai_compatible_base_url_is_local(base_url: &str) -> bool {
     } else {
         host_port.split(':').next().unwrap_or(host_port)
     };
-
     matches!(
         host.to_ascii_lowercase().as_str(),
         "localhost" | "127.0.0.1" | "0.0.0.0" | "::1"
     )
 }
-
 /// Return `true` iff the raw TOML text contains a top-level `[section]`
 /// header. This is a deliberately primitive text check — we cannot use
 /// `toml::from_str` to answer this question because serde's `#[serde(default)]`
@@ -1871,7 +1911,7 @@ mod tests {
         assert_eq!(config.transcription.parakeet_model, "tdt-600m");
         assert_eq!(config.transcription.parakeet_boost_limit, 0);
         assert_eq!(config.transcription.parakeet_boost_score, 2.0);
-        assert!(config.transcription.parakeet_fp16);
+        assert!(!config.transcription.parakeet_fp16);
         assert!(config.transcription.parakeet_sidecar_enabled.is_none());
         assert_eq!(
             config.transcription.parakeet_vocab,
@@ -2116,6 +2156,17 @@ mod tests {
     fn missing_config_file_returns_defaults() {
         let config = Config::load_from(Path::new("/nonexistent/config.toml"));
         assert_eq!(config.transcription.model, "small");
+    }
+
+    #[test]
+    fn strict_load_rejects_malformed_existing_config_without_leaking_contents() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[knowledge\nPRIVATE-CONFIG-CANARY").unwrap();
+        let error = Config::load_strict_from(&path).unwrap_err();
+        assert!(error.contains("malformed"));
+        assert!(!error.contains("PRIVATE-CONFIG-CANARY"));
+        assert!(!Config::load_from(&path).knowledge.enabled);
     }
 
     #[test]

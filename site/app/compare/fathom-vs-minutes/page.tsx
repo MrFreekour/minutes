@@ -24,7 +24,7 @@ const comparisonRows = [
   {
     label: "Where audio is processed",
     competitor: "Fathom's cloud; AI via Anthropic, OpenAI, and Google",
-    minutes: "On your device (whisper.cpp or parakeet.cpp); audio is never uploaded",
+    minutes: "On your device (sealed local whisper.cpp); audio is never uploaded",
   },
   {
     label: "Where recordings live",
@@ -54,7 +54,7 @@ const comparisonRows = [
   {
     label: "API / MCP",
     competitor: "Yes — public API and a first-party MCP server over its cloud",
-    minutes: "Yes — MCP (31 tools), CLI, and SDK over local files",
+    minutes: "Yes — MCP (34 tools), CLI, and SDK over local files",
   },
   {
     label: "Pricing",
@@ -100,7 +100,7 @@ const architecture = {
       },
       {
         label: "Transcribe + diarize",
-        detail: "on-device — whisper.cpp / parakeet.cpp + pyannote",
+        detail: "on-device — sealed local whisper.cpp + pyannote",
         offDevice: false,
       },
       {

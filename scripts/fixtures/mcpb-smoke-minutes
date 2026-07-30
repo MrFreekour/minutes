@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+set -eu
+
+case "${1:-}" in
+  --version)
+    printf '%s\n' "minutes 0.24.0"
+    ;;
+  capabilities)
+    printf '%s\n' '{"version":"0.24.0","api_version":1,"features":{}}'
+    ;;
+  health)
+    printf '%s\n' '[{"label":"Speech model","state":"ready","detail":"smoke fixture","optional":false}]'
+    ;;
+  status)
+    printf '%s\n' '{"recording":false,"processing":false}'
+    ;;
+  *)
+    printf '%s\n' "MCPB smoke fixture does not implement this command" >&2
+    exit 64
+    ;;
+esac

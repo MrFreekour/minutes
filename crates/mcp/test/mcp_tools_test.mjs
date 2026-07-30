@@ -46,22 +46,67 @@ function assertEqual(actual, expected, msg) {
     throw new Error(msg || `expected ${expected}, got ${actual}`);
 }
 
-// Helper: run minutes CLI and parse JSON stdout
+function childText(value) {
+  if (typeof value === "string") return value.trim();
+  if (Buffer.isBuffer(value)) return value.toString("utf8").trim();
+  return "";
+}
+
+function cliFailure(args, error) {
+  const status =
+    typeof error.status === "number"
+      ? `exit ${error.status}`
+      : error.signal
+        ? `signal ${error.signal}`
+        : "spawn failure";
+  const stdout = childText(error.stdout);
+  const stderr = childText(error.stderr);
+  const details = [
+    `minutes ${args.join(" ")} failed (${status})`,
+    stderr && `stderr: ${stderr}`,
+    stdout && `stdout: ${stdout}`,
+  ].filter(Boolean);
+  const failure = new Error(details.join("\n"));
+  failure.cause = error;
+  return failure;
+}
+
+// Helper: run minutes CLI and return stdout. A nonzero exit is always a test
+// failure; empty stdout is never a substitute for a successful empty result.
 function minutesCli(args) {
   const bin = join(import.meta.dirname, "..", "..", "..", "target", "debug", "minutes");
   try {
     const result = execFileSync(bin, args, {
       encoding: "utf-8",
-      timeout: 10000,
+      // Match the production MCP runner. Native corpus authorization has its
+      // own stricter 15-second monotonic deadline; the harness must report
+      // that real exit rather than kill a valid large-corpus command first.
+      timeout: 30000,
+      stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, RUST_LOG: "error" },
     });
     return result.trim();
   } catch (e) {
-    return e.stdout?.trim() || "";
+    throw cliFailure(args, e);
   }
 }
 
 console.log("MCP Server Integration Tests\n");
+
+// ── Test 0: nonzero CLI exits are never converted to empty success ──
+test("minutes CLI helper propagates nonzero exits", () => {
+  try {
+    minutesCli(["definitely-not-a-minutes-command"]);
+    throw new Error("nonzero CLI exit was incorrectly accepted");
+  } catch (error) {
+    assert(
+      error.message.includes(
+        "minutes definitely-not-a-minutes-command failed (exit"
+      ),
+      `expected explicit CLI exit failure, got: ${error.message}`
+    );
+  }
+});
 
 // ── Test 1: minutes status returns valid JSON ──
 test("minutes status returns valid JSON", () => {
@@ -74,46 +119,34 @@ test("minutes status returns valid JSON", () => {
 // ── Test 2: minutes list returns array ──
 test("minutes list returns JSON array", () => {
   const output = minutesCli(["list", "--limit", "5"]);
-  if (output) {
-    const list = JSON.parse(output);
-    assert(Array.isArray(list), "list should return an array");
-  }
-  // Empty output is fine if no meetings exist
+  const list = JSON.parse(output);
+  assert(Array.isArray(list), "list should return an array");
 });
 
 // ── Test 3: minutes search returns array ──
 test("minutes search returns JSON array", () => {
   const output = minutesCli(["search", "nonexistent-query-xyz", "--limit", "5"]);
-  if (output) {
-    const results = JSON.parse(output);
-    assert(Array.isArray(results), "search should return an array");
-    assertEqual(results.length, 0, "nonexistent query should return empty");
-  }
+  const results = JSON.parse(output);
+  assert(Array.isArray(results), "search should return an array");
+  assertEqual(results.length, 0, "nonexistent query should return empty");
 });
 
 // ── Test 4: minutes setup --list works ──
 test("minutes setup --list shows models", () => {
   // setup --list outputs to stderr, not stdout
-  try {
-    execFileSync(
-      join(import.meta.dirname, "..", "..", "..", "target", "debug", "minutes"),
-      ["setup", "--list"],
-      { encoding: "utf-8", timeout: 5000 }
-    );
-  } catch (e) {
-    // Expected to exit 0
-  }
-  // If it didn't throw, it worked
+  execFileSync(
+    join(import.meta.dirname, "..", "..", "..", "target", "debug", "minutes"),
+    ["setup", "--list"],
+    { encoding: "utf-8", timeout: 5000 }
+  );
 });
 
 // ── Test 5: minutes devices returns JSON ──
 test("minutes devices returns JSON array", () => {
   const output = minutesCli(["devices"]);
-  if (output) {
-    const devices = JSON.parse(output);
-    assert(Array.isArray(devices), "devices should return an array");
-    assert(devices.length > 0, "should find at least one audio device");
-  }
+  const devices = JSON.parse(output);
+  assert(Array.isArray(devices), "devices should return an array");
+  assert(devices.length > 0, "should find at least one audio device");
 });
 
 // ── Test 5b: minutes paths exposes effective directories ──

@@ -671,8 +671,9 @@ pub fn splice_ai_sections(
 /// A successful apply rewrites summary-derived frontmatter, which invalidates
 /// every cached view built from it. This function therefore calls
 /// [`crate::derived::refresh_derived_views`] after — and only after — a real
-/// write: the graph index, vault copy, and QMD collection refresh
-/// automatically, while knowledge-base ingestion stays opt-in via
+/// write: vault and the policy-safe QMD mirror refresh automatically, while
+/// process-private search and graph projections rebuild on read and
+/// knowledge-base ingestion stays opt-in via
 /// [`ResummarizeOptions::refresh`] (its log is append-only, so re-ingesting is
 /// not idempotent). The refresh is best-effort and reported in
 /// [`ResummarizeReport::refresh`]; it can never fail a completed write.

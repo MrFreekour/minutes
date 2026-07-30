@@ -10,6 +10,7 @@ const repoRoot = path.resolve(__dirname, "..");
 const manifestPath = path.join(repoRoot, "manifest.json");
 const siteReleasePath = path.join(repoRoot, "site", "lib", "release.ts");
 const cliMainPath = path.join(repoRoot, "crates", "cli", "src", "main.rs");
+const mcpSourcePath = path.join(repoRoot, "crates", "mcp", "src", "index.ts");
 const cratesDir = path.join(repoRoot, "crates");
 const checkOnly = process.argv.includes("--check");
 
@@ -23,8 +24,31 @@ if (!version || typeof version !== "string") {
 if (!Array.isArray(manifest.tools)) {
   throw new Error(`manifest.json is missing a tools array`);
 }
+if (!Array.isArray(manifest.prompts)) {
+  throw new Error(`manifest.json is missing a prompts array`);
+}
 
 const mcpToolCount = manifest.tools.length;
+const mcpPromptCount = manifest.prompts.length;
+
+async function countMcpResources() {
+  const source = await readFile(mcpSourcePath, "utf8");
+  const identities = new Set();
+  const patterns = [
+    /registerAppResource\(\s*server,\s*"([^"]+)",\s*([A-Z0-9_":/.{}-]+),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
+    /server\.resource\(\s*"([^"]+)",\s*("[^"]+"|[A-Z][A-Z0-9_]*),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
+    /server\.resource\(\s*"([^"]+)",\s*new ResourceTemplate\(("[^"]+"|[A-Z][A-Z0-9_]*),[\s\S]*?\),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
+  ];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      identities.add(`${match[1]}\0${match[2]}`);
+    }
+  }
+  if (identities.size === 0) {
+    throw new Error(`Found no MCP resources in ${mcpSourcePath}`);
+  }
+  return identities.size;
+}
 
 async function countCliCommands() {
   const src = await readFile(cliMainPath, "utf8");
@@ -112,13 +136,16 @@ async function countTsTests() {
   let count = 0;
   for (const f of files) {
     const src = await readFile(f, "utf8");
-    const matches = src.match(/^\s*(?:test|it)\s*\(/gm);
+    const matches = src.match(
+      /^\s*(?:test|it)(?:\.(?:runIf|skipIf|only|skip|todo))?\s*\(/gm,
+    );
     if (matches) count += matches.length;
   }
   return count;
 }
 
 const cliCommandCount = await countCliCommands();
+const mcpResourceCount = await countMcpResources();
 const rustTestCount = await countRustTests();
 const tsTestCount = await countTsTests();
 const totalTestCount = rustTestCount + tsTestCount;
@@ -131,6 +158,8 @@ export const MINUTES_RELEASE_VERSION = "${version}";
 export const MINUTES_RELEASE_TAG = \`v\${MINUTES_RELEASE_VERSION}\`;
 
 export const MINUTES_MCP_TOOL_COUNT = ${mcpToolCount};
+export const MINUTES_MCP_RESOURCE_COUNT = ${mcpResourceCount};
+export const MINUTES_MCP_PROMPT_COUNT = ${mcpPromptCount};
 export const MINUTES_CLI_COMMAND_COUNT = ${cliCommandCount};
 export const MINUTES_TEST_COUNT = ${totalTestCount};
 
@@ -152,7 +181,7 @@ try {
 
 if (currentContent === nextContent) {
   console.log(
-    `site release constants already match: v${version}, ${mcpToolCount} tools, ${cliCommandCount} CLI commands, ${totalTestCount} tests`,
+    `site release constants already match: v${version}, ${mcpToolCount} tools, ${mcpResourceCount} resources, ${mcpPromptCount} prompts, ${cliCommandCount} CLI commands, ${totalTestCount} tests`,
   );
   process.exit(0);
 }
@@ -163,6 +192,8 @@ if (checkOnly) {
       "site release constants are out of sync with source",
       `manifest version: ${version}`,
       `mcp tool count: ${mcpToolCount}`,
+      `mcp resource count: ${mcpResourceCount}`,
+      `mcp prompt count: ${mcpPromptCount}`,
       `cli command count: ${cliCommandCount}`,
       `test count: ${totalTestCount} (rust: ${rustTestCount}, ts: ${tsTestCount})`,
       `target file: ${path.relative(repoRoot, siteReleasePath)}`,
@@ -174,5 +205,5 @@ if (checkOnly) {
 
 await writeFile(siteReleasePath, nextContent, "utf8");
 console.log(
-  `updated ${path.relative(repoRoot, siteReleasePath)}: v${version}, ${mcpToolCount} tools, ${cliCommandCount} CLI commands, ${totalTestCount} tests`,
+  `updated ${path.relative(repoRoot, siteReleasePath)}: v${version}, ${mcpToolCount} tools, ${mcpResourceCount} resources, ${mcpPromptCount} prompts, ${cliCommandCount} CLI commands, ${totalTestCount} tests`,
 );

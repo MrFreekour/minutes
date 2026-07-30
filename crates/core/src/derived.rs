@@ -1,30 +1,21 @@
-//! Derived-view refresh — the single owner of "this artifact changed on disk,
-//! so everything computed from it is now stale."
+//! Post-write refresh for external views of the canonical Markdown corpus.
 //!
-//! Minutes keeps markdown as the canonical store, but several consumers cache
-//! views derived from it:
+//! Minutes keeps Markdown as the source of truth. Search and graph answers are
+//! deliberately rebuilt as bounded, process-private, policy-attested
+//! projections when they are read, so a write cannot leave a durable local
+//! cache stale or retain newly restricted meeting text. The remaining
+//! user-configured external views still need an explicit refresh:
 //!
 //! | View | Refresh | Idempotent? |
 //! |---|---|---|
-//! | `graph.db` (people, meetings, topics, commitments) | [`crate::graph::rebuild_index`] | yes — full rebuild from files |
-//! | `search.db` (full-text index) | [`crate::search_index::SearchIndex::upsert_file`] | yes — unconditional per-file reindex |
+//! | Graph projection | fresh, policy-attested projection on read | yes — never retained |
+//! | Search projection | fresh stable-corpus scan on read | yes — never retained |
 //! | Vault copy (`strategy = "copy"` only) | [`crate::vault::sync_file`] | yes — overwrite |
-//! | QMD collection index | `qmd update -c <collection>` | yes — reindex |
+//! | QMD policy mirror | [`crate::knowledge::refresh_qmd_collection`] | yes — rebuild policy-safe mirror |
 //! | Knowledge base (wiki/PARA/Obsidian) | [`crate::knowledge::ingest_file`] | **no** — facts dedup, but the chronological log always appends |
 //!
-//! The search index earns its place despite syncing lazily on read: that sync
-//! (`SyncMode::Auto`) compares only **mtime and size**, and the enum's own
-//! docs note that `SyncMode::Force` exists to catch "mtime-collision edge
-//! cases". A regenerated summary of identical byte length, written within the
-//! filesystem's mtime granularity of the last sync, would therefore stay
-//! stale. `upsert_file` re-reads and reindexes unconditionally, which closes
-//! that window for the one file we know just changed — without paying for a
-//! whole-corpus re-walk.
-//!
-//! MCP and QMD document reads go straight to the markdown and need nothing.
-//!
-//! The first four run automatically after any write that changes
-//! summary-derived frontmatter. Knowledge ingestion is opt-in
+//! Vault and QMD refresh automatically after a write that changes
+//! summary-derived frontmatter. Knowledge ingestion remains opt-in
 //! ([`RefreshOptions::ingest_knowledge`]) precisely because it is not
 //! idempotent: re-ingesting the same meeting writes a second entry into the
 //! user's append-only knowledge log even when no fact changed.
@@ -72,9 +63,15 @@ pub enum QmdRefresh {
 /// failure.
 #[derive(Debug, Default)]
 pub struct RefreshReport {
-    /// Graph rebuild stats, when the rebuild succeeded.
+    /// Legacy report field retained for API compatibility.
+    ///
+    /// Always `None`: graph answers use disposable policy projections and
+    /// therefore have no durable view to refresh.
     pub graph: Option<GraphStats>,
-    /// Whether the artifact was reindexed into the full-text search index.
+    /// Legacy report field retained for API compatibility.
+    ///
+    /// Always `false`: search uses a disposable process-private projection and
+    /// performs a complete stable source scan before a query.
     pub search_indexed: bool,
     /// Destination path, when a vault copy was written (`strategy = "copy"`).
     pub vault: Option<PathBuf>,
@@ -95,65 +92,17 @@ impl RefreshReport {
     }
 }
 
-/// Refresh every derived view that depends on `path`, best-effort.
+/// Refresh every external view that depends on `path`, best-effort.
 ///
 /// Call this after any write that changes an artifact's summary-derived
 /// frontmatter (`entities`, `people`, `intents`, `action_items`, `decisions`)
 /// or its AI-owned body sections. It never fails: each step records a warning
 /// and the rest continue.
 ///
-/// The graph rebuild is whole-corpus, not per-file —
-/// [`crate::graph::rebuild_index`] clears the tables and rewalks every
-/// markdown file under `config.output_dir`. That is the existing pipeline
-/// convention (`jobs.rs`, `watch.rs`), it is what makes the refresh inherently
-/// idempotent, and it is accepted here as a deliberate trade-off: a corpus of
-/// ~90 meetings rebuilds in well under a second.
+/// Search and graph need no action here: their process-private projections are
+/// rebuilt from stable, policy-authorized source snapshots when queried.
 pub fn refresh_derived_views(path: &Path, config: &Config, opts: &RefreshOptions) -> RefreshReport {
-    refresh_derived_views_at(
-        path,
-        config,
-        opts,
-        &crate::graph::db_path(),
-        &crate::search_index::SearchIndex::default_db_path(),
-    )
-}
-
-/// [`refresh_derived_views`] against explicit database paths.
-///
-/// Crate-private and mirroring [`crate::graph::rebuild_index_at`]: the public
-/// entry point always targets the real `~/.minutes/{graph,search}.db`, while
-/// tests point at temporary files. Without this seam a unit test that merely
-/// sets `config.output_dir` to a `TempDir` would still clear the developer's
-/// real indexes and repopulate them from the fixture corpus — both db paths
-/// are global, not derived from the config.
-pub(crate) fn refresh_derived_views_at(
-    path: &Path,
-    config: &Config,
-    opts: &RefreshOptions,
-    graph_db: &Path,
-    search_db: &Path,
-) -> RefreshReport {
     let mut report = RefreshReport::default();
-
-    match crate::graph::rebuild_index_at(config, graph_db) {
-        Ok(stats) => report.graph = Some(stats),
-        Err(error) => {
-            tracing::warn!(error = %error, artifact = %path.display(), "graph index rebuild failed");
-            report
-                .warnings
-                .push(format!("graph index rebuild: {error}"));
-        }
-    }
-
-    match crate::search_index::SearchIndex::open_at(search_db, config)
-        .and_then(|index| index.upsert_file(path))
-    {
-        Ok(()) => report.search_indexed = true,
-        Err(error) => {
-            tracing::warn!(error = %error, artifact = %path.display(), "search index upsert failed");
-            report.warnings.push(format!("search index: {error}"));
-        }
-    }
 
     match crate::vault::sync_file(path, config) {
         Ok(Some(vault_path)) => {
@@ -229,37 +178,12 @@ fn refresh_knowledge(path: &Path, config: &Config, report: &mut RefreshReport) {
 
 /// Ask QMD to reindex the configured collection.
 pub fn refresh_qmd_collection(config: &Config) -> QmdRefresh {
-    refresh_qmd_collection_with(config, "qmd")
-}
-
-/// [`refresh_qmd_collection`] against an explicit program name, so the
-/// spawn-failure branch is testable on machines where `qmd` *is* installed.
-///
-/// Note that a wrong collection name is not detectable here: `qmd update -c
-/// <unknown>` exits 0, so only a genuine spawn failure or non-zero exit is
-/// reported.
-fn refresh_qmd_collection_with(config: &Config, program: &str) -> QmdRefresh {
-    let Some(collection) = config.search.qmd_collection.as_ref() else {
+    if config.search.qmd_collection.is_none() {
         return QmdRefresh::NotConfigured;
-    };
-    let status = crate::engine_process::command(program)
-        .args(["update", "-c", collection])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => QmdRefresh::Refreshed,
-        // A non-zero exit means the collection did not reindex. Reporting it
-        // as success would let the CLI claim a fresh index over a stale one.
-        Ok(status) => QmdRefresh::Failed(format!(
-            "`{program} update -c {collection}` exited {status}"
-        )),
-        Err(error) => {
-            tracing::debug!(error = %error, collection = %collection, "qmd update skipped");
-            QmdRefresh::Failed(format!(
-                "could not run `{program}` for `{collection}`: {error}"
-            ))
-        }
+    }
+    match crate::knowledge::refresh_qmd_collection(config) {
+        Ok(_) => QmdRefresh::Refreshed,
+        Err(error) => QmdRefresh::Failed(error),
     }
 }
 
@@ -268,16 +192,11 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A config whose meetings live in `dir`, plus the temp graph and search
-    /// db paths that keep the real `~/.minutes/*.db` out of the test.
-    fn fixture(dir: &TempDir) -> (Config, PathBuf, PathBuf) {
+    /// A config whose meetings live in `dir`.
+    fn fixture(dir: &TempDir) -> Config {
         let mut config = Config::default();
         config.output_dir = dir.path().to_path_buf();
-        (
-            config,
-            dir.path().join("graph.db"),
-            dir.path().join("search.db"),
-        )
+        config
     }
 
     fn write_meeting(dir: &TempDir, name: &str) -> PathBuf {
@@ -300,124 +219,42 @@ mod tests {
     #[test]
     fn qmd_refresh_is_skipped_when_no_collection_configured() {
         let dir = TempDir::new().unwrap();
-        let (config, _, _) = fixture(&dir);
+        let config = fixture(&dir);
         assert!(config.search.qmd_collection.is_none());
         assert_eq!(refresh_qmd_collection(&config), QmdRefresh::NotConfigured);
     }
 
     #[test]
-    fn qmd_refresh_reports_failure_when_the_binary_cannot_be_spawned() {
+    fn post_write_refresh_never_creates_durable_search_or_graph_caches() {
         let dir = TempDir::new().unwrap();
-        let (mut config, _, _) = fixture(&dir);
-        config.search.qmd_collection = Some("meetings".into());
-
-        // Pin the program name rather than relying on `qmd` being absent: it
-        // is installed on plenty of dev machines, and `qmd update -c <bogus>`
-        // exits 0 there — so a collection-name-based test would assert nothing
-        // and would pass for opposite reasons on different machines.
-        let result = refresh_qmd_collection_with(&config, "minutes-no-such-binary-qmd");
-
-        match result {
-            QmdRefresh::Failed(reason) => {
-                assert!(
-                    reason.contains("minutes-no-such-binary-qmd"),
-                    "failure should name the program, got {reason:?}"
-                );
-            }
-            other => panic!("expected a spawn failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn search_index_upsert_targets_the_given_db_and_never_the_global_one() {
-        // Same regression class as the graph db: `SearchIndex::default_db_path`
-        // is global, so a test that only redirects `output_dir` would rebuild
-        // the developer's real ~/.minutes/search.db.
-        let dir = TempDir::new().unwrap();
-        let (config, graph_db, search_db) = fixture(&dir);
+        let config = fixture(&dir);
         let artifact = write_meeting(&dir, "meeting.md");
+        let graph_db = dir.path().join("graph.db");
+        let search_db = dir.path().join("search.db");
 
-        let report = refresh_derived_views_at(
-            &artifact,
-            &config,
-            &RefreshOptions::default(),
-            &graph_db,
-            &search_db,
-        );
-
-        assert!(report.search_indexed, "warnings: {:?}", report.warnings);
-        assert!(
-            search_db.exists(),
-            "the injected search db path must be the target"
-        );
-    }
-
-    #[test]
-    fn graph_rebuild_targets_the_given_db_and_never_the_global_one() {
-        // Regression guard: `graph::db_path()` is global, so a test that only
-        // redirects `output_dir` would wipe the developer's real graph index.
-        let dir = TempDir::new().unwrap();
-        let (config, graph_db, search_db) = fixture(&dir);
-        let artifact = write_meeting(&dir, "meeting.md");
-
-        let report = refresh_derived_views_at(
-            &artifact,
-            &config,
-            &RefreshOptions::default(),
-            &graph_db,
-            &search_db,
-        );
-
-        assert!(report.graph.is_some(), "graph should rebuild");
-        assert!(graph_db.exists(), "the injected db path must be the target");
-    }
-
-    #[test]
-    fn missing_output_dir_warns_instead_of_failing() {
-        // Best-effort contract: a graph rebuild that cannot run must not be
-        // able to fail a write that already succeeded.
-        let dir = TempDir::new().unwrap();
-        let (mut config, graph_db, search_db) = fixture(&dir);
-        config.output_dir = dir.path().join("does-not-exist");
-        let artifact = dir.path().join("meeting.md");
-
-        let report = refresh_derived_views_at(
-            &artifact,
-            &config,
-            &RefreshOptions::default(),
-            &graph_db,
-            &search_db,
-        );
+        let report = refresh_derived_views(&artifact, &config, &RefreshOptions::default());
 
         assert!(report.graph.is_none());
-        assert!(!report.is_clean());
-        assert!(
-            report.warnings.iter().any(|w| w.contains("graph index")),
-            "expected a graph warning, got {:?}",
-            report.warnings
-        );
+        assert!(!report.search_indexed);
+        assert!(!graph_db.exists(), "post-write refresh retained graph.db");
+        assert!(!search_db.exists(), "post-write refresh retained search.db");
     }
 
     #[test]
     fn clean_refresh_reports_no_warnings_and_skips_unconfigured_views() {
         let dir = TempDir::new().unwrap();
-        let (config, graph_db, search_db) = fixture(&dir);
+        let config = fixture(&dir);
         let artifact = write_meeting(&dir, "meeting.md");
 
-        let report = refresh_derived_views_at(
-            &artifact,
-            &config,
-            &RefreshOptions::default(),
-            &graph_db,
-            &search_db,
-        );
+        let report = refresh_derived_views(&artifact, &config, &RefreshOptions::default());
 
         assert!(
             report.is_clean(),
             "unexpected warnings: {:?}",
             report.warnings
         );
-        assert!(report.graph.is_some());
+        assert!(report.graph.is_none());
+        assert!(!report.search_indexed);
         // Vault and QMD are unconfigured by default; knowledge was not opted in.
         assert!(report.vault.is_none());
         assert!(!report.qmd_refreshed);
@@ -429,14 +266,14 @@ mod tests {
         // `update_from_meeting` returns Ok with zero counts when knowledge is
         // disabled, which is indistinguishable from "ran, found nothing".
         let dir = TempDir::new().unwrap();
-        let (config, graph_db, search_db) = fixture(&dir);
+        let config = fixture(&dir);
         let artifact = write_meeting(&dir, "meeting.md");
         assert!(!config.knowledge.enabled);
 
         let opts = RefreshOptions {
             ingest_knowledge: true,
         };
-        let report = refresh_derived_views_at(&artifact, &config, &opts, &graph_db, &search_db);
+        let report = refresh_derived_views(&artifact, &config, &opts);
 
         assert!(
             report.knowledge.is_none(),
@@ -456,7 +293,7 @@ mod tests {
     fn restricted_artifacts_are_refused_by_knowledge_ingest() {
         let dir = TempDir::new().unwrap();
         let knowledge_dir = TempDir::new().unwrap();
-        let (mut config, graph_db, search_db) = fixture(&dir);
+        let mut config = fixture(&dir);
         config.knowledge.enabled = true;
         config.knowledge.path = knowledge_dir.path().to_path_buf();
 
@@ -470,7 +307,7 @@ mod tests {
         let opts = RefreshOptions {
             ingest_knowledge: true,
         };
-        let report = refresh_derived_views_at(&artifact, &config, &opts, &graph_db, &search_db);
+        let report = refresh_derived_views(&artifact, &config, &opts);
 
         assert!(report.knowledge.is_none());
         assert!(

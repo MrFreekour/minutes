@@ -25,8 +25,8 @@ const SOLO_MAX_CLIPPING_FRACTION: f32 = 0.05;
 // ──────────────────────────────────────────────────────────────
 // Voice profile storage and matching.
 //
-// Stored in ~/.minutes/voices.db — separate from graph.db
-// (which is a rebuildable cache that wipes on rebuild).
+// Stored durably in ~/.minutes/voices.db — separate from the disposable,
+// process-private relationship graph projections.
 // ──────────────────────────────────────────────────────────────
 
 /// Resolve the model version tag for the currently configured embedding model.

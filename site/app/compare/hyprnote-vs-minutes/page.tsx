@@ -34,7 +34,7 @@ const comparisonRows = [
   {
     label: "Agent surface",
     competitor: "Desktop app first",
-    minutes: "Files, 31 MCP tools, CLI, SDK, live transcript reads, Claude Code plugin",
+    minutes: "Files, 34 MCP tools, CLI, SDK, live transcript reads, Claude Code plugin",
   },
   {
     label: "Consent provenance",
@@ -49,7 +49,7 @@ const comparisonRows = [
   {
     label: "Cross-meeting memory",
     competitor: "Notes organized per meeting",
-    minutes: "People, decisions, and commitments tracked across the whole corpus",
+    minutes: "People, decisions, and commitments from policy-authorized live sources",
   },
 ] as const;
 
@@ -65,7 +65,7 @@ export default function HyprnoteVsMinutesPage() {
       competitorName="Hyprnote"
       competitorLabel="Hyprnote (Anarlog)"
       markdownHref="/compare/hyprnote-vs-minutes.md"
-      heroSummary="Hyprnote and Minutes are friendly neighbors: both are open source, local-first, and serious about privacy. The practical difference is the job. Hyprnote is a notepad you write in during meetings, with AI that enhances what you wrote. Minutes is a memory layer: it turns everything you record into structured markdown that Claude, Codex, and any MCP client can query later, with consent provenance in every file."
+      heroSummary="Hyprnote and Minutes are friendly neighbors: both are open source, local-first, and serious about privacy. The practical difference is the job. Hyprnote is a notepad you write in during meetings, with AI that enhances what you wrote. Minutes is a memory layer: it turns everything you record into structured markdown you own, then exposes policy-authorized normal sources to Claude, Codex, and MCP clients while excluding restricted meetings by default, with consent provenance in every file."
       quickVerdictCompetitor="you want a polished local notepad for taking and enhancing your own meeting notes, and the app itself is where you want to live."
       quickVerdictMinutes="you want a durable, agent-readable corpus: files on your disk, MCP tools, a CLI, and consent and provenance metadata your tools can rely on."
       comparisonRows={comparisonRows as any}
@@ -77,15 +77,15 @@ export default function HyprnoteVsMinutesPage() {
       minutesWins={[
         "Minutes is built for what happens after the meeting: a corpus of markdown with YAML frontmatter that agents query across months of conversations.",
         "The agent surface is broader: MCP server, CLI, SDK, live transcript reads for mid-meeting coaching, and a Claude Code plugin.",
-        "Governance lives in the data: consent basis is stamped into every recording, with sensitive no-capture meetings and agent-enforced sensitivity on the roadmap.",
+        "Governance lives in the data: consent basis is stamped into every recording, sensitive no-capture meetings are supported, and restricted meetings are excluded from agents by default with audited overrides.",
       ]}
       workflowSection={[
         "Both projects process audio locally, so the privacy floor is similar. The fork in the road is the output contract. Hyprnote's durable artifact is your enhanced notes. Minutes' durable artifact is a structured, diarized transcript plus extracted decisions, action items, and people, written as plain files that outlive any one app.",
-        "If your assistant should answer 'what did we decide about pricing in April', the question is whether the record it reads was designed for that. Minutes' files, MCP tools, and knowledge graph are built for exactly that query.",
+        "If your assistant should answer 'what did we decide about pricing in April', the question is whether the record it reads was designed for that. Minutes' files, policy-bound MCP/search surfaces, and bounded live relationship projection are built for that query.",
       ]}
       chooseSection={[
         "Pick Hyprnote if the notepad is the product you want: you write, it listens, your notes get better.",
-        "Pick Minutes if the corpus is the product you want: everything recorded becomes agent-readable memory with provenance.",
+        "Pick Minutes if the corpus is the product you want: recordings become owned memory with provenance, normal sources are agent-readable by default, and restricted sources fail closed.",
         "Running both is coherent: they solve adjacent jobs, and neither locks your data away.",
       ]}
       notRightFitSection={[

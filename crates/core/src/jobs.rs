@@ -1350,6 +1350,22 @@ fn recording_duration(job: &ProcessingJob) -> String {
     }
 }
 
+fn refresh_qmd_collection(config: &Config) {
+    if config.search.qmd_collection.is_none() {
+        return;
+    }
+    match crate::knowledge::refresh_qmd_collection(config) {
+        Ok(mirror) => tracing::debug!(
+            path = %mirror.path.display(),
+            files = mirror.files,
+            "QMD policy mirror refreshed"
+        ),
+        Err(error) => {
+            tracing::warn!(error = %error, "QMD policy-safe refresh skipped");
+        }
+    }
+}
+
 fn job_context(job: &ProcessingJob) -> BackgroundPipelineContext {
     let template = job.template_slug.as_deref().and_then(|slug| {
         match crate::template::TemplateResolver::new().resolve(slug) {
@@ -1534,10 +1550,9 @@ fn process_pending_jobs_with_transcriber(
                 &recording_duration(&review_job),
             ));
             maybe_mark_context_session_complete(&review_job, artifact.write_result.content_type);
-            if let Err(error) = crate::graph::rebuild_index(config) {
-                tracing::warn!(error = %error, "graph index rebuild failed after queued job");
-            }
-            let _ = crate::derived::refresh_qmd_collection(config);
+            // Graph answers are disposable, policy-fresh projections of the
+            // current Markdown corpus; there is no durable index to refresh.
+            refresh_qmd_collection(config);
             sync_processing_status();
             on_job_update(&review_job);
             continue;
@@ -1621,10 +1636,8 @@ fn process_pending_jobs_with_transcriber(
                     &result,
                     &recording_duration(&completed_job),
                 ));
-                if let Err(error) = crate::graph::rebuild_index(config) {
-                    tracing::warn!(error = %error, "graph index rebuild failed after queued job");
-                }
-                let _ = crate::derived::refresh_qmd_collection(config);
+                // Graph consumers project the newly written Markdown on use.
+                refresh_qmd_collection(config);
                 // Run post_record hook (async, non-blocking)
                 pipeline::run_post_record_hook(config, &result.path);
                 if completed_job.state == JobState::Complete {
@@ -1715,9 +1728,9 @@ mod tests {
             word_count: 0,
             content_type: ContentType::Meeting,
         };
-        pipeline::TranscriptArtifact {
+        pipeline::TranscriptArtifact::ambient_for_test(
             write_result,
-            frontmatter: Frontmatter {
+            Frontmatter {
                 title: "Capture reliability fixture".into(),
                 r#type: ContentType::Meeting,
                 date: Local::now(),
@@ -1752,9 +1765,8 @@ mod tests {
                 template: None,
                 filter_diagnosis: Some("fake engine found no speech".into()),
             },
-            transcript: String::new(),
-            diarization_audio_path: None,
-        }
+            String::new(),
+        )
     }
 
     #[test]
@@ -2385,14 +2397,14 @@ mod tests {
 
     #[test]
     fn no_speech_artifacts_require_review_and_preserve_capture() {
-        let artifact = pipeline::TranscriptArtifact {
-            write_result: WriteResult {
+        let artifact = pipeline::TranscriptArtifact::ambient_for_test(
+            WriteResult {
                 path: PathBuf::from("/tmp/review.md"),
                 title: "Untitled Recording".into(),
                 word_count: 0,
                 content_type: ContentType::Meeting,
             },
-            frontmatter: Frontmatter {
+            Frontmatter {
                 title: "Untitled Recording".into(),
                 r#type: ContentType::Meeting,
                 date: Local::now(),
@@ -2427,9 +2439,8 @@ mod tests {
                 template: None,
                 filter_diagnosis: Some("silence strip removed ALL audio".into()),
             },
-            transcript: String::new(),
-            diarization_audio_path: None,
-        };
+            String::new(),
+        );
 
         assert_eq!(
             terminal_state_for_artifact(&artifact),
@@ -2825,14 +2836,14 @@ mod tests {
         status: OutputStatus,
         recording_health: Option<crate::markdown::RecordingHealth>,
     ) -> pipeline::TranscriptArtifact {
-        pipeline::TranscriptArtifact {
-            write_result: WriteResult {
+        pipeline::TranscriptArtifact::ambient_for_test(
+            WriteResult {
                 path: PathBuf::from(format!("/tmp/{id}.md")),
                 title: format!("title-{id}"),
                 word_count: 42,
                 content_type: ContentType::Meeting,
             },
-            frontmatter: Frontmatter {
+            Frontmatter {
                 title: format!("title-{id}"),
                 r#type: ContentType::Meeting,
                 date: Local::now(),
@@ -2867,9 +2878,8 @@ mod tests {
                 template: None,
                 filter_diagnosis: None,
             },
-            transcript: "[0:00] recovered call audio".into(),
-            diarization_audio_path: None,
-        }
+            "[0:00] recovered call audio".into(),
+        )
     }
 
     #[test]

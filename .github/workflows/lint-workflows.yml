@@ -16,7 +16,7 @@ jobs:
   actionlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Lint workflows
         run: >-
@@ -29,7 +29,15 @@ jobs:
         run: node scripts/check_workflow_runner_context.mjs
 
       - name: Check signed acceptance trust boundary
-        run: node scripts/check_signed_acceptance_policy.mjs
+        run: |
+          node scripts/check_signed_acceptance_policy.mjs
+          node scripts/check_signed_acceptance_policy.test.mjs
+
+      - name: Check graph worker packaging parity
+        run: |
+          node scripts/check_graph_worker_packaging.mjs
+          node scripts/check_graph_worker_packaging.mjs --self-test
+          python3 scripts/seal_graph_worker_hash.py --self-test
 
       - name: Verify broken workflow is rejected
         run: |
@@ -74,3 +82,14 @@ jobs:
             echo "signed acceptance policy unexpectedly accepted the unsafe fixture" >&2
             exit 1
           fi
+          for fixture in \
+            tests/fixtures/workflows/unsafe-signed-local-action.yml \
+            tests/fixtures/workflows/unsafe-signed-payload-run.yml
+          do
+            if node scripts/check_signed_acceptance_policy.mjs \
+              --signing-job-fixture "$fixture"
+            then
+              echo "signed acceptance policy accepted candidate execution: $fixture" >&2
+              exit 1
+            fi
+          done

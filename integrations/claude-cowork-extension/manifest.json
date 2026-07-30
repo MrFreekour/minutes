@@ -31,16 +31,14 @@
     { "name": "start_recording", "description": "Start live capture with Minutes" },
     { "name": "stop_recording", "description": "Stop capture and process the recording" },
     { "name": "get_status", "description": "Check current recording or processing status" },
-    { "name": "list_meetings", "description": "List recent meetings and memos" },
-    { "name": "search_meetings", "description": "Search transcripts or structured intents" },
+    { "name": "list_meetings", "description": "List recent normal meetings and memos; restricted items are excluded by policy" },
+    { "name": "search_meetings", "description": "Search normal transcripts or structured intents; restricted items are excluded by policy" },
     { "name": "research_topic", "description": "Research a topic across meetings, decisions, and open follow-ups" },
     { "name": "consistency_report", "description": "Flag conflicting decisions and stale commitments" },
     { "name": "get_person_profile", "description": "Build a profile for a person across meetings" },
-    { "name": "get_meeting", "description": "Read a full meeting or memo artifact" },
-    { "name": "process_audio", "description": "Process an audio file into a Minutes artifact" },
-    { "name": "add_note", "description": "Add a note during recording or annotate an existing artifact" },
-    { "name": "qmd_collection_status", "description": "Check whether Minutes artifacts are indexed in QMD" },
-    { "name": "register_qmd_collection", "description": "Register the Minutes output folder as a QMD collection" }
+    { "name": "get_meeting", "description": "Read a normal meeting or memo artifact; restricted items return a content-free stub" },
+    { "name": "process_audio", "description": "Process audio from the Minutes inbox or Downloads; retained library recordings are unavailable" },
+    { "name": "add_note", "description": "Add a note to the current active recording" }
   ],
   "keywords": [
     "meetings",

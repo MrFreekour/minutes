@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 export const metadata: Metadata = {
   title: "whisper.cpp vs parakeet.cpp for local transcription — minutes",
   description:
-    "We ship both engines in an open-source transcription pipeline. Real numbers on accuracy, speed on Apple Silicon, language coverage, and the build friction nobody mentions.",
+    "A candid comparison of two local transcription engines: accuracy, Apple Silicon speed, language coverage, build friction, and why Minutes currently selects sealed Whisper.",
   alternates: {
     canonical: "/writing/whisper-cpp-vs-parakeet-cpp",
   },
@@ -47,11 +47,12 @@ export default function Post() {
 
         <div className="mt-8 space-y-5 text-[16px] leading-[1.75] text-[var(--text-secondary)]">
           <p>
-            Minutes ships both engines: whisper.cpp as the default, parakeet.cpp behind an opt-in
-            build flag. That means we&apos;ve had to make both work in production — batch
-            transcription, live meeting transcription, dictation, folder-watcher processing — on
-            the same audio, on the same machines. This is what we&apos;ve learned, with the
-            numbers and the friction included.
+            Minutes retains integrations for both engines, but currently selects only its sealed,
+            in-process whisper.cpp path. The available parakeet.cpp helpers accept audio by
+            pathname, which cannot safely receive Minutes&apos; sealed private-audio capability.
+            Parakeet therefore fails closed on every platform until it has a safe byte transport.
+            The upstream performance comparison is still useful, so here are the numbers and the
+            friction we found while building the integration.
           </p>
 
           <h2 className="pt-4 font-serif text-[26px] leading-tight tracking-[-0.02em] text-[var(--text)]">
@@ -130,19 +131,20 @@ export default function Post() {
           <p>
             <span className="font-medium text-[var(--text)]">Streaming partials.</span> Our
             dictation overlay depends on fast mid-utterance partial results, and Whisper&apos;s
-            streaming behavior is what makes that feel live. Even with Parakeet enabled, Minutes
-            keeps Whisper powering dictation partials and uses Parakeet at utterance finalization.
+            streaming behavior is what makes that feel live. The retained Parakeet integration
+            does not currently receive production audio because its pathname-only handoff would
+            require restoring plaintext staging.
           </p>
           <p>
-            <span className="font-medium text-[var(--text)]">Fallback maturity.</span> A
-            transcription engine in production needs an answer for &quot;the engine failed
-            mid-meeting.&quot; Whisper is compiled into every Minutes build, so Parakeet paths
-            fall back to it automatically — warmup error, sidecar unreachable, or a single failed
-            utterance. The reverse arrangement wouldn&apos;t work today.
+            <span className="font-medium text-[var(--text)]">Private-audio transport.</span>{" "}
+            A transcription engine must consume audio without creating a named plaintext file
+            that another same-user process can open. Whisper runs in-process against Minutes&apos;
+            sealed reader. The current Parakeet subprocess and warm-server protocols accept a
+            pathname, so Minutes rejects Parakeet selection and uses Whisper instead.
           </p>
 
           <h2 className="pt-4 font-serif text-[26px] leading-tight tracking-[-0.02em] text-[var(--text)]">
-            When Parakeet is clearly worth it
+            Where Parakeet&apos;s upstream results stand out
           </h2>
           <p>
             English or major-European-language audio on Apple Silicon, especially live
@@ -158,14 +160,15 @@ export default function Post() {
             The recommendation
           </h2>
           <p>
-            Start with Whisper — it&apos;s the default for a reason: universal language coverage,
-            no build step, battle-tested fallbacks. If you&apos;re on Apple Silicon, work mostly
-            in English or European languages, and care about live latency or long batch jobs,
-            the parakeet.cpp build is worth the afternoon. Minutes lets both coexist in one
-            binary and switches per-path in config, so this isn&apos;t a marriage either way.
+            Use Whisper in Minutes today. Even if a Parakeet preference or binary is present,
+            Minutes resolves to sealed Whisper rather than stage private audio on a pathname.
+            Parakeet selection can return when its subprocess accepts a safe byte stream, or when
+            an explicitly acknowledged descriptor-isolation protocol closes the same-user open
+            race. Until then, the benchmark advantage is promising research, not a setup path we
+            recommend to Minutes users.
           </p>
           <p>
-            The full setup guide, including every build pitfall we hit, is in{" "}
+            The retained integration notes, including the safety gate and build pitfalls, are in{" "}
             <a
               href="https://github.com/silverstein/minutes/blob/main/docs/architecture/parakeet.md"
               className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"

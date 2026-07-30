@@ -31,7 +31,7 @@
     "name": "Desktop app",
     "when": "User wants a menu bar app with one-click recording, Recall, and artifact drafting.",
     "install": "brew install --cask silverstein/tap/minutes",
-    "note": "Tauri v2, macOS only today. Includes command palette, dictation hotkey, live mode toggle, and auto-updates from GitHub Releases.",
+    "note": "Tauri v2, macOS only today. Includes command palette, dictation hotkey, and live mode toggle. Updates remain manual until a hosted manifest and rollback UX exist.",
     "activation": "Best for first recording, live capture, and post-meeting artifact work."
   }
 ]

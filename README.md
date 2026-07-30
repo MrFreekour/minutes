@@ -6,11 +6,18 @@
 
 **Open-source conversation memory.** &nbsp; [useminutes.app](https://useminutes.app)
 
-**Your AI remembers every conversation — and no one can take it from you.**
+**Your AI remembers the conversations you authorize — and no one can take them from you.**
 
 Agents have run logs. Humans have conversations. **minutes** captures the human side — the decisions, the intent, the context that agents need but can't observe — and makes it queryable. Record a meeting. Capture a voice memo on a walk. Dictate a thought at your cursor. Ask Claude *"what did I promise Sarah?"* — and get an answer.
 
-Everything is transcribed **on your machine** and written to `~/meetings/` as plain markdown, which every AI you use (Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi) reads directly. Nothing is uploaded. When a cloud memory app gets acquired or subpoenaed, your recordings aren't theirs to hand over — they never left your disk.
+Everything is transcribed **on your machine** and written to `~/meetings/` as
+plain markdown. Policy-aware local tools expose normal sources to the AI clients
+you choose (Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi) while
+restricted meetings stay excluded by default. Minutes never uploads your audio;
+meeting text leaves your device only when you explicitly send policy-authorized
+context to a connected cloud agent or summarizer. When a cloud memory app gets
+acquired or subpoenaed, your recordings aren't theirs to hand over — they never
+left your disk.
 
 > **The private, owned conversation-memory layer.** Not another AI notetaker — that category ships free inside Zoom and Meet now. Minutes is audio capture, transcripts, decisions, commitments, people, and provenance as plain files, CLI commands, MCP tools, and live transcript streams. No SDK. No API key. No vendor to outlive. Ten years from now, `grep` still works on your corpus. &nbsp;[**For agents →**](https://useminutes.app/for-agents) &nbsp;·&nbsp; [**Frontmatter schema →**](docs/architecture/frontmatter-schema.md)
 
@@ -49,7 +56,7 @@ brew trust silverstein/tap
 
 # Any platform — from source (requires Rust + cmake; Windows also needs LLVM)
 cargo install minutes-cli                          # macOS/Linux
-cargo install minutes-cli --no-default-features    # Windows (see install notes below)
+cargo install minutes-cli --no-default-features --features whisper  # Windows without diarization
 
 # MCP server only — no Rust needed (Claude Code, Codex, OpenCode, Gemini CLI, Claude Desktop, etc.)
 npx minutes-mcp
@@ -88,14 +95,14 @@ The README is now the product overview and install guide, not the only home for 
 ## How it works
 
 ```
-Audio → Transcribe → Diarize → Summarize → Structured Markdown → Relationship Graph
-         (local)     (local)     (LLM)       (decisions,            (people, commitments,
-        whisper.cpp  pyannote-rs Claude/       action items,          topics, scores)
-        /parakeet    (native)    Ollama/       people, entities)      SQLite index
-                                Mistral/OpenAI
+Audio → Transcribe → Diarize → Summarize → Structured Markdown → Policy-safe search
+         (local)     (local)     (LLM)       (decisions,            (bounded live-source
+        whisper.cpp  pyannote-rs Claude/       action items,          profiles and topics)
+        (retained    (native)    Ollama/       people, entities)
+        Parakeet → Whisper)      Mistral/OpenAI
 ```
 
-Everything runs locally. Your audio never leaves your machine (unless you opt into cloud LLM summarization). Speakers are identified via native diarization. The relationship graph indexes people, commitments, and topics across all meetings for instant queries.
+Everything runs locally. Your audio never leaves your machine (unless you opt into cloud LLM summarization). Speakers are identified via native diarization. Relationship answers are rebuilt in a bounded process-private projection from current policy-authorized Markdown and discarded after use.
 
 ## Features
 
@@ -161,38 +168,28 @@ minutes note "Logan agreed"                       # LLM weights your notes heavi
 
 ### Process voice memos
 ```bash
-minutes process ~/Downloads/voice-memo.m4a        # Any audio format
+minutes process ~/Downloads/voice-memo.m4a        # WAV, M4A, MP3, OGG, WebM, MP4, MOV, or AAC
 minutes process ~/.minutes/native-captures/2026-05-19-120148-call.voice.wav --type meeting
 minutes watch                                     # Auto-process new files in inbox
 ```
 
-### Search everything
+### Search your authorized memory
 ```bash
 minutes search "pricing"                          # Full-text search
 minutes search "onboarding" -t memo               # Filter by type
-minutes actions                                   # Open action items across all meetings
+minutes actions                                   # Open action items across normal meetings
 minutes actions --assignee sarah                   # Filter by person
 minutes list                                      # Recent recordings
 ```
 
 ### Relationship intelligence
 
-> *"What did I promise Sarah?"* — the query nobody else can answer.
-
-```bash
-minutes people                                     # Who you talk to, how often, about what
-minutes people --rebuild                           # Rebuild the relationship index
-minutes people merge junrei junlei jun-rei          # Confirm variants are one person (canonical first)
-minutes commitments                                # All open + overdue commitments
-minutes commitments --person alex                   # What did I promise Alex?
-```
-
-Tracks people, commitments, topics, and relationship health across every meeting. Detects when you're losing touch with someone. Suggests duplicate contacts ("Sarah Chen" ↔ "Sarah") and name-variant fragments a transcriber spelled several ways ("junrei" ↔ "junlei" ↔ "jun-rei"). `minutes people --rebuild` prints a ready-to-run `minutes people merge` command under each suggested cluster; confirming it records a durable alias so every variant collapses to the canonical person on future rebuilds. Powered by a SQLite index rebuilt from your markdown in <50ms.
+`minutes people` and `minutes commitments` derive bounded relationship intelligence through a process-private projection of current policy-authorized Markdown. `minutes person` and `minutes research` use bounded live-source search instead. Both paths re-attest policy before results are returned; no durable graph cache is trusted.
 
 ### Cross-meeting intelligence
 ```bash
-minutes research "pricing strategy"               # Search across all meetings
-minutes person "Alex"                              # Build a profile from meeting history
+minutes research "pricing strategy"               # Search across normal meetings
+minutes person "Alex"                              # Bounded profile from live normal sources
 minutes consistency                                # Flag contradicting decisions + stale commitments
 ```
 
@@ -201,14 +198,14 @@ minutes consistency                                # Flag contradicting decision
 minutes live                                     # Start real-time transcription
 minutes stop                                     # Stop live session
 ```
-Streams local transcription to a JSONL file in real time — any AI agent can read it mid-meeting for live coaching. When the session stops, the default `[live_transcript] promote_on_stop = "process"` preserves the raw WAV/JSONL pair and runs the normal diarization and summarization pipeline to create a meeting; use `"preserve"` to keep only the timestamped source pair or `"off"` for the legacy overwrite-prone fixed slot. Depending on your build and config, live mode can run on Whisper, Parakeet, or the experimental Apple Speech standalone-live path. Apple Speech currently applies to standalone live transcript (`minutes live`) and opt-in dictation finalization, not recording-sidecar or batch transcription, and it falls back to a ready Parakeet backend before Whisper if Apple Speech is unavailable or fails mid-session in live mode. See [docs/architecture/apple-speech.md](docs/architecture/apple-speech.md) for the current Apple Speech scope. The MCP `read_live_transcript` tool provides delta reads (by line cursor or wall-clock duration). Works with Claude Code, Codex, OpenCode, Gemini CLI, or any agent that reads files. The Tauri desktop app has a Live Mode toggle that starts this with one click.
+Streams local transcription to a JSONL file in real time — any AI agent can read it mid-meeting for live coaching. When the session stops, the default `[live_transcript] promote_on_stop = "process"` preserves the raw WAV/JSONL pair and runs the normal diarization and summarization pipeline to create a meeting; use `"preserve"` to keep only the timestamped source pair or `"off"` for the legacy overwrite-prone fixed slot. Live mode currently runs on sealed local Whisper. Existing Apple Speech and Parakeet preferences are retained but resolve to Whisper until their pathname-only helpers gain a secure byte transport; Minutes will not create a named plaintext WAV just to invoke them. See [docs/architecture/apple-speech.md](docs/architecture/apple-speech.md) and [docs/architecture/parakeet.md](docs/architecture/parakeet.md) for current scope. The MCP `read_live_transcript` tool provides delta reads (by line cursor or wall-clock duration). Works with Claude Code, Codex, OpenCode, Gemini CLI, or any agent that reads files. The Tauri desktop app has a Live Mode toggle that starts this with one click.
 
 ### Dictation mode
 ```bash
 minutes dictate                                  # Speak → text appears as you talk
 minutes dictate --stdout                         # Output to stdout instead of clipboard
 ```
-Text streams progressively as you speak (partial results every 2 seconds). By default it accumulates across pauses and writes the combined text to clipboard + daily note when dictation ends. Set `[dictation] accumulate = false` to keep the older per-pause behavior. The default backend is local Whisper; on supported macOS builds, `[dictation] backend = "apple-speech"` tries Apple DictationTranscriber for final utterances, and `[dictation] backend = "parakeet"` tries the installed Parakeet backend for final utterances. Both opt-in paths keep Whisper partials and fallback. Linux clipboard output works through `wl-clipboard` on Wayland or `xclip` / `xsel` on X11; desktop auto-paste only attempts X11 paste automation when `xdotool` is available. Local engines, no cloud.
+Text streams progressively as you speak (partial results every 2 seconds). By default it accumulates across pauses and writes the combined text to clipboard + daily note when dictation ends. Set `[dictation] accumulate = false` to keep the older per-pause behavior. Dictation runs on sealed local Whisper. Retained `[dictation] backend = "apple-speech"` and `"parakeet"` preferences currently resolve to Whisper because their pathname-only helpers cannot receive Minutes' secure private audio. Linux clipboard output works through `wl-clipboard` on Wayland or `xclip` / `xsel` on X11; desktop auto-paste only attempts X11 paste automation when `xdotool` is available. Local engines, no cloud.
 
 ### Command palette (desktop app)
 Press `⌘⇧K` from anywhere on macOS to open a keyboard-first palette of every Minutes command. Start a recording, drop a note into the active session, jump to the latest meeting, search transcripts, or rename the meeting open in your assistant — all without leaving the keyboard. Backed by a single typed command registry in `minutes-core`, so visibility follows real backend state: stop-recording only appears while you're recording, mid-recording dictation rows are hidden, and the list re-fetches automatically when state changes.
@@ -241,7 +238,10 @@ minutes demo                                     # Run a pipeline test (bundled 
 
 ## Switching from Granola?
 
-Import your meeting history into Minutes' conversation memory. Once imported, your meetings become searchable context for AI agents, feed the relationship graph for meeting prep, and surface action items and decision patterns across months of conversations.
+Import your meeting history into Minutes' conversation memory. Once imported,
+normal meetings become searchable context for AI agents and surface action items,
+decision patterns, and bounded relationship intelligence across months of
+conversations. Restricted meetings stay excluded from agent results by default.
 
 ```bash
 minutes import granola --dry-run    # Preview what will be imported
@@ -412,7 +412,7 @@ minutes service restart        # Restart all services (e.g. after upgrading the 
 |-------|----------|--------------|
 | **watcher** | Always on | Processes voice memos from `~/.minutes/inbox/` |
 | **weekly-summary** | Sundays 7pm | Generates a weekly digest to `~/.minutes/automations/` |
-| **proactive-context** | Daily 8am | Builds a context bundle (recent meetings, stale commitments, losing-touch alerts) |
+| **proactive-context** | Daily 8am | Builds a context bundle from recent meetings, memos, and live stale commitments |
 
 > **Upgrading?** `minutes service install` is idempotent. Re-running it after a binary
 > upgrade rewrites all plists/units and reloads with the new binary path.
@@ -450,7 +450,7 @@ If your phone workflow also saves a `.json` file alongside the audio (same name,
 
 This adds `device` and `captured_at` to the meeting's frontmatter. Works with any automation tool (Apple Shortcuts, Tasker, etc.).
 
-Supports `.m4a`, `.mp3`, `.wav`, `.ogg`, `.webm`. Format conversion is automatic — uses [ffmpeg](https://ffmpeg.org/) when available (recommended for non-English audio), falls back to [symphonia](https://github.com/pdeljanov/Symphonia).
+Supports `.m4a`, `.mp3`, `.wav`, `.ogg`, `.webm`. WAV is decoded in process. Compressed formats are decoded inside a bounded child process, using [ffmpeg](https://ffmpeg.org/) when it is installed and a bundled decoder otherwise. The bundled decoder covers AAC, MP3, Vorbis and FLAC; ffmpeg is required for Opus, which is what `.webm` browser recordings and `.ogg` voice notes normally contain, and for ALAC in `.m4a`.
 
 If a desktop call capture leaves a raw file under `~/.minutes/native-captures/`, process that audio file directly with `minutes process <path> --type meeting`. For compatibility, `minutes import <audio-file>` also routes to the same meeting-processing path; `minutes import granola` remains the Granola history importer.
 
@@ -500,9 +500,9 @@ Canonical MCP reference now lives at:
 - <https://useminutes.app/docs/mcp/tools.md>
 - <https://useminutes.app/llms.txt>
 
-The MCP surface currently includes recording control, meeting search/retrieval, relationship memory, structured insights, live transcript reading, dictation, QMD integration, and an interactive dashboard resource. Tool names, resource URIs, and prompt templates are generated from the live product surface instead of hand-maintained in this README.
+The MCP surface currently includes recording control, meeting search/retrieval, policy-bound person profiles, structured insights, live transcript reading, dictation, QMD integration, and an interactive dashboard resource. Tool names, resource URIs, and prompt templates are generated from the live product surface instead of hand-maintained in this README.
 
-**Interactive dashboard (Claude Desktop):** tools render an inline interactive UI via [MCP Apps](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/apps) — meeting list with filter/search, detail view with fullscreen + "Send to Claude" context injection, People tab with relationship cards and click-through profiles, and consistency reports. Text-only clients see the same data as plain text.
+**Interactive dashboard (Claude Desktop):** tools render an inline interactive UI via [MCP Apps](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/apps) — meeting list with filter/search, detail view with fullscreen + "Send to Claude" context injection, bounded relationship maps, and consistency reports. Text-only clients see the same data as plain text.
 
 ### OpenCode CLI
 
@@ -583,7 +583,7 @@ command = "npx"
 args = ["minutes-mcp"]
 ```
 
-All 36 tools are available in Vibe as `minutes_*` (e.g. `minutes_start_recording`, `minutes_search_meetings`).
+Minutes tools are available in Vibe as `minutes_*` (e.g. `minutes_start_recording`, `minutes_search_meetings`).
 
 ### Claude Code (Plugin)
 
@@ -651,7 +651,7 @@ same local meeting artifacts. It runs as a singleton assistant session:
 - `AI Assistant` opens or focuses the persistent assistant window
 - `Discuss with AI` reuses that same assistant and switches its active meeting focus
 - Recall writes matching `CLAUDE.md` and `AGENTS.md` instructions into its assistant workspace so Claude-style and AGENTS.md-aware terminal agents get the same meeting context
-- Auto-updates from GitHub Releases with signed artifacts, never interrupting a recording
+- Updates remain manual until a hosted release manifest and rollback UX exist; auto-update stays off
 
 ### Cowork / Dispatch
 The currently verified path for Cowork is plugin-oriented, not “raw MCP automatically appears everywhere.” Minutes ships a Cowork extension scaffold under `integrations/claude-cowork-extension/` and a local bundle build script at `scripts/build_cowork_extension.sh`. On this machine, the bundle build is verified; actual in-Cowork install/use remains a proof-of-life workflow, not a guaranteed default path. Treat Dispatch-triggered recording and other mobile workflows as experimental until the plugin-native path is installed and checked end to end.
@@ -750,7 +750,10 @@ engine = "none"        # "none" = structured YAML only (safest), "agent" = LLM e
 min_confidence = "strong"
 ```
 
-After each meeting, structured facts (decisions, action items, commitments) flow into person profiles automatically. Every fact carries provenance back to its source meeting.
+After each policy-authorized normal meeting, structured facts (decisions,
+action items, commitments) can flow into person profiles automatically.
+Restricted meetings are skipped. Every emitted fact carries provenance back to
+its source meeting.
 
 ```bash
 minutes ingest --dry-run --all   # Preview what would be extracted
@@ -793,14 +796,18 @@ winget install LLVM.LLVM
 [Environment]::SetEnvironmentVariable("LIBCLANG_PATH", "C:\Program Files\LLVM\bin", "User")
 # Restart your terminal after setting LIBCLANG_PATH
 
+# Compressed imports use ffmpeg.exe when installed, otherwise the bundled bounded decode worker. Add its bin directory to PATH, or:
+[Environment]::SetEnvironmentVariable("MINUTES_FFMPEG", "C:\path\to\ffmpeg.exe", "User")
+
 # Full build (includes speaker diarization):
 cargo install --path crates/cli
 
 # Without speaker diarization:
-cargo install --path crates/cli --no-default-features
+cargo install --path crates/cli --no-default-features --features whisper
 ```
 
-> **Note:** If diarization fails to compile on Windows, use `--no-default-features`.
+> **Note:** If diarization fails to compile on Windows, use
+> `--no-default-features --features whisper` so transcription remains enabled.
 > This is a [known upstream issue](https://github.com/silverstein/minutes/issues/27)
 > with `pyannote-rs`'s ONNX Runtime dependency. Everything except speaker labels works without it.
 
@@ -824,7 +831,7 @@ cargo install --path crates/cli
 - `clang`, `libclang-dev` — bindgen (used by `whisper-rs` and `pipewire-sys`)
 - `libasound2-dev` — cpal's ALSA backend
 - `libpipewire-0.3-dev`, `libspa-0.2-dev` — cpal's PipeWire backend (compiled unconditionally on Linux)
-- `ffmpeg` — preferred audio decoder for `.m4a`/`.mp3`/`.ogg` (falls back to pure-Rust symphonia if absent)
+- `ffmpeg` — preferred bounded decoder for `.m4a`/`.mp3`/`.ogg`; optional, since the bundled bounded decode worker handles the same containers when ffmpeg is absent. WAV is decoded directly
 
 **Other distros** (best-effort — Debian/Ubuntu is the validated path; please [open an issue](https://github.com/silverstein/minutes/issues) if any package name is wrong on your distro):
 
@@ -942,11 +949,13 @@ minutes setup --model small   # Recommended (466MB, good accuracy)
 minutes setup --model tiny    # Fastest (75MB, but misses quiet audio)
 minutes setup --model base    # Middle ground (141MB)
 
-# Install ffmpeg for best transcription quality (strongly recommended for non-English audio)
+# Install ffmpeg for non-WAV audio formats such as m4a/mp3/ogg/flac
 brew install ffmpeg           # macOS
 # apt install ffmpeg          # Linux
-# Without ffmpeg, symphonia handles m4a/mp3 decoding — works for English but may
-# produce loops on non-English audio. ffmpeg is optional but recommended.
+# Windows: install ffmpeg.exe and add it to PATH, or set MINUTES_FFMPEG
+# to its full path (for example C:\path\to\ffmpeg.exe).
+# Without ffmpeg, compressed input is decoded by the bundled bounded worker;
+# WAV processing remains available.
 
 # Enable speaker diarization (optional, ~34MB ONNX models)
 minutes setup --diarization
@@ -962,19 +971,10 @@ minutes setup --sherpa        # downloads the int8 ONNX model (~670MB) + sets en
 # macOS sherpa builds are self-contained (static). On Linux/Windows, run from the
 # repo (cargo run) rather than copying the binary out of target/ — details in the doc.
 
-# Alternative: use Parakeet engine (opt-in, local GPU via parakeet.cpp)
-# Requires (1) parakeet.cpp installed (https://github.com/Frikallo/parakeet.cpp)
-# AND (2) a Minutes CLI compiled with `--features parakeet`. The downloadable
-# DMG and tagged CLI release binaries include the feature; the Homebrew Formula
-# CLI (`brew install silverstein/tap/minutes`) and bare `cargo install minutes-cli`
-# do not. See docs/architecture/parakeet.md for the source-build walkthrough.
-#
-# Note: `minutes setup --parakeet` installs the bundled Silero VAD weights
-# (~1.2 MB) and prints a manual recipe for downloading + converting the
-# tdt-600m .nemo from HuggingFace (the resulting safetensors file is ~2.3 GB).
-# The `.nemo` download and `convert_nemo.py` step are still manual.
-minutes setup --parakeet                          # Multilingual v3 setup (tdt-600m)
-minutes setup --parakeet --parakeet-model tdt-ctc-110m  # English-only compact (tdt-ctc-110m)
+# Parakeet preferences currently resolve to Whisper on every platform. The
+# pathname-only parakeet.cpp helper cannot safely receive Minutes' sealed
+# private audio, so setup and selection fail closed until a secure byte
+# transport lands. See docs/architecture/parakeet.md for technical status.
 
 # Enroll your voice for automatic speaker identification
 minutes enroll              # Records 10s of your voice
@@ -1154,18 +1154,18 @@ Optional — minutes works out of the box.
 # Or: $XDG_CONFIG_HOME/minutes/config.toml when XDG_CONFIG_HOME is set
 
 [transcription]
-engine = "whisper"        # "whisper" (default), "parakeet" (opt-in, lower WER), or "apple-speech" (experimental)
+engine = "whisper"        # "whisper" is the executable private-audio backend
 model = "small"           # whisper: tiny (75MB), base, small (466MB), medium, large-v3 (3.1GB)
 # language = "ur"          # Force transcription language (ISO 639-1 code, e.g. "en", "ur", "es", "zh")
                           # Default: auto-detect. Set this for similar-sounding languages (Urdu/Hindi, etc.)
-# engine = "apple-speech"  # Experimental: standalone `minutes live` only. Configure via config file or CLI, not desktop settings.
-#                         # If Apple Speech cannot run, standalone live falls back to a ready Parakeet backend, then Whisper.
-#                         # See docs/architecture/apple-speech.md for current scope and limitations.
+# engine = "apple-speech"  # Retained for compatibility, but currently resolves to Whisper until secure byte transport lands.
+#                          # See docs/architecture/apple-speech.md for current scope and limitations.
+# engine = "parakeet"      # Retained for compatibility, but currently resolves to Whisper until secure byte transport lands.
 # parakeet_model = "tdt-600m"                    # parakeet: tdt-ctc-110m (English), tdt-600m (multilingual v3)
 # parakeet_binary = "parakeet"                   # Path to parakeet.cpp binary (or name in PATH)
 # parakeet_boost_limit = 25                      # Experimental: boost top graph-derived phrases (0 disables)
 # parakeet_boost_score = 2.0                     # Experimental tuning for parakeet.cpp --boost-score
-# parakeet_fp16 = true                           # Default on macOS Apple Silicon: ~35% faster transcription with lower GPU memory (see docs/designs/parakeet-perf-2026-04-14.md)
+# parakeet_fp16 = false                          # Retained legacy setting; inert while Parakeet batch selection resolves to Whisper
 # parakeet_vocab = "tdt-600m.tokenizer.vocab"      # Safer when multiple Parakeet models are installed
 # vad_model = "silero-v6.2.0"     # Silero VAD model (auto-downloaded by setup). Empty = disable.
                                    # Prevents whisper hallucination loops on non-English/noisy audio.
@@ -1255,7 +1255,7 @@ minutes/
 ├── crates/reader/        Lightweight read-only meeting parser (no audio deps)
 ├── crates/assets/        Bundled assets (demo.wav)
 ├── crates/sdk/           TypeScript SDK — `npm install minutes-sdk` (query meetings programmatically)
-├── crates/mcp/           MCP server — 36 tools + 8 resources + interactive dashboard
+├── crates/mcp/           MCP server — 34 tools + 11 resources + interactive dashboard
 │   └── ui/               MCP App dashboard (vanilla TS → single-file HTML)
 ├── tauri/                Menu bar app — system tray, recording UI, singleton AI Assistant
 └── .claude/plugins/minutes/   Claude Code plugin — 19 skills + 1 agent + 2 hooks
@@ -1273,7 +1273,7 @@ Minutes is designed as infrastructure for AI agents. Files are the durable subst
 - **Record + process**: `start_recording`, `stop_recording`, `process_audio` for pipeline control
 - **Live coaching**: `start_live_transcript`, `read_live_transcript` for transcript access; `start_copilot`, `copilot_status`, `read_copilot_nudges`, and `stop_copilot` control and observe the independent real-time copilot
 - **Local event stream**: `minutes events --follow --since-seq N` tails newline-delimited events, including finalized live utterances, for agents that want a durable cursor
-- **Voice profiles**: `list_voices`, `confirm_speaker` for speaker identification workflows
+- **Voice profiles**: `list_voices` for inspecting speaker identities; `confirm_speaker` remains a compatibility name that directs identity changes to the Minutes app or a human CLI session
 - **Resources**: Stable URIs (`minutes://meetings/recent`, `minutes://actions/open`, `minutes://live/copilot`) for agent context injection and live copilot observation
 
 Any agent framework that speaks MCP can use Minutes as its conversation memory layer — the agent handles the intelligence, Minutes handles the recall.
@@ -1291,7 +1291,7 @@ const meetings = await listMeetings("~/meetings", 20);
 const results = await searchMeetings("~/meetings", "pricing");
 ```
 
-**Built with:** Rust, [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (transcription), [pyannote-rs](https://github.com/pyannote/pyannote-rs) (speaker diarization), [Silero VAD](https://github.com/snakers4/silero-vad) (voice activity detection), [symphonia](https://github.com/pdeljanov/Symphonia) (audio decoding), [cpal](https://github.com/RustAudio/cpal) (audio capture), [Tauri v2](https://v2.tauri.app/) (desktop app), [ureq](https://github.com/algesten/ureq) (HTTP). Optional: [ffmpeg](https://ffmpeg.org/) (recommended for non-English audio decoding).
+**Built with:** Rust, [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (transcription), [pyannote-rs](https://github.com/pdeljanov/pyannote-rs) (speaker diarization), [Silero VAD](https://github.com/snakers4/silero-vad) (voice activity detection), [hound](https://github.com/ruuda/hound) (bounded WAV decoding), [cpal](https://github.com/RustAudio/cpal) (audio capture), [Tauri v2](https://v2.tauri.app/) (desktop app), [ureq](https://github.com/algesten/ureq) (HTTP), and [ffmpeg](https://ffmpeg.org/) (bounded compressed-audio decoding).
 
 ## Star History
 

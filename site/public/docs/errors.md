@@ -2,11 +2,11 @@
 
 > Generated file. Do not edit by hand.
 > Source: crates/core thiserror definitions
-> Last generated: 2026-07-29
+> Last generated: 2026-07-30
 
 This is the generated public catalog of stable Minutes core errors. It intentionally favors actionable, user-facing errors over generic wrapper variants.
 
-- Visible actionable errors: 67
+- Visible actionable errors: 68
 - Hidden low-signal wrappers: 17
 
 # CaptureError
@@ -198,6 +198,18 @@ Exact message:
 Source: `crates/core/src/error.rs`
 
 Reference URL: https://useminutes.app/docs/errors#error-transcribeerror-transcriptionfailed
+
+<a id="error-transcribeerror-compresseddecoderunavailable"></a>
+
+## `TranscribeError::CompressedDecoderUnavailable`
+
+Exact message:
+
+> compressed audio decoder unavailable: {0}
+
+Source: `crates/core/src/error.rs`
+
+Reference URL: https://useminutes.app/docs/errors#error-transcribeerror-compresseddecoderunavailable
 
 <a id="error-transcribeerror-enginenotavailable"></a>
 

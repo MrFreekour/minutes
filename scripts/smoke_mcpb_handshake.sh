@@ -31,6 +31,14 @@ trap 'rm -rf "$tmp"' EXIT
 
 unzip -q "$bundle_path" -d "$tmp"
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Match the server's first source-tree candidate so the smoke never depends on
+# a developer's installed CLI or the latest public release.
+fixture_bin="$tmp/target/debug"
+mkdir -p "$fixture_bin"
+cp -f "$script_dir/fixtures/mcpb-smoke-minutes" "$fixture_bin/minutes"
+chmod 700 "$fixture_bin/minutes"
+
 if [[ ! -f "$tmp/crates/mcp/dist/index.js" ]]; then
   echo "Packed bundle is missing crates/mcp/dist/index.js" >&2
   exit 1
@@ -60,15 +68,16 @@ done
 
 if [[ -n "$timeout_cmd" ]]; then
   printf '%s\n' "$initialize" "$initialized" "$tools_list" "$resources_list" "$read_dashboard" "$read_status" | \
+    env PATH="$fixture_bin:$PATH" MINUTES_HOME="$tmp/minutes-home" \
     "$timeout_cmd" 15 node "$tmp/crates/mcp/dist/index.js" >"$out" 2>"$err" || rc=$?
 else
   # No timeout binary available. Fall back to running without one — node
   # exits on stdin EOF so a healthy server still returns quickly.
   printf '%s\n' "$initialize" "$initialized" "$tools_list" "$resources_list" "$read_dashboard" "$read_status" | \
+    env PATH="$fixture_bin:$PATH" MINUTES_HOME="$tmp/minutes-home" \
     node "$tmp/crates/mcp/dist/index.js" >"$out" 2>"$err" || rc=$?
 fi
 
 rc="${rc:-0}"
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python3 "$script_dir/smoke_mcpb_handshake.py" "$out" "$err" "$rc"
