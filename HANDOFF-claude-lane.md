@@ -131,6 +131,25 @@ Because the graph-worker authority file now includes both the portable fixture
 and the host-independent wire-identifier validation, the replacement also
 refreshes its whole-file packaging golden after reviewing the complete file;
 the structural and mutation self-tests remain required.
+
+Hosted CI run
+[30501091431](https://github.com/silverstein/minutes/actions/runs/30501091431)
+at `91d8ee43` proved the Windows MCP/corpus job and the rest of the short
+cross-platform checks green, and reduced the ordinary Windows core result from
+175 failures to 74. It is still a blocked diagnostic SHA. Its assertion-level
+output exposed that the Windows executable snapshot retained its setup handle
+with write access, which conflicts with image-loader sharing, and that the
+directory descriptor used as a relative `NtCreateFile` root lacked native
+traverse access. The next batch rebinds and digest-checks the completed
+snapshot through a retained read-only/no-write-share handle, adds an executable
+snapshot child-launch regression, grants the relative root traverse access,
+uses native paths in the graph event-filter fixture, and adds test-only
+graph-journal dirty-cause diagnostics for any residual hosted failure. The same
+run's macOS full-workspace clippy step found an unused, uncalled Recall
+streaming/executable-authority prototype. That dead prototype and its lone
+`File` import are removed rather than lint-suppressed; the active
+source-reauthorization and local Ollama paths remain.
+
 Its required finish line remains: a clean exact SHA based on current
 `origin/main`, terminal-green ordinary CI plus the isolated focused Windows
 run, and three fresh independent reviews of that exact replacement. The exact

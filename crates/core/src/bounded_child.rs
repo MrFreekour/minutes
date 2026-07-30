@@ -363,18 +363,36 @@ fn immutable_windows_executable_snapshot(
     reader.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let bytes = std::io::copy(&mut reader, &mut hasher)?;
+    let digest: [u8; 32] = hasher.finalize().into();
+    drop(reader);
+    drop(snapshot);
+
+    // Windows' image loader will not execute a file while a live handle still
+    // has write access unless the loader also shares writes. Keep the setup
+    // handle non-write/non-delete-shared while copying, close it, then bind a
+    // read-only handle and compare it with the digest captured before that
+    // close/reopen boundary. A replacement in the gap therefore fails closed,
+    // while the retained reader prevents any later write or name swap.
+    let mut snapshot = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&snapshot_path)?;
+    let mut rebound_hasher = Sha256::new();
+    let rebound_bytes = std::io::copy(&mut snapshot, &mut rebound_hasher)?;
+    let rebound_digest: [u8; 32] = rebound_hasher.finalize().into();
+    if rebound_bytes != bytes || rebound_digest != digest {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worker executable snapshot changed at its read-only bind boundary",
+        ));
+    }
     snapshot.seek(SeekFrom::Start(0))?;
     let owner = Arc::new(WindowsExecutableSnapshotOwner {
         _directory_guard: directory_guard,
         _temp_dir: temp_dir,
     });
-    Ok((
-        snapshot,
-        snapshot_path,
-        owner,
-        bytes,
-        hasher.finalize().into(),
-    ))
+    Ok((snapshot, snapshot_path, owner, bytes, digest))
 }
 
 #[cfg(target_os = "linux")]
@@ -2603,6 +2621,35 @@ mod windows_tests {
             stderr_tail: 32,
         }
     }
+
+    #[test]
+    fn read_only_executable_snapshot_launches_without_a_writer_sharing_conflict() {
+        let authority = BoundExecutable::current().expect("bind the running test image");
+        let mut command =
+            BoundedCommand::from_bound_executable(authority).expect("bind its immutable snapshot");
+        command.args([
+            "--exact",
+            "bounded_child::windows_tests::read_only_snapshot_child",
+            "--nocapture",
+        ]);
+        let run = run(
+            &mut command,
+            None,
+            StdoutTarget::Capture {
+                max_bytes: 16 * 1024,
+            },
+            budget(30_000),
+        )
+        .expect("launch the read-only snapshot");
+        assert!(
+            run.output.status.success(),
+            "snapshot child failed: {}",
+            String::from_utf8_lossy(&run.output.stderr)
+        );
+    }
+
+    #[test]
+    fn read_only_snapshot_child() {}
 
     fn run_with_windows_memory_limits(
         script: &str,

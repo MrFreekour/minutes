@@ -989,7 +989,25 @@ after reviewing the portable fixture and host-independent wire validation in
 the complete authority file; the structural and mutation self-tests remain
 green.
 
-STATUS: neither `e9b2ac90` nor `a62cc0b0` is accepted. Exact terminal receipts
+THE FIRST REPLACEMENT REMAINS BLOCKED. Hosted run 30501091431 at `91d8ee43`
+made the Windows MCP/corpus lane and all short cross-platform checks green and
+reduced the ordinary Windows core result from 175 failures to 74, but did not
+make that suite green. Visible assertions identified a retained Windows
+executable-snapshot setup handle with write access, which conflicts with the
+image loader's sharing request, and a relative `NtCreateFile` root descriptor
+without native traverse access. The next batch closes the setup writer, binds
+the completed snapshot read-only with no write/delete sharing, verifies it
+against the digest captured before the close/reopen boundary, and adds a
+Windows child-launch regression. It also grants the private directory
+descriptor traverse access, makes the graph event-filter fixture
+platform-native, and emits graph-journal dirty-cause details only in test
+builds so any residual hosted false-positive is attributable. The run's macOS
+full-workspace clippy step separately found an unused and uncalled Recall
+streaming/executable-authority prototype. The batch removes that dead prototype
+and its lone `File` import instead of suppressing the lint; active Recall
+source reauthorization and local Ollama behavior are unchanged.
+
+STATUS: `e9b2ac90`, `a62cc0b0`, and `91d8ee43` are not accepted. Exact terminal receipts
 for the replacement candidate are recorded on draft PR #604 rather than in a
 post-validation receipt-only commit. Acceptance still requires ordinary CI and
 the focused validation-only Windows workflow to be green for the same exact

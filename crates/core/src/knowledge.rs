@@ -10838,8 +10838,8 @@ mod windows_private {
         GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+        OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
     use windows_sys::Win32::System::SystemServices::{
@@ -11185,7 +11185,7 @@ mod windows_private {
         // this exact directory until the descriptor is dropped.
         let file = open_existing(
             path,
-            FILE_LIST_DIRECTORY | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
             true,
             false,
         )?;

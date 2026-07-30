@@ -1016,10 +1016,18 @@ impl GraphSnapshotJournal {
                                 .map(|directory| directory.display_path())
                                 .collect::<Vec<_>>(),
                         ) {
+                            #[cfg(test)]
+                            eprintln!(
+                                "graph snapshot journal marked {label:?} dirty from paths: {paths:?}"
+                            );
                             self.dirty = true;
                         }
                     }
                     Ok(GraphJournalEvent::Overflow) | Err(_) => {
+                        #[cfg(test)]
+                        eprintln!(
+                            "graph snapshot journal marked {label:?} dirty from overflow/disconnect"
+                        );
                         self.dirty = true;
                         break;
                     }
@@ -1028,6 +1036,13 @@ impl GraphSnapshotJournal {
             let retired = fences
                 .iter()
                 .all(|(directory, fence, _)| directory.remove_owned_private_file(fence).is_ok());
+            #[cfg(test)]
+            if observed.iter().any(|seen| !seen) || !retired || self.dirty {
+                eprintln!(
+                    "graph snapshot journal checkpoint {label:?} failed: observed={observed:?} retired={retired} dirty={}",
+                    self.dirty
+                );
+            }
             if observed.iter().any(|seen| !seen) || !retired || self.dirty {
                 return Err(GraphError::Io(std::io::Error::other(
                     "graph corpus or corrections changed during one ordered snapshot",
@@ -5482,8 +5497,9 @@ Skip the wizard. Drop users into a pre-populated demo workspace.
 
     #[test]
     fn ordered_snapshot_ignores_unrelated_state_activity() {
-        let corpus = PathBuf::from("/tmp/minutes-corpus");
-        let corrections = PathBuf::from("/tmp/minutes-state");
+        let fixture_root = std::env::temp_dir().join("minutes-graph-event-filter-test");
+        let corpus = fixture_root.join("minutes-corpus");
+        let corrections = fixture_root.join("minutes-state");
         let vocabulary = corrections.join("vocabulary.toml");
         let overlays = corrections.join("overlays.db");
         let fences = corrections.join(GRAPH_SNAPSHOT_FENCE_DIRECTORY);
