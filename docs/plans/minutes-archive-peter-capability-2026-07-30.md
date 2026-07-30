@@ -436,8 +436,17 @@ Document-level conjunction is a separate result type with criterion evidence;
 criteria are grouped inside one document and exclusions apply across its
 provisions. Candidate-budget overflow fails closed rather than returning an
 apparently complete answer. The proof does not yet ingest PDF or DOCX, persist
-a protected vault, resolve an evidence card back to a live source, or
-implement OCR; those remain Gate 2 work rather than implied capability.
+a protected vault, open an original in its native application, or implement
+OCR; those remain Gate 2 work rather than implied capability.
+
+The desktop app now exposes this proof only after a completed census and an
+explicit content-access action. It ingests bounded UTF-8 `.txt`, `.text`, and
+`.md` files through the retained folder capabilities into an in-memory index.
+Before an evidence card is returned, the app revalidates the approved root,
+relative membership without links, file identity, current bytes, and SHA-256
+revision. Moved, replaced, mutated, or inaccessible sources are withdrawn.
+The browser-facing UI receives document titles and exact evidence only for
+current matches; it never receives source paths or general filesystem access.
 
 Evaluate:
 
@@ -511,11 +520,15 @@ Peter's entire initial contribution is:
 He does not install developer tools, configure QMD, write prompts for a generic
 agent, classify thousands of documents, or move his archive into Minutes.
 
-## Immediate Build Decision
+## Current Build Decision
 
-Build the signed multi-root census app before the search UI.
+The multi-root census and the bounded TXT or Markdown evidence UI now exist in
+the separate app. Keep this content proof ephemeral until live-source
+resolution and revocation remain green under native interaction testing.
 
-It validates distribution, permissions, cloud hydration, format coverage, and
-the least-privilege Tauri boundary without exposing client content. The result
-determines the converter order and prevents a polished retrieval demo from
-being built around the wrong corpus assumptions.
+Next, use the aggregate census to choose the converter order and implement
+searchable PDF and DOCX with source anchors. Do not add a persistent derivative
+store, embeddings, model generation, or an Open Original action until their
+separate protection and final-fence contracts are proven. Developer ID
+signing, notarization, and native permission and interaction testing remain
+Peter handoff gates.

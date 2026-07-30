@@ -1,7 +1,7 @@
 # Minutes Archive: Discovery and Security Contract
 
-Status: implementation underway; synthetic census core and separate native app
-target implemented
+Status: implementation underway; native census and capability-bound TXT or
+Markdown evidence pilot implemented
 
 Date: 2026-07-30
 
@@ -249,9 +249,18 @@ inert prompt-like source text. Document-level conjunction is now implemented
 as a separate evidence type that groups criteria inside one document, applies
 exclusions across its provisions, and never assembles a match across documents.
 A committed legal fixture exercises the provision and document modes, and an
-overflowing lexical candidate set fails closed. Format conversion,
-live-source resolution, protected persistence, and OCR remain unimplemented
-Stage 2 gates.
+overflowing lexical candidate set fails closed. Format conversion, protected
+persistence, and OCR remain unimplemented Stage 2 gates.
+
+The separate desktop app now makes content access a distinct post-census
+action. It can build an in-memory index from bounded UTF-8 `.txt`, `.text`, and
+`.md` sources using the retained folder-picker authorities. Traversal skips
+links and packages, deduplicates file identities, holds read-only source
+handles, and applies a final root, membership, identity, byte, and SHA-256
+revision fence before returning any evidence card. A moved, replaced, mutated,
+or inaccessible result is withdrawn. The aggregate build report contains no
+source name or path and states that neither source text nor the index was
+persisted.
 
 ### Stage 3: Controlled private pilot
 

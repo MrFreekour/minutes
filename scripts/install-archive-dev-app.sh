@@ -12,7 +12,7 @@ if [[ -n "$RUSTUP_CARGO" ]]; then
   export PATH="$(dirname "$RUSTUP_CARGO"):$PATH"
 fi
 
-PRODUCT_NAME="Archive Census Dev"
+PRODUCT_NAME="Minutes Archive Dev"
 BUILD_APP="$REPO_ROOT/target/release/bundle/macos/${PRODUCT_NAME}.app"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/Applications}"
 INSTALL_APP="${INSTALL_DIR}/${PRODUCT_NAME}.app"

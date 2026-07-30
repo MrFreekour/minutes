@@ -4,13 +4,18 @@ const elements = {
   setupView: document.querySelector("#setup-view"),
   scanningView: document.querySelector("#scanning-view"),
   resultsView: document.querySelector("#results-view"),
+  indexingView: document.querySelector("#indexing-view"),
+  searchView: document.querySelector("#search-view"),
   emptyLocations: document.querySelector("#empty-locations"),
   locationList: document.querySelector("#location-list"),
   addLocations: document.querySelector("#add-locations"),
   runCensus: document.querySelector("#run-census"),
   cancelCensus: document.querySelector("#cancel-census"),
+  cancelIndexing: document.querySelector("#cancel-indexing"),
   startOver: document.querySelector("#start-over"),
   exportReport: document.querySelector("#export-report"),
+  buildTextVault: document.querySelector("#build-text-vault"),
+  backToCensus: document.querySelector("#back-to-census"),
   setupStatus: document.querySelector("#setup-status"),
   exportStatus: document.querySelector("#export-status"),
   errorBanner: document.querySelector("#error-banner"),
@@ -24,9 +29,20 @@ const elements = {
   metricCloud: document.querySelector("#metric-cloud"),
   categoryList: document.querySelector("#category-list"),
   signalsList: document.querySelector("#signals-list"),
+  vaultSummary: document.querySelector("#vault-summary"),
+  searchForm: document.querySelector("#search-form"),
+  searchQuery: document.querySelector("#search-query"),
+  searchSubmit: document.querySelector("#search-submit"),
+  queryInterpretation: document.querySelector("#query-interpretation"),
+  queryChips: document.querySelector("#query-chips"),
+  candidateCount: document.querySelector("#candidate-count"),
+  searchStatus: document.querySelector("#search-status"),
+  searchResults: document.querySelector("#search-results"),
 };
 
 let locations = [];
+let lastReport = null;
+let vaultReport = null;
 
 const categoryLabels = {
   pdf: "PDF",
@@ -58,9 +74,16 @@ function showView(name) {
   elements.setupView.hidden = name !== "setup";
   elements.scanningView.hidden = name !== "scanning";
   elements.resultsView.hidden = name !== "results";
+  elements.indexingView.hidden = name !== "indexing";
+  elements.searchView.hidden = name !== "search";
+  const activeStep =
+    name === "setup" ? "1" : name === "scanning" ? "2" : name === "results" ? "3" : "4";
+  for (const step of document.querySelectorAll("[data-step]")) {
+    step.classList.toggle("is-active", step.dataset.step === activeStep);
+  }
 }
 
-function setControlsDisabled(disabled) {
+function setLocationControlsDisabled(disabled) {
   elements.addLocations.disabled = disabled;
   elements.runCensus.disabled = disabled || locations.length === 0;
   for (const button of elements.locationList.querySelectorAll("button")) {
@@ -87,7 +110,7 @@ function renderLocations(nextLocations) {
     const title = document.createElement("strong");
     title.textContent = location.label;
     const detail = document.createElement("span");
-    detail.textContent = "Read-only metadata authority";
+    detail.textContent = "Read-only native authority";
     text.append(title, detail);
     copy.append(icon, text);
 
@@ -112,25 +135,29 @@ function renderLocations(nextLocations) {
 
 async function chooseLocations() {
   hideError();
-  setControlsDisabled(true);
+  setLocationControlsDisabled(true);
   try {
     renderLocations(await invoke("choose_archive_locations"));
+    lastReport = null;
+    vaultReport = null;
   } catch (error) {
     showError(error);
   } finally {
-    setControlsDisabled(false);
+    setLocationControlsDisabled(false);
   }
 }
 
 async function removeLocation(locationId) {
   hideError();
-  setControlsDisabled(true);
+  setLocationControlsDisabled(true);
   try {
     renderLocations(await invoke("remove_archive_location", { locationId }));
+    lastReport = null;
+    vaultReport = null;
   } catch (error) {
     showError(error);
   } finally {
-    setControlsDisabled(false);
+    setLocationControlsDisabled(false);
   }
 }
 
@@ -153,6 +180,7 @@ function createSignal(label, value) {
 }
 
 function renderReport(report) {
+  lastReport = report;
   const status = report.status.replaceAll("_", " ");
   elements.resultStatus.textContent = status;
   elements.resultStatus.dataset.status = report.status;
@@ -196,25 +224,35 @@ function renderReport(report) {
   }
 
   elements.signalsList.replaceChildren(
-    createSignal("Likely OCR candidates", report.categories.find((item) => item.category === "image_or_scan")?.artifacts ?? 0),
+    createSignal(
+      "Likely OCR candidates",
+      report.categories.find((item) => item.category === "image_or_scan")?.artifacts ?? 0,
+    ),
     createSignal("iCloud placeholders", report.signals.icloud_placeholders),
     createSignal("Apple packages", report.summary.packages),
     createSignal("Unreadable by mode", report.signals.permission_mode_unreadable),
     createSignal("Links skipped", report.signals.symlinks_skipped),
-    createSignal("Metadata errors", report.signals.metadata_errors + report.signals.directory_errors),
+    createSignal(
+      "Metadata errors",
+      report.signals.metadata_errors + report.signals.directory_errors,
+    ),
   );
 
-  elements.exportReport.disabled = report.status !== "complete" && report.status !== "partial";
+  const usableReport = report.status === "complete" || report.status === "partial";
+  elements.exportReport.disabled = !usableReport;
+  elements.buildTextVault.disabled = !usableReport;
   elements.exportStatus.textContent = "";
   showView("results");
 }
 
 async function runCensus() {
   hideError();
+  vaultReport = null;
   showView("scanning");
   try {
     const report = await invoke("run_archive_census");
     if (report.status === "cancelled") {
+      lastReport = null;
       showView("setup");
       elements.setupStatus.textContent = "Census cancelled. No report was retained.";
       return;
@@ -226,16 +264,17 @@ async function runCensus() {
   }
 }
 
-async function cancelCensus() {
-  elements.cancelCensus.disabled = true;
-  elements.cancelCensus.textContent = "Cancelling…";
+async function cancelOperation(button) {
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "Cancelling…";
   try {
     await invoke("cancel_archive_census");
   } catch (error) {
     showError(error);
   } finally {
-    elements.cancelCensus.textContent = "Cancel census";
-    elements.cancelCensus.disabled = false;
+    button.textContent = original;
+    button.disabled = false;
   }
 }
 
@@ -254,19 +293,235 @@ async function exportReport() {
   }
 }
 
+function renderVaultSummary(report) {
+  vaultReport = report;
+  elements.vaultSummary.textContent =
+    `${report.indexed_documents.toLocaleString()} supported document${
+      report.indexed_documents === 1 ? "" : "s"
+    } indexed (${formatBytes(report.indexed_bytes)}). ` +
+    `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
+      report.unsupported_files_skipped === 1 ? "" : "s"
+    } skipped. The index exists only in memory.`;
+}
+
+async function buildTextVault() {
+  hideError();
+  showView("indexing");
+  try {
+    const report = await invoke("build_archive_text_vault");
+    renderVaultSummary(report);
+    elements.searchResults.replaceChildren();
+    elements.queryInterpretation.hidden = true;
+    elements.searchStatus.textContent =
+      report.indexed_documents === 0
+        ? "No supported TXT or Markdown documents were found in the approved locations."
+        : "Enter a legal retrieval question. Results are exact source excerpts, not generated answers.";
+    showView("search");
+    if (report.indexed_documents > 0) {
+      elements.searchQuery.focus();
+    }
+  } catch (error) {
+    if (lastReport) renderReport(lastReport);
+    else showView("setup");
+    showError(error);
+  }
+}
+
+function humanize(value) {
+  return value.replaceAll("_", " ");
+}
+
+function addQueryChip(label) {
+  const chip = document.createElement("span");
+  chip.className = "query-chip";
+  chip.textContent = label;
+  elements.queryChips.append(chip);
+}
+
+function renderQueryInterpretation(response) {
+  const query = response.query;
+  elements.queryChips.replaceChildren();
+  addQueryChip(
+    query.scope === "same_provision" ? "Same provision" : "Anywhere in one document",
+  );
+  for (const concept of query.required_concepts) {
+    addQueryChip(`Must cover: ${humanize(concept)}`);
+  }
+  for (const concept of query.excluded_concepts) {
+    addQueryChip(`Exclude: ${humanize(concept)}`);
+  }
+  if (query.exact_phrase) addQueryChip(`Exact: “${query.exact_phrase}”`);
+  if (query.max_sentences) addQueryChip(`At most ${query.max_sentences} sentences`);
+  elements.candidateCount.textContent =
+    `${response.lexical_candidates_considered.toLocaleString()} lexical candidate${
+      response.lexical_candidates_considered === 1 ? "" : "s"
+    } checked`;
+  elements.queryInterpretation.hidden = false;
+}
+
+function evidenceCard(card, compact = false) {
+  if (compact) {
+    const item = document.createElement("div");
+    item.className = "criterion-evidence";
+    const heading = document.createElement("strong");
+    heading.textContent = card.provision_heading ?? card.source_anchor;
+    const excerpt = document.createElement("p");
+    excerpt.textContent = card.exact_excerpt;
+    item.append(heading, excerpt);
+    return item;
+  }
+
+  const article = document.createElement("article");
+  article.className = "evidence-card";
+  const header = document.createElement("div");
+  header.className = "evidence-card-header";
+  const titleBlock = document.createElement("div");
+  const kicker = document.createElement("span");
+  kicker.className = "evidence-kicker";
+  kicker.textContent = card.provision_heading ?? "Provision";
+  const title = document.createElement("strong");
+  title.className = "evidence-title";
+  title.textContent = card.document_title;
+  titleBlock.append(kicker, title);
+  const fresh = document.createElement("span");
+  fresh.className = "metadata-pill";
+  fresh.textContent = card.index_fresh ? "Source verified" : "Unavailable";
+  header.append(titleBlock, fresh);
+
+  const excerpt = document.createElement("blockquote");
+  excerpt.className = "evidence-excerpt";
+  excerpt.textContent = card.exact_excerpt;
+  const meta = document.createElement("div");
+  meta.className = "evidence-meta";
+  const anchor = document.createElement("span");
+  anchor.textContent = card.source_anchor;
+  const sentences = document.createElement("span");
+  sentences.textContent = `${card.sentence_count} sentence${
+    card.sentence_count === 1 ? "" : "s"
+  }`;
+  meta.append(anchor, sentences);
+  const why = document.createElement("p");
+  why.className = "evidence-why";
+  why.textContent = card.why_matched;
+  article.append(header, excerpt, meta, why);
+  return article;
+}
+
+function documentCard(card) {
+  const article = document.createElement("article");
+  article.className = "document-card";
+  const header = document.createElement("div");
+  header.className = "document-card-header";
+  const titleBlock = document.createElement("div");
+  const kicker = document.createElement("span");
+  kicker.className = "evidence-kicker";
+  kicker.textContent = "Document-level conjunction";
+  const title = document.createElement("strong");
+  title.className = "evidence-title";
+  title.textContent = card.document_title;
+  titleBlock.append(kicker, title);
+  const count = document.createElement("span");
+  count.className = "metadata-pill";
+  count.textContent = `${card.criterion_evidence.length} proof provision${
+    card.criterion_evidence.length === 1 ? "" : "s"
+  }`;
+  header.append(titleBlock, count);
+  const why = document.createElement("p");
+  why.className = "evidence-why";
+  why.textContent = card.why_matched;
+  const criteria = document.createElement("div");
+  criteria.className = "criterion-list";
+  for (const evidence of card.criterion_evidence) {
+    criteria.append(evidenceCard(evidence, true));
+  }
+  article.append(header, why, criteria);
+  return article;
+}
+
+function renderSearchResponse(response) {
+  renderQueryInterpretation(response);
+  elements.searchResults.replaceChildren();
+  for (const card of response.evidence) {
+    elements.searchResults.append(evidenceCard(card));
+  }
+  for (const card of response.documents) {
+    elements.searchResults.append(documentCard(card));
+  }
+  const resultCount = response.evidence.length + response.documents.length;
+  if (resultCount === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-results";
+    empty.textContent =
+      response.stale_evidence_withdrawn > 0
+        ? "The indexed match is no longer current. It was withdrawn; rebuild the text index before relying on it."
+        : "No current source satisfied every visible constraint. Try removing one constraint or search for a different legal concept.";
+    elements.searchResults.append(empty);
+  }
+  const resultKind = response.query.scope === "same_provision" ? "provision" : "document";
+  const staleNote =
+    response.stale_evidence_withdrawn > 0
+      ? ` ${response.stale_evidence_withdrawn.toLocaleString()} stale source${
+          response.stale_evidence_withdrawn === 1 ? " was" : "s were"
+        } withdrawn.`
+      : "";
+  elements.searchStatus.textContent =
+    `${resultCount.toLocaleString()} current ${resultKind}${
+      resultCount === 1 ? "" : "s"
+    } matched every visible constraint.${staleNote}`;
+}
+
+async function searchVault(event) {
+  event.preventDefault();
+  hideError();
+  const query = elements.searchQuery.value.trim();
+  if (!query) {
+    elements.searchStatus.textContent = "Enter a legal retrieval question first.";
+    elements.searchQuery.focus();
+    return;
+  }
+  elements.searchSubmit.disabled = true;
+  elements.searchStatus.textContent = "Checking lexical candidates and current source revisions…";
+  try {
+    const response = await invoke("search_archive_text_vault", { query });
+    renderSearchResponse(response);
+  } catch (error) {
+    elements.searchStatus.textContent = "No evidence was returned.";
+    showError(error);
+  } finally {
+    elements.searchSubmit.disabled = false;
+  }
+}
+
 function startOver() {
   hideError();
   showView("setup");
   elements.setupStatus.textContent = `${locations.length.toLocaleString()} approved location${
     locations.length === 1 ? "" : "s"
-  }. Change locations or run again.`;
+  }. Change locations or run the metadata census again.`;
+}
+
+function backToCensus() {
+  hideError();
+  if (lastReport) renderReport(lastReport);
+  else showView("setup");
 }
 
 async function bootstrap() {
   try {
     const state = await invoke("archive_bootstrap");
     renderLocations(state.locations);
-    showView(state.scanRunning ? "scanning" : "setup");
+    lastReport = state.report;
+    vaultReport = state.textVaultReport;
+    if (state.scanRunning) {
+      showView("scanning");
+    } else if (state.textVaultReport) {
+      renderVaultSummary(state.textVaultReport);
+      showView("search");
+    } else if (state.report) {
+      renderReport(state.report);
+    } else {
+      showView("setup");
+    }
   } catch (error) {
     showError(error);
   }
@@ -274,9 +529,13 @@ async function bootstrap() {
 
 elements.addLocations.addEventListener("click", chooseLocations);
 elements.runCensus.addEventListener("click", runCensus);
-elements.cancelCensus.addEventListener("click", cancelCensus);
+elements.cancelCensus.addEventListener("click", () => cancelOperation(elements.cancelCensus));
+elements.cancelIndexing.addEventListener("click", () => cancelOperation(elements.cancelIndexing));
 elements.startOver.addEventListener("click", startOver);
 elements.exportReport.addEventListener("click", exportReport);
+elements.buildTextVault.addEventListener("click", buildTextVault);
+elements.backToCensus.addEventListener("click", backToCensus);
+elements.searchForm.addEventListener("submit", searchVault);
 elements.dismissError.addEventListener("click", hideError);
 
 bootstrap();

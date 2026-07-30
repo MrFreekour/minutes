@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 pub mod retrieval;
+pub mod vault;
 
 pub const CENSUS_SCHEMA: &str = "minutes.archive-census.v1";
 pub const MAX_APPROVED_ROOTS: usize = 32;
@@ -552,29 +553,7 @@ pub fn scan_approved_roots(
     let mut stack = Vec::with_capacity(roots.len());
 
     for root in roots {
-        let lexical_metadata =
-            fs::symlink_metadata(&root.canonical_path).map_err(|_| CensusError::RootChanged)?;
-        if metadata_is_link_or_reparse(&lexical_metadata) || !lexical_metadata.is_dir() {
-            return Err(CensusError::RootChanged);
-        }
-        let current_path =
-            fs::canonicalize(&root.canonical_path).map_err(|_| CensusError::RootChanged)?;
-        if current_path != root.canonical_path {
-            return Err(CensusError::RootChanged);
-        }
-        let ambient_metadata =
-            fs::metadata(&root.canonical_path).map_err(|_| CensusError::RootChanged)?;
-        if std_metadata_identity(&ambient_metadata, &root.canonical_path) != root.identity {
-            return Err(CensusError::RootChanged);
-        }
-        let directory = Dir::open_ambient_dir(&root.canonical_path, ambient_authority())
-            .map_err(|_| CensusError::RootChanged)?;
-        let opened_metadata = directory
-            .dir_metadata()
-            .map_err(|_| CensusError::RootChanged)?;
-        if !cap_identity_matches(&opened_metadata, root.identity) {
-            return Err(CensusError::RootChanged);
-        }
+        let directory = open_approved_root(root)?;
         stack.push(PendingDirectory {
             directory,
             depth: 0,
@@ -686,6 +665,33 @@ pub fn scan_approved_roots(
     }
 
     Ok(census.finish())
+}
+
+pub(crate) fn open_approved_root(root: &ApprovedRoot) -> Result<Dir, CensusError> {
+    let lexical_metadata =
+        fs::symlink_metadata(&root.canonical_path).map_err(|_| CensusError::RootChanged)?;
+    if metadata_is_link_or_reparse(&lexical_metadata) || !lexical_metadata.is_dir() {
+        return Err(CensusError::RootChanged);
+    }
+    let current_path =
+        fs::canonicalize(&root.canonical_path).map_err(|_| CensusError::RootChanged)?;
+    if current_path != root.canonical_path {
+        return Err(CensusError::RootChanged);
+    }
+    let ambient_metadata =
+        fs::metadata(&root.canonical_path).map_err(|_| CensusError::RootChanged)?;
+    if std_metadata_identity(&ambient_metadata, &root.canonical_path) != root.identity {
+        return Err(CensusError::RootChanged);
+    }
+    let directory = Dir::open_ambient_dir(&root.canonical_path, ambient_authority())
+        .map_err(|_| CensusError::RootChanged)?;
+    let opened_metadata = directory
+        .dir_metadata()
+        .map_err(|_| CensusError::RootChanged)?;
+    if !cap_identity_matches(&opened_metadata, root.identity) {
+        return Err(CensusError::RootChanged);
+    }
+    Ok(directory)
 }
 
 #[cfg(unix)]

@@ -1,6 +1,6 @@
 {
   "identifier": "archive-main",
-  "description": "Minimal permissions for the Archive Census window",
+  "description": "Minimal permissions for the Minutes Archive private pilot window",
   "windows": ["main"],
   "permissions": [
     "core:default",

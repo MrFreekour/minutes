@@ -1,0 +1,805 @@
+//! Capability-bound ingestion and live-source verification for a local legal
+//! text vault.
+//!
+//! This module is intentionally a narrow Gate 2 proof. It supports bounded
+//! UTF-8 text and Markdown sources, keeps its FTS index in memory, retains
+//! read-only file capabilities, and revalidates source membership, identity,
+//! bytes, and revision before evidence leaves the vault.
+
+use crate::retrieval::{
+    interpret_legal_query, normalize_text_document, CurrentRevisionSet, DocumentId, LegalIndex,
+    LegalQuery, LegalSearchResponse, RetrievalError, SourceRevision, VaultId,
+    MAX_NORMALIZED_DOCUMENT_BYTES,
+};
+use crate::{
+    cap_identity_matches, cap_metadata_identity_portable, cap_metadata_is_link_or_reparse,
+    extension_for_name, open_approved_root, package_category, validate_approved_roots,
+    ApprovedRoot, CensusError, FileIdentity,
+};
+use cap_std::fs::{Dir, File};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsStr;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use thiserror::Error;
+
+pub const TEXT_VAULT_SCHEMA: &str = "minutes.archive-text-vault.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextVaultLimits {
+    pub max_documents: usize,
+    pub max_total_bytes: u64,
+    pub max_directories: u64,
+    pub max_depth: u32,
+}
+
+impl Default for TextVaultLimits {
+    fn default() -> Self {
+        Self {
+            max_documents: 50_000,
+            max_total_bytes: 2 * 1024 * 1024 * 1024,
+            max_directories: 100_000,
+            max_depth: 128,
+        }
+    }
+}
+
+impl TextVaultLimits {
+    fn validate(self) -> Result<Self, VaultError> {
+        if self.max_documents == 0
+            || self.max_total_bytes == 0
+            || self.max_directories == 0
+            || self.max_depth == 0
+        {
+            return Err(VaultError::InvalidLimits);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum VaultError {
+    #[error("the vault build limits must be greater than zero")]
+    InvalidLimits,
+    #[error("the approved archive authority is invalid")]
+    InvalidAuthority,
+    #[error("an approved archive location changed")]
+    RootChanged,
+    #[error("the vault build limits were exceeded; narrow the source set")]
+    BuildBudgetExceeded,
+    #[error("the vault build was cancelled; no partial vault was retained")]
+    Cancelled,
+    #[error("the private source index is unavailable")]
+    IndexUnavailable,
+    #[error("the lexical candidate budget was exceeded; narrow the query")]
+    CandidateBudgetExceeded,
+    #[error("the query could not be applied safely")]
+    InvalidQuery,
+}
+
+impl From<CensusError> for VaultError {
+    fn from(error: CensusError) -> Self {
+        match error {
+            CensusError::RootChanged
+            | CensusError::RootUnavailable { .. }
+            | CensusError::RootNotDirectory { .. }
+            | CensusError::RootIsLink { .. } => Self::RootChanged,
+            _ => Self::InvalidAuthority,
+        }
+    }
+}
+
+impl From<RetrievalError> for VaultError {
+    fn from(error: RetrievalError) -> Self {
+        match error {
+            RetrievalError::InvalidVaultScope
+            | RetrievalError::InvalidDocumentIdentity
+            | RetrievalError::InvalidTitle
+            | RetrievalError::InvalidDocumentText
+            | RetrievalError::TooManyProvisions
+            | RetrievalError::InvalidQuery
+            | RetrievalError::ScopeMismatch => Self::InvalidQuery,
+            RetrievalError::CandidateBudgetExceeded => Self::CandidateBudgetExceeded,
+            RetrievalError::IndexUnavailable => Self::IndexUnavailable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TextVaultBuildReport {
+    pub schema: &'static str,
+    pub vault_id: VaultId,
+    pub approved_locations: u64,
+    pub indexed_documents: u64,
+    pub indexed_bytes: u64,
+    pub unsupported_files_skipped: u64,
+    pub oversized_files_skipped: u64,
+    pub malformed_text_files_skipped: u64,
+    pub duplicate_files_skipped: u64,
+    pub symlinks_skipped: u64,
+    pub metadata_errors: u64,
+    pub directory_errors: u64,
+    pub source_content_persisted: bool,
+    pub retrieval_index_persisted: bool,
+    pub supported_formats: Vec<&'static str>,
+}
+
+struct AuthorizedVaultRoot {
+    approval: ApprovedRoot,
+    directory: Dir,
+}
+
+impl std::fmt::Debug for AuthorizedVaultRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthorizedVaultRoot([redacted capability])")
+    }
+}
+
+struct AuthorizedSource {
+    root_index: usize,
+    relative_path: PathBuf,
+    identity: FileIdentity,
+    file: File,
+    indexed_revision: SourceRevision,
+}
+
+impl std::fmt::Debug for AuthorizedSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthorizedSource([redacted capability and path])")
+    }
+}
+
+/// A non-serializable, in-memory vault bound to folder-picker authorities.
+pub struct AuthorizedTextVault {
+    vault_id: VaultId,
+    roots: Vec<AuthorizedVaultRoot>,
+    sources: BTreeMap<DocumentId, AuthorizedSource>,
+    index: LegalIndex,
+    build_report: TextVaultBuildReport,
+}
+
+impl std::fmt::Debug for AuthorizedTextVault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedTextVault")
+            .field("vault_id", &self.vault_id)
+            .field("roots", &self.roots.len())
+            .field("sources", &self.sources.len())
+            .field("index", &"[private in-memory sqlite]")
+            .finish()
+    }
+}
+
+impl AuthorizedTextVault {
+    pub fn vault_id(&self) -> &VaultId {
+        &self.vault_id
+    }
+
+    pub fn build_report(&self) -> &TextVaultBuildReport {
+        &self.build_report
+    }
+
+    pub fn interpret_and_search(
+        &self,
+        raw_query: impl Into<String>,
+    ) -> Result<LegalSearchResponse, VaultError> {
+        let query = interpret_legal_query(raw_query).map_err(VaultError::from)?;
+        self.search(query)
+    }
+
+    pub fn search(&self, query: LegalQuery) -> Result<LegalSearchResponse, VaultError> {
+        self.revalidate_roots()?;
+
+        let indexed_revisions = self
+            .sources
+            .iter()
+            .map(|(document_id, source)| (document_id.clone(), source.indexed_revision.clone()))
+            .collect::<Vec<_>>();
+        let mut revisions = CurrentRevisionSet::default();
+        for (document_id, revision) in indexed_revisions {
+            revisions.insert(document_id, revision);
+        }
+        let mut response = self
+            .index
+            .search(&self.vault_id, query, &revisions)
+            .map_err(VaultError::from)?;
+
+        let result_documents = response
+            .evidence
+            .iter()
+            .map(|card| card.document_id.clone())
+            .chain(
+                response
+                    .documents
+                    .iter()
+                    .map(|card| card.document_id.clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut withdrawn = BTreeSet::new();
+        for document_id in result_documents {
+            let Some(source) = self.sources.get(&document_id) else {
+                withdrawn.insert(document_id);
+                continue;
+            };
+            if !self.source_is_current(source) {
+                withdrawn.insert(document_id);
+            }
+        }
+
+        response
+            .evidence
+            .retain(|card| !withdrawn.contains(&card.document_id));
+        response
+            .documents
+            .retain(|card| !withdrawn.contains(&card.document_id));
+        response.stale_evidence_withdrawn = response
+            .stale_evidence_withdrawn
+            .saturating_add(withdrawn.len() as u64);
+        Ok(response)
+    }
+
+    fn revalidate_roots(&self) -> Result<(), VaultError> {
+        for root in &self.roots {
+            open_approved_root(&root.approval).map_err(VaultError::from)?;
+            let retained_metadata = root
+                .directory
+                .dir_metadata()
+                .map_err(|_| VaultError::RootChanged)?;
+            if !cap_identity_matches(&retained_metadata, root.approval.identity) {
+                return Err(VaultError::RootChanged);
+            }
+        }
+        Ok(())
+    }
+
+    fn source_is_current(&self, source: &AuthorizedSource) -> bool {
+        let Some(root) = self.roots.get(source.root_index) else {
+            return false;
+        };
+        if !relative_source_identity_matches(
+            &root.directory,
+            &source.relative_path,
+            source.identity,
+        ) {
+            return false;
+        }
+        let Ok(mut file) = source.file.try_clone() else {
+            return false;
+        };
+        let Ok(before) = file.metadata() else {
+            return false;
+        };
+        if !cap_identity_matches(&before, source.identity)
+            || before.len() > MAX_NORMALIZED_DOCUMENT_BYTES as u64
+        {
+            return false;
+        }
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return false;
+        }
+        let Ok(bytes) = read_bounded(&mut file, MAX_NORMALIZED_DOCUMENT_BYTES) else {
+            return false;
+        };
+        let Ok(after) = file.metadata() else {
+            return false;
+        };
+        cap_identity_matches(&after, source.identity)
+            && after.len() == before.len()
+            && SourceRevision::from_bytes(&bytes) == source.indexed_revision
+            && relative_source_identity_matches(
+                &root.directory,
+                &source.relative_path,
+                source.identity,
+            )
+    }
+}
+
+#[derive(Debug)]
+struct PendingDirectory {
+    root_index: usize,
+    relative_path: PathBuf,
+    directory: Dir,
+    depth: u32,
+}
+
+#[derive(Debug, Default)]
+struct BuildCounters {
+    indexed_documents: u64,
+    indexed_bytes: u64,
+    unsupported_files_skipped: u64,
+    oversized_files_skipped: u64,
+    malformed_text_files_skipped: u64,
+    duplicate_files_skipped: u64,
+    symlinks_skipped: u64,
+    metadata_errors: u64,
+    directory_errors: u64,
+    directories_scanned: u64,
+}
+
+pub fn build_authorized_text_vault(
+    vault_id: VaultId,
+    approved_roots: &[ApprovedRoot],
+    limits: TextVaultLimits,
+    cancelled: &AtomicBool,
+) -> Result<AuthorizedTextVault, VaultError> {
+    let limits = limits.validate()?;
+    validate_approved_roots(approved_roots).map_err(VaultError::from)?;
+    let mut roots = Vec::with_capacity(approved_roots.len());
+    let mut pending = Vec::with_capacity(approved_roots.len());
+
+    for (root_index, approval) in approved_roots.iter().enumerate() {
+        let directory = open_approved_root(approval).map_err(VaultError::from)?;
+        let traversal = directory.try_clone().map_err(|_| VaultError::RootChanged)?;
+        roots.push(AuthorizedVaultRoot {
+            approval: approval.clone(),
+            directory,
+        });
+        pending.push(PendingDirectory {
+            root_index,
+            relative_path: PathBuf::new(),
+            directory: traversal,
+            depth: 0,
+        });
+    }
+
+    let mut index = LegalIndex::new(vault_id.clone()).map_err(VaultError::from)?;
+    let mut sources = BTreeMap::new();
+    let mut identities = HashSet::new();
+    let mut counters = BuildCounters::default();
+
+    while let Some(current) = pending.pop() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(VaultError::Cancelled);
+        }
+        if counters.directories_scanned >= limits.max_directories {
+            return Err(VaultError::BuildBudgetExceeded);
+        }
+        let entries = match current.directory.entries() {
+            Ok(entries) => entries,
+            Err(_) => {
+                counters.directory_errors = counters.directory_errors.saturating_add(1);
+                continue;
+            }
+        };
+        counters.directories_scanned = counters.directories_scanned.saturating_add(1);
+
+        for entry_result in entries {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(VaultError::Cancelled);
+            }
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(_) => {
+                    counters.directory_errors = counters.directory_errors.saturating_add(1);
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let metadata = match current.directory.symlink_metadata(&name) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    continue;
+                }
+            };
+            if cap_metadata_is_link_or_reparse(&metadata) {
+                counters.symlinks_skipped = counters.symlinks_skipped.saturating_add(1);
+                continue;
+            }
+            if metadata.is_dir() {
+                if package_category(&extension_for_name(&name)).is_some() {
+                    counters.unsupported_files_skipped =
+                        counters.unsupported_files_skipped.saturating_add(1);
+                    continue;
+                }
+                if current.depth >= limits.max_depth {
+                    return Err(VaultError::BuildBudgetExceeded);
+                }
+                let expected = cap_metadata_identity_portable(&metadata);
+                let child = match entry.open_dir() {
+                    Ok(child) => child,
+                    Err(_) => {
+                        counters.directory_errors = counters.directory_errors.saturating_add(1);
+                        continue;
+                    }
+                };
+                let opened_metadata = match child.dir_metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                        continue;
+                    }
+                };
+                if cap_metadata_is_link_or_reparse(&opened_metadata)
+                    || expected
+                        .zip(cap_metadata_identity_portable(&opened_metadata))
+                        .is_some_and(|(before, after)| before != after)
+                {
+                    counters.symlinks_skipped = counters.symlinks_skipped.saturating_add(1);
+                    continue;
+                }
+                pending.push(PendingDirectory {
+                    root_index: current.root_index,
+                    relative_path: current.relative_path.join(&name),
+                    directory: child,
+                    depth: current.depth + 1,
+                });
+                continue;
+            }
+            if !metadata.is_file() {
+                counters.unsupported_files_skipped =
+                    counters.unsupported_files_skipped.saturating_add(1);
+                continue;
+            }
+            if !is_supported_text_extension(&name) {
+                counters.unsupported_files_skipped =
+                    counters.unsupported_files_skipped.saturating_add(1);
+                continue;
+            }
+            if metadata.len() == 0 || metadata.len() > MAX_NORMALIZED_DOCUMENT_BYTES as u64 {
+                counters.oversized_files_skipped =
+                    counters.oversized_files_skipped.saturating_add(1);
+                continue;
+            }
+            if counters.indexed_documents as usize >= limits.max_documents
+                || counters.indexed_bytes.saturating_add(metadata.len()) > limits.max_total_bytes
+            {
+                return Err(VaultError::BuildBudgetExceeded);
+            }
+            let Some(identity) = cap_metadata_identity_portable(&metadata) else {
+                counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                continue;
+            };
+            if !identities.insert(identity) {
+                counters.duplicate_files_skipped =
+                    counters.duplicate_files_skipped.saturating_add(1);
+                continue;
+            }
+
+            let mut file = match current.directory.open(&name) {
+                Ok(file) => file,
+                Err(_) => {
+                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    continue;
+                }
+            };
+            let opened_metadata = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    continue;
+                }
+            };
+            if !cap_identity_matches(&opened_metadata, identity) {
+                counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                continue;
+            }
+            let bytes = match read_bounded(&mut file, MAX_NORMALIZED_DOCUMENT_BYTES) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    counters.oversized_files_skipped =
+                        counters.oversized_files_skipped.saturating_add(1);
+                    continue;
+                }
+            };
+            let post_read_metadata = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    continue;
+                }
+            };
+            if !cap_identity_matches(&post_read_metadata, identity)
+                || post_read_metadata.len() != opened_metadata.len()
+            {
+                counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                continue;
+            }
+
+            let document_number = counters.indexed_documents.saturating_add(1);
+            let document_id = DocumentId::parse(format!("document-{document_number:016x}"))
+                .map_err(VaultError::from)?;
+            let Some(title) = source_title(&name) else {
+                counters.malformed_text_files_skipped =
+                    counters.malformed_text_files_skipped.saturating_add(1);
+                continue;
+            };
+            let normalized = match normalize_text_document(document_id.clone(), title, &bytes) {
+                Ok(document) => document,
+                Err(_) => {
+                    counters.malformed_text_files_skipped =
+                        counters.malformed_text_files_skipped.saturating_add(1);
+                    continue;
+                }
+            };
+            index
+                .replace_document(&normalized)
+                .map_err(VaultError::from)?;
+            sources.insert(
+                document_id,
+                AuthorizedSource {
+                    root_index: current.root_index,
+                    relative_path: current.relative_path.join(&name),
+                    identity,
+                    file,
+                    indexed_revision: normalized.revision,
+                },
+            );
+            counters.indexed_documents = document_number;
+            counters.indexed_bytes = counters
+                .indexed_bytes
+                .saturating_add(post_read_metadata.len());
+        }
+    }
+
+    let build_report = TextVaultBuildReport {
+        schema: TEXT_VAULT_SCHEMA,
+        vault_id: vault_id.clone(),
+        approved_locations: roots.len() as u64,
+        indexed_documents: counters.indexed_documents,
+        indexed_bytes: counters.indexed_bytes,
+        unsupported_files_skipped: counters.unsupported_files_skipped,
+        oversized_files_skipped: counters.oversized_files_skipped,
+        malformed_text_files_skipped: counters.malformed_text_files_skipped,
+        duplicate_files_skipped: counters.duplicate_files_skipped,
+        symlinks_skipped: counters.symlinks_skipped,
+        metadata_errors: counters.metadata_errors,
+        directory_errors: counters.directory_errors,
+        source_content_persisted: false,
+        retrieval_index_persisted: false,
+        supported_formats: vec![".md", ".text", ".txt"],
+    };
+    Ok(AuthorizedTextVault {
+        vault_id,
+        roots,
+        sources,
+        index,
+        build_report,
+    })
+}
+
+fn is_supported_text_extension(name: &OsStr) -> bool {
+    matches!(extension_for_name(name).as_str(), ".md" | ".text" | ".txt")
+}
+
+fn source_title(name: &OsStr) -> Option<String> {
+    let path = Path::new(name);
+    let title = path.file_stem()?.to_string_lossy().trim().to_string();
+    (!title.is_empty()).then_some(title)
+}
+
+fn read_bounded(file: &mut File, maximum: usize) -> Result<Vec<u8>, std::io::Error> {
+    let mut bytes = Vec::new();
+    file.take((maximum as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source exceeded the byte budget",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn relative_source_identity_matches(
+    root: &Dir,
+    relative_path: &Path,
+    expected_file: FileIdentity,
+) -> bool {
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    let Ok(mut directory) = root.try_clone() else {
+        return false;
+    };
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let Ok(metadata) = directory.symlink_metadata(name) else {
+            return false;
+        };
+        if cap_metadata_is_link_or_reparse(&metadata) {
+            return false;
+        }
+        let is_last = index + 1 == components.len();
+        if is_last {
+            return metadata.is_file() && cap_identity_matches(&metadata, expected_file);
+        }
+        if !metadata.is_dir() {
+            return false;
+        }
+        let before = cap_metadata_identity_portable(&metadata);
+        let Ok(child) = directory.open_dir(name) else {
+            return false;
+        };
+        let Ok(after_metadata) = child.dir_metadata() else {
+            return false;
+        };
+        if cap_metadata_is_link_or_reparse(&after_metadata)
+            || before
+                .zip(cap_metadata_identity_portable(&after_metadata))
+                .is_some_and(|(before, after)| before != after)
+        {
+            return false;
+        }
+        directory = child;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approve_roots;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn build(temp: &TempDir) -> (AuthorizedTextVault, PathBuf) {
+        let root = temp.path().join("approved");
+        fs::create_dir(&root).expect("root");
+        let source = root.join("Confidential Precedent.txt");
+        fs::write(
+            &source,
+            "7. CONFIDENTIALITY\nConfidential Information includes affiliate data. Disclosure is allowed when required by law. These duties survive termination.",
+        )
+        .expect("source");
+        fs::write(root.join("unsupported.pdf"), b"%PDF-synthetic").expect("pdf");
+        let approved = approve_roots(&[root]).expect("approve");
+        let vault = build_authorized_text_vault(
+            VaultId::parse("authorized-text").expect("vault"),
+            &approved,
+            TextVaultLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("build");
+        (vault, source)
+    }
+
+    #[test]
+    fn build_report_is_aggregate_and_derivatives_are_not_persisted() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, _) = build(&temp);
+        let report = vault.build_report();
+        assert_eq!(report.indexed_documents, 1);
+        assert_eq!(report.unsupported_files_skipped, 1);
+        assert!(!report.source_content_persisted);
+        assert!(!report.retrieval_index_persisted);
+        let serialized = serde_json::to_string(report).expect("serialize");
+        assert!(!serialized.contains("Confidential Precedent"));
+        assert!(!serialized.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn authorized_text_search_returns_current_exact_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, _) = build(&temp);
+        let response = vault
+            .interpret_and_search(
+                "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.",
+            )
+            .expect("search");
+        assert_eq!(response.evidence.len(), 1);
+        assert_eq!(
+            response.evidence[0].document_title,
+            "Confidential Precedent"
+        );
+        assert_eq!(response.evidence[0].source_anchor, "section:0001");
+        assert!(response.evidence[0]
+            .exact_excerpt
+            .starts_with("Confidential Information"));
+    }
+
+    #[test]
+    fn source_mutation_withdraws_previously_indexed_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, source) = build(&temp);
+        fs::write(&source, "7. PUBLICITY\nPress releases require approval.").expect("mutate");
+        let response = vault
+            .interpret_and_search(
+                "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.",
+            )
+            .expect("search");
+        assert!(response.evidence.is_empty());
+        assert_eq!(response.stale_evidence_withdrawn, 1);
+    }
+
+    #[test]
+    fn source_path_replacement_is_not_reauthorized_by_name() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, source) = build(&temp);
+        let moved = source.with_extension("moved");
+        fs::rename(&source, &moved).expect("move original");
+        fs::write(
+            &source,
+            "7. CONFIDENTIALITY\nConfidential Information includes affiliate data. Disclosure is allowed when required by law. These duties survive termination.",
+        )
+        .expect("replacement");
+        let response = vault
+            .interpret_and_search(
+                "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.",
+            )
+            .expect("search");
+        assert!(response.evidence.is_empty());
+        assert_eq!(response.stale_evidence_withdrawn, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_links_are_skipped_and_never_become_sources() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp");
+        let outside = temp.path().join("outside.txt");
+        fs::write(
+            &outside,
+            "CONFIDENTIALITY\nConfidential Information survives termination.",
+        )
+        .expect("outside");
+        let root = temp.path().join("approved");
+        fs::create_dir(&root).expect("root");
+        symlink(&outside, root.join("linked.txt")).expect("link");
+        let approved = approve_roots(&[root]).expect("approve");
+        let vault = build_authorized_text_vault(
+            VaultId::parse("link-test").expect("vault"),
+            &approved,
+            TextVaultLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("build");
+        assert_eq!(vault.build_report().indexed_documents, 0);
+        assert_eq!(vault.build_report().symlinks_skipped, 1);
+    }
+
+    #[test]
+    fn build_budget_and_cancellation_discard_partial_vaults() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("approved");
+        fs::create_dir(&root).expect("root");
+        fs::write(root.join("one.txt"), "ASSIGNMENT\nNo assignment.").expect("one");
+        fs::write(root.join("two.txt"), "ASSIGNMENT\nNo assignment.").expect("two");
+        let approved = approve_roots(&[root]).expect("approve");
+        assert!(matches!(
+            build_authorized_text_vault(
+                VaultId::parse("bounded").expect("vault"),
+                &approved,
+                TextVaultLimits {
+                    max_documents: 1,
+                    ..TextVaultLimits::default()
+                },
+                &AtomicBool::new(false),
+            ),
+            Err(VaultError::BuildBudgetExceeded)
+        ));
+        assert!(matches!(
+            build_authorized_text_vault(
+                VaultId::parse("cancelled").expect("vault"),
+                &approved,
+                TextVaultLimits::default(),
+                &AtomicBool::new(true),
+            ),
+            Err(VaultError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn root_replacement_fails_the_query_instead_of_using_retained_authority() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, source) = build(&temp);
+        let root = source.parent().expect("root").to_path_buf();
+        let moved_root = temp.path().join("moved-root");
+        fs::rename(&root, &moved_root).expect("move root");
+        fs::create_dir(&root).expect("replacement root");
+        assert_eq!(
+            vault.interpret_and_search("Find confidentiality provisions."),
+            Err(VaultError::RootChanged)
+        );
+    }
+}

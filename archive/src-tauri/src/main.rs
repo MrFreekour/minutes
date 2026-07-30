@@ -1,5 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use minutes_archive_core::retrieval::{LegalSearchResponse, VaultId};
+use minutes_archive_core::vault::{
+    build_authorized_text_vault, AuthorizedTextVault, TextVaultBuildReport, TextVaultLimits,
+};
 use minutes_archive_core::{
     approve_roots, scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits,
     CensusReport, CensusStatus,
@@ -29,6 +33,7 @@ struct ScanControl {
 struct SessionState {
     locations: Vec<ApprovedLocation>,
     last_report: Option<CensusReport>,
+    text_vault: Option<AuthorizedTextVault>,
     scan: ScanControl,
 }
 
@@ -59,11 +64,12 @@ struct LocationSummary {
 struct BootstrapState {
     locations: Vec<LocationSummary>,
     scan_running: bool,
-    has_report: bool,
+    report: Option<CensusReport>,
+    text_vault_report: Option<TextVaultBuildReport>,
 }
 
 fn lock_error() -> String {
-    "Archive Census could not access its private session state.".to_string()
+    "Minutes Archive could not access its private session state.".to_string()
 }
 
 fn safe_census_error(error: impl std::fmt::Display) -> String {
@@ -94,7 +100,11 @@ fn archive_bootstrap(state: State<'_, ArchiveState>) -> Result<BootstrapState, S
     Ok(BootstrapState {
         locations: location_summaries(&session.locations),
         scan_running: session.scan.running,
-        has_report: session.last_report.is_some(),
+        report: session.last_report.clone(),
+        text_vault_report: session
+            .text_vault
+            .as_ref()
+            .map(|vault| vault.build_report().clone()),
     })
 }
 
@@ -143,6 +153,7 @@ async fn choose_archive_locations(
         });
     }
     session.last_report = None;
+    session.text_vault = None;
     Ok(location_summaries(&session.locations))
 }
 
@@ -161,6 +172,7 @@ fn remove_archive_location(
         return Err("That approved location is no longer available.".to_string());
     }
     session.last_report = None;
+    session.text_vault = None;
     Ok(location_summaries(&session.locations))
 }
 
@@ -178,6 +190,7 @@ async fn run_archive_census(state: State<'_, ArchiveState>) -> Result<CensusRepo
         session.scan.running = true;
         session.scan.cancelled = Some(Arc::clone(&cancelled));
         session.last_report = None;
+        session.text_vault = None;
         session
             .locations
             .iter()
@@ -231,7 +244,7 @@ fn refuse_link_target(path: &Path) -> Result<(), String> {
 fn write_private_report(path: &Path, report: &CensusReport) -> Result<(), String> {
     refuse_link_target(path)?;
     let json = serde_json::to_vec_pretty(report)
-        .map_err(|_| "Archive Census could not prepare the aggregate report.".to_string())?;
+        .map_err(|_| "Minutes Archive could not prepare the aggregate report.".to_string())?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -241,17 +254,17 @@ fn write_private_report(path: &Path, report: &CensusReport) -> Result<(), String
     }
     let mut file = options
         .open(path)
-        .map_err(|_| "Archive Census could not save the aggregate report.".to_string())?;
+        .map_err(|_| "Minutes Archive could not save the aggregate report.".to_string())?;
     file.write_all(&json)
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())
-        .map_err(|_| "Archive Census could not finish saving the aggregate report.".to_string())?;
+        .map_err(|_| "Minutes Archive could not finish saving the aggregate report.".to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|_| {
-                "Archive Census could not protect the aggregate report permissions.".to_string()
+                "Minutes Archive could not protect the aggregate report permissions.".to_string()
             })?;
     }
     Ok(())
@@ -286,6 +299,70 @@ async fn export_archive_census(
     Ok(true)
 }
 
+#[tauri::command]
+async fn build_archive_text_vault(
+    state: State<'_, ArchiveState>,
+) -> Result<TextVaultBuildReport, String> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let roots = {
+        let mut session = state.session.lock().map_err(|_| lock_error())?;
+        if session.locations.is_empty() {
+            return Err("Choose at least one archive location first.".to_string());
+        }
+        if session.last_report.is_none() {
+            return Err(
+                "Run and review the metadata-only census before opening any documents.".to_string(),
+            );
+        }
+        if session.scan.running {
+            return Err("Another private archive operation is already running.".to_string());
+        }
+        session.scan.running = true;
+        session.scan.cancelled = Some(Arc::clone(&cancelled));
+        session.text_vault = None;
+        session
+            .locations
+            .iter()
+            .map(|location| location.root.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let build_result = tauri::async_runtime::spawn_blocking(move || {
+        let vault_id = VaultId::parse("local-private-vault")
+            .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
+        build_authorized_text_vault(vault_id, &roots, TextVaultLimits::default(), &cancelled)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "The private text-index worker stopped unexpectedly.".to_string());
+
+    {
+        let mut session = state.session.lock().map_err(|_| lock_error())?;
+        session.scan.running = false;
+        session.scan.cancelled = None;
+    }
+
+    let vault = build_result??;
+    let report = vault.build_report().clone();
+    state.session.lock().map_err(|_| lock_error())?.text_vault = Some(vault);
+    Ok(report)
+}
+
+#[tauri::command]
+fn search_archive_text_vault(
+    query: String,
+    state: State<'_, ArchiveState>,
+) -> Result<LegalSearchResponse, String> {
+    let session = state.session.lock().map_err(|_| lock_error())?;
+    ensure_scan_idle(&session)?;
+    let vault = session.text_vault.as_ref().ok_or_else(|| {
+        "Build the private text index before searching. No partial index was retained.".to_string()
+    })?;
+    vault
+        .interpret_and_search(query)
+        .map_err(|error| error.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(ArchiveState::default())
@@ -297,9 +374,11 @@ fn main() {
             run_archive_census,
             cancel_archive_census,
             export_archive_census,
+            build_archive_text_vault,
+            search_archive_text_vault,
         ])
         .run(tauri::generate_context!())
-        .expect("Archive Census failed to start");
+        .expect("Minutes Archive failed to start");
 }
 
 #[cfg(test)]
