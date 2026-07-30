@@ -8712,12 +8712,10 @@ fn replace_para_person_generation_legacy(
     let people = directory.parent().ok_or("PARA person has no parent")?;
     require_para_generation_capacity(private_root, 3)?;
     let mut successor = match (successor_items, successor_summary) {
-        (Some(items), Some(summary)) => Some(create_para_successor(
-            private_root,
-            directory,
-            items,
-            summary,
-        )?),
+        (Some(items), Some(summary)) => Some(
+            create_para_successor(private_root, directory, items, summary)
+                .map_err(|error| format!("PARA private successor creation failed: {error}"))?,
+        ),
         (None, None) => None,
         _ => return Err("PARA successor generation was incomplete".into()),
     };
@@ -8785,8 +8783,10 @@ fn replace_para_person_generation_legacy(
             baseline_parked: false,
             prior_sequence: None,
         },
-    )?;
-    move_para_directory_to_claim(directory, &capture, &snapshot.directory)?
+    )
+    .map_err(|error| format!("PARA private transaction start failed: {error}"))?;
+    move_para_directory_to_claim(directory, &capture, &snapshot.directory)
+        .map_err(|error| format!("PARA old-generation claim failed: {error}"))?
         .ok_or("PARA person changed before its exact generation could be claimed")?;
     if !para_snapshot_matches_path(&capture, snapshot) {
         return Err("PARA person changed inside its exact generation claim".into());
@@ -9690,12 +9690,16 @@ where
         }
     };
     if config.knowledge.adapter.eq_ignore_ascii_case("para") {
-        let wiki = rewrite_wiki_people(config, inactive)?;
-        let para = rewrite_para_people(config, |source, id| disposition(source, id))?;
+        let wiki = rewrite_wiki_people(config, inactive)
+            .map_err(|error| format!("inactive Wiki retirement failed: {error}"))?;
+        let para = rewrite_para_people(config, |source, id| disposition(source, id))
+            .map_err(|error| format!("active PARA retirement failed: {error}"))?;
         Ok(wiki + para)
     } else {
-        let para = rewrite_para_people(config, inactive)?;
-        let wiki = rewrite_wiki_people(config, |source, id| disposition(source, id))?;
+        let para = rewrite_para_people(config, inactive)
+            .map_err(|error| format!("inactive PARA retirement failed: {error}"))?;
+        let wiki = rewrite_wiki_people(config, |source, id| disposition(source, id))
+            .map_err(|error| format!("active Wiki retirement failed: {error}"))?;
         Ok(para + wiki)
     }
 }
@@ -9799,17 +9803,20 @@ fn retract_meeting_derivatives_locked(
     };
     let facts_removed = rewrite_knowledge_sources(config, &manifest, |source, id| {
         classify(source, id, keys.contains(source))
-    })?;
+    })
+    .map_err(|error| format!("targeted knowledge source retirement failed: {error}"))?;
     let log_entries_removed = rewrite_knowledge_logs(config, &manifest, |source, id| {
         classify(source, id, path_candidates.contains(source))
-    })?;
+    })
+    .map_err(|error| format!("targeted knowledge log retirement failed: {error}"))?;
     for key in &keys {
         manifest.sources.remove(key);
         manifest.records.remove(key);
     }
     manifest.managed_logs = managed_log_relative_path(config).into_iter().collect();
     manifest.schema = 4;
-    save_provenance_manifest(config, &manifest)?;
+    save_provenance_manifest(config, &manifest)
+        .map_err(|error| format!("targeted knowledge provenance commit failed: {error}"))?;
     Ok(KnowledgeReconcileResult {
         facts_removed,
         log_entries_removed,
@@ -9830,6 +9837,12 @@ fn reconcile_knowledge_derivatives_locked(
 ) -> Result<KnowledgeReconcileResult, Box<dyn std::error::Error>> {
     if !config.knowledge.enabled || config.knowledge.path.as_os_str().is_empty() {
         return Ok(KnowledgeReconcileResult::default());
+    }
+    match fs::symlink_metadata(&config.knowledge.path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err("configured knowledge derivative is not a normal directory".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let mut authorized_keys = HashSet::new();
     let mut authorized_paths = HashSet::new();
@@ -9866,10 +9879,12 @@ fn reconcile_knowledge_derivatives_locked(
     };
     let facts_removed = rewrite_knowledge_sources(config, &manifest, |source, id| {
         classify(source, id, authorized_keys.contains(source))
-    })?;
+    })
+    .map_err(|error| format!("knowledge source retirement failed: {error}"))?;
     let log_entries_removed = rewrite_knowledge_logs(config, &manifest, |source, id| {
         classify(source, id, authorized_paths.contains(source))
-    })?;
+    })
+    .map_err(|error| format!("knowledge log retirement failed: {error}"))?;
     manifest.schema = 4;
     manifest
         .sources
@@ -9878,7 +9893,8 @@ fn reconcile_knowledge_derivatives_locked(
         .records
         .retain(|source, _| manifest.sources.contains_key(source));
     manifest.managed_logs = managed_log_relative_path(config).into_iter().collect();
-    save_provenance_manifest(config, &manifest)?;
+    save_provenance_manifest(config, &manifest)
+        .map_err(|error| format!("knowledge provenance commit failed: {error}"))?;
     Ok(KnowledgeReconcileResult {
         facts_removed,
         log_entries_removed,
@@ -10178,9 +10194,12 @@ fn count_knowledge_snapshot_locked(
         config.knowledge.path.join("people")
     };
     if para {
-        let private_root = para_private_root(config)?;
-        prepare_para_private_root(&private_root)?;
-        recover_para_transactions(&people, &private_root, Some(config))?;
+        let private_root = para_private_root(config)
+            .map_err(|error| format!("PARA private-root binding failed: {error}"))?;
+        prepare_para_private_root(&private_root)
+            .map_err(|error| format!("PARA private-root attestation failed: {error}"))?;
+        recover_para_transactions(&people, &private_root, Some(config))
+            .map_err(|error| format!("PARA private transaction recovery failed: {error}"))?;
     }
     let people_count = match fs::symlink_metadata(&people) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -15178,7 +15197,15 @@ mod tests {
             })
             .map(|entry| entry.path())
             .collect();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(retained_generations.is_empty());
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            assert_eq!(retained_generations.len(), 1);
+            assert!(all_text_unfiltered(&retained_generations[0]).contains("KEPT"));
+            assert!(!all_text_unfiltered(&retained_generations[0])
+                .contains("FINAL-SUMMARY-PUBLICATION-WINNER"));
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -15625,6 +15652,17 @@ mod tests {
             "records": current["records"].clone(),
         });
         fs::write(&manifest_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        #[cfg(windows)]
+        {
+            // A real v3 installation predates the Windows publication
+            // journals. Recreate that upgrade topology instead of leaving a
+            // valid v4 terminal receipt whose exact target was then modified
+            // behind its back.
+            let namespace = manifest_path.parent().unwrap();
+            for journal in PRIVATE_KNOWLEDGE_PROVENANCE_JOURNALS {
+                fs::write(namespace.join(journal), b"").unwrap();
+            }
+        }
         let profile = config.knowledge.path.join("people/alex-kim.md");
         let mut profile_content = fs::read_to_string(&profile).unwrap();
         profile_content.push_str("\nV3-MANUAL-CANARY\n");
@@ -16767,12 +16805,24 @@ mod tests {
             .unwrap();
         }));
         assert!(crashed.is_err());
-        assert!(
-            directory.exists(),
-            "whole-directory exchange has no absence window"
-        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(
+                directory.exists(),
+                "whole-directory exchange has no absence window"
+            );
+            assert!(all_text_unfiltered(&knowledge).contains("NEW"));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            assert!(
+                !directory.exists(),
+                "legacy whole-directory claim must not publish before authorization resumes"
+            );
+            assert!(!all_text_unfiltered(&knowledge).contains("NEW"));
+            assert!(all_text_unfiltered(&private_root).contains("NEW"));
+        }
         assert!(!all_text_unfiltered(&knowledge).contains("OLD"));
-        assert!(all_text_unfiltered(&knowledge).contains("NEW"));
         assert!(all_text_unfiltered(&private_root).contains("OLD"));
 
         recover_para_transactions(&people, &private_root, None).unwrap();

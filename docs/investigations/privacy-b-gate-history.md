@@ -1096,3 +1096,41 @@ ordinary Windows suite green on its exact SHA before the focused
 validation-only Windows workflow or independent final reviews run. Draft PR
 #604 remains unmerged, and no merge, tag, signing, publication, deployment, or
 release is authorized.
+
+THE FIFTH REPLACEMENT REMAINS BLOCKED, BUT REDUCED THE WINDOWS TAIL TO FOURTEEN.
+Hosted full-CI run 30506491802 and lint run 30506491825 exercised exact SHA
+`0cef4bee`. Lint, Linux, macOS, every short cross-platform lane, Windows
+corpus/MCP policy, Windows CLI installation, and the unsigned Windows installer
+were green. The complete no-whisper Windows core result improved from 1,455
+passed and 46 failed to 1,487 passed and 14 failed, with 5 ignored.
+
+The direct Windows enforcement fixtures now pass: owner-private preservation
+objects are protected from creation, graph watchers ignore metadata-only
+notifications without ignoring byte or namespace changes, exact private
+retirement consumes its authority, no-delete-sharing leases attest through
+their own contract, and the Windows Job memory ceiling refuses committed
+memory above the configured process and aggregate limits.
+
+The fourteen remaining failures separate into portability assertions and
+unattributed filesystem boundaries. Two process-tree tests allowed only three
+or five seconds for PowerShell startup, descendant PID publication, leader
+exit, and Job retirement while the hosted runner was executing the complete
+suite in parallel. Two PARA tests asserted Linux/macOS recyclable-generation
+exchange outcomes even though the conservative Windows legacy protocol
+retains old and intended generations privately across the corresponding crash
+or final-winner boundary. One v3 migration fixture rewrote a journaled v4
+target behind an exact terminal receipt rather than recreating the
+pre-journal v3 upgrade topology. Two invalid-configuration tests depended on
+platform-specific child-path errors instead of rejecting a configured
+knowledge path that is itself a file. The residual raw Windows code-5 failures
+need privacy-safe stage attribution before changing any filesystem policy.
+
+STATUS: `0cef4bee` is not accepted. The next candidate increases only the
+Windows process-fixture envelopes while retaining a shorter-than-child-sleep
+timeout, makes recyclable-versus-legacy PARA assertions explicit, recreates a
+pre-journal v3 state for migration, rejects non-directory knowledge roots, and
+adds stage-only diagnostics that contain no source paths, filenames, or
+content. Acceptance still requires full ordinary CI and focused
+validation-only Windows success for one exact SHA, followed by three fresh
+independent reviews. Draft PR #604 remains unmerged; no merge or release action
+is authorized.

@@ -2912,12 +2912,12 @@ mod windows_tests {
             &mut powershell(&script),
             None,
             StdoutTarget::Capture { max_bytes: 1024 },
-            budget(3_000),
+            budget(10_000),
         )
         .unwrap();
 
         assert!(run.timed_out);
-        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(started.elapsed() < Duration::from_secs(20));
         assert_process_tree_retired(read_pid(&pid_path));
     }
 
@@ -2932,7 +2932,7 @@ mod windows_tests {
             &mut powershell(&script),
             None,
             StdoutTarget::Capture { max_bytes: 1024 },
-            budget(5_000),
+            budget(15_000),
         )
         .unwrap();
 
