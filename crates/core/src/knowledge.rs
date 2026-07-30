@@ -8424,6 +8424,11 @@ fn create_para_successor(
     boundary.attest_for_source_cleanup()?;
     sync_para_directory_handle(&opened)?;
     sync_para_directory(private_root)?;
+    // The bound policy capability intentionally denies delete sharing while
+    // private members are written and flushed. Release that guard before the
+    // final PARA verifier reopens the directory with DELETE authority for the
+    // later exact-generation move.
+    drop(stage);
     let successor = ParaPersonSuccessor {
         path,
         directory: opened,

@@ -1379,3 +1379,29 @@ protocol timeout in unchanged JavaScript. No validation-only workflow or
 independent final reviews count for this SHA. A new exact candidate must repeat
 all local and hosted gates. Draft PR #604 remains unmerged; no merge, tag,
 signing, publication, deployment, or release is authorized.
+
+THE PROVEN PARA HANDLE REMAINED LIVE ONE ATTESTATION TOO LONG. Exact SHA
+`154cb847` passed lint run 30516584511, and all 16 completed non-native/short
+lanes in full-CI run 30516584502 were green. Native Windows again completed
+with 1,496 passed, 9 failed, and 5 ignored. The prior DACL-attestation failure
+was gone, legacy capture cleanup passed, and the macOS watcher-protocol lane
+also passed. The root creation failure was now Windows sharing error 32 while
+creating a private PARA successor.
+
+The replacement correctly reopened the atomically created directory with the
+PARA write/delete/share contract, then rebound a policy capability that denies
+delete sharing while private members were written and flushed. It kept that
+temporary no-delete guard alive while calling the final PARA verifier, which
+must reopen the directory with DELETE authority so the returned exact
+generation can later be moved. Windows correctly rejected that conflicting
+open. The replacement now explicitly drops the temporary bound guard only
+after member and directory durability completes and immediately before final
+successor attestation. The retained PARA handle and final identity/content/name
+proofs remain load-bearing. The other eight failures followed transaction
+retraction after this same successor-creation failure.
+
+STATUS: `154cb847` is not accepted. Its already-failed run was canceled while
+remaining native jobs were active. No validation-only workflow or independent
+final reviews count for this SHA. A new exact candidate must repeat every local
+and hosted gate. Draft PR #604 remains unmerged; no merge, tag, signing,
+publication, deployment, or release is authorized.
