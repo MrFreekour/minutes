@@ -1964,11 +1964,12 @@ impl BoundRecoveryDirectory {
     pub fn create_new_exact_file(&self, name: &OsStr) -> std::io::Result<File> {
         validate_entry_name(name)?;
         self.attest_location()?;
-        let file = self
-            .chain
-            .leaf()
-            .open_with(name, &recovery_file_open_options(true))?
-            .into_std();
+        let options = if self.owner_private_namespace {
+            private_control_file_open_options(true)
+        } else {
+            recovery_file_open_options(true)
+        };
+        let file = self.chain.leaf().open_with(name, &options)?.into_std();
         if !opened_regular_file_is_safe(&file) {
             return Err(invalid_recovery_path(
                 "new capability-bound file is not a single-link regular file",
@@ -3212,7 +3213,7 @@ mod tests {
     fn legacy_policy_caches_are_zeroed_for_open_holders_then_retired() {
         let root = tempfile::TempDir::new().unwrap();
         let state = root.path().join("state");
-        fs::create_dir(&state).unwrap();
+        drop(BoundRecoveryDirectory::prepare_owner_private(&state).unwrap());
         let search = state.join("search.db");
         let graph_wal = state.join("graph.db-wal");
         let graph_dir = state.join("graph");
@@ -3512,7 +3513,8 @@ mod tests {
         );
 
         let root = tempfile::TempDir::new().unwrap();
-        let directory = BoundRecoveryDirectory::prepare_owner_private(root.path()).unwrap();
+        let directory =
+            BoundRecoveryDirectory::prepare_owner_private(&root.path().join("private")).unwrap();
         directory
             .sync()
             .expect("the host durability helper must accept an attested directory capability");

@@ -1202,3 +1202,32 @@ complete ordinary CI, and validation-only Windows execution are terminal green
 and all three independent reviews are repeated. Draft PR #604 must remain
 unmerged. No merge, tag, signing, publication, deployment, or release is
 authorized.
+
+THE FIRST ATOMIC-DACL REPLACEMENT IS BLOCKED BY NATIVE WINDOWS EXECUTION.
+Hosted lint run 30510588819 was green at exact SHA `72334ac2`. Full-CI run
+30510588769 made every completed non-Windows/short lane green, but the complete
+Windows core job failed with 1,410 passed, 93 failed, and 5 ignored.
+
+The failures isolated two replacement-owned integration contracts. New private
+files were opened with read/write/delete authority, then the replacement tried
+to install their canonical protected DACL through the exact handle without
+having requested READ_CONTROL/WRITE_DAC/WRITE_OWNER; Windows correctly returned
+access denied. Owner-private new-file opens now use the existing private-control
+authority contract before tightening. Existing leaves remain verification-only.
+
+The stricter existing-directory rule also exposed fixtures that treated an
+already-created ordinary temporary root as owner-private. The real Windows
+immutable-executable snapshot now creates a nested atomically private directory
+inside the outer cleanup-owned temporary directory. The one transcription test
+that mutates `MINUTES_HOME` now uses the repository-wide HOME-environment lock
+and points at an absent child, preventing parallel tests from observing its
+ordinary existing TempDir as global private state. Legacy-cache fixtures create
+their state roots through the owner-private primitive before populating them;
+the durability fixture similarly tests an atomically created private child.
+These changes preserve strict production rejection rather than weakening the
+new DACL assertions to accommodate test setup.
+
+STATUS: `72334ac2` is not accepted. No focused validation-only workflow or
+independent final review runs for that SHA. The next candidate must rerun exact
+lint and complete ordinary CI first; draft PR #604 remains unmerged, and no
+merge, tag, signing, publication, deployment, or release is authorized.

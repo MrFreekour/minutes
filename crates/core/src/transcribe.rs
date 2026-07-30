@@ -4520,13 +4520,12 @@ mod tests {
     #[test]
     #[cfg(not(feature = "whisper"))]
     fn traced_transcribe_path_writes_ordered_process_breadcrumbs() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_home_env_lock();
         let old_minutes_home = std::env::var_os("MINUTES_HOME");
         let old_minutes_trace = std::env::var_os("MINUTES_TRACE");
 
         let dir = tempfile::TempDir::new().unwrap();
-        std::env::set_var("MINUTES_HOME", dir.path());
+        std::env::set_var("MINUTES_HOME", dir.path().join("minutes-home"));
         std::env::remove_var("MINUTES_TRACE");
 
         let audio_path = dir.path().join("probe.wav");

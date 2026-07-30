@@ -1494,9 +1494,12 @@ mod tests {
         std::env::set_var("HOME", &home);
         let state = home.join("isolated-minutes");
         std::env::set_var("MINUTES_HOME", &state);
-        std::fs::create_dir(&state).unwrap();
+        drop(crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&state).unwrap());
         let historical_state = home.join(".minutes");
-        std::fs::create_dir(&historical_state).unwrap();
+        drop(
+            crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&historical_state)
+                .unwrap(),
+        );
         let legacy = state.join("search.db");
         let historical_legacy = historical_state.join("search.db-wal");
         std::fs::write(&legacy, b"PRIVATE-LEGACY-SEARCH-CANARY").unwrap();

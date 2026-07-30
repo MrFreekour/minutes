@@ -5244,7 +5244,7 @@ Skip the wizard. Drop users into a pre-populated demo workspace.
         std::env::set_var("HOME", &home);
         let state = home.join("isolated-minutes");
         std::env::set_var("MINUTES_HOME", &state);
-        fs::create_dir(&state).unwrap();
+        drop(crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&state).unwrap());
         let legacy = state.join("graph.db");
         fs::write(&legacy, b"PRIVATE-LEGACY-GRAPH-CANARY").unwrap();
         let legacy_holder = std::fs::File::open(&legacy).unwrap();

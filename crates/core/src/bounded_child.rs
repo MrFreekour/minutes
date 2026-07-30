@@ -347,9 +347,10 @@ fn immutable_windows_executable_snapshot(
     let temp_dir = tempfile::Builder::new()
         .prefix("minutes-policy-worker-")
         .tempdir()?;
+    let snapshot_directory = temp_dir.path().join("private");
     let directory_guard =
-        crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(temp_dir.path())?;
-    let snapshot_path = temp_dir.path().join("worker.exe");
+        crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&snapshot_directory)?;
+    let snapshot_path = snapshot_directory.join("worker.exe");
     let mut snapshot = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
