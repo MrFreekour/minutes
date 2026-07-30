@@ -3590,12 +3590,9 @@ fn parakeet_transcript_from_segments_with_stats(
 
 /// Write f32 samples as a 16kHz mono 16-bit WAV file.
 ///
-/// Used by the macOS Apple Speech bridge and by Parakeet development helpers
-/// only after the shared secure-transport gate passes.
-#[cfg(any(
-    feature = "parakeet",
-    all(feature = "streaming", feature = "whisper", target_os = "macos")
-))]
+/// Used by Parakeet development helpers only after the shared
+/// secure-transport gate passes.
+#[cfg(feature = "parakeet")]
 pub(crate) fn write_wav_16k_mono(path: &Path, samples: &[f32]) -> Result<(), TranscribeError> {
     let file = std::fs::File::create(path)?;
     write_wav_16k_mono_to_writer(file, samples)
