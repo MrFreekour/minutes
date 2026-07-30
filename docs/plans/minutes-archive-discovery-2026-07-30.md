@@ -5,7 +5,7 @@ Status: proposed discovery contract
 Date: 2026-07-30
 
 Implementation baseline: `origin/main` at
-`52a2ecfd75c63ebb1be765550855f62ccae38bc5`
+`6ac1c4f18361343ff088b4f5fd45cf60dce092a6`
 
 ## Recommendation
 
@@ -26,19 +26,22 @@ hard-coded product identity.
 ## Shipped Facts and Unlanded Inputs
 
 The implementation baseline already has local Markdown artifacts, a SQLite
-search index, sensitivity filtering, Tauri packaging, QMD registration and
-refresh hooks, and a shared Ollama adapter.
+search index, sensitivity filtering, Tauri packaging, a shared Ollama adapter,
+capability-bound secure reads, bounded corpus leases, restrictive filesystem
+policy, sealed private-audio processing, and restricted-conversation egress
+enforcement.
 
 QMD is not currently the implementation behind the public
 `minutes_core::search` path. That path opens the Minutes SQLite search index
-directly. QMD registration and refresh are integration scaffolding, not proof
-that Recall or `minutes search` performs hybrid retrieval.
+directly. Current main explicitly disables persistent QMD collections because
+QMD's global index cannot guarantee revocation after an external policy change.
+Legacy registry and mirror handling is retirement and cleanup machinery, not
+proof that Recall or `minutes search` performs hybrid retrieval.
 
-This contract also incorporates security invariants observed in the unlanded
-Silvercloud Conversation Trust and Sidekick branches. Those branches are design
-and test evidence, not shipped product behavior. No implementation should
-depend on their code until it is reconciled with fresh main and independently
-reviewed.
+This contract also incorporates scoped-history invariants observed in the
+unlanded Silvercloud Sidekick branch. That branch is design and test evidence,
+not shipped product behavior. No implementation should depend on its code until
+it is reconciled with fresh main and independently reviewed.
 
 The reusable unlanded invariants are:
 
