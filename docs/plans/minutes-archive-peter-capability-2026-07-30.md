@@ -410,6 +410,13 @@ progress, cancellation, and aggregate export.
 
 No ingestion or search occurs.
 
+Implementation status: the separate app target, multi-root capability-bound
+Rust scanner, cancellation, aggregate UI/export, restrictive CSP, minimal
+Tauri capability file, synthetic fixture, and privacy tests are implemented.
+The local bundle builds, installs, launches, and verifies with an ad-hoc seal.
+Developer ID signing, notarization, and the full native click test remain
+release gates; an ad-hoc development bundle is not a Peter handoff.
+
 ### Gate 2: Synthetic legal benchmark
 
 Build a public and synthetic corpus covering confidentiality, indemnity,

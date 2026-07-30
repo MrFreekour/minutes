@@ -1,6 +1,7 @@
 # Minutes Archive: Discovery and Security Contract
 
-Status: proposed discovery contract
+Status: implementation underway; synthetic census core and separate native app
+target implemented
 
 Date: 2026-07-30
 
@@ -211,19 +212,27 @@ The metadata-only census passes privacy tests and runs against a synthetic
 archive containing modern, legacy, package, scan, email, placeholder, and link
 cases.
 
+Implemented on the discovery branch in `minutes-archive-core` with a committed
+synthetic UI fixture. The Rust suite covers content-canary exclusion,
+unreadable regular files, package non-traversal, multiple roots, duplicate and
+overlapping roots, root and nested links, artifact bounds, and cancellation.
+
 ### Stage 1: Attorney-run aggregate census
 
-The attorney runs the census locally against an explicitly selected folder.
-Only the aggregate JSON is reviewed. No source filename, path, or content is
-transferred.
+The attorney opens the signed `Archive Census.app`, approves one or more
+locations through the native macOS picker, runs the census, reviews the
+aggregate, and chooses Export Aggregate Report. Only the aggregate JSON is
+reviewed. No source filename, path, or content is transferred.
 
-Run it from a trusted local Minutes checkout and write the result outside the
-selected archive:
+Peter is not asked to install a development environment or use Terminal. The
+maintainer-only dogfood build is:
 
 ```bash
-python3 scripts/archive_format_census.py "/explicit/archive/folder" \
-  --pretty > /tmp/minutes-archive-census.json
+./scripts/install-archive-dev-app.sh
 ```
+
+The Python census remains a reference implementation and independent privacy
+test surface. It is not the customer workflow.
 
 ### Stage 2: Synthetic retrieval proof
 

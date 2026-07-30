@@ -1,0 +1,19 @@
+[package]
+name = "minutes-archive-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Capability-bound local archive inventory and retrieval primitives"
+
+[dependencies]
+cap-std = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"

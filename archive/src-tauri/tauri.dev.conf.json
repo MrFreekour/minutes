@@ -1,0 +1,12 @@
+{
+  "productName": "Archive Census Dev",
+  "identifier": "com.useminutes.archive.dev",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Archive Census Dev"
+      }
+    ]
+  }
+}

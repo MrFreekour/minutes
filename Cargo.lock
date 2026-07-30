@@ -3582,6 +3582,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "minutes-archive-app"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "minutes-archive-core",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tempfile",
+]
+
+[[package]]
+name = "minutes-archive-core"
+version = "0.24.0"
+dependencies = [
+ "cap-std",
+ "chrono",
+ "dirs 6.0.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "minutes-cli"
 version = "0.24.0"
 dependencies = [
