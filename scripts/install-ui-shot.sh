@@ -54,9 +54,29 @@ authority="$(codesign -dv --verbose=2 "$install_path" 2>&1 | grep -m1 '^Authorit
 echo "installed $install_path"
 echo "          ${authority:-Authority=<unsigned>}"
 
+# Install the LaunchAgent. This is what makes remote captures work: macOS
+# attributes capture to the responsible process, so an SSH-invoked capture is
+# attributed to sshd and denied even when this binary is granted. An agent runs
+# in the GUI session, where the grant applies.
+agent_label="app.minutes.uishot"
+agent_plist="$HOME/Library/LaunchAgents/$agent_label.plist"
+log_path="$HOME/.minutes/ui-shot/agent.log"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.minutes/ui-shot"
+
+sed -e "s|REPLACE_WITH_HELPER_PATH|$install_path|" \
+    -e "s|REPLACE_WITH_LOG_PATH|$log_path|" \
+    "$repo_root/tauri/src-tauri/assets/$agent_label.plist" >"$agent_plist"
+
+# bootout before bootstrap so a rebuilt binary is actually picked up rather than
+# leaving the old one running.
+launchctl bootout "gui/$(id -u)/$agent_label" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$agent_plist"
+echo "agent     $agent_label loaded (log: $log_path)"
+
 echo
 if "$install_path" --check >/dev/null 2>&1; then
   echo "Screen Recording: granted. Ready to use."
+  echo "Remote captures go through the agent; local ones can call the binary directly."
 else
   cat <<'GRANT'
 Screen Recording: NOT granted yet.

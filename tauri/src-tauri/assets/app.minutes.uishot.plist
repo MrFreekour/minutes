@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for the UI screenshot helper.
+
+  A LaunchAgent runs in the user's GUI session, which is the point: macOS
+  attributes screen capture to the responsible process, so a capture invoked over
+  SSH is attributed to sshd and denied even when the helper binary itself holds
+  the Screen Recording grant. Running in-session means the grant applies, without
+  granting sshd anything.
+
+  The agent only ever reads requests and captures allowlisted Minutes windows.
+  Running continuously widens who can ask for a capture, not what can be
+  captured.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.minutes.uishot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_HELPER_PATH</string>
+        <string>--serve</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it dies, but back off so a persistent failure does not spin. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_LOG_PATH</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_LOG_PATH</string>
+
+    <!-- Background work: this is QA tooling and must never compete with a
+         recording or a live transcription for CPU. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>
