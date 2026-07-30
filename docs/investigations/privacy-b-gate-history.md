@@ -1427,3 +1427,28 @@ final reviews count for this SHA. The diagnostic candidate must repeat local
 gates before push and hosted lint/full CI on its exact SHA. Draft PR #604
 remains unmerged; no merge, tag, signing, publication, deployment, or release
 is authorized.
+
+THE DIAGNOSTIC LOCATED THE EXACT WINDOWS SHARE-MODE CONFLICT. Exact SHA
+`674fe5a2` passed lint run 30518954218. Full-CI run 30518954225 was green in
+every lane except native Windows unit tests and the aggregate gate; the Windows
+installer itself built successfully. Native Windows completed with 1,496
+passed, 9 failed, and 5 ignored. The private-directory and legacy-capture
+enforcement regressions passed. The root successor error was now labeled
+`private PARA stage capability rebind failed` with Windows sharing error 32.
+
+The rename-capable stage handle requests DELETE authority and permits delete
+sharing. The immediately following ordinary policy bind intentionally denies
+delete sharing, so Windows correctly refuses to place both handles on the same
+child. Reordering those two opens would merely reverse the same conflict.
+The replacement instead compares the rename-capable handle directly with the
+opaque identity proof captured from the atomically protected allocation and
+re-attests both its safe directory shape and owner-private permissions through
+that exact handle. The retained private parent capability is checked before
+and after this descriptor-relative reopen. No second, conflicting child handle
+is required, and an attacker-selected replacement cannot satisfy the original
+allocation proof.
+
+STATUS: `674fe5a2` is not accepted. No validation-only workflow or independent
+final reviews count for this SHA. The replacement must repeat every local and
+hosted gate on one exact candidate. Draft PR #604 remains unmerged; no merge,
+tag, signing, publication, deployment, or release is authorized.

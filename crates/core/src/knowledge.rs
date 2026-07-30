@@ -8405,14 +8405,8 @@ fn create_para_successor(
         .open_with(stage_name, &para_open_directory_options())
         .map_err(|error| format!("private PARA stage reopen failed: {error}"))?
         .into_std();
-    let stage = boundary
-        .bind_existing_owner_private_child(stage_name)
-        .map_err(|error| format!("private PARA stage capability rebind failed: {error}"))?;
-    stage
-        .attest_recovery_directory_proof(&stage_proof)
-        .map_err(|error| format!("private PARA stage identity recheck failed: {error}"))?;
-    stage
-        .attest_exact_directory_file(&opened)
+    stage_proof
+        .attest_exact_owner_private_directory_file(&opened)
         .map_err(|error| format!("private PARA stage handle comparison failed: {error}"))?;
     boundary
         .attest_for_source_cleanup()
@@ -8446,11 +8440,6 @@ fn create_para_successor(
         .map_err(|error| format!("private PARA parent final recheck failed: {error}"))?;
     sync_para_directory_handle(&opened)?;
     sync_para_directory(private_root)?;
-    // The bound policy capability intentionally denies delete sharing while
-    // private members are written and flushed. Release that guard before the
-    // final PARA verifier reopens the directory with DELETE authority for the
-    // later exact-generation move.
-    drop(stage);
     let successor = ParaPersonSuccessor {
         path,
         directory: opened,

@@ -43,6 +43,41 @@ pub struct RecoveryDirectoryProof {
     identity: BoundFileIdentity,
 }
 
+impl RecoveryDirectoryProof {
+    /// Re-attest a reopened owner-private directory through the caller's exact
+    /// handle. This lets a short-lived Windows rename-capable handle prove
+    /// continuity with an atomically protected allocation without retaining a
+    /// second no-delete-sharing policy handle beside it.
+    pub(crate) fn attest_exact_owner_private_directory_file(
+        &self,
+        directory: &File,
+    ) -> std::io::Result<()> {
+        if bound_file_identity(directory)? != self.identity {
+            return Err(invalid_recovery_path(
+                "reopened private directory does not match its allocation proof",
+            ));
+        }
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
+            return Err(invalid_recovery_path(
+                "reopened private directory is not a safe directory",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.mode() & 0o777 != 0o700 {
+                return Err(invalid_recovery_path(
+                    "reopened private directory is not mode 0700",
+                ));
+            }
+        }
+        #[cfg(windows)]
+        crate::overlays::attest_owner_only_directory_handle(directory)?;
+        Ok(())
+    }
+}
+
 impl RecoveryFileProof {
     /// Return the exact byte length bound into this opaque proof without
     /// exposing its identity or digest.
