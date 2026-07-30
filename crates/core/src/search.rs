@@ -1022,10 +1022,16 @@ impl MeetingMutation {
     }
 
     pub fn stage_delete_group(
-        &self,
+        self,
         siblings: &[PathBuf],
     ) -> std::io::Result<StagedMeetingDeletion> {
-        self.stage_delete_group_with_hooks(siblings, |_| {}, |_| {})
+        let staged = self.stage_delete_group_with_hooks(siblings, |_| {}, |_| {})?;
+        // On Windows the mutation retains companion handles that deliberately
+        // bind the source and optional siblings through the ordered move.
+        // Retire those authorization handles before the caller asks the
+        // staged transaction to apply exact POSIX-style disposition.
+        drop(self);
+        Ok(staged)
     }
 
     fn stage_delete_group_with_hooks(
@@ -4684,6 +4690,11 @@ mod tests {
         }
     }
 
+    // POSIX renames by source name and must reject a name winner installed at
+    // the claim boundary. Windows renames the already-authorized exact handle,
+    // so the safe result there is to move the old object while preserving the
+    // new source-name winner; the adjacent atomic-transfer tests enforce that.
+    #[cfg(unix)]
     #[test]
     fn archive_and_staged_delete_reject_source_inode_swap_at_atomic_claim() {
         for staged_delete in [false, true] {
@@ -4834,6 +4845,9 @@ mod tests {
         assert_single_retained_empty_staging(&root);
     }
 
+    // See the source-swap test above: this fixture exercises POSIX's
+    // name-based primitive. Windows binds and moves the exact sibling handle.
+    #[cfg(unix)]
     #[test]
     fn archive_group_rejects_sibling_inode_swap_at_atomic_claim() {
         let temp = TempDir::new().unwrap();
@@ -4873,6 +4887,7 @@ mod tests {
         assert!(!root.join("archive/meeting.wav").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn staged_delete_rejects_sibling_inode_swap_at_atomic_claim() {
         let temp = TempDir::new().unwrap();

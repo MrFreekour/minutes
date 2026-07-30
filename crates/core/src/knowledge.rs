@@ -10835,7 +10835,7 @@ mod windows_private {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, FileAttributeTagInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS,
+        GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ADD_FILE, FILE_ALL_ACCESS,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
@@ -11185,7 +11185,12 @@ mod windows_private {
         // this exact directory until the descriptor is dropped.
         let file = open_existing(
             path,
-            FILE_LIST_DIRECTORY | FILE_TRAVERSE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            FILE_ADD_FILE
+                | FILE_LIST_DIRECTORY
+                | FILE_TRAVERSE
+                | READ_CONTROL
+                | WRITE_DAC
+                | WRITE_OWNER,
             true,
             false,
         )?;

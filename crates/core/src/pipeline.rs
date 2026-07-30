@@ -3651,7 +3651,7 @@ mod authorized_process_input_tests {
             "wav",
         )
         .unwrap();
-        input.processing_path = PathBuf::from("minutes-private-audio://missing-authority.wav");
+        input.processing_path = dir.path().join("missing-private-audio-authority.wav");
 
         let error = process_with_template_authorized(
             &input,

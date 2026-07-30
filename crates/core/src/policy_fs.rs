@@ -2074,7 +2074,13 @@ impl BoundRecoveryDirectory {
 
         #[cfg(windows)]
         {
-            delete_file_by_handle(&file.file)?;
+            // POSIX-style disposition removes the visible link when the
+            // handle on which disposition was set is closed. Use a dedicated
+            // clone so the caller may keep its exact recovery capability
+            // while the namespace retirement is completed and attested.
+            let delete_handle = file.file.try_clone()?;
+            delete_file_by_handle(&delete_handle)?;
+            drop(delete_handle);
             drop(visible);
 
             match self.chain.leaf().symlink_metadata(&name) {
@@ -2140,7 +2146,15 @@ impl BoundRecoveryDirectory {
             .open_with(name, &private_lease_file_open_options(true))
         {
             Ok(file) => file.into_std(),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || cfg!(windows) && error.raw_os_error() == Some(32) =>
+            {
+                // CREATE_NEW can report ERROR_SHARING_VIOLATION before
+                // ERROR_FILE_EXISTS when a retained Windows lease identity
+                // deliberately denies delete sharing. Re-open the existing
+                // read/write identity and prove it below; the retained
+                // no-delete-sharing peer prevents a name swap meanwhile.
                 open_private_lease_file_at(self.chain.leaf(), name)?
             }
             Err(error) => return Err(error),
@@ -2492,7 +2506,14 @@ impl BoundRecoveryLeaseFile {
     pub fn try_lock_exclusive(&self) -> std::io::Result<bool> {
         match fs2::FileExt::try_lock_exclusive(&self.file.file) {
             Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && error.raw_os_error() == Some(33) =>
+            {
+                // LockFileEx reports ERROR_LOCK_VIOLATION on Windows, which
+                // Rust currently categorizes as Uncategorized.
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -2546,7 +2567,12 @@ impl BoundRecoveryFile {
     pub fn try_lock_exclusive(&self) -> std::io::Result<bool> {
         match fs2::FileExt::try_lock_exclusive(&self.file) {
             Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && error.raw_os_error() == Some(33) =>
+            {
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }

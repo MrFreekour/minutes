@@ -1007,10 +1007,30 @@ streaming/executable-authority prototype. The batch removes that dead prototype
 and its lone `File` import instead of suppressing the lint; active Recall
 source reauthorization and local Ollama behavior are unchanged.
 
-STATUS: `e9b2ac90`, `a62cc0b0`, and `91d8ee43` are not accepted. Exact terminal receipts
-for the replacement candidate are recorded on draft PR #604 rather than in a
-post-validation receipt-only commit. Acceptance still requires ordinary CI and
-the focused validation-only Windows workflow to be green for the same exact
-current-main-based SHA, followed by three fresh independent non-blocking
-reviews of that SHA. The draft PR must remain unmerged, and no release action is
-authorized.
+THE SECOND REPLACEMENT REMAINS BLOCKED, BUT CLOSED THE CHILD-LAUNCH DEFECT.
+Hosted run 30502676456 at `d5d5f94f` passed the Windows Job memory controls,
+the read-only executable-snapshot child-launch regression, the Windows
+installer build, and every completed non-core Windows lane. It reduced the
+ordinary Windows core result again, from 74 failures to 69; the audio-decode,
+diarization-fallback, duration-routing, and unrelated-state graph failures
+disappeared. The remaining output exposed four shared Windows contracts rather
+than 69 independent product defects. POSIX-style Windows disposition removes a
+link when the disposition handle closes, so exact private retirement now uses
+a dedicated clone and closes it before checking namespace absence. Windows
+reports retained-lease CREATE_NEW and lock contention as raw sharing/lock
+violations (32/33), so the binder safely reopens the no-delete-sharing identity
+after 32 and the nonblocking lock wrapper normalizes 33. Relative private file
+creation grants add-file access on the retained directory, and a missing
+private-audio authority fixture now uses a native absent path rather than a
+Unix-shaped URI. Source/sibling inode-swap fixtures are POSIX-scoped because
+Windows safely moves the already-authorized exact handle; adjacent
+Windows-capable atomic-transfer tests preserve and assert the new pathname
+winner.
+
+STATUS: `e9b2ac90`, `a62cc0b0`, `91d8ee43`, and `d5d5f94f` are not accepted.
+Exact terminal receipts for the replacement candidate are recorded on draft PR
+#604 rather than in a post-validation receipt-only commit. Acceptance still
+requires ordinary CI and the focused validation-only Windows workflow to be
+green for the same exact current-main-based SHA, followed by three fresh
+independent non-blocking reviews of that SHA. The draft PR must remain
+unmerged, and no release action is authorized.
