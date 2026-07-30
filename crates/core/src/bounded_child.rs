@@ -2689,10 +2689,19 @@ mod windows_tests {
     }
 
     fn child_and_grandchild_script(pid_path: &std::path::Path, leader_tail: &str) -> String {
+        let grandchild_stdout = pid_path.with_extension("stdout");
+        let grandchild_stderr = pid_path.with_extension("stderr");
+        // These tests exercise Job retirement, not the separate contract where
+        // a descendant retaining supervisor pipes keeps the tree alive. Make
+        // the fixture explicit instead of depending on Start-Process handle
+        // inheritance, which varies across Windows runner launches.
         format!(
             "$grandchild = Start-Process -FilePath \"$env:SystemRoot\\System32\\ping.exe\" \
-             -ArgumentList @('-n','30','127.0.0.1') -WindowStyle Hidden -PassThru; \
+             -ArgumentList @('-n','30','127.0.0.1') -WindowStyle Hidden \
+             -RedirectStandardOutput '{}' -RedirectStandardError '{}' -PassThru; \
              [IO.File]::WriteAllText('{}', [string]$grandchild.Id); {leader_tail}",
+            quote_powershell_literal(&grandchild_stdout),
+            quote_powershell_literal(&grandchild_stderr),
             quote_powershell_literal(pid_path)
         )
     }
