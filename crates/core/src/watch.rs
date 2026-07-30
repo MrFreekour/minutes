@@ -476,7 +476,12 @@ fn move_to_with_hooks(
                         sidecar_error,
                     )),
                     Err(rollback_error) => Err(WatchError::MoveError(
-                        sidecar_dest.display().to_string(),
+                        format!(
+                            "{}; audio remains at {}; sidecar remains at {}",
+                            sidecar_dest.display(),
+                            dest.display(),
+                            sidecar.display()
+                        ),
                         std::io::Error::other(format!(
                             "could not preserve watcher sidecar: {sidecar_error}; audio rollback also failed: {rollback_error}; audio remains at {} and sidecar remains at {}",
                             dest.display(),

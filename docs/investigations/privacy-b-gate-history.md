@@ -1027,7 +1027,30 @@ Windows safely moves the already-authorized exact handle; adjacent
 Windows-capable atomic-transfer tests preserve and assert the new pathname
 winner.
 
-STATUS: `e9b2ac90`, `a62cc0b0`, `91d8ee43`, and `d5d5f94f` are not accepted.
+THE THIRD REPLACEMENT REMAINS BLOCKED, BUT MADE THE RESIDUAL CONTRACT EXACT.
+Hosted run 30504083202 at `82030290` made lint, Linux, every short
+cross-platform lane, and the Windows CLI install green, but the ordinary
+Windows core result remained red: 1,441 passed, 60 failed, and 5 ignored.
+The shared private-retirement output proved that a `File::try_clone` is not an
+independent Windows POSIX-delete file object: disposition on the duplicate
+still conflicted with the retained original. Exact retirement now consumes the
+capability, closes its confirming pathname handles, applies disposition to the
+retained exact file object, and closes it before asserting namespace absence.
+The API shape prevents a caller from accidentally keeping that internal
+authority alive after retirement.
+
+The same run also proved that generic mutation-capable file attestation cannot
+be reused for a Windows no-delete-sharing lease. It requested DELETE access
+while the retained lease deliberately denied delete sharing, producing raw
+sharing violation 32 against Minutes' own handle. Lease files now rebind and
+identity-attest through the same no-delete-sharing open contract before and
+after lock/audit operations. The remaining isolated search fixture retires its
+intentionally stale mutation authority before opening a fresh explicit
+restricted-content override, and split-state watcher errors carry the audio
+and sidecar recovery locations in the outer typed error context.
+
+STATUS: `e9b2ac90`, `a62cc0b0`, `91d8ee43`, `d5d5f94f`, and `82030290` are not
+accepted.
 Exact terminal receipts for the replacement candidate are recorded on draft PR
 #604 rather than in a post-validation receipt-only commit. Acceptance still
 requires ordinary CI and the focused validation-only Windows workflow to be

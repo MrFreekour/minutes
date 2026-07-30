@@ -1033,9 +1033,12 @@ impl GraphSnapshotJournal {
                     }
                 }
             }
-            let retired = fences
-                .iter()
-                .all(|(directory, fence, _)| directory.remove_owned_private_file(fence).is_ok());
+            let mut retired = true;
+            for (directory, fence, _) in fences {
+                if directory.remove_owned_private_file(fence).is_err() {
+                    retired = false;
+                }
+            }
             #[cfg(test)]
             if observed.iter().any(|seen| !seen) || !retired || self.dirty {
                 eprintln!(

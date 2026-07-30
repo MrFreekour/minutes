@@ -4167,6 +4167,7 @@ mod tests {
         assert!(mutation.archive_group(&[]).is_err());
         assert!(path.exists());
         assert!(!dir.path().join("archive").exists());
+        drop(mutation);
 
         assert!(open_authorized_meeting_mutation(&path, &config, false).is_err());
         assert!(open_authorized_meeting_mutation(&path, &config, true).is_ok());

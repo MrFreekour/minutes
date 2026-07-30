@@ -420,9 +420,9 @@ pub fn append_restricted_override_audit_at_with_hook(
     let lease =
         directory.bind_or_create_private_lease_file(OsStr::new("sensitivity-overrides.lock"))?;
     crate::overlays::secure_private_file_handle(&lease.file.file)?;
-    lease.file.attest_visible_identity()?;
+    lease.attest_visible_identity()?;
     lease.lock_exclusive()?;
-    lease.file.attest_visible_identity()?;
+    lease.attest_visible_identity()?;
 
     // Use the non-delete-sharing lease handle contract for the data leaf too.
     // On Windows this makes rename/delete impossible while authorization is
@@ -431,7 +431,7 @@ pub fn append_restricted_override_audit_at_with_hook(
     let audit =
         directory.bind_or_create_private_lease_file(OsStr::new("sensitivity-overrides.jsonl"))?;
     crate::overlays::secure_private_file_handle(&audit.file.file)?;
-    audit.file.attest_visible_identity()?;
+    audit.attest_visible_identity()?;
     let mut file = audit.file.file.try_clone()?;
     let before = file.metadata()?.len();
     let record_len = u64::try_from(record.len())
@@ -479,10 +479,10 @@ pub fn append_restricted_override_audit_at_with_hook(
             "restricted override audit append could not be re-attested",
         ));
     }
-    audit.file.attest_visible_identity()?;
+    audit.attest_visible_identity()?;
     directory.sync()?;
-    audit.file.attest_visible_identity()?;
-    lease.file.attest_visible_identity()?;
+    audit.attest_visible_identity()?;
+    lease.attest_visible_identity()?;
     Ok(())
 }
 
@@ -2014,11 +2014,11 @@ impl BoundRecoveryDirectory {
             expected_digest: Cell::new(None),
         };
         if let Err(error) = bound.fill_exact_empty_visible(bytes) {
-            let _ = self.remove_owned_private_file(&bound);
+            let _ = self.remove_owned_private_file(bound);
             return Err(error);
         }
         if let Err(error) = self.sync() {
-            let _ = self.remove_owned_private_file(&bound);
+            let _ = self.remove_owned_private_file(bound);
             return Err(error);
         }
         Ok(bound)
@@ -2038,14 +2038,14 @@ impl BoundRecoveryDirectory {
     }
 
     /// concurrent hard link outside this namespace survives unchanged.
-    pub fn remove_owned_private_file(&self, file: &BoundRecoveryFile) -> std::io::Result<()> {
+    pub fn remove_owned_private_file(&self, file: BoundRecoveryFile) -> std::io::Result<()> {
         self.remove_owned_private_file_with_hook(file, || {})
     }
 
     #[doc(hidden)]
     pub(crate) fn remove_owned_private_file_with_hook(
         &self,
-        file: &BoundRecoveryFile,
+        file: BoundRecoveryFile,
         after_final_identity_check: impl FnOnce(),
     ) -> std::io::Result<()> {
         if !self.owner_private_namespace {
@@ -2074,14 +2074,15 @@ impl BoundRecoveryDirectory {
 
         #[cfg(windows)]
         {
-            // POSIX-style disposition removes the visible link when the
-            // handle on which disposition was set is closed. Use a dedicated
-            // clone so the caller may keep its exact recovery capability
-            // while the namespace retirement is completed and attested.
-            let delete_handle = file.file.try_clone()?;
-            delete_file_by_handle(&delete_handle)?;
-            drop(delete_handle);
+            // DuplicateHandle clones share one kernel file object, so closing
+            // only a Rust `File::try_clone` does not close the POSIX-delete
+            // file object while the original capability is retained. Exact
+            // retirement therefore consumes the capability: close every
+            // confirming pathname handle first, set disposition on the sole
+            // retained exact file object, then close that object.
             drop(visible);
+            delete_file_by_handle(&file.file)?;
+            drop(file);
 
             match self.chain.leaf().symlink_metadata(&name) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2502,6 +2503,25 @@ impl BoundRecoveryDirectory {
 }
 
 impl BoundRecoveryLeaseFile {
+    /// Re-open a retained lease with the same no-delete-sharing contract.
+    ///
+    /// `BoundRecoveryFile::attest_visible_identity` intentionally re-opens
+    /// ordinary mutation-capable files with DELETE access and delete sharing.
+    /// That is incompatible with the lease invariant on Windows and produces
+    /// ERROR_SHARING_VIOLATION against our own retained handle.
+    fn attest_visible_identity(&self) -> std::io::Result<()> {
+        self.file.parent_chain.attest()?;
+        let current = open_private_lease_file_at(self.file.parent_chain.leaf(), &self.file.name)?;
+        if !open_file_identity_matches(&self.file.file, &current)
+            || !opened_regular_file_is_safe(&self.file.file)
+        {
+            return Err(invalid_recovery_path(
+                "private lease name was replaced while retained",
+            ));
+        }
+        Ok(())
+    }
+
     /// Try to acquire the advisory lock on the exact retained lease identity.
     pub fn try_lock_exclusive(&self) -> std::io::Result<bool> {
         match fs2::FileExt::try_lock_exclusive(&self.file.file) {
@@ -3131,7 +3151,7 @@ fn retire_legacy_policy_caches_at(state_root: &Path) -> std::io::Result<()> {
             continue;
         }
         let file = state.bind_exact_file(name)?.zero_exact_for_retirement()?;
-        state.remove_owned_private_file(&file)?;
+        state.remove_owned_private_file(file)?;
     }
     let legacy_graph_name = OsStr::new("graph");
     if state.entry_exists(legacy_graph_name)? {
@@ -3144,7 +3164,7 @@ fn retire_legacy_policy_caches_at(state_root: &Path) -> std::io::Result<()> {
             let file = legacy_graph
                 .bind_exact_file(name)?
                 .zero_exact_for_retirement()?;
-            legacy_graph.remove_owned_private_file(&file)?;
+            legacy_graph.remove_owned_private_file(file)?;
         }
         state.remove_owned_private_empty_child(legacy_graph)?;
     }
@@ -4120,13 +4140,13 @@ mod tests {
             .create_random_private_control_file("policy-fence", b"OTHER_CONTROL_CANARY")
             .unwrap();
         assert_ne!(control.display_path(), other.display_path());
-        directory.remove_owned_private_file(&control).unwrap();
+        directory.remove_owned_private_file(control).unwrap();
         assert!(!path.exists());
         assert_eq!(
             fs::read(other.display_path()).unwrap(),
             b"OTHER_CONTROL_CANARY"
         );
-        directory.remove_owned_private_file(&other).unwrap();
+        directory.remove_owned_private_file(other).unwrap();
     }
 
     #[cfg(unix)]
@@ -4143,7 +4163,7 @@ mod tests {
         let bound = parent.bind_exact_file(OsStr::new("obsolete.json")).unwrap();
 
         let error = parent
-            .remove_owned_private_file_with_hook(&bound, || {
+            .remove_owned_private_file_with_hook(bound, || {
                 fs::rename(&target, &displaced).unwrap();
                 fs::rename(&sibling, &target).unwrap();
             })

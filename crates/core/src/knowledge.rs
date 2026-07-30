@@ -2265,7 +2265,7 @@ fn remove_observed_empty_windows_provenance_residue_with_hook(
     {
         return Err("private provenance empty residue changed at the removal boundary".into());
     }
-    directory.remove_owned_private_file(&file)?;
+    directory.remove_owned_private_file(file)?;
     Ok(())
 }
 
@@ -6870,7 +6870,7 @@ fn remove_owner_private_para_file(path: &Path) -> Result<(), Box<dyn std::error:
     let name = path.file_name().ok_or("private PARA file has no name")?;
     let boundary = crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(parent)?;
     let file = boundary.bind_file_allow_links(name)?;
-    boundary.remove_owned_private_file(&file)?;
+    boundary.remove_owned_private_file(file)?;
     Ok(())
 }
 
