@@ -1301,7 +1301,7 @@ describe("stable corpus lease", () => {
           return new Promise<never>(() => {});
         },
         {
-          timeoutMs: 5_000,
+          timeoutMs: 15_000,
           operationDeadlineForTest: operationDeadline,
         }
       );
