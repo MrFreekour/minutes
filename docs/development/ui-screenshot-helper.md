@@ -54,39 +54,41 @@ persistence, and it writes exactly the output path it is given.
 One-time, and it needs a GUI session because TCC prompts and the keychain are
 not reachable over SSH.
 
-1. Build and install the helper. `cargo build -p minutes-app` compiles it to
-   `tauri/src-tauri/bin/ui_shot` as part of the normal build; copy it somewhere
-   stable:
+Run this in a Terminal **on the machine**, not over SSH:
 
-   ```bash
-   mkdir -p ~/.minutes/bin
-   cp tauri/src-tauri/bin/ui_shot ~/.minutes/bin/ui_shot
-   chmod 755 ~/.minutes/bin/ui_shot
-   ```
+```bash
+./scripts/install-ui-shot.sh
+```
 
-2. **Sign it with a stable identity.** This step is what makes the grant
-   survive rebuilds, and it must run in a Terminal on the machine (the login
-   keychain is not available over SSH):
+It builds, installs to `~/.minutes/bin/ui_shot`, signs with the first stable
+identity it finds (override with `MINUTES_DEV_SIGNING_IDENTITY`), and then tells
+you whether the Screen Recording grant is already held.
 
-   ```bash
-   codesign --force --options runtime \
-     --sign "Developer ID Application: Your Name (TEAMID)" \
-     ~/.minutes/bin/ui_shot
-   ```
+Two constraints make this a script rather than a copy-paste:
 
-   Without it the binary is ad-hoc signed, which means TCC identifies it by
-   content hash and **every rebuild invalidates the grant**. That is the same
-   failure mode as a dev app whose Accessibility grant silently stops working
-   after a local rebuild: the entry still appears in System Settings, but the
-   running binary no longer matches it.
+- **`codesign` needs the login keychain**, which an SSH session cannot reach; it
+  fails with `errSecInternalComponent`. So this step cannot be automated
+  remotely, which also means an agent cannot silently re-grant itself capture
+  access.
+- **Signing must happen on every rebuild.** Without a stable identity the binary
+  is ad-hoc signed, TCC identifies it by content hash, and each rebuild
+  invalidates the grant. That is the same failure mode as a locally rebuilt dev
+  app losing Accessibility: the entry stays listed in System Settings while the
+  running binary no longer matches it.
 
-3. Grant Screen Recording. Run it once to trigger the prompt, or add it
-   manually: System Settings, Privacy and Security, Screen and System Audio
-   Recording, then add `~/.minutes/bin/ui_shot`.
+Then grant Screen Recording if the script says it is missing: System Settings,
+Privacy and Security, Screen and System Audio Recording, add
+`~/.minutes/bin/ui_shot`.
 
-   If you had granted an earlier build and it stopped working, remove the entry
-   with the minus button and re-add it. Toggling it off and on re-enables the
-   same stale record and does not help.
+If an entry is already listed but `ui_shot --check` still reports not granted,
+remove it with the minus button and re-add it. Toggling it off and on re-enables
+the same stale record.
+
+Verify any time with:
+
+```bash
+~/.minutes/bin/ui_shot --check
+```
 
 ## Usage
 
