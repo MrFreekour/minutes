@@ -1290,3 +1290,28 @@ canceled while its remaining macOS/installer jobs were still running. No
 focused validation-only workflow or independent final review counts for that
 SHA. Draft PR #604 remains unmerged; no merge, tag, signing, publication,
 deployment, or release is authorized.
+
+THE HOME-LOCK HYPOTHESIS WAS DISPROVED. Exact SHA `2667b223` passed lint run
+30513281245 and the complete deterministic local no-default core suite with
+1,649 passed, zero failed, and one ignored. Native Windows in full-CI run
+30513281240 nevertheless failed the same nine knowledge/PARA tests with the
+same owner-private directory-attestation error: 1,496 passed, 9 failed, and
+5 ignored. Therefore the speculative re-entrant home-lock change and its test
+are removed rather than retained.
+
+The remaining Windows-only common pre-step was
+`prepare_para_private_root`: it called the knowledge module's ambient
+create-or-tighten walker on the deterministic directory immediately before
+entering the policy filesystem's verification-only existing-directory
+boundary. The replacement removes that duplicate rewrite. The policy
+filesystem alone now creates an absent final directory with its DACL attached
+atomically or verifies an existing exact retained directory without rewriting
+it. Windows attestation errors now include the normalized exact path so a
+further native failure identifies the affected namespace rather than repeating
+an ambiguous descriptor message.
+
+STATUS: `2667b223` is not accepted. Its already-failed superseded run was
+canceled while the remaining native jobs were active. No focused
+validation-only workflow or independent final review counts for that SHA.
+Draft PR #604 remains unmerged; no merge, tag, signing, publication,
+deployment, or release is authorized.

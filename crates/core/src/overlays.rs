@@ -127,12 +127,6 @@ pub(crate) fn legacy_default_state_dir() -> PathBuf {
 }
 
 pub(crate) fn correction_state_dir() -> PathBuf {
-    // HOME and MINUTES_HOME are process-global. Unit tests that deliberately
-    // override either variable hold the same re-entrant lock, so unrelated
-    // path resolution waits for the override to be restored instead of
-    // escaping into a concurrently-owned temporary tree.
-    #[cfg(test)]
-    let _home_env_guard = crate::test_support::home_env_lock();
     let home = resolved_home_dir();
     let Some(configured_os) = std::env::var_os("MINUTES_HOME") else {
         return home.join(".minutes");
@@ -1336,49 +1330,6 @@ mod tests {
         drop(conn);
         let error = stable_speaker_overlay_snapshot_at(&db).unwrap_err();
         assert!(error.to_string().contains("materialization budget"));
-    }
-
-    #[test]
-    fn correction_root_waits_for_a_concurrent_home_override_to_retire() {
-        let expected = correction_state_dir();
-        let override_home = TempDir::new().unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
-
-        let override_path = override_home.path().to_path_buf();
-        let override_thread = std::thread::spawn(move || {
-            let _guard = crate::test_support::home_env_lock();
-            let old_home = std::env::var_os("HOME");
-            let old_minutes_home = std::env::var_os("MINUTES_HOME");
-            std::env::set_var("HOME", override_path);
-            std::env::remove_var("MINUTES_HOME");
-            ready_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            match old_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match old_minutes_home {
-                Some(value) => std::env::set_var("MINUTES_HOME", value),
-                None => std::env::remove_var("MINUTES_HOME"),
-            }
-        });
-
-        ready_rx.recv().unwrap();
-        let resolver = std::thread::spawn(move || {
-            resolved_tx.send(correction_state_dir()).unwrap();
-        });
-        assert!(
-            resolved_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "an unrelated resolver must not observe a concurrent override"
-        );
-        release_tx.send(()).unwrap();
-        override_thread.join().unwrap();
-        assert_eq!(resolved_rx.recv().unwrap(), expected);
-        resolver.join().unwrap();
     }
 
     #[test]

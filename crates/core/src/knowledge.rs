@@ -6187,8 +6187,6 @@ fn unscoped_para_private_root(knowledge: &Path) -> Result<PathBuf, Box<dyn std::
 }
 
 fn prepare_para_private_root(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    create_private_dir_all(path)?;
-    set_restrictive_directory_permissions(path)?;
     crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(path)?;
     Ok(())
 }

@@ -1780,7 +1780,16 @@ impl BoundRecoveryDirectory {
         #[cfg(windows)]
         crate::overlays::attest_owner_only_directory_handle(
             &directory.try_clone()?.into_std_file(),
-        )?;
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "private recovery directory DACL attestation failed for {}: {error}",
+                    normalized.display()
+                ),
+            )
+        })?;
         let chain = parent.with_child(name, &directory)?;
         chain.attest()?;
         Ok(Self {
