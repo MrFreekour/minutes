@@ -419,3 +419,55 @@ jobs:
             signed-dev-provenance.txt
           if-no-files-found: error
           retention-days: 1
+
+  run-signed-runtime:
+    name: Run signed Apple Speech byte-transport acceptance
+    needs:
+      - authorize-candidate
+      - sign-reviewed-artifact
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact protected acceptance harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/tags/acceptance-${{ needs.authorize-candidate.outputs.candidate_sha }}
+          fetch-depth: 1
+
+      - name: Download exact signed candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: minutes-dev-signed-${{ needs.authorize-candidate.outputs.candidate_sha }}
+          path: payload
+
+      - name: Verify and expand exact signed candidate
+        env:
+          CANDIDATE_SHA: ${{ needs.authorize-candidate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          (
+            cd payload
+            shasum -a 256 -c minutes-dev-signed.zip.sha256
+          )
+          mkdir -p runtime
+          ditto -x -k payload/minutes-dev-signed.zip runtime
+          test -d "runtime/Minutes Dev.app"
+
+      - name: Exercise signed byte path under same-UID open holder
+        env:
+          CANDIDATE_SHA: ${{ needs.authorize-candidate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/test_apple_speech_signed_transport.py \
+            --app "runtime/Minutes Dev.app" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            | tee signed-runtime-provenance.json
+
+      - name: Upload content-free signed runtime receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: apple-speech-signed-runtime-${{ needs.authorize-candidate.outputs.candidate_sha }}
+          path: signed-runtime-provenance.json
+          if-no-files-found: error
+          retention-days: 1

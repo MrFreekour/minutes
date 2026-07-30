@@ -1128,6 +1128,19 @@ impl AppleSpeechServicePhase {
     }
 
     fn append_chunk(&mut self, sequence: u64, data: &[u8]) -> bool {
+        self.append_chunk_with_limit(
+            sequence,
+            data,
+            crate::apple_speech_worker::MAX_REQUEST_BYTES,
+        )
+    }
+
+    fn append_chunk_with_limit(
+        &mut self,
+        sequence: u64,
+        data: &[u8],
+        max_request_bytes: usize,
+    ) -> bool {
         let Self::Receiving {
             next_sequence,
             input,
@@ -1141,7 +1154,7 @@ impl AppleSpeechServicePhase {
             || input
                 .len()
                 .checked_add(data.len())
-                .is_none_or(|total| total > crate::apple_speech_worker::MAX_REQUEST_BYTES)
+                .is_none_or(|total| total > max_request_bytes)
         {
             return false;
         }
@@ -1170,9 +1183,20 @@ impl AppleSpeechServicePhase {
     }
 
     fn install_response(&mut self, response: Vec<u8>) -> bool {
+        self.install_response_with_limit(
+            response,
+            crate::apple_speech_worker::MAX_RESPONSE_BYTES as usize,
+        )
+    }
+
+    fn install_response_with_limit(
+        &mut self,
+        response: Vec<u8>,
+        max_response_bytes: usize,
+    ) -> bool {
         if !matches!(self, Self::Processing)
             || response.is_empty()
-            || response.len() > crate::apple_speech_worker::MAX_RESPONSE_BYTES as usize
+            || response.len() > max_response_bytes
         {
             return false;
         }
@@ -1665,6 +1689,83 @@ mod tests {
         assert!(responding.install_response(b"result".to_vec()));
         assert!(responding.abort());
         assert!(!responding.abort());
+    }
+
+    #[test]
+    fn apple_speech_protocol_rejects_replay_reordering_and_premature_transitions() {
+        let mut phase = AppleSpeechServicePhase::AwaitingBegin;
+        assert!(phase.response_chunk(0).is_none());
+        assert!(phase.finish_input(0).is_none());
+        assert!(!phase.install_response(b"early".to_vec()));
+        assert!(phase.begin());
+        assert!(!phase.begin());
+        assert!(!phase.append_chunk(1, b"late"));
+        assert!(!phase.append_chunk(0, b""));
+        assert!(!phase.append_chunk(0, &vec![0; XPC_CHUNK_BYTES + 1]));
+        assert!(phase.append_chunk(0, b"first"));
+        assert!(!phase.append_chunk(0, b"replay"));
+        assert!(!phase.append_chunk(2, b"skip"));
+        assert!(phase.append_chunk(1, b"second"));
+        assert!(phase.finish_input(1).is_none());
+        assert_eq!(phase.finish_input(2).unwrap().as_slice(), b"firstsecond");
+        assert!(phase.install_response(b"response".to_vec()));
+        assert!(!phase.install_response(b"replacement".to_vec()));
+        assert!(phase.response_chunk(1).is_none());
+        assert_eq!(phase.response_chunk(0).unwrap(), b"response");
+        assert!(phase.response_complete());
+        assert!(phase.response_chunk(0).is_none());
+    }
+
+    #[test]
+    fn apple_speech_protocol_enforces_aggregate_request_and_response_budgets() {
+        let mut request = AppleSpeechServicePhase::AwaitingBegin;
+        assert!(request.begin());
+        assert!(request.append_chunk_with_limit(0, b"1234", 4));
+        assert!(!request.append_chunk_with_limit(1, b"5", 4));
+        assert_eq!(request.finish_input(1).unwrap().as_slice(), b"1234");
+
+        assert!(!request.install_response_with_limit(Vec::new(), 4));
+        assert!(!request.install_response_with_limit(b"12345".to_vec(), 4));
+        assert!(request.install_response_with_limit(b"1234".to_vec(), 4));
+        assert!(request.response_chunk(1).is_none());
+        assert_eq!(request.response_chunk(0).unwrap(), b"1234");
+        assert!(request.response_complete());
+    }
+
+    #[test]
+    fn apple_speech_abort_is_terminal_from_every_live_phase() {
+        let mut awaiting = AppleSpeechServicePhase::AwaitingBegin;
+        assert!(awaiting.abort());
+        assert!(!awaiting.abort());
+
+        let mut receiving = AppleSpeechServicePhase::AwaitingBegin;
+        assert!(receiving.begin());
+        assert!(receiving.abort());
+        assert!(!receiving.abort());
+
+        let mut processing = AppleSpeechServicePhase::Processing;
+        assert!(processing.abort());
+        assert!(!processing.abort());
+
+        let mut responding = AppleSpeechServicePhase::Processing;
+        assert!(responding.install_response(b"result".to_vec()));
+        assert!(responding.abort());
+        assert!(!responding.abort());
+    }
+
+    #[test]
+    fn apple_speech_one_process_claim_and_disconnect_are_fail_closed() {
+        let claimed = AtomicBool::new(false);
+        assert!(claim_service_process(&claimed));
+        assert!(!claim_service_process(&claimed));
+        assert_eq!(
+            classify_service_peer_event(false, false, true),
+            ServicePeerEvent::CancelPeer
+        );
+        assert_eq!(
+            classify_service_peer_event(false, true, false),
+            ServicePeerEvent::ExitProcess
+        );
     }
 
     #[test]

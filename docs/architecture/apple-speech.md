@@ -33,6 +33,14 @@ app proves the exact reviewed SHA on macOS 26, including the hostile same-UID
 open-holder regression and fallback behavior. A positive source compile,
 unsigned build, or operating-system capability probe is not that proof.
 
+The exact candidate includes a fixed-input, non-product
+`--apple-speech-transport-acceptance` route. It accepts no caller audio or path
+and does not make Apple Speech selectable. After the separately gated signing
+job has destroyed its credentials, a no-secret successor job can invoke that
+route from the signed app while a same-UID process watches and holds newly
+created temporary files. The resulting content-free receipt is acceptance
+evidence only after that protected workflow actually runs for the exact SHA.
+
 ## Fallback behavior
 
 Standalone live transcript and dictation currently resolve Apple Speech to:

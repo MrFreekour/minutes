@@ -149,6 +149,64 @@ pub(crate) fn transcribe_samples(
     })
 }
 
+/// Exercise the exact signed parent -> XPC -> Swift byte path without making
+/// Apple Speech selectable by normal product configuration. The input is a
+/// fixed synthetic canary and this entrypoint accepts no audio, path, or
+/// executable from the caller.
+#[cfg(target_os = "macos")]
+pub fn run_signed_transport_acceptance() -> Result<(), String> {
+    if crate::pipeline::apple_speech_private_audio_transport_supported() {
+        return Err("Apple Speech product selection must remain closed during acceptance".into());
+    }
+    if !crate::macos_graph_xpc::current_process_is_trusted_distribution() {
+        return Err("Apple Speech transport acceptance requires a trusted signed app".into());
+    }
+
+    let samples = acceptance_canary_samples();
+    let response =
+        transcribe_samples(&samples, Some("en-US"), AppleSpeechMode::Dictation, false)
+            .map_err(|error| format!("signed Apple Speech byte transport failed: {error}"))?;
+    validate_acceptance_response(&response, "en-US", false)?;
+
+    // Force a real framework-level failure through a second authenticated
+    // worker, then prove ordinary product resolution still chooses Whisper.
+    let failure = transcribe_samples(&samples, Some("zz-ZZ"), AppleSpeechMode::Speech, false)
+        .map_err(|error| format!("signed Apple Speech failure-path transport failed: {error}"))?;
+    validate_acceptance_response(&failure, "zz-ZZ", true)?;
+    let mut config = crate::config::Config::default();
+    config.live_transcript.backend = "apple-speech".to_string();
+    if crate::live_transcript::resolved_standalone_backend(&config) != "whisper" {
+        return Err("Apple Speech failure did not preserve the product Whisper fallback".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn acceptance_canary_samples() -> Vec<f32> {
+    (0..SAMPLE_RATE_HZ as usize)
+        .map(|index| f32::from_bits(0x3e00_0000 + (index % 4_096) as u32))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn validate_acceptance_response(
+    response: &AppleSpeechTranscriptionResult,
+    expected_locale: &str,
+    require_failure: bool,
+) -> Result<(), String> {
+    if response.kind != "transcription"
+        || response.schema_version != REQUEST_SCHEMA_VERSION
+        || response.locale != expected_locale
+        || response.ensure_assets
+    {
+        return Err("Apple Speech acceptance received an inconsistent typed response".into());
+    }
+    if require_failure && response.error.is_none() {
+        return Err("Apple Speech acceptance failure probe unexpectedly succeeded".into());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn authority() -> Result<MacAppleSpeechWorkerAuthority, String> {
     if let Some(authority) = APPLE_SPEECH_WORKER_AUTHORITY.get() {
@@ -282,9 +340,14 @@ impl Drop for SwiftResponse {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn process_private_audio_request(input: &[u8]) -> Result<Vec<u8>, String> {
-    use zeroize::Zeroizing;
+#[derive(Debug)]
+struct ParsedPrivateAudioRequest {
+    metadata: PrivateAudioRequest,
+    samples: zeroize::Zeroizing<Vec<f32>>,
+}
 
+#[cfg(target_os = "macos")]
+fn parse_private_audio_request(input: &[u8]) -> Result<ParsedPrivateAudioRequest, String> {
     if input.len() < REQUEST_MAGIC.len() + 4 || &input[..REQUEST_MAGIC.len()] != REQUEST_MAGIC {
         return Err("Apple Speech request magic was invalid".into());
     }
@@ -316,7 +379,7 @@ pub(crate) fn process_private_audio_request(input: &[u8]) -> Result<Vec<u8>, Str
     if audio.len() != metadata.sample_count.saturating_mul(size_of::<f32>()) {
         return Err("Apple Speech audio length did not match its exact sample capability".into());
     }
-    let mut samples = Zeroizing::new(Vec::with_capacity(metadata.sample_count));
+    let mut samples = zeroize::Zeroizing::new(Vec::with_capacity(metadata.sample_count));
     for bytes in audio.chunks_exact(size_of::<f32>()) {
         let sample = f32::from_le_bytes(
             bytes
@@ -328,18 +391,24 @@ pub(crate) fn process_private_audio_request(input: &[u8]) -> Result<Vec<u8>, Str
         }
         samples.push(sample);
     }
-    let mode = std::ffi::CString::new(metadata.mode.as_helper_arg())
+    Ok(ParsedPrivateAudioRequest { metadata, samples })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_private_audio_request(input: &[u8]) -> Result<Vec<u8>, String> {
+    let parsed = parse_private_audio_request(input)?;
+    let mode = std::ffi::CString::new(parsed.metadata.mode.as_helper_arg())
         .map_err(|_| "Apple Speech mode was invalid".to_string())?;
-    let locale = std::ffi::CString::new(metadata.locale)
+    let locale = std::ffi::CString::new(parsed.metadata.locale.as_str())
         .map_err(|_| "Apple Speech locale was invalid".to_string())?;
     let mut response_length = 0_usize;
     let response = unsafe {
         minutes_apple_speech_transcribe_pcm(
-            samples.as_ptr(),
-            samples.len(),
+            parsed.samples.as_ptr(),
+            parsed.samples.len(),
             mode.as_ptr(),
             locale.as_ptr(),
-            i32::from(metadata.ensure_assets),
+            i32::from(parsed.metadata.ensure_assets),
             &mut response_length,
         )
     };
@@ -436,5 +505,110 @@ mod tests {
     fn request_budget_is_finite_and_below_one_hour() {
         assert!(MAX_UTTERANCE_SECONDS <= 10 * 60);
         assert!(MAX_REQUEST_BYTES < 64 * 1024 * 1024);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn framed_request(mut metadata: PrivateAudioRequest, samples: &[f32]) -> Vec<u8> {
+        metadata.sample_count = samples.len();
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        let mut request = Vec::new();
+        request.extend_from_slice(REQUEST_MAGIC);
+        request.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        request.extend_from_slice(&metadata);
+        for sample in samples {
+            request.extend_from_slice(&sample.to_le_bytes());
+        }
+        request
+    }
+
+    #[cfg(target_os = "macos")]
+    fn valid_metadata() -> PrivateAudioRequest {
+        PrivateAudioRequest {
+            schema_version: REQUEST_SCHEMA_VERSION,
+            mode: AppleSpeechMode::Dictation,
+            locale: "en-US".to_string(),
+            ensure_assets: false,
+            sample_rate_hz: SAMPLE_RATE_HZ,
+            sample_count: 0,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_audio_parser_accepts_only_exact_finite_pcm_cardinality() {
+        let request = framed_request(valid_metadata(), &[0.25, -0.5, 0.75]);
+        let parsed = parse_private_audio_request(&request).unwrap();
+        assert_eq!(parsed.metadata.locale, "en-US");
+        assert_eq!(parsed.samples.as_slice(), &[0.25, -0.5, 0.75]);
+
+        let mut truncated = request.clone();
+        truncated.pop();
+        assert!(parse_private_audio_request(&truncated)
+            .unwrap_err()
+            .contains("exact sample capability"));
+
+        let non_finite = framed_request(valid_metadata(), &[f32::NAN]);
+        assert!(parse_private_audio_request(&non_finite)
+            .unwrap_err()
+            .contains("non-finite"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_audio_parser_rejects_magic_metadata_schema_and_budget_attacks() {
+        let valid = framed_request(valid_metadata(), &[0.0]);
+
+        let mut bad_magic = valid.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(parse_private_audio_request(&bad_magic)
+            .unwrap_err()
+            .contains("magic"));
+
+        let mut zero_metadata = valid.clone();
+        zero_metadata[REQUEST_MAGIC.len()..REQUEST_MAGIC.len() + 4]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        assert!(parse_private_audio_request(&zero_metadata)
+            .unwrap_err()
+            .contains("metadata exceeded"));
+
+        let mut bad_schema = valid_metadata();
+        bad_schema.schema_version += 1;
+        assert!(
+            parse_private_audio_request(&framed_request(bad_schema, &[0.0]))
+                .unwrap_err()
+                .contains("schema or sample budget")
+        );
+
+        let mut bad_rate = valid_metadata();
+        bad_rate.sample_rate_hz += 1;
+        assert!(
+            parse_private_audio_request(&framed_request(bad_rate, &[0.0]))
+                .unwrap_err()
+                .contains("schema or sample budget")
+        );
+
+        let oversized_metadata = PrivateAudioRequest {
+            sample_count: SAMPLE_RATE_HZ as usize * MAX_UTTERANCE_SECONDS + 1,
+            ..valid_metadata()
+        };
+        let metadata = serde_json::to_vec(&oversized_metadata).unwrap();
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(REQUEST_MAGIC);
+        oversized.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        oversized.extend_from_slice(&metadata);
+        assert!(parse_private_audio_request(&oversized)
+            .unwrap_err()
+            .contains("schema or sample budget"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn acceptance_canary_is_fixed_finite_and_one_second() {
+        let samples = acceptance_canary_samples();
+        assert_eq!(samples.len(), SAMPLE_RATE_HZ as usize);
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+        assert_eq!(samples[0].to_bits(), 0x3e00_0000);
+        assert_eq!(samples[4_095].to_bits(), 0x3e00_0fff);
+        assert_eq!(samples[4_096].to_bits(), 0x3e00_0000);
     }
 }

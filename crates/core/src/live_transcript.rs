@@ -4303,37 +4303,6 @@ mod tests {
     }
 
     #[test]
-    fn hostile_same_uid_open_holder_never_receives_apple_speech_audio() {
-        let cfg = Config::default();
-        let samples = vec![0.0f32; APPLE_SPEECH_LIVE_MIN_SAMPLES];
-        let seen_len = std::sync::Mutex::new(None::<usize>);
-        let directory = tempdir().unwrap();
-        let hostile_leaf = directory
-            .path()
-            .join("minutes-live-apple-speech-hostile.wav");
-        std::fs::write(&hostile_leaf, b"attacker-held-canary").unwrap();
-        let mut open_holder = std::fs::File::open(&hostile_leaf).unwrap();
-
-        let result = transcribe_with_apple_speech_for_live_sidecar_impl(
-            &samples,
-            &cfg,
-            |observed, _locale, _mode, _ensure_assets| {
-                *seen_len.lock().unwrap() = Some(observed.len());
-                Err(MinutesError::Io(std::io::Error::other(
-                    "simulated apple speech failure",
-                )))
-            },
-        );
-
-        assert!(result.is_err());
-        assert_eq!(*seen_len.lock().unwrap(), Some(samples.len()));
-        let mut observed = String::new();
-        std::io::Read::read_to_string(&mut open_holder, &mut observed).unwrap();
-        assert_eq!(observed, "attacker-held-canary");
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-    }
-
-    #[test]
     fn normalize_live_transcript_text_filters_noise_placeholders() {
         assert_eq!(normalize_live_transcript_text("[typing]"), None);
         assert_eq!(normalize_live_transcript_text("[BLANK_AUDIO]"), None);
