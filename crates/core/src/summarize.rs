@@ -3206,7 +3206,7 @@ mod tests {
     /// mutually exclusive with every other module that mutates HOME (a
     /// private mutex here raced with crate::test_home_env_lock users and
     /// flaked parallel runs).
-    fn home_env_lock_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn home_env_lock_guard() -> crate::test_support::HomeEnvGuard {
         crate::test_support::home_env_lock()
     }
 

@@ -211,6 +211,6 @@ pub(crate) fn test_worker_binary_is_available() -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn test_home_env_lock() -> crate::test_support::HomeEnvGuard {
     crate::test_support::home_env_lock()
 }

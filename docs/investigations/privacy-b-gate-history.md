@@ -1264,3 +1264,29 @@ review runs count for that SHA. Exact lint and complete ordinary CI must be
 green on the next candidate before the guarded focused execution and all three
 independent reviews repeat. Draft PR #604 remains unmerged; no merge, tag,
 signing, publication, deployment, or release is authorized.
+
+THE CURRENT-MAIN RECONCILED CANDIDATE IS BLOCKED BY A TEST-HARNESS HOME-STATE
+RACE. Exact SHA `3c0500f9` was conflict-free on current `main`; lint run
+30512111258 passed. Full-CI run 30512111265 made every completed lane green
+until the native Windows core unit suite failed with 1,495 passed, 9 failed,
+and 5 ignored. The nine failures all entered knowledge/PARA reconciliation
+while another test temporarily overrode process-global `HOME` or
+`MINUTES_HOME`; correction-state resolution escaped into that concurrently
+owned temporary tree, whose lifecycle and descriptor were controlled by the
+overriding test. The exact Windows owner-private descriptor checks correctly
+rejected the cross-test state instead of silently weakening it.
+
+The replacement makes the existing crate-wide home-environment test lock
+re-entrant for its owning thread and makes unit-test correction-root resolution
+join that lock. A test that intentionally overrides home can still call the
+production resolver without deadlocking, while unrelated resolver threads wait
+until the override is restored. A concurrent regression holds an override,
+proves a second resolver cannot observe it, releases it, and then proves the
+resolver returns the original state root. Production builds do not acquire the
+test lock and no production DACL, authorization, or path policy is relaxed.
+
+STATUS: `3c0500f9` is not accepted. The already-failed superseded run was
+canceled while its remaining macOS/installer jobs were still running. No
+focused validation-only workflow or independent final review counts for that
+SHA. Draft PR #604 remains unmerged; no merge, tag, signing, publication,
+deployment, or release is authorized.
