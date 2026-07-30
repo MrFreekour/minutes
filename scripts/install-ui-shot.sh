@@ -48,9 +48,34 @@ install -m 755 "/tmp/ui_shot.build" "$install_path"
 rm -f "/tmp/ui_shot.build"
 
 echo "signing   $identity"
-codesign --force --options runtime --sign "$identity" "$install_path"
+if ! codesign --force --options runtime --sign "$identity" "$install_path" 2>/tmp/ui-shot-sign.err; then
+  echo >&2
+  echo "install-ui-shot: codesign failed." >&2
+  sed 's/^/  /' /tmp/ui-shot-sign.err >&2
+  if grep -q 'errSecInternalComponent' /tmp/ui-shot-sign.err 2>/dev/null; then
+    cat >&2 <<'SSHFAIL'
 
+  errSecInternalComponent means the login keychain is not reachable from this
+  session. That happens over SSH, including your own SSH session: the keychain
+  needs an interactive login context.
+
+  Run this in Terminal.app on the Mac itself, not over SSH.
+SSHFAIL
+  fi
+  exit 1
+fi
+
+# Verify the signature actually took rather than trusting the exit code. An
+# ad-hoc signature here means the TCC grant will break on the next rebuild, which
+# fails silently and confusingly later, so catch it now.
 authority="$(codesign -dv --verbose=2 "$install_path" 2>&1 | grep -m1 '^Authority=' || true)"
+if [[ -z "$authority" ]]; then
+  echo >&2
+  echo "install-ui-shot: signing reported success but the binary is ad-hoc signed." >&2
+  echo "  A TCC grant keyed to a content hash breaks on every rebuild." >&2
+  echo "  Run this in Terminal.app on the Mac, not over SSH." >&2
+  exit 1
+fi
 echo "installed $install_path"
 echo "          ${authority:-Authority=<unsigned>}"
 
