@@ -2946,23 +2946,46 @@ mod windows_tests {
     fn successful_windows_leader_exit_retires_grandchild_and_preserves_status() {
         let directory = tempfile::TempDir::new().unwrap();
         let pid_path = directory.path().join("successful-grandchild.pid");
-        let script =
-            child_and_grandchild_script(&pid_path, "[Console]::Out.Write('leader-output'); exit 7");
-        let started = Instant::now();
+        let ready_path = directory.path().join("successful-leader-ready");
+        let leader_tail = format!(
+            "[IO.File]::WriteAllText('{}', 'ready'); \
+             [Console]::Out.Write('leader-output'); exit 7",
+            quote_powershell_literal(&ready_path)
+        );
+        let script = child_and_grandchild_script(&pid_path, &leader_tail);
 
-        let run = run(
-            &mut powershell(&script),
-            None,
-            StdoutTarget::Capture { max_bytes: 1024 },
-            budget(15_000),
-        )
-        .unwrap();
-        let elapsed = started.elapsed();
+        // Hosted PowerShell cold-start can consume most of a wall-clock
+        // budget under runner contention. Measure the ordering contract from
+        // the leader's pre-exit marker instead: tree retirement and pipe drain
+        // must be prompt once the leader is ready to exit.
+        let runner = std::thread::spawn(move || {
+            run(
+                &mut powershell(&script),
+                None,
+                StdoutTarget::Capture { max_bytes: 1024 },
+                budget(30_000),
+            )
+        });
+        let ready_deadline = Instant::now() + Duration::from_secs(30);
+        while !ready_path.exists() && !runner.is_finished() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready_observed = ready_path.exists();
+        let retirement_started = Instant::now();
+        let run = runner
+            .join()
+            .expect("supervisor thread must not panic")
+            .unwrap();
+        let retirement_elapsed = retirement_started.elapsed();
 
+        assert!(
+            ready_observed,
+            "successful leader must publish its pre-exit marker"
+        );
         assert!(!run.timed_out);
         assert!(
-            elapsed < Duration::from_secs(10),
-            "successful leader retirement took {elapsed:?}"
+            retirement_elapsed < Duration::from_secs(10),
+            "successful leader retirement took {retirement_elapsed:?} after its pre-exit marker"
         );
         assert_eq!(run.output.status.code(), Some(7));
         assert_eq!(run.output.stdout, b"leader-output");
