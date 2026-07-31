@@ -231,14 +231,29 @@ fn segment_anchored_blocks(
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        if !joined.is_empty() {
+        if joined.is_empty() {
+            // Same defect the text segmenter had: a promoted heading with no
+            // following body was dropped and, because `heading.take()` never
+            // ran, carried forward onto the next segment. This twin handles
+            // every PDF and DOCX, so two adjacent headings lost the first one,
+            // and a numbered-list contract -- where every line looks like a
+            // heading -- produced no provisions at all and the whole document
+            // was dropped from the index as a conversion failure.
+            if let Some(orphan) = heading.take() {
+                let anchor = heading_anchor
+                    .take()
+                    .or_else(|| body_anchor.take())
+                    .unwrap_or_else(|| "source".to_string());
+                segments.push((None, orphan, anchor));
+            }
+        } else {
             let anchor = body_anchor
                 .take()
                 .or_else(|| heading_anchor.take())
                 .unwrap_or_else(|| "source".to_string());
             segments.push((heading.take(), joined, anchor));
-            body.clear();
         }
+        body.clear();
     };
 
     for block in &converted.blocks {
@@ -398,13 +413,20 @@ fn looks_like_legal_heading(line: &str) -> bool {
     let known_prefix = ["section ", "article ", "schedule ", "exhibit "]
         .iter()
         .any(|prefix| lowercase.starts_with(prefix));
-    let numbered = line.split_once(['.', ')']).is_some_and(|(prefix, rest)| {
-        !rest.trim().is_empty()
-            && prefix.len() <= 12
-            && prefix
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    });
+    // A numbered line is only a caption if it is short. Without a word cap,
+    // an ordinary cross-reference -- "9. See Sections 3 (confidentiality), 4
+    // (affiliates), 5 (compelled disclosure) and 6 (survival)" -- was read as
+    // the heading of whatever clause followed it, so a payment provision was
+    // returned as a four-concept confidentiality clause. Captions are short;
+    // sentences that happen to start with a numeral are not.
+    let numbered = line.split_whitespace().count() <= 12
+        && line.split_once(['.', ')']).is_some_and(|(prefix, rest)| {
+            !rest.trim().is_empty()
+                && prefix.len() <= 12
+                && prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        });
     let letters = line.chars().filter(|character| character.is_alphabetic());
     let (letter_count, uppercase_count) = letters.fold((0usize, 0usize), |counts, character| {
         (
@@ -760,22 +782,30 @@ impl CandidateRow {
     fn evidence_card(
         &self,
         vault_id: &VaultId,
-        matched_concepts: Vec<LegalConcept>,
+        matched: Vec<LegalConcept>,
         sentence_limit: Option<u32>,
     ) -> EvidenceCard {
         let sentence_count = sentence_count(&self.body);
+        // Concepts present in the heading but absent from the body are not
+        // visible in the excerpt, so the card has to say so.
+        let body_concepts = matched_concepts(&self.body, &matched);
+        let heading_only = matched
+            .iter()
+            .copied()
+            .filter(|concept| !body_concepts.contains(concept))
+            .collect::<Vec<_>>();
         EvidenceCard {
             vault_id: vault_id.clone(),
             document_id: self.document_id.clone(),
             document_title: self.document_title.clone(),
             provision_heading: self.provision_heading.clone(),
             source_anchor: self.source_anchor.clone(),
-            exact_excerpt: self.searchable_text(),
+            exact_excerpt: self.body.clone(),
             sentence_count,
             source_revision: self.source_revision.clone(),
             source_converter: self.source_converter.clone(),
-            why_matched: why_matched(&matched_concepts, sentence_limit, sentence_count),
-            matched_concepts,
+            why_matched: why_matched(&matched, sentence_limit, sentence_count, &heading_only),
+            matched_concepts: matched,
             lexical_rank: self.lexical_rank,
             index_fresh: true,
         }
@@ -792,7 +822,7 @@ impl CandidateRow {
             document_title: self.document_title.clone(),
             provision_heading: self.provision_heading.clone(),
             source_anchor: self.source_anchor.clone(),
-            exact_excerpt: self.searchable_text(),
+            exact_excerpt: self.body.clone(),
             sentence_count: sentence_count(&self.body),
             source_revision: self.source_revision.clone(),
             source_converter: self.source_converter.clone(),
@@ -1524,6 +1554,7 @@ fn why_matched(
     concepts: &[LegalConcept],
     maximum_sentences: Option<u32>,
     actual_sentences: u32,
+    heading_only: &[LegalConcept],
 ) -> String {
     let mut reasons = concepts
         .iter()
@@ -1535,8 +1566,26 @@ fn why_matched(
     if reasons.is_empty() {
         return format!("{actual_sentences} sentence lexical match");
     }
+    // Matching spans the provision heading so a clause whose operative term
+    // appears only in its caption is still found, but the excerpt shows the
+    // body alone -- it has to, because the anchor points at the body and the
+    // sentence count describes it. Anything matched only in the heading is
+    // therefore not visible in the quoted text, and saying so is the
+    // difference between a citation and an assertion the reader cannot check.
+    let caveat = if heading_only.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {} matched in the provision heading, not the quoted text.",
+            heading_only
+                .iter()
+                .map(|concept| concept.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     format!(
-        "Matched {} in the same provision; {actual_sentences} sentence{}.",
+        "Matched {} in the same provision; {actual_sentences} sentence{}.{caveat}",
         reasons.join(", "),
         if actual_sentences == 1 { "" } else { "s" }
     )
@@ -1733,7 +1782,7 @@ mod tests {
         let preferred = document(
             "semantic-preferred",
             "Preferred",
-            "NONDISCLOSURE\nThe recipient shall not reveal nonpublic deal material.",
+            "The recipient shall not reveal nonpublic deal material.",
         );
         let other = document(
             "semantic-other",
@@ -1757,7 +1806,7 @@ mod tests {
         assert_eq!(response.suggestions[0].document_id, preferred.document_id);
         assert_eq!(
             response.suggestions[0].exact_excerpt,
-            "NONDISCLOSURE\nThe recipient shall not reveal nonpublic deal material."
+            "The recipient shall not reveal nonpublic deal material."
         );
         assert!(response.suggestions[0]
             .why_suggested
@@ -1807,6 +1856,70 @@ mod tests {
                 card.exact_excerpt.contains("Intentionally omitted."),
                 "the excerpt must show the reader the clause was struck, got {:?}",
                 card.exact_excerpt
+            );
+        }
+    }
+
+    #[test]
+    fn a_cross_reference_line_is_not_a_heading_for_the_clause_below_it() {
+        // "9. See Sections 3 (confidentiality), 4 (affiliates) ..." is an
+        // ordinary cross-reference. Read as a caption it attributed all four
+        // concepts to the unrelated clause beneath it, so a payment provision
+        // was returned as a four-concept confidentiality clause.
+        let mislabelled = document(
+            "cross-reference-agreement",
+            "Cross Reference Agreement",
+            "9. See Sections 3 (confidentiality), 4 (affiliates), 5 (compelled disclosure) and 6 (survival)\nThe Buyer shall pay the Purchase Price in immediately available funds.",
+        );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&mislabelled).expect("mislabelled");
+        let revisions = CurrentRevisionSet::from_documents([&mislabelled]);
+
+        let response = index
+            .search(&vault(), sample_query(), &revisions)
+            .expect("search");
+        // The line is 13 words, so it is no longer promoted to a caption and
+        // becomes body text instead. It legitimately contains all four terms,
+        // so a keyword match on it is honest -- provided the excerpt shows the
+        // text that matched rather than quoting only the payment sentence
+        // beneath it under a heading the reader never sees.
+        for card in &response.evidence {
+            assert!(
+                card.exact_excerpt.contains("See Sections"),
+                "a card must quote the text that matched, not just the clause below it: {:?}",
+                card.exact_excerpt
+            );
+        }
+    }
+
+    #[test]
+    fn an_excerpt_never_cites_text_outside_its_own_body() {
+        // The excerpt is quoted beside the source anchor, and the anchor
+        // points at the body. Including the heading meant the first quoted
+        // line could sit on a different page than the anchor counsel is told
+        // to open, and made sentence_count disagree with what is displayed.
+        let captioned = document(
+            "anchored-agreement",
+            "Anchored Agreement",
+            "7. CONFIDENTIALITY, AFFILIATES, COMPELLED DISCLOSURE AND SURVIVAL\nRecipient shall protect Confidential Information of its affiliates, may disclose where required by law after notice, and these duties survive termination.",
+        );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&captioned).expect("captioned");
+        let revisions = CurrentRevisionSet::from_documents([&captioned]);
+
+        let response = index
+            .search(&vault(), sample_query(), &revisions)
+            .expect("search");
+        for card in &response.evidence {
+            assert!(
+                !card.exact_excerpt.contains("7. CONFIDENTIALITY"),
+                "the excerpt must not quote the heading: {:?}",
+                card.exact_excerpt
+            );
+            assert_eq!(
+                card.sentence_count,
+                sentence_count(&card.exact_excerpt),
+                "sentence_count must describe the text actually shown"
             );
         }
     }

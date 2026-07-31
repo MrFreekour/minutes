@@ -984,11 +984,9 @@ mod tests {
             "Confidential Precedent"
         );
         assert_eq!(response.evidence[0].source_anchor, "section:0001");
-        // The excerpt carries whatever justified the match, so it may be
-        // prefixed by the provision heading.
         assert!(response.evidence[0]
             .exact_excerpt
-            .contains("Confidential Information"));
+            .starts_with("Confidential Information"));
     }
 
     #[test]
