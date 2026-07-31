@@ -44,6 +44,17 @@ const files = {
   ),
 };
 
+
+// Strip comments and string literals before asserting on structure. Without
+// this, a required call can be parked in a comment while the real code does
+// something else, which is exactly how a demonstrated bypass restored the
+// xpc_main block-vs-function-pointer regression with every check still green.
+function activeCode(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ");
+}
+
 function validate(candidate, checkGoldens = true) {
   const errors = [];
   const requireText = (source, value, message) => {
@@ -309,6 +320,44 @@ function validate(candidate, checkGoldens = true) {
     /fn xpc_main\(handler: &Block/,
     "xpc_main must never receive an Objective-C block",
   );
+
+  // The ABI is only safe if exactly one xpc_main call exists per named C
+  // connection handler, and nothing casts a block into that callback type.
+  // Text assertions alone are satisfiable by dead code, so count the real
+  // call sites in comment-stripped source.
+  {
+    const active = activeCode(candidate.xpc);
+    const handlers = (
+      active.match(/unsafe extern "C" fn \w*service_connection_handler\(/g) ?? []
+    ).length;
+    const mains = (active.match(/\bxpc_main\(/g) ?? []).length;
+    // one declaration plus one call per handler
+    if (mains !== handlers + 1) {
+      errors.push(
+        `xpc_main call sites (${mains}) must equal one per C connection handler plus its declaration (${handlers + 1})`,
+      );
+    }
+    // One transmute is legitimate: turning a dlsym address into the
+    // peer-requirement function pointer. Any other transmute, or any cast to
+    // the connection-handler type, could smuggle a block back into xpc_main.
+    const allowedTransmute = active.slice(
+      active.indexOf("fn load_peer_requirement("),
+      active.indexOf("fn set_peer_requirement("),
+    );
+    const totalTransmutes = (active.match(/\btransmute\b/g) ?? []).length;
+    const allowedTransmutes = (allowedTransmute.match(/\btransmute\b/g) ?? []).length;
+    if (totalTransmutes !== allowedTransmutes || allowedTransmutes !== 1) {
+      errors.push(
+        "the only transmute in the XPC authority must be the peer-requirement dlsym lookup",
+      );
+    }
+    if (/as\s+XpcConnectionHandler/.test(active)) {
+      errors.push("a connection handler must be a named C function, not a cast");
+    }
+    if (/#\[link_name\s*=\s*"xpc_main"\]/.test(active)) {
+      errors.push("xpc_main must not be re-declared under an alias");
+    }
+  }
   for (const value of [
     "service_request_nonce_matches",
     "claim_service_process",
@@ -368,6 +417,16 @@ function validate(candidate, checkGoldens = true) {
 
 if (process.argv.includes("--self-test")) {
   const mutations = [
+    ["xpc_main aliased to a block declaration", "xpc", (value) =>
+      value.replace(
+        "fn xpc_main(handler: XpcConnectionHandler) -> !;",
+        'fn xpc_main(handler: XpcConnectionHandler) -> !;\n    #[link_name = "xpc_main"]\n    fn xpc_main_compat(handler: &Block<dyn Fn(XpcObject)>) -> !;',
+      ), false],
+    ["connection handler smuggled in by transmute", "xpc", (value) =>
+      value.replace(
+        "unsafe { xpc_main(apple_speech_service_connection_handler) }",
+        "let shim: XpcConnectionHandler = unsafe { std::mem::transmute(0usize) };\n    unsafe { xpc_main(shim) }",
+      ), false],
     ["generic launcher", "worker", (value) => `${value}\nCommand::new(\"helper\");`, false],
     [
       "Rust named audio file",
