@@ -523,7 +523,6 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     // Structural signal for the paragraph currently being assembled.
     let mut heading_style = false;
     let mut saw_style = false;
-    let mut bold = false;
     // `w:pPrChange`/`w:rPrChange` record the properties a tracked change
     // replaced. Reading them let a revision record override the live style --
     // a real Heading1 whose change-record said Normal came out as body, and
@@ -531,16 +530,8 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     // case: size is weighted by the characters set in it and a pilcrow
     // contributes none.
     let mut skip_depth = 0usize;
-    // Characters set at each size in the paragraph. Weighting by text rather
-    // than by run count is what separates a one-character drop cap from the
-    // seventy characters of body text beside it.
-    let mut size_chars: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
-    let mut current_run_size: Option<u32> = None;
-    let mut body_sizes: Vec<u32> = Vec::new();
-    // Parallel to `paragraphs`: (styled_as_heading, bold, largest run size).
-    // The size a paragraph must exceed to read as a caption is the document's
-    // own body size, which is not known until the whole file is parsed.
-    let mut formatting: Vec<(bool, bool, u32)> = Vec::new();
+    // Parallel to `paragraphs`: whether the file named a heading style.
+    let mut formatting: Vec<bool> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -562,14 +553,6 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                             heading_style = is_heading_style(&value);
                         }
                     }
-                    b"sz" if skip_depth == 0 => {
-                        if let Some(value) = attribute_value(&event, b"val") {
-                            if let Ok(size) = value.parse::<u32>() {
-                                current_run_size = Some(size);
-                            }
-                        }
-                    }
-                    b"b" if skip_depth == 0 => bold = boolean_property(&event),
                     _ => {}
                 }
             }
@@ -581,14 +564,6 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                         heading_style = is_heading_style(&value);
                     }
                 }
-                b"sz" if skip_depth == 0 => {
-                    if let Some(value) = attribute_value(&event, b"val") {
-                        if let Ok(size) = value.parse::<u32>() {
-                            current_run_size = Some(size);
-                        }
-                    }
-                }
-                b"b" if skip_depth == 0 => bold = boolean_property(&event),
                 b"tab" => paragraph.push('\t'),
                 b"br" | b"cr" => paragraph.push('\n'),
                 // `<w:p/>` is a self-closing empty paragraph and arrives as
@@ -598,16 +573,13 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                 b"p" => paragraph_ordinal += 1,
                 _ => {}
             },
-            Ok(Event::Text(event)) if in_text => {
+            Ok(Event::Text(event)) if in_text && skip_depth == 0 => {
                 let decoded = event
                     .decode()
                     .map_err(|_| ConversionError::MalformedSource)?;
-                if let Some(size) = current_run_size {
-                    *size_chars.entry(size).or_default() += decoded.chars().count();
-                }
                 paragraph.push_str(&decoded);
             }
-            Ok(Event::GeneralRef(reference)) if in_text => {
+            Ok(Event::GeneralRef(reference)) if in_text && skip_depth == 0 => {
                 if let Some(character) = reference
                     .resolve_char_ref()
                     .map_err(|_| ConversionError::MalformedSource)?
@@ -627,13 +599,6 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             // name left it stuck above zero for the rest of the paragraph,
             // silently suppressing the live style and size.
             Ok(Event::End(event)) if skip_depth > 0 => {
-                // `in_text` must not survive the record either: leaving it set
-                // appended every later text node inside the record to the
-                // paragraph, putting text into an evidence card at an anchor
-                // where the document shows nothing.
-                if local_name(event.name().as_ref()) == b"t" {
-                    in_text = false;
-                }
                 skip_depth -= 1;
                 if local_name(event.name().as_ref()) == b"p" {
                     skip_depth = 0;
@@ -641,30 +606,12 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             }
             Ok(Event::End(event)) => match local_name(event.name().as_ref()) {
                 b"t" => in_text = false,
-                b"r" => current_run_size = None,
-                // A size on the paragraph mark sits outside any `w:r`, so it
-                // otherwise survived into the first unsized run and promoted
-                // an operative sentence to a caption.
-                b"pPr" => current_run_size = None,
                 b"p" => {
                     let paragraph_style = heading_style;
                     let paragraph_saw_style = saw_style;
-                    let paragraph_bold = bold;
-                    let paragraph_sizes = std::mem::take(&mut size_chars);
-                    current_run_size = None;
                     heading_style = false;
                     saw_style = false;
-                    bold = false;
                     skip_depth = 0;
-                    // One entry per paragraph, not per run: a paragraph split
-                    // into many runs by redlining otherwise outvoted whole
-                    // paragraphs and inverted the median.
-                    if !(paragraph_bold || paragraph_style && paragraph_saw_style) {
-                        let size = dominant_size(&paragraph_sizes);
-                        if size > 0 {
-                            body_sizes.push(size);
-                        }
-                    }
                     // Count every <w:p> element, including empty spacers and
                     // paragraphs inside tables. The anchor previously used
                     // the number of paragraphs emitted so far, so any dropped
@@ -682,14 +629,7 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                         if output_bytes > MAX_OUTPUT_BYTES || paragraphs.len() >= MAX_BLOCKS {
                             return Err(ConversionError::OutputBudgetExceeded);
                         }
-                        // The paragraph's own size is its most common run size,
-                        // not the largest: a 36pt drop cap or a superscript
-                        // otherwise promoted an ordinary sentence to a caption.
-                        formatting.push((
-                            paragraph_style && paragraph_saw_style,
-                            paragraph_saw_style,
-                            dominant_size(&paragraph_sizes),
-                        ));
+                        formatting.push(paragraph_style && paragraph_saw_style);
                         paragraphs.push(ConvertedBlock {
                             source_anchor: format!("paragraph:{paragraph_ordinal:06}"),
                             text,
@@ -707,62 +647,19 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
         }
         buffer.clear();
     }
-    // A named heading style is decisive. Otherwise a paragraph reads as a
-    // caption when it is set larger than the document's own body text.
-    // Comparing against the document rather than a fixed point size keeps
-    // this working across templates.
-    // Lower median. The upper median landed on the caption size whenever the
-    // sample had as many captions as body paragraphs, which inverted the
-    // comparison and marked every caption as body text.
-    body_sizes.sort_unstable();
-    let body_size = body_sizes
-        .get(body_sizes.len().saturating_sub(1) / 2)
-        .copied()
-        .unwrap_or(0);
-    for (block, (styled_heading, _saw_style, size)) in paragraphs.iter_mut().zip(formatting) {
-        // `None` has to mean "this format reported nothing", or the fallback
-        // is dead. Emitting `Some(false)` whenever no style and no size were
-        // read reported absence of signal as a positive claim of body text,
-        // and a real Word agreement collapsed from 21 provisions to 2 -- one
-        // 93-sentence blob -- because nothing could be a caption and the
-        // lexical rule was never consulted.
-        // Only claim a verdict when the formatting actually discriminates.
-        // Testing that a size was *read* is not the same as testing that it
-        // *distinguishes*: in the standard legal template every paragraph is
-        // one size and captions are set apart by bold or caps instead, so
-        // `size == body_size` was reported as a positive claim of body text
-        // and the lexical fallback -- the only mechanism that segments those
-        // documents at all -- never ran. A real Business Associate Agreement
-        // collapsed from 21 provisions to 2.
-        //
-        // `None` here means the file did not distinguish this paragraph, and
-        // the caller falls back. That makes the signal strictly additive: it
-        // can only improve on the heuristic, never replace it with silence.
-        // Only a named heading style, or text set clearly larger than the
-        // body, is a verdict. Everything else is `None`.
-        //
-        // Two earlier attempts reported absence of distinction as a positive
-        // claim, first at `size == body_size` and then at the inequalities.
-        // Smaller-than-body was read as "not a caption", which silenced the
-        // lexical fallback across a 9pt exhibit and took its indemnity,
-        // survival and governing-law clauses from one evidence card each to
-        // none -- the exhibit welded into a single ten-sentence blob. Being
-        // smaller than the body means the file marked it as fine print, not
-        // that the file said it is body text.
-        //
-        // A bare `>` was also too eager: a clause pasted at 12pt into an 11pt
-        // agreement was promoted, which severed it from its own caption and
-        // took a conjunctive query -- one concept in the caption, one in the
-        // body -- from one card to none. The margin is two points, expressed
-        // in the half-points OOXML uses, so an incidental size difference
-        // from a paste or a rider is not read as document structure.
-        const HEADING_SIZE_MARGIN: u32 = 4;
-        block.is_heading =
-            if styled_heading || (body_size > 0 && size >= body_size + HEADING_SIZE_MARGIN) {
-                Some(true)
-            } else {
-                None
-            };
+    // A named heading style is the only verdict. A relative-size rule was
+    // measured against a real corpus and bought nothing -- every real
+    // improvement came from `pStyle` alone, and the real Business Associate
+    // Agreement's twenty-one captions are body-sized and found by the lexical
+    // rule -- while causing every regression across five rounds. Size is
+    // layout, not structure: a statutory conspicuous-type notice is set
+    // larger because a statute demands it, and a twelve-point front page over
+    // a ten-point back page is an order form over standard terms. Both are
+    // operative text, and promoting them severs a clause from its caption.
+    //
+    // `None` means the file did not say, and the lexical fallback runs.
+    for (block, styled_heading) in paragraphs.iter_mut().zip(formatting) {
+        block.is_heading = if styled_heading { Some(true) } else { None };
     }
 
     Ok(ConvertedDocument {
@@ -780,31 +677,18 @@ fn attribute_value(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8]) -> 
     })
 }
 
-/// The size a paragraph is actually set in: its most common run size.
-fn dominant_size(sizes: &std::collections::BTreeMap<u32, usize>) -> u32 {
-    sizes
-        .iter()
-        .max_by_key(|(size, chars)| (**chars, **size))
-        .map(|(size, _)| *size)
-        .unwrap_or(0)
-}
-
-/// An OOXML boolean property. `<w:b/>` is on, but `<w:b w:val="0"/>` is off --
-/// Word writes the latter constantly to override a bold style, and reading it
-/// as on excluded those paragraphs from the body-size sample.
-fn boolean_property(event: &quick_xml::events::BytesStart<'_>) -> bool {
-    match attribute_value(event, b"val") {
-        Some(value) => !matches!(value.as_str(), "0" | "false" | "off"),
-        None => true,
-    }
-}
-
 /// Whether a `w:pStyle` value names one of Word's heading styles.
 fn is_heading_style(value: &str) -> bool {
+    // Exact identifiers only. A prefix match claimed `Subtitle`,
+    // `HeadingNote`, `TitlePage` and `HeadingBase` -- and Word templates put
+    // the preamble and recitals under `Subtitle`, which is operative text. A
+    // style verdict is unconditional and the lexical fallback cannot recover
+    // from it, so it has to be narrow.
     let lowered = value.to_ascii_lowercase();
-    lowered.starts_with("heading")
-        || lowered.starts_with("title")
-        || lowered.starts_with("subtitle")
+    lowered == "title"
+        || lowered
+            .strip_prefix("heading")
+            .is_some_and(|rest| rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn local_name(name: &[u8]) -> &[u8] {
@@ -1130,31 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn an_even_size_sample_does_not_invert_the_body_size() {
-        // Two captions and two body paragraphs: the upper median landed on
-        // the caption size, so every caption failed `size > body_size` and
-        // the whole document came out as body text.
-        let bytes = synthetic_docx(
-            r#"<w:document xmlns:w="urn:test"><w:body>
-            <w:p><w:r><w:rPr><w:sz w:val="28"/></w:rPr><w:t>7. Confidentiality</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Recipient shall not disclose.</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:sz w:val="28"/></w:rPr><w:t>8. Return and Destruction</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Recipient shall return all materials.</w:t></w:r></w:p>
-            </w:body></w:document>"#,
-        );
-        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
-        let marked = |needle: &str| {
-            document
-                .blocks
-                .iter()
-                .find(|block| block.text.contains(needle))
-                .and_then(|block| block.is_heading)
-        };
-        assert_eq!(marked("7. Confidentiality"), Some(true));
-        assert_eq!(marked("8. Return and Destruction"), Some(true));
-    }
-
-    #[test]
     fn a_paragraph_mark_size_does_not_leak_into_the_first_run() {
         // `<w:pPr><w:rPr><w:sz/></w:rPr></w:pPr>` is the pilcrow's own
         // formatting and sits outside any `w:r`, so it survived into the
@@ -1267,16 +1126,15 @@ mod tests {
 
     #[test]
     fn docx_headings_come_from_the_document_not_from_the_text() {
-        // The two cases five rounds of lexical heuristics could not separate.
-        // A cross-reference sentence and a caption can read identically; the
-        // file distinguishes them unambiguously and always did.
+        // The case no lexical rule could get right, and the one the file
+        // answers unambiguously: a paragraph styled as a heading whose words
+        // read as a cross-reference, beside an all-caps line that reads
+        // exactly like a caption and carries no style.
         let bytes = synthetic_docx(
             r#"<w:document xmlns:w="urn:test"><w:body>
             <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>9. See Sections 3 and 4</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Body text of the first clause.</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>7. CONFIDENTIALITY AND SURVIVAL OF OBLIGATIONS</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:sz w:val="48"/><w:b/></w:rPr><w:t>Indemnification</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Seller shall indemnify the Buyer.</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Body text of the first clause.</w:t></w:r></w:p>
+            <w:p><w:r><w:t>7. CONFIDENTIALITY AND SURVIVAL OF OBLIGATIONS</w:t></w:r></w:p>
             </w:body></w:document>"#,
         );
         let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
@@ -1287,16 +1145,80 @@ mod tests {
                 .find(|block| block.text.contains(needle))
                 .and_then(|block| block.is_heading)
         };
-        // Styled Heading1: a caption even though the words read as a
-        // cross-reference, which every lexical rule promoted or demoted wrongly.
         assert_eq!(marked("See Sections"), Some(true));
-        // All-caps at body size: the file does not distinguish it, so the
-        // converter must not claim it is a caption. `None` hands it to the
-        // lexical fallback rather than asserting body text.
-        assert_ne!(marked("CONFIDENTIALITY AND SURVIVAL"), Some(true));
-        // Unstyled but set at 24pt bold over 12pt body: a caption.
-        assert_eq!(marked("Indemnification"), Some(true));
-        assert_ne!(marked("Seller shall indemnify"), Some(true));
+        // Unstyled: the file did not say, so the lexical rule decides.
+        assert_eq!(marked("CONFIDENTIALITY AND SURVIVAL"), None);
+        assert_eq!(marked("Body text of the first"), None);
+    }
+
+    #[test]
+    fn size_alone_never_promotes_a_paragraph() {
+        // Five rounds of relative-size rules each promoted operative text and
+        // severed it from its caption. A statutory conspicuous-type notice is
+        // set larger because a statute requires it; a twelve-point front page
+        // over a ten-point back page is an order form over standard terms.
+        // Neither is a caption, and both were promoted. Size is layout, not
+        // structure, so it is no longer consulted at all.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>7. INDEMNIFICATION AND HOLD HARMLESS.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/><w:b/></w:rPr><w:t>NOTICE: THE SELLER SHALL INDEMNIFY THE BUYER AND THIS OBLIGATION SURVIVES TERMINATION.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        for block in &document.blocks {
+            assert_eq!(
+                block.is_heading, None,
+                "size must never be read as structure: {:?}",
+                block.text
+            );
+        }
+    }
+
+    #[test]
+    fn an_absurd_declared_size_cannot_overflow_or_promote() {
+        // `w:sz` was parsed as u32 and never range-checked, and the margin
+        // comparison added to it: an attacker-declared 4294967294 panicked in
+        // overflow-checked builds and wrapped in release, promoting every
+        // paragraph. No arithmetic is performed on declared sizes now.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:r><w:rPr><w:sz w:val="4294967294"/></w:rPr><w:t>Recipient shall not disclose.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="22"/></w:rPr><w:t>These duties survive termination.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        for block in &document.blocks {
+            assert_eq!(block.is_heading, None);
+        }
+    }
+
+    #[test]
+    fn a_style_verdict_is_limited_to_real_heading_identifiers() {
+        // A prefix match claimed `Subtitle`, `HeadingNote`, `TitlePage` and
+        // `HeadingBase`. Word templates put the preamble and recitals under
+        // `Subtitle`, and a style verdict is unconditional -- the lexical
+        // fallback cannot recover from it.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>7. Confidentiality</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="Subtitle"/></w:pPr><w:r><w:t>The parties enter this Agreement as of the date below.</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="HeadingNote"/></w:pPr><w:r><w:t>Recipient shall not disclose.</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="TitlePage"/></w:pPr><w:r><w:t>These duties survive termination.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        let marked = |needle: &str| {
+            document
+                .blocks
+                .iter()
+                .find(|block| block.text.contains(needle))
+                .and_then(|block| block.is_heading)
+        };
+        assert_eq!(marked("7. Confidentiality"), Some(true));
+        assert_eq!(marked("parties enter this Agreement"), None);
+        assert_eq!(marked("Recipient shall not disclose"), None);
+        assert_eq!(marked("These duties survive"), None);
     }
 
     #[test]

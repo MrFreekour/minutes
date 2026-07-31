@@ -287,6 +287,44 @@ fn segment_anchored_blocks(
         // looks like a caption. The lexical rule is the fallback for formats
         // that carry no signal, where guessing is all that is left.
         let structural = block.is_heading;
+        // A block the file marks as a caption is ONE caption, however many
+        // line breaks it contains. Applying the verdict per line split a
+        // two-line caption in half and attributed the remainder to the next
+        // clause, and a block carrying thousands of `<w:br/>` lines produced
+        // more segments than a document is allowed, so a file the lexical
+        // path indexes fine was dropped entirely.
+        if structural == Some(true) {
+            let caption = block
+                .text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !caption.is_empty() {
+                flush(
+                    &mut segments,
+                    &mut heading,
+                    &mut heading_anchor,
+                    &mut body_anchor,
+                    &mut body,
+                    true,
+                );
+                heading = Some(caption);
+                heading_anchor = Some(block.source_anchor.clone());
+            }
+            if block.flow == AnchorFlow::HardBoundary {
+                flush(
+                    &mut segments,
+                    &mut heading,
+                    &mut heading_anchor,
+                    &mut body_anchor,
+                    &mut body,
+                    false,
+                );
+            }
+            continue;
+        }
         for line in block.text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
