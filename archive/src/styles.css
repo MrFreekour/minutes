@@ -205,8 +205,12 @@ a:focus-visible {
   background: var(--green);
 }
 
+/* Scoped to the description column. `.step span` also matched
+   `.step-number`, and at higher specificity than `.step-number` itself, so it
+   overrode `display: grid` and the step numerals rendered at the top-left of
+   their circles instead of centred. */
 .step strong,
-.step span {
+.step div span {
   display: block;
 }
 
@@ -314,6 +318,12 @@ a:focus-visible {
   justify-content: center;
   gap: 8px;
   padding: 9px 15px;
+  /* A button label is a single phrase and should never wrap. Without this it
+     wrapped whenever its flex row tightened, leaving a centred two-line stack
+     beside a vertically-centred icon. `flex-shrink: 0` stops the row from
+     compressing the button to force the wrap in the first place. */
+  flex-shrink: 0;
+  white-space: nowrap;
   border: 1px solid transparent;
   border-radius: 10px;
   cursor: pointer;
