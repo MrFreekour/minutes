@@ -52,6 +52,13 @@ struct SessionState {
 struct ArchiveState {
     session: Mutex<SessionState>,
     next_location_id: AtomicU64,
+    /// Snapshot directories of workers that are currently alive.
+    ///
+    /// During a vault build the converter and engine live inside a blocking
+    /// task, not in `session`, so the close handler owns nothing to drop and
+    /// `exit(0)` leaves both 40 MB snapshots behind. Registering the paths at
+    /// creation lets the purge reclaim them whichever way the app exits.
+    live_snapshots: Arc<Mutex<Vec<std::path::PathBuf>>>,
 }
 
 impl Default for ArchiveState {
@@ -59,6 +66,7 @@ impl Default for ArchiveState {
         Self {
             session: Mutex::new(SessionState::default()),
             next_location_id: AtomicU64::new(1),
+            live_snapshots: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -340,6 +348,7 @@ async fn build_archive_text_vault(
 
     let worker_executable = std::env::current_exe()
         .map_err(|_| "Minutes Archive could not bind its document converter.".to_string())?;
+    let snapshot_registry = Arc::clone(&state.live_snapshots);
     let build_result = tauri::async_runtime::spawn_blocking(move || {
         let vault_id = VaultId::parse("local-private-vault")
             .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
@@ -347,6 +356,13 @@ async fn build_archive_text_vault(
             BoundedConverter::bind(&worker_executable).map_err(|error| error.to_string())?;
         let semantic_engine =
             BoundedSemanticEngine::bind(&worker_executable).map_err(|error| error.to_string())?;
+        // Register both snapshots before the long build starts. Until the
+        // vault exists these objects live only in this blocking task, so a
+        // close during the build would otherwise leave both directories.
+        if let Ok(mut registry) = snapshot_registry.lock() {
+            registry.push(converter.snapshot_directory().to_path_buf());
+            registry.push(semantic_engine.snapshot_directory().to_path_buf());
+        }
         build_authorized_document_vault(
             vault_id,
             &roots,
@@ -501,6 +517,15 @@ fn purge_session(app_handle: &tauri::AppHandle) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *session = SessionState::default();
+    drop(session);
+
+    let mut snapshots = state
+        .live_snapshots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for snapshot in snapshots.drain(..) {
+        let _ = fs::remove_dir_all(&snapshot);
+    }
 }
 
 #[cfg(test)]

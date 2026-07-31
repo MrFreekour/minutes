@@ -160,6 +160,16 @@ impl std::fmt::Debug for BoundedConverter {
 }
 
 impl BoundedConverter {
+    /// Path of the private worker snapshot directory.
+    ///
+    /// Exposed so the app can reclaim it explicitly. `exit(0)` does not
+    /// unwind, and during a vault build this object lives inside a blocking
+    /// task rather than in shared session state, so nothing the close handler
+    /// can reach owns it and no destructor will run.
+    pub fn snapshot_directory(&self) -> &Path {
+        self._snapshot_directory.path()
+    }
+
     pub fn bind(worker_executable: &Path) -> Result<Self, WorkerError> {
         let canonical =
             fs::canonicalize(worker_executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
