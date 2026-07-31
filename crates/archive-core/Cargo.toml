@@ -11,6 +11,7 @@ description = "Capability-bound local archive inventory and retrieval primitives
 cap-std = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+minutes-archive-convert = { path = "../archive-convert" }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 sha2 = "0.10"
@@ -19,3 +20,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }

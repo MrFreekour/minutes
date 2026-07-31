@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use minutes_archive_convert::{run_worker_process, BoundedConverter, WORKER_MARKER};
 use minutes_archive_core::retrieval::{LegalSearchResponse, VaultId};
 use minutes_archive_core::vault::{
-    build_authorized_text_vault, AuthorizedTextVault, TextVaultBuildReport, TextVaultLimits,
+    build_authorized_document_vault, AuthorizedDocumentVault, DocumentVaultBuildReport,
+    DocumentVaultLimits,
 };
 use minutes_archive_core::{
     approve_roots, scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits,
@@ -33,7 +35,7 @@ struct ScanControl {
 struct SessionState {
     locations: Vec<ApprovedLocation>,
     last_report: Option<CensusReport>,
-    text_vault: Option<AuthorizedTextVault>,
+    text_vault: Option<AuthorizedDocumentVault>,
     scan: ScanControl,
 }
 
@@ -65,7 +67,7 @@ struct BootstrapState {
     locations: Vec<LocationSummary>,
     scan_running: bool,
     report: Option<CensusReport>,
-    text_vault_report: Option<TextVaultBuildReport>,
+    text_vault_report: Option<DocumentVaultBuildReport>,
 }
 
 fn lock_error() -> String {
@@ -302,7 +304,7 @@ async fn export_archive_census(
 #[tauri::command]
 async fn build_archive_text_vault(
     state: State<'_, ArchiveState>,
-) -> Result<TextVaultBuildReport, String> {
+) -> Result<DocumentVaultBuildReport, String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let roots = {
         let mut session = state.session.lock().map_err(|_| lock_error())?;
@@ -327,14 +329,24 @@ async fn build_archive_text_vault(
             .collect::<Vec<_>>()
     };
 
+    let worker_executable = std::env::current_exe()
+        .map_err(|_| "Minutes Archive could not bind its document converter.".to_string())?;
     let build_result = tauri::async_runtime::spawn_blocking(move || {
         let vault_id = VaultId::parse("local-private-vault")
             .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
-        build_authorized_text_vault(vault_id, &roots, TextVaultLimits::default(), &cancelled)
-            .map_err(|error| error.to_string())
+        let converter =
+            BoundedConverter::bind(&worker_executable).map_err(|error| error.to_string())?;
+        build_authorized_document_vault(
+            vault_id,
+            &roots,
+            DocumentVaultLimits::default(),
+            &cancelled,
+            &converter,
+        )
+        .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|_| "The private text-index worker stopped unexpectedly.".to_string());
+    .map_err(|_| "The private document-index worker stopped unexpectedly.".to_string());
 
     {
         let mut session = state.session.lock().map_err(|_| lock_error())?;
@@ -364,6 +376,16 @@ fn search_archive_text_vault(
 }
 
 fn main() {
+    let mut arguments = std::env::args();
+    let _program = arguments.next();
+    if arguments.next().as_deref() == Some(WORKER_MARKER) {
+        let format = arguments.next().unwrap_or_default();
+        if arguments.next().is_some() {
+            std::process::exit(64);
+        }
+        std::process::exit(run_worker_process(&format));
+    }
+
     tauri::Builder::default()
         .manage(ArchiveState::default())
         .plugin(tauri_plugin_dialog::init())

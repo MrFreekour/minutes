@@ -1,7 +1,7 @@
 # Minutes Archive: Discovery and Security Contract
 
-Status: implementation underway; native census and capability-bound TXT or
-Markdown evidence pilot implemented
+Status: implementation underway; native census and capability-bound searchable
+PDF, DOCX, and text evidence pilot implemented
 
 Date: 2026-07-30
 
@@ -249,18 +249,32 @@ inert prompt-like source text. Document-level conjunction is now implemented
 as a separate evidence type that groups criteria inside one document, applies
 exclusions across its provisions, and never assembles a match across documents.
 A committed legal fixture exercises the provision and document modes, and an
-overflowing lexical candidate set fails closed. Format conversion, protected
-persistence, and OCR remain unimplemented Stage 2 gates.
+overflowing lexical candidate set fails closed. Additional legacy and email
+format conversion, protected persistence, and OCR remain unimplemented Stage 2
+gates.
 
 The separate desktop app now makes content access a distinct post-census
-action. It can build an in-memory index from bounded UTF-8 `.txt`, `.text`, and
-`.md` sources using the retained folder-picker authorities. Traversal skips
-links and packages, deduplicates file identities, holds read-only source
-handles, and applies a final root, membership, identity, byte, and SHA-256
-revision fence before returning any evidence card. A moved, replaced, mutated,
-or inaccessible result is withdrawn. The aggregate build report contains no
-source name or path and states that neither source text nor the index was
-persisted.
+action. It can build an in-memory index from bounded searchable `.pdf`, `.docx`,
+`.txt`, `.text`, and `.md` sources using the retained folder-picker
+authorities. Traversal skips links and packages, deduplicates file identities,
+holds read-only source handles, and applies a final root, membership, identity,
+byte, and SHA-256 revision fence before returning any evidence card. A moved,
+replaced, mutated, or inaccessible result is withdrawn. The aggregate build
+report contains no source name or path and states that neither source text nor
+the index was persisted.
+
+PDF and DOCX parsers run only in a self-executed worker snapshot. The parent
+binds and re-hashes the immutable executable snapshot, clears the environment,
+uses stdin and stdout pipes rather than source paths or named plaintext
+temporary files, caps source and output bytes, enforces a deadline and process
+group, and requires a real startup self-test. On macOS the worker installs CPU,
+file, descriptor, and measured address-space limits plus a deny-by-default
+Seatbelt profile before reading source bytes. The self-test proves both an
+`/etc/passwd` read and a localhost listener are denied. Synthetic end-to-end
+coverage sends TXT, DOCX, and PDF through the actual app executable, verifies
+page or paragraph anchors, retrieves all three, mutates the PDF, and observes
+its evidence withdrawal. Scanned PDFs are reported as OCR-required rather than
+silently treated as searchable.
 
 ### Stage 3: Controlled private pilot
 

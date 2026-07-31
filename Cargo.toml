@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "archive/src-tauri",
+    "crates/archive-convert",
     "crates/archive-core",
     "crates/core",
     "crates/cli",

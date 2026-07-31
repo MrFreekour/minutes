@@ -299,9 +299,13 @@ function renderVaultSummary(report) {
     `${report.indexed_documents.toLocaleString()} supported document${
       report.indexed_documents === 1 ? "" : "s"
     } indexed (${formatBytes(report.indexed_bytes)}). ` +
+    `${report.searchable_pdf_documents.toLocaleString()} PDF, ` +
+    `${report.docx_documents.toLocaleString()} DOCX. ` +
     `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
       report.unsupported_files_skipped === 1 ? "" : "s"
-    } skipped. The index exists only in memory.`;
+    } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
+      report.ocr_required_files === 1 ? "" : "s"
+    } require OCR. The index exists only in memory.`;
 }
 
 async function buildTextVault() {
@@ -314,7 +318,7 @@ async function buildTextVault() {
     elements.queryInterpretation.hidden = true;
     elements.searchStatus.textContent =
       report.indexed_documents === 0
-        ? "No supported TXT or Markdown documents were found in the approved locations."
+        ? "No searchable PDF, DOCX, TXT, or Markdown documents were found in the approved locations."
         : "Enter a legal retrieval question. Results are exact source excerpts, not generated answers.";
     showView("search");
     if (report.indexed_documents > 0) {
@@ -399,7 +403,9 @@ function evidenceCard(card, compact = false) {
   sentences.textContent = `${card.sentence_count} sentence${
     card.sentence_count === 1 ? "" : "s"
   }`;
-  meta.append(anchor, sentences);
+  const converter = document.createElement("span");
+  converter.textContent = humanize(card.source_converter);
+  meta.append(anchor, sentences, converter);
   const why = document.createElement("p");
   why.className = "evidence-why";
   why.textContent = card.why_matched;
@@ -453,7 +459,7 @@ function renderSearchResponse(response) {
     empty.className = "empty-results";
     empty.textContent =
       response.stale_evidence_withdrawn > 0
-        ? "The indexed match is no longer current. It was withdrawn; rebuild the text index before relying on it."
+        ? "The indexed match is no longer current. It was withdrawn; rebuild the document index before relying on it."
         : "No current source satisfied every visible constraint. Try removing one constraint or search for a different legal concept.";
     elements.searchResults.append(empty);
   }

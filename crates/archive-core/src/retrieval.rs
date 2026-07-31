@@ -5,6 +5,7 @@
 //! filesystem path. Source ingestion and revision revalidation happen outside
 //! the index; every search supplies the currently authorized source revisions.
 
+use minutes_archive_convert::{AnchorFlow, ConvertedDocument, SourceFormat};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -134,6 +135,7 @@ pub struct NormalizedDocument {
     pub document_id: DocumentId,
     pub title: String,
     pub revision: SourceRevision,
+    pub converter: String,
     pub provisions: Vec<NormalizedProvision>,
 }
 
@@ -162,8 +164,146 @@ pub fn normalize_text_document(
         document_id,
         title,
         revision: SourceRevision::from_bytes(bytes),
+        converter: "utf8-text-v1".to_string(),
         provisions,
     })
+}
+
+pub fn normalize_converted_document(
+    document_id: DocumentId,
+    title: impl Into<String>,
+    source_bytes: &[u8],
+    converted: &ConvertedDocument,
+) -> Result<NormalizedDocument, RetrievalError> {
+    let title = title.into();
+    if title.is_empty()
+        || title.chars().count() > MAX_DOCUMENT_TITLE_CHARS
+        || title.chars().any(|character| character.is_control())
+    {
+        return Err(RetrievalError::InvalidTitle);
+    }
+    if source_bytes.is_empty() || source_bytes.len() > MAX_NORMALIZED_DOCUMENT_BYTES {
+        return Err(RetrievalError::InvalidDocumentText);
+    }
+    converted
+        .validate()
+        .map_err(|_| RetrievalError::InvalidDocumentText)?;
+    let provisions = segment_anchored_blocks(converted)?;
+    Ok(NormalizedDocument {
+        document_id,
+        title,
+        revision: SourceRevision::from_bytes(source_bytes),
+        converter: match converted.format {
+            SourceFormat::Pdf => "pdf-extract-0.12.0-v1",
+            SourceFormat::Docx => "docx-xml-0.41.0-v1",
+        }
+        .to_string(),
+        provisions,
+    })
+}
+
+fn segment_anchored_blocks(
+    converted: &ConvertedDocument,
+) -> Result<Vec<NormalizedProvision>, RetrievalError> {
+    let mut segments = Vec::<(Option<String>, String, String)>::new();
+    let mut heading = None::<String>;
+    let mut heading_anchor = None::<String>;
+    let mut body_anchor = None::<String>;
+    let mut body = Vec::<String>::new();
+
+    let flush = |segments: &mut Vec<(Option<String>, String, String)>,
+                 heading: &mut Option<String>,
+                 heading_anchor: &mut Option<String>,
+                 body_anchor: &mut Option<String>,
+                 body: &mut Vec<String>| {
+        let joined = body
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !joined.is_empty() {
+            let anchor = body_anchor
+                .take()
+                .or_else(|| heading_anchor.take())
+                .unwrap_or_else(|| "source".to_string());
+            segments.push((heading.take(), joined, anchor));
+            body.clear();
+        }
+    };
+
+    for block in &converted.blocks {
+        if block.flow == AnchorFlow::HardBoundary {
+            flush(
+                &mut segments,
+                &mut heading,
+                &mut heading_anchor,
+                &mut body_anchor,
+                &mut body,
+            );
+        }
+        for line in block.text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if looks_like_legal_heading(trimmed) {
+                flush(
+                    &mut segments,
+                    &mut heading,
+                    &mut heading_anchor,
+                    &mut body_anchor,
+                    &mut body,
+                );
+                heading = Some(trimmed.to_string());
+                heading_anchor = Some(block.source_anchor.clone());
+            } else {
+                if body_anchor.is_none() {
+                    body_anchor = Some(block.source_anchor.clone());
+                }
+                body.push(trimmed.to_string());
+            }
+            if segments.len() > MAX_PROVISIONS_PER_DOCUMENT {
+                return Err(RetrievalError::TooManyProvisions);
+            }
+        }
+        if block.flow == AnchorFlow::HardBoundary {
+            flush(
+                &mut segments,
+                &mut heading,
+                &mut heading_anchor,
+                &mut body_anchor,
+                &mut body,
+            );
+        }
+    }
+    flush(
+        &mut segments,
+        &mut heading,
+        &mut heading_anchor,
+        &mut body_anchor,
+        &mut body,
+    );
+    if segments.is_empty() {
+        return Err(RetrievalError::InvalidDocumentText);
+    }
+    if segments.len() > MAX_PROVISIONS_PER_DOCUMENT {
+        return Err(RetrievalError::TooManyProvisions);
+    }
+    Ok(segments
+        .into_iter()
+        .enumerate()
+        .map(|(index, (heading, text, source_anchor))| {
+            let ordinal = (index + 1) as u32;
+            NormalizedProvision {
+                ordinal,
+                anchor: format!("{source_anchor}/section:{ordinal:04}"),
+                heading,
+                sentence_count: sentence_count(&text),
+                text,
+            }
+        })
+        .collect())
 }
 
 fn segment_legal_provisions(text: &str) -> Result<Vec<NormalizedProvision>, RetrievalError> {
@@ -496,6 +636,7 @@ pub struct EvidenceCard {
     pub exact_excerpt: String,
     pub sentence_count: u32,
     pub source_revision: SourceRevision,
+    pub source_converter: String,
     pub matched_concepts: Vec<LegalConcept>,
     pub why_matched: String,
     pub lexical_rank: f64,
@@ -517,6 +658,7 @@ pub struct DocumentEvidenceCard {
     pub document_id: DocumentId,
     pub document_title: String,
     pub source_revision: SourceRevision,
+    pub source_converter: String,
     pub matched_concepts: Vec<LegalConcept>,
     pub exact_phrase_matched: bool,
     pub criterion_evidence: Vec<EvidenceCard>,
@@ -534,6 +676,7 @@ struct CandidateRow {
     source_anchor: String,
     body: String,
     source_revision: SourceRevision,
+    source_converter: String,
     lexical_rank: f64,
 }
 
@@ -561,6 +704,7 @@ impl CandidateRow {
             exact_excerpt: self.body.clone(),
             sentence_count,
             source_revision: self.source_revision.clone(),
+            source_converter: self.source_converter.clone(),
             why_matched: why_matched(&matched_concepts, sentence_limit, sentence_count),
             matched_concepts,
             lexical_rank: self.lexical_rank,
@@ -574,6 +718,7 @@ struct DocumentAccumulator {
     document_id: DocumentId,
     document_title: String,
     source_revision: SourceRevision,
+    source_converter: String,
     matched_concepts: BTreeSet<LegalConcept>,
     exact_phrase_matched: bool,
     excluded_concept_matched: bool,
@@ -611,7 +756,8 @@ impl LegalIndex {
                     document_id TEXT PRIMARY KEY NOT NULL,
                     title TEXT NOT NULL,
                     revision_sha256 TEXT NOT NULL,
-                    revision_bytes INTEGER NOT NULL
+                    revision_bytes INTEGER NOT NULL,
+                    converter TEXT NOT NULL
                 ) STRICT;
                 CREATE VIRTUAL TABLE provisions USING fts5(
                     document_id UNINDEXED,
@@ -714,7 +860,8 @@ impl LegalIndex {
                 bm25(provisions),
                 d.title,
                 d.revision_sha256,
-                d.revision_bytes
+                d.revision_bytes,
+                d.converter
             FROM provisions p
             JOIN documents d ON d.document_id = p.document_id
             WHERE provisions MATCH ?1
@@ -751,6 +898,7 @@ impl LegalIndex {
                 source_anchor: row.get(2).map_err(|_| RetrievalError::IndexUnavailable)?,
                 body: row.get(4).map_err(|_| RetrievalError::IndexUnavailable)?,
                 source_revision: revision,
+                source_converter: row.get(9).map_err(|_| RetrievalError::IndexUnavailable)?,
                 lexical_rank: row.get(5).map_err(|_| RetrievalError::IndexUnavailable)?,
             });
         }
@@ -839,6 +987,7 @@ impl LegalIndex {
                     document_id: candidate.document_id.clone(),
                     document_title: candidate.document_title.clone(),
                     source_revision: candidate.source_revision.clone(),
+                    source_converter: candidate.source_converter.clone(),
                     matched_concepts: BTreeSet::new(),
                     exact_phrase_matched: false,
                     excluded_concept_matched: false,
@@ -894,6 +1043,7 @@ impl LegalIndex {
                     document_id: document.document_id,
                     document_title: document.document_title,
                     source_revision: document.source_revision,
+                    source_converter: document.source_converter,
                     matched_concepts,
                     exact_phrase_matched: document.exact_phrase_matched,
                     criterion_evidence: document.criterion_evidence,
@@ -960,12 +1110,13 @@ fn replace_document_transaction(
     transaction
         .execute(
             "
-            INSERT INTO documents (document_id, title, revision_sha256, revision_bytes)
-            VALUES (?1, ?2, ?3, ?4)
+            INSERT INTO documents (document_id, title, revision_sha256, revision_bytes, converter)
+            VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(document_id) DO UPDATE SET
                 title = excluded.title,
                 revision_sha256 = excluded.revision_sha256,
-                revision_bytes = excluded.revision_bytes
+                revision_bytes = excluded.revision_bytes,
+                converter = excluded.converter
             ",
             params![
                 document.document_id.as_str(),
@@ -973,6 +1124,7 @@ fn replace_document_transaction(
                 document.revision.sha256,
                 i64::try_from(document.revision.byte_len)
                     .map_err(|_| RetrievalError::InvalidDocumentText)?,
+                document.converter,
             ],
         )
         .map_err(|_| RetrievalError::IndexUnavailable)?;
@@ -1191,6 +1343,75 @@ mod tests {
         );
         assert_eq!(document.provisions[0].anchor, "section:0001");
         assert_eq!(document.provisions[1].anchor, "section:0002");
+    }
+
+    #[test]
+    fn converted_pdf_and_docx_preserve_honest_source_anchors() {
+        let pdf = ConvertedDocument {
+            format: SourceFormat::Pdf,
+            blocks: vec![
+                minutes_archive_convert::ConvertedBlock {
+                    source_anchor: "page:0001".to_string(),
+                    text: "7. CONFIDENTIALITY\nConfidential Information is protected.".to_string(),
+                    flow: AnchorFlow::HardBoundary,
+                },
+                minutes_archive_convert::ConvertedBlock {
+                    source_anchor: "page:0002".to_string(),
+                    text: "8. ASSIGNMENT\nNeither party may assign this Agreement.".to_string(),
+                    flow: AnchorFlow::HardBoundary,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let normalized_pdf = normalize_converted_document(
+            DocumentId::parse("converted-pdf").expect("id"),
+            "Converted PDF",
+            b"%PDF-synthetic",
+            &pdf,
+        )
+        .expect("pdf");
+        assert_eq!(
+            normalized_pdf.provisions[0].anchor,
+            "page:0001/section:0001"
+        );
+        assert_eq!(
+            normalized_pdf.provisions[1].anchor,
+            "page:0002/section:0002"
+        );
+        assert_eq!(normalized_pdf.converter, "pdf-extract-0.12.0-v1");
+
+        let docx = ConvertedDocument {
+            format: SourceFormat::Docx,
+            blocks: vec![
+                minutes_archive_convert::ConvertedBlock {
+                    source_anchor: "paragraph:000001".to_string(),
+                    text: "7. CONFIDENTIALITY".to_string(),
+                    flow: AnchorFlow::Continue,
+                },
+                minutes_archive_convert::ConvertedBlock {
+                    source_anchor: "paragraph:000002".to_string(),
+                    text: "Confidential Information is protected.".to_string(),
+                    flow: AnchorFlow::Continue,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let normalized_docx = normalize_converted_document(
+            DocumentId::parse("converted-docx").expect("id"),
+            "Converted DOCX",
+            b"PK-synthetic",
+            &docx,
+        )
+        .expect("docx");
+        assert_eq!(
+            normalized_docx.provisions[0].anchor,
+            "paragraph:000002/section:0001"
+        );
+        assert_eq!(
+            normalized_docx.provisions[0].heading.as_deref(),
+            Some("7. CONFIDENTIALITY")
+        );
+        assert_eq!(normalized_docx.converter, "docx-xml-0.41.0-v1");
     }
 
     #[test]

@@ -67,7 +67,7 @@ const census = {
 };
 
 const vaultReport = {
-  schema: "minutes.archive-text-vault.v1",
+  schema: "minutes.archive-document-vault.v1",
   vault_id: "local-private-vault",
   approved_locations: 1,
   indexed_documents: 3,
@@ -75,13 +75,18 @@ const vaultReport = {
   unsupported_files_skipped: 1,
   oversized_files_skipped: 0,
   malformed_text_files_skipped: 0,
+  conversion_failures: 0,
+  ocr_required_files: 0,
+  searchable_pdf_documents: 1,
+  docx_documents: 1,
   duplicate_files_skipped: 0,
   symlinks_skipped: 0,
   metadata_errors: 0,
   directory_errors: 0,
   source_content_persisted: false,
   retrieval_index_persisted: false,
-  supported_formats: [".md", ".text", ".txt"],
+  converter_sandbox_verified: true,
+  supported_formats: [".docx", ".md", ".pdf", ".text", ".txt"],
 };
 
 const evidence = {
@@ -105,6 +110,7 @@ const evidence = {
         "Confidential Information includes information of Recipient and its affiliates.",
       sentence_count: 1,
       source_revision: { sha256: "00", byte_len: 76 },
+      source_converter: "pdf-extract-0.12.0-v1",
       matched_concepts: ["confidentiality", "affiliates"],
       why_matched:
         "Matched confidentiality, affiliates, sentence limit in the same provision; 1 sentence.",

@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Minutes Archive — private local legal evidence retrieval"
 
 [dependencies]
+minutes-archive-convert = { path = "../../crates/archive-convert" }
 minutes-archive-core = { path = "../../crates/archive-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }

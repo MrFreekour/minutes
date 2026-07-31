@@ -7,9 +7,9 @@
 //! bytes, and revision before evidence leaves the vault.
 
 use crate::retrieval::{
-    interpret_legal_query, normalize_text_document, CurrentRevisionSet, DocumentId, LegalIndex,
-    LegalQuery, LegalSearchResponse, RetrievalError, SourceRevision, VaultId,
-    MAX_NORMALIZED_DOCUMENT_BYTES,
+    interpret_legal_query, normalize_converted_document, normalize_text_document,
+    CurrentRevisionSet, DocumentId, LegalIndex, LegalQuery, LegalSearchResponse, RetrievalError,
+    SourceRevision, VaultId, MAX_NORMALIZED_DOCUMENT_BYTES,
 };
 use crate::{
     cap_identity_matches, cap_metadata_identity_portable, cap_metadata_is_link_or_reparse,
@@ -17,6 +17,7 @@ use crate::{
     ApprovedRoot, CensusError, FileIdentity,
 };
 use cap_std::fs::{Dir, File};
+use minutes_archive_convert::{BoundedConverter, SourceFormat, WorkerError};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
@@ -25,7 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
-pub const TEXT_VAULT_SCHEMA: &str = "minutes.archive-text-vault.v1";
+pub const DOCUMENT_VAULT_SCHEMA: &str = "minutes.archive-document-vault.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextVaultLimits {
@@ -73,6 +74,8 @@ pub enum VaultError {
     Cancelled,
     #[error("the private source index is unavailable")]
     IndexUnavailable,
+    #[error("the bounded document converter is unavailable")]
+    ConverterUnavailable,
     #[error("the lexical candidate budget was exceeded; narrow the query")]
     CandidateBudgetExceeded,
     #[error("the query could not be applied safely")]
@@ -117,12 +120,17 @@ pub struct TextVaultBuildReport {
     pub unsupported_files_skipped: u64,
     pub oversized_files_skipped: u64,
     pub malformed_text_files_skipped: u64,
+    pub conversion_failures: u64,
+    pub ocr_required_files: u64,
+    pub searchable_pdf_documents: u64,
+    pub docx_documents: u64,
     pub duplicate_files_skipped: u64,
     pub symlinks_skipped: u64,
     pub metadata_errors: u64,
     pub directory_errors: u64,
     pub source_content_persisted: bool,
     pub retrieval_index_persisted: bool,
+    pub converter_sandbox_verified: bool,
     pub supported_formats: Vec<&'static str>,
 }
 
@@ -159,6 +167,10 @@ pub struct AuthorizedTextVault {
     index: LegalIndex,
     build_report: TextVaultBuildReport,
 }
+
+pub type AuthorizedDocumentVault = AuthorizedTextVault;
+pub type DocumentVaultBuildReport = TextVaultBuildReport;
+pub type DocumentVaultLimits = TextVaultLimits;
 
 impl std::fmt::Debug for AuthorizedTextVault {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -311,6 +323,10 @@ struct BuildCounters {
     unsupported_files_skipped: u64,
     oversized_files_skipped: u64,
     malformed_text_files_skipped: u64,
+    conversion_failures: u64,
+    ocr_required_files: u64,
+    searchable_pdf_documents: u64,
+    docx_documents: u64,
     duplicate_files_skipped: u64,
     symlinks_skipped: u64,
     metadata_errors: u64,
@@ -323,6 +339,26 @@ pub fn build_authorized_text_vault(
     approved_roots: &[ApprovedRoot],
     limits: TextVaultLimits,
     cancelled: &AtomicBool,
+) -> Result<AuthorizedTextVault, VaultError> {
+    build_authorized_vault(vault_id, approved_roots, limits, cancelled, None)
+}
+
+pub fn build_authorized_document_vault(
+    vault_id: VaultId,
+    approved_roots: &[ApprovedRoot],
+    limits: TextVaultLimits,
+    cancelled: &AtomicBool,
+    converter: &BoundedConverter,
+) -> Result<AuthorizedTextVault, VaultError> {
+    build_authorized_vault(vault_id, approved_roots, limits, cancelled, Some(converter))
+}
+
+fn build_authorized_vault(
+    vault_id: VaultId,
+    approved_roots: &[ApprovedRoot],
+    limits: TextVaultLimits,
+    cancelled: &AtomicBool,
+    converter: Option<&BoundedConverter>,
 ) -> Result<AuthorizedTextVault, VaultError> {
     let limits = limits.validate()?;
     validate_approved_roots(approved_roots).map_err(VaultError::from)?;
@@ -433,11 +469,11 @@ pub fn build_authorized_text_vault(
                     counters.unsupported_files_skipped.saturating_add(1);
                 continue;
             }
-            if !is_supported_text_extension(&name) {
+            let Some(source_kind) = source_kind(&name, converter.is_some()) else {
                 counters.unsupported_files_skipped =
                     counters.unsupported_files_skipped.saturating_add(1);
                 continue;
-            }
+            };
             if metadata.len() == 0 || metadata.len() > MAX_NORMALIZED_DOCUMENT_BYTES as u64 {
                 counters.oversized_files_skipped =
                     counters.oversized_files_skipped.saturating_add(1);
@@ -506,11 +542,46 @@ pub fn build_authorized_text_vault(
                     counters.malformed_text_files_skipped.saturating_add(1);
                 continue;
             };
-            let normalized = match normalize_text_document(document_id.clone(), title, &bytes) {
+            let normalized = match source_kind {
+                SourceKind::Text => normalize_text_document(document_id.clone(), title, &bytes),
+                SourceKind::Converted(format) => {
+                    let Some(converter) = converter else {
+                        return Err(VaultError::ConverterUnavailable);
+                    };
+                    let converted = match converter.convert(format, &bytes) {
+                        Ok(converted) => converted,
+                        Err(WorkerError::SourceRefused | WorkerError::WorkerBudgetExceeded) => {
+                            counters.conversion_failures =
+                                counters.conversion_failures.saturating_add(1);
+                            continue;
+                        }
+                        Err(_) => return Err(VaultError::ConverterUnavailable),
+                    };
+                    if converted.blocks.is_empty()
+                        && converted
+                            .warnings
+                            .iter()
+                            .any(|warning| warning == "ocr_required_or_no_extractable_text")
+                    {
+                        counters.ocr_required_files = counters.ocr_required_files.saturating_add(1);
+                        continue;
+                    }
+                    normalize_converted_document(document_id.clone(), title, &bytes, &converted)
+                }
+            };
+            let normalized = match normalized {
                 Ok(document) => document,
                 Err(_) => {
-                    counters.malformed_text_files_skipped =
-                        counters.malformed_text_files_skipped.saturating_add(1);
+                    match source_kind {
+                        SourceKind::Text => {
+                            counters.malformed_text_files_skipped =
+                                counters.malformed_text_files_skipped.saturating_add(1);
+                        }
+                        SourceKind::Converted(_) => {
+                            counters.conversion_failures =
+                                counters.conversion_failures.saturating_add(1);
+                        }
+                    }
                     continue;
                 }
             };
@@ -528,6 +599,16 @@ pub fn build_authorized_text_vault(
                 },
             );
             counters.indexed_documents = document_number;
+            match source_kind {
+                SourceKind::Converted(SourceFormat::Pdf) => {
+                    counters.searchable_pdf_documents =
+                        counters.searchable_pdf_documents.saturating_add(1);
+                }
+                SourceKind::Converted(SourceFormat::Docx) => {
+                    counters.docx_documents = counters.docx_documents.saturating_add(1);
+                }
+                SourceKind::Text => {}
+            }
             counters.indexed_bytes = counters
                 .indexed_bytes
                 .saturating_add(post_read_metadata.len());
@@ -535,7 +616,7 @@ pub fn build_authorized_text_vault(
     }
 
     let build_report = TextVaultBuildReport {
-        schema: TEXT_VAULT_SCHEMA,
+        schema: DOCUMENT_VAULT_SCHEMA,
         vault_id: vault_id.clone(),
         approved_locations: roots.len() as u64,
         indexed_documents: counters.indexed_documents,
@@ -543,13 +624,22 @@ pub fn build_authorized_text_vault(
         unsupported_files_skipped: counters.unsupported_files_skipped,
         oversized_files_skipped: counters.oversized_files_skipped,
         malformed_text_files_skipped: counters.malformed_text_files_skipped,
+        conversion_failures: counters.conversion_failures,
+        ocr_required_files: counters.ocr_required_files,
+        searchable_pdf_documents: counters.searchable_pdf_documents,
+        docx_documents: counters.docx_documents,
         duplicate_files_skipped: counters.duplicate_files_skipped,
         symlinks_skipped: counters.symlinks_skipped,
         metadata_errors: counters.metadata_errors,
         directory_errors: counters.directory_errors,
         source_content_persisted: false,
         retrieval_index_persisted: false,
-        supported_formats: vec![".md", ".text", ".txt"],
+        converter_sandbox_verified: converter.is_some(),
+        supported_formats: if converter.is_some() {
+            vec![".docx", ".md", ".pdf", ".text", ".txt"]
+        } else {
+            vec![".md", ".text", ".txt"]
+        },
     };
     Ok(AuthorizedTextVault {
         vault_id,
@@ -560,8 +650,19 @@ pub fn build_authorized_text_vault(
     })
 }
 
-fn is_supported_text_extension(name: &OsStr) -> bool {
-    matches!(extension_for_name(name).as_str(), ".md" | ".text" | ".txt")
+#[derive(Debug, Clone, Copy)]
+enum SourceKind {
+    Text,
+    Converted(SourceFormat),
+}
+
+fn source_kind(name: &OsStr, converter_available: bool) -> Option<SourceKind> {
+    match extension_for_name(name).as_str() {
+        ".md" | ".text" | ".txt" => Some(SourceKind::Text),
+        ".pdf" if converter_available => Some(SourceKind::Converted(SourceFormat::Pdf)),
+        ".docx" if converter_available => Some(SourceKind::Converted(SourceFormat::Docx)),
+        _ => None,
+    }
 }
 
 fn source_title(name: &OsStr) -> Option<String> {

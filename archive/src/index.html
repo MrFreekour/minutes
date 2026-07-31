@@ -29,8 +29,8 @@
         <h1>Map first. Then find the exact language.</h1>
         <p class="hero-copy">
           Start with a metadata-only census. If the coverage looks right, build
-          a local, in-memory text index and search exact provisions with source
-          evidence. Nothing is uploaded.
+          a local, in-memory document index and search exact provisions with
+          source evidence. Nothing is uploaded.
         </p>
       </section>
 
@@ -62,7 +62,7 @@
               <span class="step-number">4</span>
               <div>
                 <strong>Search exact evidence</strong>
-                <span>TXT and Markdown only in this proof.</span>
+                <span>Searchable PDF, DOCX, and text.</span>
               </div>
             </li>
           </ol>
@@ -212,17 +212,18 @@
             <div class="pilot-strip">
               <div>
                 <p class="section-label">Optional next gate</p>
-                <strong>Build a temporary text search index</strong>
+                <strong>Build a temporary document search index</strong>
                 <p>
-                  This explicitly opens supported <code>.txt</code>,
-                  <code>.text</code>, and <code>.md</code> files. Source text
-                  and the FTS index remain in memory and are discarded when
-                  the app closes. PDFs, Word files, scans, and email are not
-                  searched in this build.
+                  This explicitly opens searchable <code>.pdf</code>,
+                  <code>.docx</code>, <code>.txt</code>, <code>.text</code>,
+                  and <code>.md</code> files. PDF and DOCX bytes go to a
+                  bounded, network-denied converter. Source text and the FTS
+                  index stay in memory. Scans, legacy Word, and email are
+                  counted but not searched.
                 </p>
               </div>
               <button id="build-text-vault" class="button button-primary" type="button">
-                Build text pilot
+                Build document pilot
                 <span aria-hidden="true">→</span>
               </button>
             </div>
@@ -245,11 +246,12 @@
               <span></span>
             </div>
             <p class="section-label">Explicit content step</p>
-            <h2>Building the private text index…</h2>
+            <h2>Building the private document index…</h2>
             <p>
-              Reading bounded TXT and Markdown files from the approved
-              locations. The index stays in memory, links remain excluded, and
-              no model or network service is used.
+              Reading bounded supported files from the approved locations.
+              PDF and DOCX conversion runs in the network-denied worker. The
+              index stays in memory, links remain excluded, and no model is
+              used.
             </p>
             <div class="progress-track" aria-hidden="true">
               <span></span>
@@ -262,10 +264,10 @@
           <div id="search-view" hidden>
             <div class="search-heading">
               <div>
-                <p class="section-label">Evidence-first text pilot</p>
+                <p class="section-label">Evidence-first document pilot</p>
                 <h2>Search the approved archive</h2>
                 <p id="vault-summary">
-                  The private text index is ready in memory.
+                  The private document index is ready in memory.
                 </p>
               </div>
               <button id="back-to-census" class="button button-secondary" type="button">

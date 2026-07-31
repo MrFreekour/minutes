@@ -435,18 +435,23 @@ law, BAA language, remembered phrases, and prompt-like source text.
 Document-level conjunction is a separate result type with criterion evidence;
 criteria are grouped inside one document and exclusions apply across its
 provisions. Candidate-budget overflow fails closed rather than returning an
-apparently complete answer. The proof does not yet ingest PDF or DOCX, persist
-a protected vault, open an original in its native application, or implement
-OCR; those remain Gate 2 work rather than implied capability.
+apparently complete answer. The proof does not yet persist a protected vault,
+open an original in its native application, convert legacy Word or email
+containers, or implement OCR; those remain Gate 2 work rather than implied
+capability.
 
 The desktop app now exposes this proof only after a completed census and an
-explicit content-access action. It ingests bounded UTF-8 `.txt`, `.text`, and
-`.md` files through the retained folder capabilities into an in-memory index.
-Before an evidence card is returned, the app revalidates the approved root,
-relative membership without links, file identity, current bytes, and SHA-256
-revision. Moved, replaced, mutated, or inaccessible sources are withdrawn.
-The browser-facing UI receives document titles and exact evidence only for
-current matches; it never receives source paths or general filesystem access.
+explicit content-access action. It ingests bounded searchable `.pdf`, `.docx`,
+`.txt`, `.text`, and `.md` files through the retained folder capabilities into
+an in-memory index. PDF and DOCX bytes are sent through pipes to a bounded,
+network-denied worker; source paths are never passed to the parser. PDF results
+carry page anchors and DOCX results carry paragraph anchors plus the converter
+version. Before an evidence card is returned, the app revalidates the approved
+root, relative membership without links, file identity, current bytes, and
+SHA-256 revision. Moved, replaced, mutated, or inaccessible sources are
+withdrawn. The browser-facing UI receives document titles and exact evidence
+only for current matches; it never receives source paths or general filesystem
+access.
 
 Evaluate:
 
@@ -522,13 +527,14 @@ agent, classify thousands of documents, or move his archive into Minutes.
 
 ## Current Build Decision
 
-The multi-root census and the bounded TXT or Markdown evidence UI now exist in
-the separate app. Keep this content proof ephemeral until live-source
-resolution and revocation remain green under native interaction testing.
+The multi-root census and the bounded searchable PDF, DOCX, and text evidence
+UI now exist in the separate app. Keep this content proof ephemeral until
+live-source resolution and revocation remain green under native interaction
+testing.
 
-Next, use the aggregate census to choose the converter order and implement
-searchable PDF and DOCX with source anchors. Do not add a persistent derivative
-store, embeddings, model generation, or an Open Original action until their
-separate protection and final-fence contracts are proven. Developer ID
-signing, notarization, and native permission and interaction testing remain
-Peter handoff gates.
+Next, use the aggregate census to determine whether local OCR, legacy Word,
+WordPerfect, email containers, Apple packages, or cloud hydration is the next
+coverage constraint. Do not add a persistent derivative store, embeddings,
+model generation, or an Open Original action until their separate protection
+and final-fence contracts are proven. Developer ID signing, notarization, and
+native permission and interaction testing remain Peter handoff gates.
