@@ -422,61 +422,37 @@ fn segment_legal_provisions(text: &str) -> Result<Vec<NormalizedProvision>, Retr
         .collect())
 }
 
-/// Whether a line reads as a caption rather than a sentence.
+/// Heuristic caption detection. Known-inadequate; see the note inside.
 ///
-/// Captions capitalise their content words; prose does not. Short function
-/// words are exempt so "Indemnification by Supplier for Third-Party Claims"
-/// still qualifies, and a token with no alphabetic character (a numeral, a
-/// bare parenthetical) is ignored rather than counted against it.
-fn is_title_case(line: &str) -> bool {
-    const FUNCTION_WORDS: &[&str] = &[
-        "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "out", "the",
-        "to", "with", "under", "upon", "into", "relating", "arising",
-    ];
-    let mut content_words = 0usize;
-    let mut capitalised = 0usize;
-    for word in line.split_whitespace().skip(1) {
-        let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
-        let Some(first) = trimmed.chars().find(|c| c.is_alphabetic()) else {
-            continue;
-        };
-        if FUNCTION_WORDS.contains(&trimmed.to_ascii_lowercase().as_str()) {
-            continue;
-        }
-        content_words += 1;
-        if first.is_uppercase() {
-            capitalised += 1;
-        }
-    }
-    content_words > 0 && capitalised == content_words
-}
-
+/// This should be replaced by structural signal from the converter --
+/// `w:pStyle` for DOCX, `#` for Markdown, and no promotion at all for PDF,
+/// which carries no reliable heading marker. Until then every change here
+/// trades one class of legal-facing error for another.
 fn looks_like_legal_heading(line: &str) -> bool {
     if line.len() > 180 || line.ends_with('.') && line.split_whitespace().count() > 12 {
         return false;
     }
     let lowercase = line.to_ascii_lowercase();
-    // The same title-case requirement applies here. This branch had no
-    // constraint at all, so "Section 12 (Confidentiality), Section 13
-    // (Affiliates) ... are cross-referenced here" became the caption of the
-    // clause beneath it and a payment provision was returned as a
-    // four-concept confidentiality clause.
+    // Capped for the same reason as `numbered`. This branch had no
+    // constraint at all, which is why an uncapped cross-reference beginning
+    // "Section 12 (Confidentiality), Section 13 (Affiliates) ..." became the
+    // caption of the clause beneath it.
     let known_prefix = ["section ", "article ", "schedule ", "exhibit "]
         .iter()
         .any(|prefix| lowercase.starts_with(prefix))
-        && is_title_case(line);
-    // Word count is the wrong signal for caption-versus-sentence. Capping it
-    // demoted genuine captions -- "9. Indemnification by Supplier for
-    // Third-Party Claims Arising out of or Relating to the Services" is
-    // ordinary commercial phrasing at fifteen words -- which merged them into
-    // the clause body and pushed real provisions past a sentence limit, the
-    // silent-no-results failure that is worse than a false attribution.
-    // Leaving it uncapped promoted ordinary cross-references instead.
-    //
-    // Captions are title case; sentences are not. "9. See Sections 3
-    // (confidentiality), 4 (affiliates)" carries lowercase content words and
-    // fails, while a long genuine caption passes at any length.
-    let numbered = is_title_case(line)
+        && line.split_whitespace().count() <= 12;
+    // Caption detection here is a lexical heuristic and it does not converge.
+    // Five successive attempts -- word cap, title case, and combinations --
+    // each admitted prose as a caption or demoted a real one, and in a tool
+    // used for privilege review both directions are harmful: a promoted
+    // cross-reference attributes concepts to an unrelated clause, and a
+    // demoted caption inflates the sentence count until a real provision
+    // silently returns nothing. The word cap is retained as the least-bad
+    // interim because its failures are at least symmetric and predictable.
+    // The real signal is structural, not lexical: DOCX carries `w:pStyle`,
+    // Markdown carries `#`, and PDF carries none -- which is the honest
+    // answer for PDF. See the note above `looks_like_legal_heading`.
+    let numbered = line.split_whitespace().count() <= 12
         && line.split_once(['.', ')']).is_some_and(|(prefix, rest)| {
             !rest.trim().is_empty()
                 && prefix.len() <= 12
