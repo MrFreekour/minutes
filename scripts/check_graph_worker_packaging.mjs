@@ -8,7 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 // satisfying the structural checks below.
 const EXPECTED_SOURCE_SHA256 = {
   release: "564b8401767f9390e3f3502eecd562711df7d10e4790178bbb6099eebe6c0ed5",
-  acceptance: "701960b7d3f9a8a363946a72e4e2271cc057919ea0425d4b6ad4abf25673dd13",
+  acceptance: "94b1a57515357bcd229ca57095f7cc10736d22e9a271b58994945ba8651de158",
   build: "6a1933306c99ccbfc6c5cb35a577389fbe79f08333e855661dc1994f0f9718b1",
   dev: "b308c3088597f154a247cbfb299cd8b4da432378b4a41b3309fb0a2a15beff3c",
   packageXpc: "baebd532d240fc26188c431f571d0a44f2ce1e7240c3277284c9ea9e69c1ef82",
