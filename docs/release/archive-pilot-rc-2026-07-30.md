@@ -63,7 +63,7 @@ Observed on 2026-07-30:
   cards, search view visible.
 - Installed bundle seal: valid and satisfies its designated requirement.
 - Installed executable SHA-256:
-  `e74f25428d95fbb8d2f36a68428923842f90d5707b1f1c63da97fe9da1ccc15c`.
+  `8e0c88abf7049c123b8280cd263687149f300397fc869142ba8ee8436ace3a6b`.
 - Fresh installed app process: no open network socket observed.
 - macOS Archive tree: `quick-xml 0.41.0`; no `quick-xml 0.37.5`.
 
