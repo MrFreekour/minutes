@@ -141,7 +141,7 @@ jobs:
       - name: Gate whole-bundle integrity
         run: |
           set -euo pipefail
-          scripts/archive-bundle-integrity.sh \
+          scripts/archive-bundle-integrity.py \
             "target/release/bundle/macos/Minutes Archive.app" \
             "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID"
 
@@ -159,7 +159,7 @@ jobs:
           # The smoke tests above run candidate-controlled code against the
           # bundle path, so the pre-execution gate constrains nothing about
           # what is actually packaged. Re-gate immediately before zipping.
-          scripts/archive-bundle-integrity.sh \
+          scripts/archive-bundle-integrity.py \
             "target/release/bundle/macos/Minutes Archive.app" \
             "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID"
 
@@ -203,7 +203,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-          sparse-checkout: scripts/archive-bundle-integrity.sh
+          sparse-checkout: scripts/archive-bundle-integrity.py
           sparse-checkout-cone-mode: false
 
       - name: Download exact unsigned Archive candidate
@@ -221,7 +221,7 @@ jobs:
           (cd payload && shasum -a 256 -c minutes-archive-unsigned.zip.sha256)
           mkdir signed
           ditto -x -k payload/minutes-archive-unsigned.zip signed
-          scripts/archive-bundle-integrity.sh \
+          scripts/archive-bundle-integrity.py \
             "signed/Minutes Archive.app" \
             "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID"
 
@@ -357,7 +357,7 @@ jobs:
         run: |
           set -euo pipefail
           app="signed/Minutes Archive.app"
-          scripts/archive-bundle-integrity.sh \
+          scripts/archive-bundle-integrity.py \
             "$app" "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID" \
             > archive-bundle-report.txt
           cat archive-bundle-report.txt
