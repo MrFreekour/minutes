@@ -89,6 +89,9 @@ jobs:
             -p minutes-archive-app \
             --all-targets -- -D warnings
 
+      - name: Validate client-free human QA fixtures
+        run: scripts/make-archive-qa-fixtures.test.sh
+
       - name: Build isolated production Archive app without signing
         run: |
           set -euo pipefail

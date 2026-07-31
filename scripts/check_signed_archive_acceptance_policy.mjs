@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 // Updated only after a line-by-line review of the complete unsigned-build
 // boundary and secret-bearing signing/notarization job.
 const EXPECTED_PRE_SIGNING_BOUNDARY_SHA256 =
-  "4a0e63562ee562d1eb9129550c7abc636e15b76ee06265663d214f6431e437e8";
+  "784c49efcd1bf04c8e7cc4912d9d6fd4098c59c430706ffb0bdd8dac62bce37a";
 const EXPECTED_SIGNING_JOB_SHA256 =
   "fa048e38bc4a3c51f45bbf8933df9986635e0dda16b33a182800335fdee6ccdb";
 const EXPECTED_TRIGGER_BLOCK = `on:
@@ -88,6 +88,10 @@ requirePattern(
 requirePattern(
   /document_vault_smoke -- \\\n\s+"\$executable"/,
   "the unsigned Archive candidate must exercise its exact document and worker executable",
+);
+requirePattern(
+  /name: Validate client-free human QA fixtures\n\s+run: scripts\/make-archive-qa-fixtures\.test\.sh/,
+  "the unsigned Archive candidate must validate the client-free human QA fixture kit",
 );
 
 if (!signingJob) {

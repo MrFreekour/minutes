@@ -53,6 +53,14 @@ const mutations = [
     ),
   },
   {
+    name: "human QA fixture validation removed",
+    expected: "complete Archive trigger, authorization, and unsigned-build boundary changed",
+    source: workflow.replace(
+      "      - name: Validate client-free human QA fixtures\n        run: scripts/make-archive-qa-fixtures.test.sh\n\n",
+      "",
+    ),
+  },
+  {
     name: "notarization removed",
     expected: "complete Archive secret-bearing job changed",
     source: workflow.replace(
