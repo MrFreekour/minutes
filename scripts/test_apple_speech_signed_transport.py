@@ -245,6 +245,40 @@ def bounded_stream(stream: str) -> str:
     ]
 
 
+def bounded_head(text: str) -> str:
+    """Bound a document whose meaning lives at the top rather than the end.
+
+    A macOS ``.ips`` crash report puts the exception, termination reason and
+    faulting-thread backtrace near the head, and hundreds of loaded binary
+    images at the end. Keeping the tail would discard the crash and print the
+    dylib list, so these are bounded head-first.
+    """
+    if not text:
+        return "<empty>"
+    if len(text) <= DIAGNOSTIC_STREAM_LIMIT:
+        return text
+    return (
+        text[:DIAGNOSTIC_STREAM_LIMIT]
+        + f"\n<truncated to first {DIAGNOSTIC_STREAM_LIMIT} characters>"
+    )
+
+
+def bounded_lines(lines: list[str]) -> str:
+    """Keep both ends of a line sequence when it exceeds the budget.
+
+    A launch failure is explained by the first lines and a crash by the last,
+    so neither end can be dropped. `com.apple.xpc.launchd` is chatty enough at
+    launch to exhaust the budget before the interesting entries appear.
+    """
+    if len(lines) <= DIAGNOSTIC_LOG_LINES:
+        return "\n".join(lines)
+    half = DIAGNOSTIC_LOG_LINES // 2
+    omitted = len(lines) - (half * 2)
+    return "\n".join(
+        lines[:half] + [f"<{omitted} lines omitted>"] + lines[-half:]
+    )
+
+
 def signal_label(returncode) -> str | None:
     """Render a negative exit status as its terminating signal name."""
     if returncode is None or returncode >= 0:
@@ -258,24 +292,43 @@ def signal_label(returncode) -> str | None:
 def unified_log_excerpt(started_at: float) -> str:
     """Collect helper-scoped unified log entries emitted during the run."""
     start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at))
+    # The observed failure was reported parent-side, and the parent is the
+    # signed app itself, so matching only the two helpers would have missed it
+    # entirely. Client-side libxpc invalidation logs under "com.apple.xpc"
+    # rather than "com.apple.xpc.launchd", and code-signature rejections come
+    # from amfid. --private-data is deliberately NOT passed, so os_log private
+    # fields stay redacted.
     predicate = (
         'process == "minutes-apple-speech-worker"'
         ' OR process == "minutes-graph-worker"'
-        ' OR subsystem == "com.apple.xpc.launchd"'
+        ' OR process == "amfid"'
+        ' OR processImagePath CONTAINS "Minutes"'
+        ' OR subsystem BEGINSWITH "com.apple.xpc"'
     )
     try:
         completed = subprocess.run(
-            ["log", "show", "--start", start, "--style", "compact", "--predicate", predicate],
+            [
+                "log",
+                "show",
+                "--start",
+                start,
+                "--info",
+                "--style",
+                "compact",
+                "--predicate",
+                predicate,
+            ],
             capture_output=True,
             text=True,
-            timeout=120,
+            errors="replace",
+            timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as error:
         return f"<unified log unavailable: {error}>"
     lines = completed.stdout.splitlines()
     if not lines:
         return f"<no matching entries; log exited {completed.returncode}>"
-    return "\n".join(lines[:DIAGNOSTIC_LOG_LINES])
+    return bounded_lines(lines)
 
 
 def crash_report_excerpts(started_at: float) -> list[tuple[pathlib.Path, str]]:
@@ -321,14 +374,17 @@ def emit_failure_diagnostics(started_at: float, returncode, stdout, stderr) -> N
     write(bounded_stream(stdout))
     write("--- child stderr ---")
     write(bounded_stream(stderr))
-    write("--- unified log ---")
-    write(unified_log_excerpt(started_at))
+    # Crash reports come before the unified log because they are the densest
+    # evidence and `log show` can burn a minute first. sys.stderr is line
+    # buffered, so anything already written survives a job cancellation.
     reports = crash_report_excerpts(started_at)
     if not reports:
         write("--- crash reports: none written during this run ---")
     for path, body in reports:
         write(f"--- crash report {path} ---")
-        write(bounded_stream(body))
+        write(bounded_head(body))
+    write("--- unified log ---")
+    write(bounded_stream(unified_log_excerpt(started_at)))
     write("=== end diagnostics ===")
     sys.stderr.flush()
 
@@ -369,6 +425,12 @@ def main() -> int:
                 env=environment,
                 capture_output=True,
                 text=True,
+                # A helper killed mid multi-byte character yields undecodable
+                # bytes. Strict decoding would raise UnicodeDecodeError, which
+                # is neither OSError nor SubprocessError nor TimeoutExpired, so
+                # it would escape every handler below and reproduce the exact
+                # evidence-free failure this harness exists to prevent.
+                errors="replace",
                 timeout=ACCEPTANCE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as expired:
@@ -384,6 +446,14 @@ def main() -> int:
                 "signed Apple Speech transport acceptance timed out after "
                 f"{ACCEPTANCE_TIMEOUT_SECONDS}s"
             ) from expired
+        except Exception:
+            # Defence in depth: any other failure launching or reading the
+            # signed app must still leave evidence behind rather than a bare
+            # traceback. Deliberately not BaseException, so a cancelled job is
+            # not delayed by log collection. The streams are unavailable here,
+            # so this reports the system-side evidence only, then re-raises.
+            emit_failure_diagnostics(started_at, None, None, None)
+            raise
         finally:
             time.sleep(0.1)
             held_contents = watcher.close()
@@ -406,6 +476,13 @@ def main() -> int:
     if runtime_supported_match is None:
         raise RuntimeError("signed app did not report whether the Speech runtime was supported")
     runtime_supported = runtime_supported_match.group(1) == "true"
+    # Echo to stderr as well as the receipt. The receipt is only uploaded as an
+    # artifact, so without this a runtimeSupported=false run would read as a
+    # clean pass to anyone reading the job log.
+    print(
+        f"apple-speech-signed-runtime-supported={str(runtime_supported).lower()}",
+        file=sys.stderr,
+    )
     raw_f32, pcm_i16 = canary_patterns()
     for contents in held_contents:
         if raw_f32 in contents or pcm_i16 in contents:
