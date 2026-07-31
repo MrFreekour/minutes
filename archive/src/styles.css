@@ -1112,3 +1112,10 @@ footer {
     animation-iteration-count: 1 !important;
   }
 }
+
+.criterion-why {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}

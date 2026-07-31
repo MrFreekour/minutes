@@ -311,7 +311,37 @@ function renderVaultSummary(report) {
           report.semantic_provisions_indexed === 1 ? "" : "s"
         } built with the pinned macOS model inside its network-denied worker. `
       : "Semantic suggestions are unavailable on this Mac. ") +
+    describeDroppedSources(report) +
     "All indexes exist only in memory.";
+}
+
+// Documents that could not be indexed were counted and never shown. Counsel
+// saw "N supported documents indexed" and had no way to learn that a
+// privileged PDF had been refused by the converter, was malformed, was over
+// budget, or sat behind a permission error -- a search would simply return
+// nothing for a clause that is plainly in the file. Coverage gaps have to be
+// visible to be acted on.
+function describeDroppedSources(report) {
+  const dropped = [
+    [report.conversion_failures, "could not be converted"],
+    [report.malformed_text_files_skipped, "were malformed"],
+    [report.oversized_files_skipped, "exceeded the size budget"],
+    [report.duplicate_files_skipped, "were duplicates"],
+    [report.metadata_errors, "could not be read"],
+    [report.directory_errors, "were in unreadable folders"],
+  ].filter(([count]) => count > 0);
+  if (dropped.length === 0) {
+    return "No supported document was dropped. ";
+  }
+  const total = dropped.reduce((sum, [count]) => sum + count, 0);
+  const detail = dropped
+    .map(([count, reason]) => `${count.toLocaleString()} ${reason}`)
+    .join(", ");
+  return (
+    `${total.toLocaleString()} document${total === 1 ? "" : "s"} ` +
+    `${total === 1 ? "was" : "were"} not indexed and cannot be searched ` +
+    `(${detail}). Review these before relying on a negative result. `
+  );
 }
 
 async function buildTextVault() {
@@ -384,6 +414,16 @@ function evidenceCard(card, compact = false, semantic = false) {
     const excerpt = document.createElement("p");
     excerpt.textContent = card.exact_excerpt;
     item.append(heading, excerpt);
+    // The compact card dropped why_matched entirely, so in document-scope
+    // results the disclosure that a concept matched in the heading rather
+    // than in the quoted text never reached the reader. The anchor went too,
+    // leaving nothing to verify the excerpt against in the source.
+    if (card.why_matched) {
+      const why = document.createElement("p");
+      why.className = "criterion-why";
+      why.textContent = `${card.source_anchor} — ${card.why_matched}`;
+      item.append(why);
+    }
     return item;
   }
 
