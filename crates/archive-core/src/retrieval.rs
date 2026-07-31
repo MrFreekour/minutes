@@ -220,11 +220,20 @@ fn segment_anchored_blocks(
     let mut body_anchor = None::<String>;
     let mut body = Vec::<String>::new();
 
+    // `orphan_pending_heading` is false on page-boundary flushes. Every PDF
+    // block is a HardBoundary, so flush runs at the start and end of every
+    // page; orphaning there severed a caption that fell at a page break from
+    // the clause continuing on the next page. The caption shipped as its own
+    // provision at the wrong page and the clause went headless -- and where
+    // its body did not repeat the term, unfindable. Keep the heading pending
+    // across page boundaries; orphan only when a new heading displaces it or
+    // the document ends.
     let flush = |segments: &mut Vec<(Option<String>, String, String)>,
                  heading: &mut Option<String>,
                  heading_anchor: &mut Option<String>,
                  body_anchor: &mut Option<String>,
-                 body: &mut Vec<String>| {
+                 body: &mut Vec<String>,
+                 orphan_pending_heading: bool| {
         let joined = body
             .iter()
             .map(|line| line.trim())
@@ -232,6 +241,10 @@ fn segment_anchored_blocks(
             .collect::<Vec<_>>()
             .join(" ");
         if joined.is_empty() {
+            if !orphan_pending_heading {
+                body.clear();
+                return;
+            }
             // Same defect the text segmenter had: a promoted heading with no
             // following body was dropped and, because `heading.take()` never
             // ran, carried forward onto the next segment. This twin handles
@@ -264,6 +277,7 @@ fn segment_anchored_blocks(
                 &mut heading_anchor,
                 &mut body_anchor,
                 &mut body,
+                false,
             );
         }
         for line in block.text.lines() {
@@ -278,6 +292,7 @@ fn segment_anchored_blocks(
                     &mut heading_anchor,
                     &mut body_anchor,
                     &mut body,
+                    true,
                 );
                 heading = Some(trimmed.to_string());
                 heading_anchor = Some(block.source_anchor.clone());
@@ -298,6 +313,7 @@ fn segment_anchored_blocks(
                 &mut heading_anchor,
                 &mut body_anchor,
                 &mut body,
+                false,
             );
         }
     }
@@ -307,6 +323,7 @@ fn segment_anchored_blocks(
         &mut heading_anchor,
         &mut body_anchor,
         &mut body,
+        true,
     );
     if segments.is_empty() {
         return Err(RetrievalError::InvalidDocumentText);
@@ -405,21 +422,61 @@ fn segment_legal_provisions(text: &str) -> Result<Vec<NormalizedProvision>, Retr
         .collect())
 }
 
+/// Whether a line reads as a caption rather than a sentence.
+///
+/// Captions capitalise their content words; prose does not. Short function
+/// words are exempt so "Indemnification by Supplier for Third-Party Claims"
+/// still qualifies, and a token with no alphabetic character (a numeral, a
+/// bare parenthetical) is ignored rather than counted against it.
+fn is_title_case(line: &str) -> bool {
+    const FUNCTION_WORDS: &[&str] = &[
+        "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "out", "the",
+        "to", "with", "under", "upon", "into", "relating", "arising",
+    ];
+    let mut content_words = 0usize;
+    let mut capitalised = 0usize;
+    for word in line.split_whitespace().skip(1) {
+        let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
+        let Some(first) = trimmed.chars().find(|c| c.is_alphabetic()) else {
+            continue;
+        };
+        if FUNCTION_WORDS.contains(&trimmed.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        content_words += 1;
+        if first.is_uppercase() {
+            capitalised += 1;
+        }
+    }
+    content_words > 0 && capitalised == content_words
+}
+
 fn looks_like_legal_heading(line: &str) -> bool {
     if line.len() > 180 || line.ends_with('.') && line.split_whitespace().count() > 12 {
         return false;
     }
     let lowercase = line.to_ascii_lowercase();
+    // The same title-case requirement applies here. This branch had no
+    // constraint at all, so "Section 12 (Confidentiality), Section 13
+    // (Affiliates) ... are cross-referenced here" became the caption of the
+    // clause beneath it and a payment provision was returned as a
+    // four-concept confidentiality clause.
     let known_prefix = ["section ", "article ", "schedule ", "exhibit "]
         .iter()
-        .any(|prefix| lowercase.starts_with(prefix));
-    // A numbered line is only a caption if it is short. Without a word cap,
-    // an ordinary cross-reference -- "9. See Sections 3 (confidentiality), 4
-    // (affiliates), 5 (compelled disclosure) and 6 (survival)" -- was read as
-    // the heading of whatever clause followed it, so a payment provision was
-    // returned as a four-concept confidentiality clause. Captions are short;
-    // sentences that happen to start with a numeral are not.
-    let numbered = line.split_whitespace().count() <= 12
+        .any(|prefix| lowercase.starts_with(prefix))
+        && is_title_case(line);
+    // Word count is the wrong signal for caption-versus-sentence. Capping it
+    // demoted genuine captions -- "9. Indemnification by Supplier for
+    // Third-Party Claims Arising out of or Relating to the Services" is
+    // ordinary commercial phrasing at fifteen words -- which merged them into
+    // the clause body and pushed real provisions past a sentence limit, the
+    // silent-no-results failure that is worse than a false attribution.
+    // Leaving it uncapped promoted ordinary cross-references instead.
+    //
+    // Captions are title case; sentences are not. "9. See Sections 3
+    // (confidentiality), 4 (affiliates)" carries lowercase content words and
+    // fails, while a long genuine caption passes at any length.
+    let numbered = is_title_case(line)
         && line.split_once(['.', ')']).is_some_and(|(prefix, rest)| {
             !rest.trim().is_empty()
                 && prefix.len() <= 12
@@ -811,6 +868,11 @@ impl CandidateRow {
         }
     }
 
+    /// Semantic cards carry the same disclosure obligation. The embedding is
+    /// built from title + heading + text, so the heading provably influences
+    /// similarity, and the UI replaces the kicker on these cards so
+    /// `provision_heading` is never rendered. Without this the reader sees a
+    /// body-only quotation and no indication the heading contributed.
     fn semantic_evidence_card(
         &self,
         vault_id: &VaultId,
@@ -827,7 +889,17 @@ impl CandidateRow {
             source_revision: self.source_revision.clone(),
             source_converter: self.source_converter.clone(),
             semantic_similarity,
-            why_suggested: "Meaning-similar suggestion from a revision-pinned on-device model; review the exact excerpt. This is not a determination of legal sufficiency.".to_string(),
+            why_suggested: match &self.provision_heading {
+                // The embedding is built from title + heading + text, so the
+                // heading influences similarity, and the UI replaces the
+                // kicker on semantic cards so `provision_heading` is never
+                // rendered. Name it here or the reader has no way to know it
+                // contributed.
+                Some(heading) => format!(
+                    "Meaning-similar suggestion from a revision-pinned on-device model; review the exact excerpt. Matched under the provision heading {heading:?}, which is not part of the quoted text. This is not a determination of legal sufficiency."
+                ),
+                None => "Meaning-similar suggestion from a revision-pinned on-device model; review the exact excerpt. This is not a determination of legal sufficiency.".to_string(),
+            },
             index_fresh: true,
         }
     }
@@ -1782,7 +1854,7 @@ mod tests {
         let preferred = document(
             "semantic-preferred",
             "Preferred",
-            "The recipient shall not reveal nonpublic deal material.",
+            "NONDISCLOSURE\nThe recipient shall not reveal nonpublic deal material.",
         );
         let other = document(
             "semantic-other",
@@ -1804,9 +1876,19 @@ mod tests {
         assert_eq!(response.candidates_considered, 2);
         assert_eq!(response.suggestions.len(), 2);
         assert_eq!(response.suggestions[0].document_id, preferred.document_id);
+        // The excerpt is body-only so it sits at its anchor, and the heading
+        // that influenced the embedding is disclosed instead of being folded
+        // silently into the quotation.
         assert_eq!(
             response.suggestions[0].exact_excerpt,
             "The recipient shall not reveal nonpublic deal material."
+        );
+        assert!(
+            response.suggestions[0]
+                .why_suggested
+                .contains("NONDISCLOSURE"),
+            "a semantic card must disclose the heading the UI does not render: {}",
+            response.suggestions[0].why_suggested
         );
         assert!(response.suggestions[0]
             .why_suggested
