@@ -104,6 +104,32 @@ public func minutesAppleSpeechTranscribePCM(
         )
     }
 
+    guard let data = runSpeechTranscription(
+        copiedSamples,
+        mode: mode,
+        locale: locale,
+        ensureAssets: ensureAssetsValue == 1
+    ) else {
+        return nil
+    }
+    return copyOutResponse(data, responseLength)
+}
+
+/// Run the Speech-typed work behind a boundary the optimizer will not cross.
+///
+/// The macOS 26 Speech type metadata is materialized where it is used, and at
+/// `-O` those accessors can be hoisted to the entry of whatever function
+/// contains them. Keeping this out of the `@_cdecl` entry means an incapable
+/// device returns from the capability guard without ever reaching a site that
+/// resolves a Speech symbolic reference.
+@inline(never)
+private func runSpeechTranscription(
+    _ copiedSamples: [Float],
+    mode: String,
+    locale: String,
+    ensureAssets: Bool
+) -> Data? {
+    let ensureAssetsValue: Int32 = ensureAssets ? 1 : 0
     let responseBox = ResponseBox()
     let semaphore = DispatchSemaphore(value: 0)
     Task.detached {
@@ -130,7 +156,7 @@ public func minutesAppleSpeechTranscribePCM(
     guard let data = responseBox.take(), !data.isEmpty else {
         return nil
     }
-    return copyOutResponse(data, responseLength)
+    return data
 }
 
 /// Encode a response and hand it to the caller using the same ownership
@@ -211,9 +237,19 @@ private func failureResponse(
 /// the symbols keeps that device on the Whisper fallback instead of aborting
 /// the helper.
 private let speechRuntimeSymbols = [
-    "$s6Speech0A8AnalyzerCMa",
-    "$s6Speech14AssetInventoryCMa",
+    // Symbolic references in mangled type names resolve to *descriptors*, not
+    // to metadata accessors, so probe the descriptors themselves. The protocol
+    // descriptor matters most: every `[any SpeechModule]` existential in this
+    // bridge resolves through it.
+    "$s6Speech0A6ModuleMp",
+    "$s6Speech0A11TranscriberCMn",
+    "$s6Speech0A11TranscriberC6ResultVMn",
+    "$s6Speech0A11TranscriberC15ReportingOptionOMn",
+    "$s6Speech0A11TranscriberC21ResultAttributeOptionOMn",
+    "$s6Speech0A8AnalyzerC7OptionsVMn",
+    "$s6Speech13AnalyzerInputVMn",
     "$s6Speech20DictationTranscriberC11ContentHintVMn",
+    "$s6Speech0A11TranscriberCAA0A6ModuleAAMc",
 ]
 
 private func speechRuntimeSymbolsResolvable() -> Bool {

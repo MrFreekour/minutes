@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 const EXPECTED_SOURCE_SHA256 = {
   worker: "e260d5d97889c44dba0cf18a56b053541011690cf88ddbbec760af86d1864a89",
   xpc: "bfe9dfc1f015e6825adc02212305af52efe0f2faeff0d79c736cdce4e4c4d2aa",
-  swift: "1c79e4a61ed09de725b92880c98f98fb9c1d6c70ccfa63e14f0065f265174520",
+  swift: "77310730cfa46ac8301c1a65622681005ebf00f0c699f24fdca757e2e02fcef4",
   main: "95b27313f9f064bc9bad6e4a2f89a81adae5e9894dff156329b9442918f226ea",
   acceptanceWorkflow:
     "8ae35943181c6d0f248f580587b894c53db9c30257f307c5aa5264a83f13969d",
