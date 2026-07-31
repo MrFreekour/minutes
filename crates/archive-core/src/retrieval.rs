@@ -294,13 +294,23 @@ fn segment_anchored_blocks(
         // more segments than a document is allowed, so a file the lexical
         // path indexes fine was dropped entirely.
         if structural == Some(true) {
-            let caption = block
+            // Only the FIRST line is the caption. Joining every line absorbed
+            // the clause into its own heading whenever a styled paragraph
+            // carried a `<w:br/>` -- Shift+Enter, routine Word authoring --
+            // so a two-sentence indemnity became a four-sentence provision
+            // with no heading and fell out of a three-sentence query, and a
+            // card was emitted whose anchor and excerpt pointed at an
+            // unrelated paragraph. The remaining lines are body text and
+            // accumulate into one provision rather than one segment each,
+            // which is what keeps a block of thousands of breaks from
+            // exceeding the per-document provision limit.
+            let mut lines = block
                 .text
                 .lines()
                 .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+                .filter(|line| !line.is_empty());
+            let caption = lines.next().unwrap_or_default().to_string();
+            let remainder = lines.collect::<Vec<_>>();
             if !caption.is_empty() {
                 flush(
                     &mut segments,
@@ -312,6 +322,12 @@ fn segment_anchored_blocks(
                 );
                 heading = Some(caption);
                 heading_anchor = Some(block.source_anchor.clone());
+            }
+            if !remainder.is_empty() {
+                if body_anchor.is_none() {
+                    body_anchor = Some(block.source_anchor.clone());
+                }
+                body.push(remainder.join(" "));
             }
             if block.flow == AnchorFlow::HardBoundary {
                 flush(
@@ -612,7 +628,11 @@ impl LegalConcept {
                 "termination or expiration",
                 "expiration or termination",
             ],
-            Self::Indemnity => &["indemnify", "indemnification", "hold harmless"],
+            // "indemnity" was absent from its own concept's aliases, so a
+            // clause reading "this indemnity survives termination" matched
+            // Survival but not Indemnity, and a conjunctive query found no
+            // single provision carrying both.
+            Self::Indemnity => &["indemnity", "indemnify", "indemnification", "hold harmless"],
             Self::DefenseControl => &[
                 "control of the defense",
                 "control the defense",
@@ -1803,6 +1823,66 @@ mod tests {
         );
         assert_eq!(document.provisions[0].anchor, "section:0001");
         assert_eq!(document.provisions[1].anchor, "section:0002");
+    }
+
+    #[test]
+    fn a_caption_block_with_a_line_break_keeps_its_clause_as_body() {
+        // Shift+Enter inside a styled heading is routine Word authoring. The
+        // previous fix joined every line of a marked block into the caption,
+        // which absorbed the clause: a two-sentence indemnity became a
+        // four-sentence provision with no heading and fell out of a
+        // three-sentence query, and a card was emitted whose anchor and
+        // excerpt pointed at an unrelated paragraph.
+        let marked = ConvertedDocument {
+            format: SourceFormat::Docx,
+            blocks: vec![
+                minutes_archive_convert::ConvertedBlock {
+                    is_heading: Some(true),
+                    source_anchor: "paragraph:000001".to_string(),
+                    text: "7. INDEMNIFICATION.\nProvider shall indemnify the Buyer. This indemnity survives termination."
+                        .to_string(),
+                    flow: AnchorFlow::Continue,
+                },
+                minutes_archive_convert::ConvertedBlock {
+                    is_heading: None,
+                    source_anchor: "paragraph:000002".to_string(),
+                    text: "Signature blocks appear on the following page.".to_string(),
+                    flow: AnchorFlow::Continue,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let normalized = normalize_converted_document(
+            DocumentId::parse("break-caption").expect("id"),
+            "Break Caption",
+            b"PK-synthetic",
+            &marked,
+        )
+        .expect("docx");
+
+        let indemnity = normalized
+            .provisions
+            .iter()
+            .find(|provision| provision.text.contains("indemnify"))
+            .expect("the clause must remain retrievable");
+        assert_eq!(
+            indemnity.heading.as_deref(),
+            Some("7. INDEMNIFICATION."),
+            "only the first line is the caption"
+        );
+        assert!(
+            !indemnity.text.contains("INDEMNIFICATION."),
+            "the caption must not be absorbed into the body it labels: {:?}",
+            indemnity.text
+        );
+        // The anchor must point at the paragraph the clause is in. Absorbing
+        // the clause into the caption left the body starting at the next
+        // block, so the card sent counsel to the signature page.
+        assert!(
+            indemnity.anchor.starts_with("paragraph:000001"),
+            "the anchor must point at the clause's own paragraph, got {:?}",
+            indemnity.anchor
+        );
     }
 
     #[test]
