@@ -74,27 +74,72 @@ fi
 # a signed, notarized bundle that a content-only hash certifies as clean.
 # Resource forks are rejected by codesign as detritus; arbitrary names are not.
 unexpected_xattrs=""
-while IFS= read -r -d '' f; do
+while IFS= read -r -d '' entry; do
   while IFS= read -r attribute; do
     [ -n "$attribute" ] || continue
     case "$attribute" in
       com.apple.provenance | com.apple.quarantine | com.apple.macl) ;;
-      *) unexpected_xattrs+="$attribute on ${f#"$app"/}"$'\n' ;;
+      *) unexpected_xattrs+="$attribute on ${entry#"$app"}"$'\n' ;;
     esac
-  done < <(xattr "$f" 2>/dev/null)
-done < <(find "$app" -type f -print0)
+  done < <(xattr "$entry" 2>/dev/null)
+done < <(find "$app" -print0)
 if [ -n "$unexpected_xattrs" ]; then
   echo "REJECT: bundle carries unexpected extended attributes" >&2
   printf '%s' "$unexpected_xattrs" | sed 's|^|  |' >&2
   exit 1
 fi
 
-# Hash the whole tree, not one file, so provenance describes everything shipped.
+# Digest of everything shipped: every entry of every type, its extended
+# attributes, and file contents.
+#
+# Three earlier defects, all of which made the provenance record unreliable
+# rather than merely incomplete. Directories were never walked, so xattrs on a
+# directory smuggled unbounded content with a byte-identical hash. `sort`
+# without LC_ALL=C is locale-dependent, so a reviewer reproducing the digest
+# locally could legitimately differ from CI. And a newline-joined
+# "<hash>  <path>" stream is not injective: a filename containing a newline
+# forges entries, so two different trees can collide.
+#
+# Records are NUL-terminated and field-separated, paths are taken verbatim
+# rather than through shasum's escaping, and content is hashed from stdin so
+# the filename never enters shasum's output.
 tree_hash="$(
-  find "$app" -type f -print0 | sort -z |
-    while IFS= read -r -d '' f; do
-      printf '%s  %s\n' "$(shasum -a 256 "$f" | awk '{print $1}')" "${f#"$app"/}"
-    done | shasum -a 256 | awk '{print $1}'
+  {
+    find "$app" -print0 | LC_ALL=C sort -z |
+      while IFS= read -r -d '' entry; do
+        relative="${entry#"$app"}"
+        if [ -L "$entry" ]; then
+          kind=l
+          payload="$(readlink "$entry")"
+        elif [ -d "$entry" ]; then
+          kind=d
+          payload=""
+        elif [ -f "$entry" ]; then
+          kind=f
+          payload="$(shasum -a 256 < "$entry" | awk '{print $1}')"
+          if [ -z "$payload" ]; then
+            echo "REJECT: could not read $relative for hashing" >&2
+            exit 1
+          fi
+        else
+          kind=o
+          payload=""
+        fi
+        printf '%s\037%s\037%s\000' "$kind" "$relative" "$payload"
+        while IFS= read -r attribute; do
+          [ -n "$attribute" ] || continue
+          attribute_digest="$(
+            xattr -p "$attribute" "$entry" 2>/dev/null | shasum -a 256 | awk '{print $1}'
+          )"
+          printf 'x\037%s\037%s\037%s\000' \
+            "$relative" "$attribute" "$attribute_digest"
+        done < <(xattr "$entry" 2>/dev/null | LC_ALL=C sort)
+      done
+  } | shasum -a 256 | awk '{print $1}'
 )"
+if [ -z "$tree_hash" ]; then
+  echo "REJECT: could not compute the bundle tree digest" >&2
+  exit 1
+fi
 printf 'mach_o_count=%s\nidentifier=%s\nentry=%s\ntree_sha256=%s\n' \
   "$mach_o_count" "$bundle_identifier" "$bundle_executable" "$tree_hash"

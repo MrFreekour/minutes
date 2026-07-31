@@ -31,6 +31,7 @@ env:
   ARCHIVE_BUNDLE_ID: com.useminutes.archive
   ARCHIVE_EXECUTABLE: minutes-archive-app
   ARCHIVE_TEAM_ID: 63TMLKT8HN
+  EXPECTED_RECIPIENT_FINGERPRINT: "cef5dee2d8e5510f48fec6198cc3bcbaf2af11ef08a80e916f7b9e4575caf20f"
 
 jobs:
   authorize-candidate:
@@ -224,6 +225,17 @@ jobs:
             "signed/Minutes Archive.app" \
             "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID"
 
+      # Installed BEFORE the signing identity is unlocked. `brew install` runs
+      # unpinned, network-fetched formula code; doing it later would put
+      # arbitrary third-party execution inside the window where the ephemeral
+      # keychain is unlocked with codesign in its partition list -- a Developer
+      # ID signing oracle for whatever that code chose to sign.
+      - name: Install age before any credential is unlocked
+        run: |
+          set -euo pipefail
+          brew install age >/dev/null 2>&1 || brew install age
+          age --version
+
       - name: Import Developer ID identity into an ephemeral keychain
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -366,7 +378,20 @@ jobs:
             echo "ARCHIVE_PILOT_AGE_RECIPIENT variable is not set; refusing to publish a plaintext signed build" >&2
             exit 1
           fi
-          brew install age >/dev/null 2>&1 || brew install age
+          # The recipient lives in a repository variable, which sits outside
+          # the environment's reviewer gate. Swapping it would re-encrypt the
+          # artifact to someone else's key and still go green, so the expected
+          # key is pinned here in the reviewed workflow. Rotating the key is a
+          # reviewed change to this line, not a silent variable edit.
+          recipient_fingerprint="$(
+            printf '%s' "$AGE_RECIPIENT" | awk '{print $1" "$2}' | shasum -a 256 | awk '{print $1}'
+          )"
+          if [ "$recipient_fingerprint" != "$EXPECTED_RECIPIENT_FINGERPRINT" ]; then
+            echo "Delivery recipient does not match the reviewed key; refusing to encrypt" >&2
+            echo "  expected $EXPECTED_RECIPIENT_FINGERPRINT" >&2
+            echo "  actual   $recipient_fingerprint" >&2
+            exit 1
+          fi
           recipients="$RUNNER_TEMP/pilot-recipients.txt"
           printf '%s\n' "$AGE_RECIPIENT" > "$recipients"
           ditto -c -k --sequesterRsrc --keepParent \
