@@ -40,6 +40,8 @@ CRASH_REPORT_DIRECTORIES = (
     pathlib.Path("/Library/Logs/DiagnosticReports"),
 )
 CRASH_REPORT_PREFIXES = ("minutes-apple-speech-worker", "minutes-graph-worker", "Minutes")
+CRASH_REPORT_WAIT_SECONDS = 30
+CRASH_REPORT_POLL_SECONDS = 0.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -302,6 +304,7 @@ def unified_log_excerpt(started_at: float) -> str:
         'process == "minutes-apple-speech-worker"'
         ' OR process == "minutes-graph-worker"'
         ' OR process == "amfid"'
+        ' OR process == "kernel"'
         ' OR processImagePath CONTAINS "Minutes"'
         ' OR subsystem BEGINSWITH "com.apple.xpc"'
     )
@@ -331,8 +334,8 @@ def unified_log_excerpt(started_at: float) -> str:
     return bounded_lines(lines)
 
 
-def crash_report_excerpts(started_at: float) -> list[tuple[pathlib.Path, str]]:
-    """Return crash reports for our own processes written during this run."""
+def scan_crash_reports(started_at: float) -> list[tuple[pathlib.Path, str]]:
+    """Collect crash reports for our own processes written during this run."""
     reports = []
     for directory in CRASH_REPORT_DIRECTORIES:
         try:
@@ -353,7 +356,64 @@ def crash_report_excerpts(started_at: float) -> list[tuple[pathlib.Path, str]]:
     return reports
 
 
-def emit_failure_diagnostics(started_at: float, returncode, stdout, stderr) -> None:
+def crash_report_excerpts(started_at: float) -> list[tuple[pathlib.Path, str]]:
+    """Wait briefly for ReportCrash to finish writing, then collect reports.
+
+    ReportCrash writes the .ips asynchronously after the process dies. Run
+    30635749868 proved the cost of not waiting: ReportCrash was demonstrably
+    running, yet the immediate scan reported no crash reports and the faulting
+    symbol was lost. Poll until a report appears or the deadline expires.
+    """
+    deadline = time.monotonic() + CRASH_REPORT_WAIT_SECONDS
+    while True:
+        reports = scan_crash_reports(started_at)
+        if reports or time.monotonic() >= deadline:
+            return reports
+        time.sleep(CRASH_REPORT_POLL_SECONDS)
+
+
+def environment_excerpt(worker: pathlib.Path | None) -> str:
+    """Report the runtime OS and the worker's linked platform versions.
+
+    A binary built against an SDK newer than the running OS can leave a
+    macOS-26 Speech symbol weakly bound to null, which surfaces as a Swift
+    symbolic-reference failure rather than a link error. Recording the runtime
+    build alongside the worker's LC_BUILD_VERSION makes that skew visible
+    instead of leaving it to inference.
+    """
+    lines = []
+    for label, argv in (
+        ("sw_vers", ["sw_vers"]),
+        ("worker platform", ["otool", "-l", str(worker)] if worker else None),
+    ):
+        if argv is None:
+            continue
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, text=True, errors="replace", timeout=60
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            lines.append(f"{label}: <unavailable: {error}>")
+            continue
+        if label == "worker platform":
+            keep, emit = [], False
+            for line in completed.stdout.splitlines():
+                token = line.strip()
+                if token.startswith("cmd LC_BUILD_VERSION"):
+                    emit = True
+                elif emit and token.startswith("cmd "):
+                    emit = False
+                if emit:
+                    keep.append(token)
+            lines.append(f"{label}:\n" + ("\n".join(keep) or "<no LC_BUILD_VERSION>"))
+        else:
+            lines.append(f"{label}:\n{completed.stdout.strip()}")
+    return "\n".join(lines) or "<unavailable>"
+
+
+def emit_failure_diagnostics(
+    started_at: float, returncode, stdout, stderr, worker: pathlib.Path | None = None
+) -> None:
     """Print helper failure evidence to stderr.
 
     Diagnostics must never reach stdout: the workflow tees stdout into
@@ -370,6 +430,8 @@ def emit_failure_diagnostics(started_at: float, returncode, stdout, stderr) -> N
     terminator = signal_label(returncode)
     if terminator:
         write(f"terminated by: {terminator}")
+    write("--- environment ---")
+    write(environment_excerpt(worker))
     write("--- child stdout ---")
     write(bounded_stream(stdout))
     write("--- child stderr ---")
@@ -441,6 +503,7 @@ def main() -> int:
                 None,
                 decode_stream(expired.stdout),
                 decode_stream(expired.stderr),
+                worker,
             )
             raise RuntimeError(
                 "signed Apple Speech transport acceptance timed out after "
@@ -452,7 +515,7 @@ def main() -> int:
             # traceback. Deliberately not BaseException, so a cancelled job is
             # not delayed by log collection. The streams are unavailable here,
             # so this reports the system-side evidence only, then re-raises.
-            emit_failure_diagnostics(started_at, None, None, None)
+            emit_failure_diagnostics(started_at, None, None, None, worker)
             raise
         finally:
             time.sleep(0.1)
@@ -460,7 +523,7 @@ def main() -> int:
 
     if result.returncode != 0:
         emit_failure_diagnostics(
-            started_at, result.returncode, result.stdout, result.stderr
+            started_at, result.returncode, result.stdout, result.stderr, worker
         )
         raise RuntimeError(
             "signed Apple Speech transport acceptance failed with "
