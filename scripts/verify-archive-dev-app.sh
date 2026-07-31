@@ -48,6 +48,9 @@ cargo run -p minutes-archive-core --example document_vault_smoke -- "$APP_EXECUT
 echo "=== Deterministic UI interaction smoke ==="
 node scripts/archive-ui-smoke.mjs
 
+echo "=== Installed native window lifecycle smoke ==="
+scripts/archive-native-lifecycle-smoke.sh "$APP_PATH"
+
 echo "=== Artifact identity ==="
 codesign -dv --verbose=4 "$APP_PATH" 2>&1 |
   grep -E "^(Identifier|Signature|TeamIdentifier)="

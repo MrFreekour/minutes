@@ -35,6 +35,9 @@ meeting store.
   resource-limited worker that denies network access and access to user,
   volume, and network roots.
 - No source content, FTS rows, or semantic vectors persisted.
+- Closing the only Archive window terminates the process so an invisible app
+  cannot retain source text, FTS rows, or semantic vectors. The visible footer
+  tells the user that closing ends the session and discards the index.
 - No downloaded model, QMD runtime, cloud AI, generated legal answer, shell,
   opener, broad filesystem permission, or webview network permission.
 
@@ -51,7 +54,9 @@ legal benchmark, both real worker tests, and strict Clippy; rejects vulnerable
 `quick-xml 0.37.5` if it enters the macOS Archive dependency tree; exercises
 TXT, DOCX, and PDF through the installed app executable; verifies current
 evidence and mutation withdrawal; runs the deterministic UI interaction smoke;
-and prints the bundle identity and executable SHA-256.
+runs an installed native-window lifecycle smoke that requires a visible main
+window, a real close event, and process exit; and prints the bundle identity
+and executable SHA-256.
 
 Observed on 2026-07-30:
 
@@ -61,9 +66,11 @@ Observed on 2026-07-30:
   `document_vault_smoke=passed indexed=3 current_after_mutation=2`.
 - Deterministic UI interaction smoke: one approved location, two evidence
   cards, search view visible.
+- Installed native lifecycle smoke:
+  `archive_native_lifecycle=passed window=visible close=purged`.
 - Installed bundle seal: valid and satisfies its designated requirement.
 - Installed executable SHA-256:
-  `8e0c88abf7049c123b8280cd263687149f300397fc869142ba8ee8436ace3a6b`.
+  `54797b481c2eb09e8e72197f5d3623f999ab3b4abf3c723b2301278093410f3f`.
 - Fresh installed app process: no open network socket observed.
 - macOS Archive tree: `quick-xml 0.41.0`; no `quick-xml 0.37.5`.
 
@@ -82,7 +89,8 @@ transitive warnings. These facts are recorded, not waived.
   signing, notarization, staple verification, and another installed-artifact
   hash are required before sending the app to Peter.
 - Native Computer Use could not start its host pipe. The deterministic Chrome
-  interaction test passed, but a human must still click-test the installed
+  interaction test and installed native window lifecycle test passed, but the
+  console session was locked and a human must still click-test the installed
   Tauri app, native folder picker, cancellation, export, supported indexing,
   search, and source withdrawal.
 - The end-to-end workflow has not yet been exercised by a human with networking

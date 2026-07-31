@@ -23,8 +23,10 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::State;
+use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
+
+const NATIVE_LIFECYCLE_SELFTEST_MARKER: &str = "--archive-native-lifecycle-selftest";
 
 #[derive(Debug)]
 struct ApprovedLocation {
@@ -404,10 +406,49 @@ fn main() {
         };
         std::process::exit(status);
     }
+    let native_lifecycle_selftest = marker.as_deref() == Some(NATIVE_LIFECYCLE_SELFTEST_MARKER);
+    if native_lifecycle_selftest && arguments.next().is_some() {
+        std::process::exit(64);
+    }
 
     tauri::Builder::default()
         .manage(ArchiveState::default())
         .plugin(tauri_plugin_dialog::init())
+        .setup(move |app| {
+            if native_lifecycle_selftest {
+                let window = app.get_webview_window("main").ok_or_else(|| {
+                    std::io::Error::other("Archive native lifecycle self-test found no main window")
+                })?;
+                if !window.is_visible()? {
+                    return Err(std::io::Error::other(
+                        "Archive native lifecycle self-test found a hidden main window",
+                    )
+                    .into());
+                }
+                println!("archive_native_window=visible");
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    println!("archive_native_close=requested");
+                    if let Err(error) = window.close() {
+                        eprintln!("archive_native_close_error={error}");
+                    }
+                });
+            }
+            Ok(())
+        })
+        .on_window_event(move |window, event| {
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+            {
+                // Archive has no tray mode. Exiting with the only window prevents
+                // an invisible process from retaining privileged source text,
+                // FTS rows, or semantic vectors after the user closes the app.
+                if native_lifecycle_selftest {
+                    println!("archive_native_close_event=received");
+                }
+                window.app_handle().exit(0);
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             archive_bootstrap,
             choose_archive_locations,

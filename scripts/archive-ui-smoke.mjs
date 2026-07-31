@@ -302,9 +302,10 @@ try {
         if (
           !body.includes("Synthetic Agreement") ||
           !body.includes("Source verified") ||
-          !body.toLowerCase().includes("review, not verified legal matches")
+          !body.toLowerCase().includes("review, not verified legal matches") ||
+          !body.includes("Closing the window ends the session and discards the index")
         ) {
-          throw new Error("Evidence provenance did not render");
+          throw new Error("Evidence provenance or session-disposal notice did not render");
         }
         if (body.includes("/Users/") || body.includes("SYNTHETIC_CONTENT_CANARY")) {
           throw new Error("A path or source canary crossed the UI boundary");
