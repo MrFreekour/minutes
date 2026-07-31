@@ -539,6 +539,10 @@ def main() -> int:
     if runtime_supported_match is None:
         raise RuntimeError("signed app did not report whether the Speech runtime was supported")
     runtime_supported = runtime_supported_match.group(1) == "true"
+    if "apple-speech-signed-parent-trusted=true" not in result.stdout:
+        raise RuntimeError(
+            "signed app did not confirm it evaluated its signing authority as trusted"
+        )
     # Echo to stderr as well as the receipt. The receipt is only uploaded as an
     # artifact, so without this a runtimeSupported=false run would read as a
     # clean pass to anyone reading the job log.
@@ -571,6 +575,10 @@ def main() -> int:
         # the framework declines after the bytes arrive. Record it so the
         # receipt cannot be read as more than it proves.
         "runtimeSupported": runtime_supported,
+        # The worker derives its peer requirement from the same trusted-
+        # distribution verdict, and fails closed when that evaluation cannot
+        # complete, so a trusted parent means no identifier-only downgrade.
+        "parentTrustedDistribution": True,
     }
     print(json.dumps(receipt, sort_keys=True))
     return 0

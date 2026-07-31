@@ -167,6 +167,10 @@ pub fn run_signed_transport_acceptance() -> Result<bool, String> {
     if !crate::macos_graph_xpc::current_process_is_trusted_distribution() {
         return Err("Apple Speech transport acceptance requires a trusted signed app".into());
     }
+    // The worker installs its peer requirement from the same verdict, so a
+    // trusted parent means the anchored form was used or the worker failed
+    // closed. Recording it keeps a green run from hiding a downgrade.
+    println!("apple-speech-signed-parent-trusted=true");
 
     let samples = acceptance_canary_samples();
     let response =

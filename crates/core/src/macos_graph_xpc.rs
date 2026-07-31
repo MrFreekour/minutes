@@ -169,7 +169,31 @@ fn lock_parent_request<'a>(
 const CS_OPS_CDHASH: libc::c_uint = 5;
 
 pub(crate) fn current_process_is_trusted_distribution() -> bool {
-    unsafe { minutes_current_process_is_trusted_distribution() == 1 }
+    trusted_distribution_verdict() == TrustedDistribution::Yes
+}
+
+/// Whether this process is a trusted distribution build.
+///
+/// `Indeterminate` is not `No`. The Security evaluation can fail to complete,
+/// and treating that as "this is a development build" is what allowed a signed
+/// worker to silently install a weaker peer requirement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TrustedDistribution {
+    Yes,
+    No,
+    Indeterminate,
+}
+
+pub(crate) fn trusted_distribution_verdict() -> TrustedDistribution {
+    verdict_from_status(unsafe { minutes_current_process_is_trusted_distribution() })
+}
+
+fn verdict_from_status(status: c_int) -> TrustedDistribution {
+    match status {
+        1 => TrustedDistribution::Yes,
+        0 => TrustedDistribution::No,
+        _ => TrustedDistribution::Indeterminate,
+    }
 }
 
 pub(crate) fn current_process_cdhash() -> std::io::Result<[u8; 20]> {
@@ -1046,16 +1070,31 @@ impl ServicePhase {
     }
 }
 
+fn parent_requirement_for(
+    verdict: TrustedDistribution,
+    identifiers: &str,
+) -> Result<String, String> {
+    match verdict {
+        TrustedDistribution::Yes => Ok(format!(
+            "{identifiers} and anchor apple generic and certificate leaf[subject.OU] = \"63TMLKT8HN\""
+        )),
+        TrustedDistribution::No => Ok(identifiers.to_string()),
+        TrustedDistribution::Indeterminate => Err(
+            "XPC parent requirement could not establish this process's signing authority"
+                .to_string(),
+        ),
+    }
+}
+
 fn service_parent_requirement() -> Result<CString, String> {
     let identifiers =
         "(identifier \"com.useminutes.desktop\" or identifier \"com.useminutes.desktop.dev\")";
-    let requirement = if current_process_is_trusted_distribution() {
-        format!(
-            "{identifiers} and anchor apple generic and certificate leaf[subject.OU] = \"63TMLKT8HN\""
-        )
-    } else {
-        identifiers.to_string()
-    };
+    // A signed build must never accept the identifier-only form: any
+    // ad-hoc-signed binary claiming the bundle id would satisfy it at the same
+    // UID, which is exactly the adversary the hostile open-holder test models.
+    // Downgrade only on a definitive "not a distribution build", never because
+    // the evaluation could not complete.
+    let requirement = parent_requirement_for(trusted_distribution_verdict(), identifiers)?;
     CString::new(requirement)
         .map_err(|_| "policy graph parent requirement was malformed".to_string())
 }
@@ -1837,6 +1876,36 @@ mod tests {
             classify_service_peer_event(false, true, false),
             ServicePeerEvent::ExitProcess
         );
+    }
+
+    #[test]
+    fn signed_builds_never_fall_open_to_an_identifier_only_peer_requirement() {
+        let identifiers = "(identifier \"com.useminutes.desktop\")";
+        // A definitive trusted-distribution verdict anchors to the team.
+        let anchored = parent_requirement_for(TrustedDistribution::Yes, identifiers).unwrap();
+        assert!(anchored.contains("anchor apple generic"));
+        assert!(anchored.contains("63TMLKT8HN"));
+        // A definitive "not a distribution build" keeps local development working.
+        assert_eq!(
+            parent_requirement_for(TrustedDistribution::No, identifiers).unwrap(),
+            identifiers
+        );
+        // An evaluation that could not complete must fail closed rather than
+        // install a requirement any ad-hoc binary at the same UID satisfies.
+        assert!(parent_requirement_for(TrustedDistribution::Indeterminate, identifiers).is_err());
+    }
+
+    #[test]
+    fn only_an_exact_success_or_requirement_failure_is_a_verdict() {
+        assert_eq!(verdict_from_status(1), TrustedDistribution::Yes);
+        assert_eq!(verdict_from_status(0), TrustedDistribution::No);
+        for status in [-1, -67050, 2, i32::MIN, i32::MAX] {
+            assert_eq!(
+                verdict_from_status(status),
+                TrustedDistribution::Indeterminate,
+                "status {status} must not be read as a verdict"
+            );
+        }
     }
 
     #[test]

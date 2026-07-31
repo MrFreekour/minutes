@@ -82,18 +82,21 @@ public func minutesCurrentProcessIsTrustedDistribution() -> Int32 {
         &requirement
     ) == errSecSuccess,
     let requirement else {
-        return 0
+        return -1
     }
     var liveCode: SecCode?
     guard SecCodeCopySelf(SecCSFlags(), &liveCode) == errSecSuccess,
           let liveCode else {
-        return 0
+        return -1
     }
-    return SecCodeCheckValidity(
-        liveCode,
-        SecCSFlags(),
-        requirement
-    ) == errSecSuccess ? 1 : 0
+    let status = SecCodeCheckValidity(liveCode, SecCSFlags(), requirement)
+    if status == errSecSuccess {
+        return 1
+    }
+    // Only errSecCSReqFailed is a definitive "this process is not a trusted
+    // distribution build". Any other status means the evaluation itself could
+    // not complete, and the caller must not read that as a development build.
+    return status == errSecCSReqFailed ? 0 : -1
 }
 
 /// Validate the signed application bundle that seals the embedded XPC
