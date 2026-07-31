@@ -547,6 +547,10 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             Ok(Event::Start(event)) => {
                 let name = event.name();
                 let local = local_name(name.as_ref());
+                // Count every element while inside a change record, and
+                // decrement on every close below. Decrementing only for the
+                // record's own name left the counter stuck above zero for the
+                // rest of the paragraph, silently suppressing the live style.
                 if skip_depth > 0 || matches!(local, b"pPrChange" | b"rPrChange") {
                     skip_depth += 1;
                 }
@@ -618,10 +622,23 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                     paragraph.push_str(value);
                 }
             }
+            // Inside a tracked-change record: count every close so the
+            // counter returns to zero. Decrementing only on the record's own
+            // name left it stuck above zero for the rest of the paragraph,
+            // silently suppressing the live style and size.
+            Ok(Event::End(event)) if skip_depth > 0 => {
+                skip_depth -= 1;
+                if local_name(event.name().as_ref()) == b"p" {
+                    skip_depth = 0;
+                }
+            }
             Ok(Event::End(event)) => match local_name(event.name().as_ref()) {
-                b"pPrChange" | b"rPrChange" => skip_depth = skip_depth.saturating_sub(1),
                 b"t" => in_text = false,
                 b"r" => current_run_size = None,
+                // A size on the paragraph mark sits outside any `w:r`, so it
+                // otherwise survived into the first unsized run and promoted
+                // an operative sentence to a caption.
+                b"pPr" => current_run_size = None,
                 b"p" => {
                     let paragraph_style = heading_style;
                     let paragraph_saw_style = saw_style;
@@ -687,8 +704,14 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     // caption when it is set larger than the document's own body text.
     // Comparing against the document rather than a fixed point size keeps
     // this working across templates.
+    // Lower median. The upper median landed on the caption size whenever the
+    // sample had as many captions as body paragraphs, which inverted the
+    // comparison and marked every caption as body text.
     body_sizes.sort_unstable();
-    let body_size = body_sizes.get(body_sizes.len() / 2).copied().unwrap_or(0);
+    let body_size = body_sizes
+        .get(body_sizes.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0);
     for (block, (styled_heading, _saw_style, size)) in paragraphs.iter_mut().zip(formatting) {
         // `None` has to mean "this format reported nothing", or the fallback
         // is dead. Emitting `Some(false)` whenever no style and no size were
@@ -696,12 +719,24 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
         // and a real Word agreement collapsed from 21 provisions to 2 -- one
         // 93-sentence blob -- because nothing could be a caption and the
         // lexical rule was never consulted.
-        // A size was read for this paragraph and the document's body size is
-        // known, so it can be classified. Otherwise report no signal.
-        block.is_heading = if styled_heading {
+        // Only claim a verdict when the formatting actually discriminates.
+        // Testing that a size was *read* is not the same as testing that it
+        // *distinguishes*: in the standard legal template every paragraph is
+        // one size and captions are set apart by bold or caps instead, so
+        // `size == body_size` was reported as a positive claim of body text
+        // and the lexical fallback -- the only mechanism that segments those
+        // documents at all -- never ran. A real Business Associate Agreement
+        // collapsed from 21 provisions to 2.
+        //
+        // `None` here means the file did not distinguish this paragraph, and
+        // the caller falls back. That makes the signal strictly additive: it
+        // can only improve on the heuristic, never replace it with silence.
+        block.is_heading = if styled_heading || (body_size > 0 && size > body_size) {
             Some(true)
-        } else if body_size > 0 && size > 0 {
-            Some(size > body_size)
+        } else if body_size > 0 && size > 0 && size < body_size {
+            // Smaller than body text: footnotes and fine print are not
+            // captions, and saying so suppresses a heuristic false positive.
+            Some(false)
         } else {
             None
         };
@@ -1044,6 +1079,84 @@ mod tests {
     }
 
     #[test]
+    fn uniform_sizing_reports_no_signal_so_the_fallback_survives() {
+        // The shape that regressed five fixtures: every paragraph one size,
+        // captions set apart by bold or caps rather than by size. This is the
+        // standard legal template. Reporting `Some(false)` here was a
+        // positive claim of body text that suppressed the lexical fallback,
+        // and a real Business Associate Agreement collapsed from 21
+        // provisions to 2 -- "find the indemnification provision" went from
+        // one correct card to none.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:r><w:rPr><w:sz w:val="22"/><w:b/></w:rPr><w:t>14. Indemnification</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="22"/></w:rPr><w:t>Business Associate shall indemnify Covered Entity.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="22"/><w:b/></w:rPr><w:t>13. Term; Termination; Survival</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="22"/></w:rPr><w:t>These obligations survive termination.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        for block in &document.blocks {
+            assert_eq!(
+                block.is_heading, None,
+                "uniform sizing does not distinguish {:?}; claiming a verdict \
+                 here suppresses the only mechanism that segments these files",
+                block.text
+            );
+        }
+    }
+
+    #[test]
+    fn an_even_size_sample_does_not_invert_the_body_size() {
+        // Two captions and two body paragraphs: the upper median landed on
+        // the caption size, so every caption failed `size > body_size` and
+        // the whole document came out as body text.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:r><w:rPr><w:sz w:val="28"/></w:rPr><w:t>7. Confidentiality</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Recipient shall not disclose.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="28"/></w:rPr><w:t>8. Return and Destruction</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Recipient shall return all materials.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        let marked = |needle: &str| {
+            document
+                .blocks
+                .iter()
+                .find(|block| block.text.contains(needle))
+                .and_then(|block| block.is_heading)
+        };
+        assert_eq!(marked("7. Confidentiality"), Some(true));
+        assert_eq!(marked("8. Return and Destruction"), Some(true));
+    }
+
+    #[test]
+    fn a_paragraph_mark_size_does_not_leak_into_the_first_run() {
+        // `<w:pPr><w:rPr><w:sz/></w:rPr></w:pPr>` is the pilcrow's own
+        // formatting and sits outside any `w:r`, so it survived into the
+        // first unsized run and promoted an operative sentence to a caption.
+        // Word writes it routinely after merges and deletions.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Recipient shall protect Confidential Information.</w:t></w:r></w:p>
+            <w:p><w:pPr><w:rPr><w:sz w:val="72"/></w:rPr></w:pPr><w:r><w:t>Notwithstanding the foregoing, disclosure compelled by law is permitted.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        let promoted = document
+            .blocks
+            .iter()
+            .find(|block| block.text.contains("Notwithstanding"))
+            .and_then(|block| block.is_heading);
+        assert_ne!(
+            promoted,
+            Some(true),
+            "a paragraph-mark size must not promote an operative sentence"
+        );
+    }
+
+    #[test]
     fn docx_reports_no_signal_rather_than_claiming_body_text() {
         // The regression this guards: emitting Some(false) whenever no style
         // and no size were read reported absence of signal as a positive
@@ -1104,8 +1217,9 @@ mod tests {
         };
         // The live style wins over the change record.
         assert_eq!(marked("CONFIDENTIALITY"), Some(true));
-        // Bold-off paragraphs still count as body, so the sample is not empty.
-        assert_eq!(marked("shall not disclose"), Some(false));
+        // Bold-off paragraphs still count toward the body-size sample, so it
+        // is not empty; at body size the file does not distinguish them.
+        assert_ne!(marked("shall not disclose"), Some(true));
     }
 
     #[test]
@@ -1121,9 +1235,9 @@ mod tests {
             </w:body></w:document>"#,
         );
         let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
-        assert_eq!(
+        assert_ne!(
             document.blocks[0].is_heading,
-            Some(false),
+            Some(true),
             "a drop cap must not promote an operative sentence to a caption"
         );
     }
@@ -1153,11 +1267,13 @@ mod tests {
         // Styled Heading1: a caption even though the words read as a
         // cross-reference, which every lexical rule promoted or demoted wrongly.
         assert_eq!(marked("See Sections"), Some(true));
-        // All-caps at body size: NOT a caption, however much it looks like one.
-        assert_eq!(marked("CONFIDENTIALITY AND SURVIVAL"), Some(false));
+        // All-caps at body size: the file does not distinguish it, so the
+        // converter must not claim it is a caption. `None` hands it to the
+        // lexical fallback rather than asserting body text.
+        assert_ne!(marked("CONFIDENTIALITY AND SURVIVAL"), Some(true));
         // Unstyled but set at 24pt bold over 12pt body: a caption.
         assert_eq!(marked("Indemnification"), Some(true));
-        assert_eq!(marked("Seller shall indemnify"), Some(false));
+        assert_ne!(marked("Seller shall indemnify"), Some(true));
     }
 
     #[test]
