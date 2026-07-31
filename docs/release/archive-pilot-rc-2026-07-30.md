@@ -32,14 +32,60 @@ meeting store.
   parser worker.
 - Separately labeled meaning-similar suggestions using Apple's pinned built-in
   English sentence model. Provision and query embeddings run in a second
-  resource-limited worker that denies network access and access to user,
-  volume, and network roots.
+  deny-by-default worker: no filesystem write is permitted anywhere, reads are
+  limited to the paths Apple's model needs, and network is denied. Its
+  self-test probes paths the profile does not name, so a regression to
+  allow-by-default fails it. `mach-lookup` cannot be denied outright without
+  breaking the model, so the pasteboard, distributed notification centre and
+  syslog are denied by name -- a denylist, and therefore weaker than the file
+  rules. The primary control is that the worker performs no logging or IPC at
+  all; `os_log` can reach the unified log without a `mach-lookup`, so that
+  discipline rather than the profile is what keeps text out of
+  `/var/db/diagnostics`. An independent reviewer should re-verify it.
 - No source content, FTS rows, or semantic vectors persisted.
-- Closing the only Archive window terminates the process so an invisible app
-  cannot retain source text, FTS rows, or semantic vectors. The visible footer
-  tells the user that closing ends the session and discards the index.
+- Closing the Archive window releases the session and exits. Purge is explicit,
+  not a destructor: `exit(0)` does not unwind, so nothing written as `Drop`
+  would run. It is invoked from both the window-close event and `RunEvent::Exit`
+  (Cmd-Q maps to `[NSApp terminate:]`, which never fires a close event), it
+  recovers from a poisoned session lock, and it drains a registry of worker
+  snapshot directories populated before indexing starts, so an exit during a
+  build does not strand them. It does not cover `SIGKILL`.
 - No downloaded model, QMD runtime, cloud AI, generated legal answer, shell,
   opener, broad filesystem permission, or webview network permission.
+
+## Corrections from adversarial review
+
+Independent review after 2026-07-30 disproved several claims this record
+previously made. They are listed because a reviewer needs to know what was
+wrong, not only what is now asserted.
+
+- The census exported client surnames. Filenames follow legal filing
+  conventions -- `Ltr to A.Weinstein`, `Retainer.Rothschild` -- and any
+  lowercase tail after the final dot was emitted verbatim as an extension,
+  each with `files: 1`, alongside a hardcoded `filenames_emitted: false`.
+  Only extensions the format taxonomy recognizes are now emitted.
+- `approve_roots` refused the home directory by canonical path string. On
+  macOS `/System/Volumes/Data/Users/<user>` is a firmlink, so the same
+  directory reached that way was approved, as were `/Users` and the whole
+  data volume. Approval now compares device and inode against every
+  directory containing home, including the firmlinked spelling.
+- Overlapping roots reached through a firmlink were accepted, double-counting
+  every artifact in the intersection.
+- The semantic worker ran `(allow default)`; everything outside three
+  subtrees was readable and writable, including `$TMPDIR`, while the worker
+  received verbatim privileged text. Its self-test could not detect this: it
+  probed `/etc/passwd`, a path denied by an explicit literal written to
+  satisfy that test.
+- Evidence cards asserted concepts matched "in the same provision" that their
+  own excerpt did not contain, so a struck clause under a heading naming its
+  subjects read as present. Excerpts now carry the text that was matched.
+- DOCX `paragraph:NNNNNN` anchors counted paragraphs emitted rather than
+  `<w:p>` elements, so empty spacers and table cells shifted them.
+- Worker snapshots -- two 40 MB copies of the executable -- survived the
+  process in `$TMPDIR`, because `exit(0)` skips every destructor.
+- `scripts/verify-archive-pilot-artifact.sh` skipped its entire
+  forbidden-entitlement check whenever `codesign` failed, and never asserted
+  the hardened runtime.
 
 ## Reproducible verification
 
