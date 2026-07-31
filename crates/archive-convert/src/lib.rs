@@ -64,6 +64,20 @@ pub struct ConvertedBlock {
     pub source_anchor: String,
     pub text: String,
     pub flow: AnchorFlow,
+    /// Whether the source marked this block as a heading.
+    ///
+    /// Documents record their own structure and retrieval should read it
+    /// rather than guess from the text. DOCX carries `w:pStyle` when Word
+    /// styles are used and, when they are not, run properties: a caption set
+    /// in 24pt bold over 12pt body is unambiguous in the file and invisible
+    /// to any lexical rule. Guessing produced five successive regressions --
+    /// promoting cross-references onto unrelated clauses, and demoting real
+    /// captions until genuine provisions returned nothing.
+    ///
+    /// `None` means the format carried no structural signal, not that the
+    /// block is body text.
+    #[serde(default)]
+    pub is_heading: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +456,13 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             source_anchor: format!("page:{:04}", index + 1),
             text,
             flow: AnchorFlow::HardBoundary,
+            // This extractor emits one block per page and does not carry per
+            // span font metrics, so it has no structural signal to report.
+            // `None` says exactly that -- it is not a claim that the page is
+            // body text. Deriving heading levels from the font-size
+            // distribution, the way PyMuPDF4LLM's IdentifyHeaders does, is
+            // deterministic and needs no model, and is the next step here.
+            is_heading: None,
         });
     }
     let warnings = if blocks.is_empty() {
@@ -499,16 +520,53 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     let mut paragraph_ordinal: usize = 0;
     let mut in_text = false;
     let mut output_bytes = 0usize;
+    // Structural signal for the paragraph currently being assembled.
+    let mut heading_style = false;
+    let mut bold = false;
+    let mut run_sizes: Vec<u32> = Vec::new();
+    let mut body_sizes: Vec<u32> = Vec::new();
+    // Parallel to `paragraphs`: (styled_as_heading, bold, largest run size).
+    // The size a paragraph must exceed to read as a caption is the document's
+    // own body size, which is not known until the whole file is parsed.
+    let mut formatting: Vec<(bool, bool, u32)> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(event)) => {
                 let name = event.name();
-                if local_name(name.as_ref()) == b"t" {
-                    in_text = true;
+                match local_name(name.as_ref()) {
+                    b"t" => in_text = true,
+                    b"pStyle" => {
+                        if let Some(value) = attribute_value(&event, b"val") {
+                            heading_style = is_heading_style(&value);
+                        }
+                    }
+                    b"sz" => {
+                        if let Some(value) = attribute_value(&event, b"val") {
+                            if let Ok(size) = value.parse::<u32>() {
+                                run_sizes.push(size);
+                            }
+                        }
+                    }
+                    b"b" => bold = true,
+                    _ => {}
                 }
             }
             Ok(Event::Empty(event)) => match local_name(event.name().as_ref()) {
+                // Run and paragraph properties are usually self-closing.
+                b"pStyle" => {
+                    if let Some(value) = attribute_value(&event, b"val") {
+                        heading_style = is_heading_style(&value);
+                    }
+                }
+                b"sz" => {
+                    if let Some(value) = attribute_value(&event, b"val") {
+                        if let Ok(size) = value.parse::<u32>() {
+                            run_sizes.push(size);
+                        }
+                    }
+                }
+                b"b" => bold = true,
                 b"tab" => paragraph.push('\t'),
                 b"br" | b"cr" => paragraph.push('\n'),
                 // `<w:p/>` is a self-closing empty paragraph and arrives as
@@ -542,6 +600,14 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             Ok(Event::End(event)) => match local_name(event.name().as_ref()) {
                 b"t" => in_text = false,
                 b"p" => {
+                    let paragraph_style = heading_style;
+                    let paragraph_bold = bold;
+                    let paragraph_sizes = std::mem::take(&mut run_sizes);
+                    heading_style = false;
+                    bold = false;
+                    if !paragraph_style && !paragraph_bold {
+                        body_sizes.extend(paragraph_sizes.iter().copied());
+                    }
                     // Count every <w:p> element, including empty spacers and
                     // paragraphs inside tables. The anchor previously used
                     // the number of paragraphs emitted so far, so any dropped
@@ -559,10 +625,16 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                         if output_bytes > MAX_OUTPUT_BYTES || paragraphs.len() >= MAX_BLOCKS {
                             return Err(ConversionError::OutputBudgetExceeded);
                         }
+                        formatting.push((
+                            paragraph_style,
+                            paragraph_bold,
+                            paragraph_sizes.iter().copied().max().unwrap_or(0),
+                        ));
                         paragraphs.push(ConvertedBlock {
                             source_anchor: format!("paragraph:{paragraph_ordinal:06}"),
                             text,
                             flow: AnchorFlow::Continue,
+                            is_heading: Some(paragraph_style),
                         });
                     }
                 }
@@ -575,11 +647,37 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
         }
         buffer.clear();
     }
+    // A named heading style is decisive. Otherwise a paragraph reads as a
+    // caption when it is set larger than the document's own body text.
+    // Comparing against the document rather than a fixed point size keeps
+    // this working across templates.
+    body_sizes.sort_unstable();
+    let body_size = body_sizes.get(body_sizes.len() / 2).copied().unwrap_or(0);
+    for (block, (styled, _bold, size)) in paragraphs.iter_mut().zip(formatting) {
+        block.is_heading = Some(styled || (body_size > 0 && size > body_size));
+    }
+
     Ok(ConvertedDocument {
         format: SourceFormat::Docx,
         blocks: paragraphs,
         warnings: Vec::new(),
     })
+}
+
+/// Attribute value by local name, ignoring namespace prefix.
+fn attribute_value(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8]) -> Option<String> {
+    event.attributes().flatten().find_map(|attribute| {
+        (local_name(attribute.key.as_ref()) == wanted)
+            .then(|| String::from_utf8_lossy(&attribute.value).into_owned())
+    })
+}
+
+/// Whether a `w:pStyle` value names one of Word's heading styles.
+fn is_heading_style(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    lowered.starts_with("heading")
+        || lowered.starts_with("title")
+        || lowered.starts_with("subtitle")
 }
 
 fn local_name(name: &[u8]) -> &[u8] {
@@ -877,6 +975,38 @@ mod tests {
     }
 
     #[test]
+    fn docx_headings_come_from_the_document_not_from_the_text() {
+        // The two cases five rounds of lexical heuristics could not separate.
+        // A cross-reference sentence and a caption can read identically; the
+        // file distinguishes them unambiguously and always did.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>9. See Sections 3 and 4</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Body text of the first clause.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>7. CONFIDENTIALITY AND SURVIVAL OF OBLIGATIONS</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="48"/><w:b/></w:rPr><w:t>Indemnification</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Seller shall indemnify the Buyer.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        let marked = |needle: &str| {
+            document
+                .blocks
+                .iter()
+                .find(|block| block.text.contains(needle))
+                .and_then(|block| block.is_heading)
+        };
+        // Styled Heading1: a caption even though the words read as a
+        // cross-reference, which every lexical rule promoted or demoted wrongly.
+        assert_eq!(marked("See Sections"), Some(true));
+        // All-caps at body size: NOT a caption, however much it looks like one.
+        assert_eq!(marked("CONFIDENTIALITY AND SURVIVAL"), Some(false));
+        // Unstyled but set at 24pt bold over 12pt body: a caption.
+        assert_eq!(marked("Indemnification"), Some(true));
+        assert_eq!(marked("Seller shall indemnify"), Some(false));
+    }
+
+    #[test]
     fn docx_paragraph_anchors_survive_empty_spacers_and_table_cells() {
         // Word documents routinely carry empty spacer paragraphs and
         // paragraphs inside tables. Anchoring on the count of paragraphs
@@ -938,6 +1068,7 @@ mod tests {
         let document = ConvertedDocument {
             format: SourceFormat::Pdf,
             blocks: vec![ConvertedBlock {
+                is_heading: None,
                 source_anchor: "page:\n1".to_string(),
                 text: "Evidence".to_string(),
                 flow: AnchorFlow::HardBoundary,

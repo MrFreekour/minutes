@@ -280,12 +280,23 @@ fn segment_anchored_blocks(
                 false,
             );
         }
+        // The document's own structure decides, when it reports any. A DOCX
+        // paragraph styled Heading1, or set larger than the document's body
+        // text, is a caption regardless of how its words read -- and an
+        // ordinary sentence in body formatting is not one however much it
+        // looks like a caption. The lexical rule is the fallback for formats
+        // that carry no signal, where guessing is all that is left.
+        let structural = block.is_heading;
         for line in block.text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            if looks_like_legal_heading(trimmed) {
+            let is_caption = match structural {
+                Some(marked) => marked,
+                None => looks_like_legal_heading(trimmed),
+            };
+            if is_caption {
                 flush(
                     &mut segments,
                     &mut heading,
@@ -1762,11 +1773,13 @@ mod tests {
             format: SourceFormat::Pdf,
             blocks: vec![
                 minutes_archive_convert::ConvertedBlock {
+                    is_heading: None,
                     source_anchor: "page:0001".to_string(),
                     text: "7. CONFIDENTIALITY\nConfidential Information is protected.".to_string(),
                     flow: AnchorFlow::HardBoundary,
                 },
                 minutes_archive_convert::ConvertedBlock {
+                    is_heading: None,
                     source_anchor: "page:0002".to_string(),
                     text: "8. ASSIGNMENT\nNeither party may assign this Agreement.".to_string(),
                     flow: AnchorFlow::HardBoundary,
@@ -1795,11 +1808,13 @@ mod tests {
             format: SourceFormat::Docx,
             blocks: vec![
                 minutes_archive_convert::ConvertedBlock {
+                    is_heading: None,
                     source_anchor: "paragraph:000001".to_string(),
                     text: "7. CONFIDENTIALITY".to_string(),
                     flow: AnchorFlow::Continue,
                 },
                 minutes_archive_convert::ConvertedBlock {
+                    is_heading: None,
                     source_anchor: "paragraph:000002".to_string(),
                     text: "Confidential Information is protected.".to_string(),
                     flow: AnchorFlow::Continue,
