@@ -6,6 +6,9 @@
 //! the index; every search supplies the currently authorized source revisions.
 
 use minutes_archive_convert::{AnchorFlow, ConvertedDocument, SourceFormat};
+use minutes_archive_semantic::{
+    cosine_similarity, SemanticModelMetadata, APPLE_ENGLISH_SENTENCE_DIMENSION,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,6 +22,8 @@ pub const MAX_QUERY_CHARS: usize = 2_000;
 pub const MAX_EVIDENCE_RESULTS: usize = 100;
 const MAX_FTS_CANDIDATES: usize = 2_000;
 const MAX_DOCUMENT_EVIDENCE_PROVISIONS: usize = 64;
+pub const MAX_SEMANTIC_PROVISIONS: usize = 100_000;
+const MAX_SEMANTIC_CANDIDATES: usize = 400;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -40,6 +45,10 @@ pub enum RetrievalError {
     CandidateBudgetExceeded,
     #[error("the private lexical index is unavailable")]
     IndexUnavailable,
+    #[error("the semantic vector or model identity is invalid")]
+    InvalidSemanticVector,
+    #[error("the in-memory semantic candidate budget was exceeded")]
+    SemanticBudgetExceeded,
 }
 
 impl PartialEq for RetrievalError {
@@ -648,8 +657,39 @@ pub struct LegalSearchResponse {
     pub query: LegalQuery,
     pub evidence: Vec<EvidenceCard>,
     pub documents: Vec<DocumentEvidenceCard>,
+    pub semantic_suggestions: Vec<SemanticEvidenceCard>,
     pub lexical_candidates_considered: usize,
+    pub semantic_candidates_considered: usize,
+    pub semantic_query_applied: bool,
+    pub semantic_model: Option<SemanticModelMetadata>,
     pub stale_evidence_withdrawn: u64,
+    #[serde(skip)]
+    pub(crate) stale_document_ids: BTreeSet<DocumentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SemanticEvidenceCard {
+    pub vault_id: VaultId,
+    pub document_id: DocumentId,
+    pub document_title: String,
+    pub provision_heading: Option<String>,
+    pub source_anchor: String,
+    pub exact_excerpt: String,
+    pub sentence_count: u32,
+    pub source_revision: SourceRevision,
+    pub source_converter: String,
+    pub semantic_similarity: f32,
+    pub why_suggested: String,
+    pub index_fresh: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticSearchResult {
+    pub suggestions: Vec<SemanticEvidenceCard>,
+    pub candidates_considered: usize,
+    pub stale_evidence_withdrawn: u64,
+    pub model: Option<SemanticModelMetadata>,
+    pub(crate) stale_document_ids: BTreeSet<DocumentId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -711,6 +751,27 @@ impl CandidateRow {
             index_fresh: true,
         }
     }
+
+    fn semantic_evidence_card(
+        &self,
+        vault_id: &VaultId,
+        semantic_similarity: f32,
+    ) -> SemanticEvidenceCard {
+        SemanticEvidenceCard {
+            vault_id: vault_id.clone(),
+            document_id: self.document_id.clone(),
+            document_title: self.document_title.clone(),
+            provision_heading: self.provision_heading.clone(),
+            source_anchor: self.source_anchor.clone(),
+            exact_excerpt: self.body.clone(),
+            sentence_count: sentence_count(&self.body),
+            source_revision: self.source_revision.clone(),
+            source_converter: self.source_converter.clone(),
+            semantic_similarity,
+            why_suggested: "Meaning-similar suggestion from a revision-pinned on-device model; review the exact excerpt. This is not a determination of legal sufficiency.".to_string(),
+            index_fresh: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -730,6 +791,8 @@ struct DocumentAccumulator {
 pub struct LegalIndex {
     vault_id: VaultId,
     connection: Connection,
+    semantic_model: Option<SemanticModelMetadata>,
+    semantic_vectors: BTreeMap<(DocumentId, u32), Vec<f32>>,
 }
 
 impl std::fmt::Debug for LegalIndex {
@@ -738,6 +801,8 @@ impl std::fmt::Debug for LegalIndex {
             .debug_struct("LegalIndex")
             .field("vault_id", &self.vault_id)
             .field("connection", &"[private in-memory sqlite]")
+            .field("semantic_model", &self.semantic_model)
+            .field("semantic_vectors", &self.semantic_vectors.len())
             .finish()
     }
 }
@@ -773,11 +838,21 @@ impl LegalIndex {
         Ok(Self {
             vault_id,
             connection,
+            semantic_model: None,
+            semantic_vectors: BTreeMap::new(),
         })
     }
 
     pub fn vault_id(&self) -> &VaultId {
         &self.vault_id
+    }
+
+    pub fn semantic_model(&self) -> Option<&SemanticModelMetadata> {
+        self.semantic_model.as_ref()
+    }
+
+    pub fn semantic_provision_count(&self) -> usize {
+        self.semantic_vectors.len()
     }
 
     pub fn replace_document(
@@ -791,7 +866,65 @@ impl LegalIndex {
         replace_document_transaction(&transaction, document)?;
         transaction
             .commit()
-            .map_err(|_| RetrievalError::IndexUnavailable)
+            .map_err(|_| RetrievalError::IndexUnavailable)?;
+        self.semantic_vectors
+            .retain(|(document_id, _), _| document_id != &document.document_id);
+        Ok(())
+    }
+
+    pub fn replace_document_with_semantics(
+        &mut self,
+        document: &NormalizedDocument,
+        model: SemanticModelMetadata,
+        embeddings: &[Option<Vec<f32>>],
+    ) -> Result<usize, RetrievalError> {
+        if model.dimension != APPLE_ENGLISH_SENTENCE_DIMENSION
+            || embeddings.len() != document.provisions.len()
+            || self
+                .semantic_model
+                .as_ref()
+                .is_some_and(|existing| existing != &model)
+        {
+            return Err(RetrievalError::InvalidSemanticVector);
+        }
+        let populated = embeddings.iter().filter(|vector| vector.is_some()).count();
+        let retained_for_other_documents = self
+            .semantic_vectors
+            .keys()
+            .filter(|(document_id, _)| document_id != &document.document_id)
+            .count();
+        if retained_for_other_documents.saturating_add(populated) > MAX_SEMANTIC_PROVISIONS {
+            return Err(RetrievalError::SemanticBudgetExceeded);
+        }
+        for vector in embeddings.iter().flatten() {
+            let self_similarity = cosine_similarity(vector, vector)
+                .map_err(|_| RetrievalError::InvalidSemanticVector)?;
+            if !(0.999..=1.001).contains(&self_similarity) {
+                return Err(RetrievalError::InvalidSemanticVector);
+            }
+        }
+
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| RetrievalError::IndexUnavailable)?;
+        replace_document_transaction(&transaction, document)?;
+        transaction
+            .commit()
+            .map_err(|_| RetrievalError::IndexUnavailable)?;
+
+        self.semantic_vectors
+            .retain(|(document_id, _), _| document_id != &document.document_id);
+        for (provision, vector) in document.provisions.iter().zip(embeddings) {
+            if let Some(vector) = vector {
+                self.semantic_vectors.insert(
+                    (document.document_id.clone(), provision.ordinal),
+                    vector.clone(),
+                );
+            }
+        }
+        self.semantic_model = Some(model);
+        Ok(populated)
     }
 
     pub fn remove_document(&mut self, document_id: &DocumentId) -> Result<(), RetrievalError> {
@@ -813,7 +946,13 @@ impl LegalIndex {
             .map_err(|_| RetrievalError::IndexUnavailable)?;
         transaction
             .commit()
-            .map_err(|_| RetrievalError::IndexUnavailable)
+            .map_err(|_| RetrievalError::IndexUnavailable)?;
+        self.semantic_vectors
+            .retain(|(indexed_document, _), _| indexed_document != document_id);
+        if self.semantic_vectors.is_empty() {
+            self.semantic_model = None;
+        }
+        Ok(())
     }
 
     pub fn search(
@@ -843,6 +982,129 @@ impl LegalIndex {
                 lexical_candidates_considered,
             ),
         }
+    }
+
+    pub fn semantic_search(
+        &self,
+        requested_vault: &VaultId,
+        query_vector: &[f32],
+        current_revisions: &CurrentRevisionSet,
+        limit: usize,
+    ) -> Result<SemanticSearchResult, RetrievalError> {
+        if requested_vault != &self.vault_id {
+            return Err(RetrievalError::ScopeMismatch);
+        }
+        if limit == 0 || limit > MAX_EVIDENCE_RESULTS {
+            return Err(RetrievalError::InvalidQuery);
+        }
+        let Some(model) = self.semantic_model.clone() else {
+            return Ok(SemanticSearchResult {
+                suggestions: Vec::new(),
+                candidates_considered: 0,
+                stale_evidence_withdrawn: 0,
+                model: None,
+                stale_document_ids: BTreeSet::new(),
+            });
+        };
+        let query_norm = cosine_similarity(query_vector, query_vector)
+            .map_err(|_| RetrievalError::InvalidSemanticVector)?;
+        if !(0.999..=1.001).contains(&query_norm)
+            || query_vector.len() != model.dimension
+            || self.semantic_vectors.len() > MAX_SEMANTIC_PROVISIONS
+        {
+            return Err(RetrievalError::InvalidSemanticVector);
+        }
+
+        let candidates_considered = self.semantic_vectors.len();
+        let mut ranked = self
+            .semantic_vectors
+            .iter()
+            .map(|((document_id, ordinal), vector)| {
+                cosine_similarity(query_vector, vector)
+                    .map(|similarity| (similarity, document_id.clone(), *ordinal))
+                    .map_err(|_| RetrievalError::InvalidSemanticVector)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        ranked.truncate(MAX_SEMANTIC_CANDIDATES.min(ranked.len()));
+
+        let mut suggestions = Vec::new();
+        let mut stale_documents = BTreeSet::new();
+        for (similarity, document_id, ordinal) in ranked {
+            let Some(candidate) = self.load_candidate(&document_id, ordinal)? else {
+                continue;
+            };
+            if !current_revisions.matches(&candidate.document_id, &candidate.source_revision) {
+                stale_documents.insert(candidate.document_id);
+                continue;
+            }
+            suggestions.push(candidate.semantic_evidence_card(&self.vault_id, similarity));
+            if suggestions.len() >= limit {
+                break;
+            }
+        }
+        Ok(SemanticSearchResult {
+            suggestions,
+            candidates_considered,
+            stale_evidence_withdrawn: stale_documents.len() as u64,
+            model: Some(model),
+            stale_document_ids: stale_documents,
+        })
+    }
+
+    fn load_candidate(
+        &self,
+        document_id: &DocumentId,
+        ordinal: u32,
+    ) -> Result<Option<CandidateRow>, RetrievalError> {
+        self.connection
+            .query_row(
+                "
+                SELECT
+                    p.document_id,
+                    p.ordinal,
+                    p.anchor,
+                    p.heading,
+                    p.body,
+                    d.title,
+                    d.revision_sha256,
+                    d.revision_bytes,
+                    d.converter
+                FROM provisions p
+                JOIN documents d ON d.document_id = p.document_id
+                WHERE p.document_id = ?1 AND p.ordinal = ?2
+                LIMIT 1
+                ",
+                params![document_id.as_str(), ordinal.to_string()],
+                |row| {
+                    let revision_bytes = row
+                        .get::<_, i64>(7)?
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, i64::MAX))?;
+                    Ok(CandidateRow {
+                        document_id: DocumentId::parse(row.get::<_, String>(0)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        document_title: row.get(5)?,
+                        provision_heading: row.get(3)?,
+                        source_anchor: row.get(2)?,
+                        body: row.get(4)?,
+                        source_revision: SourceRevision {
+                            sha256: row.get(6)?,
+                            byte_len: revision_bytes,
+                        },
+                        source_converter: row.get(8)?,
+                        lexical_rank: 0.0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| RetrievalError::IndexUnavailable)
     }
 
     fn load_candidates(&self, query: &LegalQuery) -> Result<Vec<CandidateRow>, RetrievalError> {
@@ -951,8 +1213,13 @@ impl LegalIndex {
             query,
             evidence,
             documents: Vec::new(),
+            semantic_suggestions: Vec::new(),
             lexical_candidates_considered,
+            semantic_candidates_considered: 0,
+            semantic_query_applied: false,
+            semantic_model: self.semantic_model.clone(),
             stale_evidence_withdrawn: stale_documents.len() as u64,
+            stale_document_ids: stale_documents,
         })
     }
 
@@ -1065,8 +1332,13 @@ impl LegalIndex {
             query,
             evidence: Vec::new(),
             documents: document_evidence,
+            semantic_suggestions: Vec::new(),
             lexical_candidates_considered,
+            semantic_candidates_considered: 0,
+            semantic_query_applied: false,
+            semantic_model: self.semantic_model.clone(),
             stale_evidence_withdrawn: stale_documents.len() as u64,
+            stale_document_ids: stale_documents,
         })
     }
 
@@ -1295,6 +1567,12 @@ mod tests {
         }
     }
 
+    fn semantic_axis(axis: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; APPLE_ENGLISH_SENTENCE_DIMENSION];
+        vector[axis] = 1.0;
+        vector
+    }
+
     #[test]
     fn interprets_peter_query_into_visible_constraints() {
         let query = sample_query();
@@ -1412,6 +1690,59 @@ mod tests {
             Some("7. CONFIDENTIALITY")
         );
         assert_eq!(normalized_docx.converter, "docx-xml-0.41.0-v1");
+    }
+
+    #[test]
+    fn semantic_candidates_remain_vault_scoped_exact_and_revision_fenced() {
+        let preferred = document(
+            "semantic-preferred",
+            "Preferred",
+            "NONDISCLOSURE\nThe recipient shall not reveal nonpublic deal material.",
+        );
+        let other = document(
+            "semantic-other",
+            "Other",
+            "FRUIT\nA banana grows in a tropical climate.",
+        );
+        let model = SemanticModelMetadata::apple_english_sentence_revision_one();
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index
+            .replace_document_with_semantics(&preferred, model.clone(), &[Some(semantic_axis(0))])
+            .expect("preferred");
+        index
+            .replace_document_with_semantics(&other, model, &[Some(semantic_axis(1))])
+            .expect("other");
+        let current = CurrentRevisionSet::from_documents([&preferred, &other]);
+        let response = index
+            .semantic_search(&vault(), &semantic_axis(0), &current, 10)
+            .expect("semantic search");
+        assert_eq!(response.candidates_considered, 2);
+        assert_eq!(response.suggestions.len(), 2);
+        assert_eq!(response.suggestions[0].document_id, preferred.document_id);
+        assert_eq!(
+            response.suggestions[0].exact_excerpt,
+            "The recipient shall not reveal nonpublic deal material."
+        );
+        assert!(response.suggestions[0]
+            .why_suggested
+            .contains("not a determination"));
+
+        let only_other_current = CurrentRevisionSet::from_documents([&other]);
+        let fenced = index
+            .semantic_search(&vault(), &semantic_axis(0), &only_other_current, 10)
+            .expect("fenced search");
+        assert_eq!(fenced.suggestions.len(), 1);
+        assert_eq!(fenced.suggestions[0].document_id, other.document_id);
+        assert_eq!(fenced.stale_evidence_withdrawn, 1);
+        assert!(matches!(
+            index.semantic_search(
+                &VaultId::parse("wrong-vault").expect("scope"),
+                &semantic_axis(0),
+                &current,
+                10
+            ),
+            Err(RetrievalError::ScopeMismatch)
+        ));
     }
 
     #[test]

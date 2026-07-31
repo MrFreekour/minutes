@@ -453,6 +453,24 @@ withdrawn. The browser-facing UI receives document titles and exact evidence
 only for current matches; it never receives source paths or general filesystem
 access.
 
+The app now includes a deliberately narrower semantic experiment alongside
+exact search. Apple's built-in English sentence embedding is pinned to revision
+1; the code calls no model asset-request or download API. Provision vectors
+are bounded, vault-scoped, held only in memory, removed with their document,
+and subjected to the same current-source fence before display. Semantic
+results appear in a separate “meaning-similar suggestion” section and state
+that they are not determinations of legal sufficiency. They are not fused into
+or counted as deterministic constraint matches. QMD, downloaded GGUF models,
+cross-encoder reranking, and answer generation remain disabled.
+
+Both indexing-time and query-time embeddings now run in a separate persistent
+worker. Before any model construction or confidential input, the worker
+installs resource ceilings and a macOS sandbox that denies network access and
+reads or writes under user, volume, and network roots. The parent passes only
+bounded text through length-framed pipes, never a source path. Binding requires
+an immutable private executable snapshot plus a startup self-test proving
+localhost binding and `/etc/passwd` reads are denied.
+
 Evaluate:
 
 - exact phrase;
@@ -476,8 +494,8 @@ Peter supplies roughly 20 real questions and identifies useful results. He does
 not need to create a formal relevance-judgment spreadsheet; the UI captures
 useful, wrong result, and missing result locally.
 
-Exact/FTS retrieval ships first. Semantic retrieval remains an independent,
-reversible experiment.
+Exact/FTS retrieval remains authoritative. The built-in semantic suggestion
+lane is an independent, reversible experiment with no durable vectors.
 
 ### Gate 4: Multi-location vault
 
@@ -528,13 +546,19 @@ agent, classify thousands of documents, or move his archive into Minutes.
 ## Current Build Decision
 
 The multi-root census and the bounded searchable PDF, DOCX, and text evidence
-UI now exist in the separate app. Keep this content proof ephemeral until
-live-source resolution and revocation remain green under native interaction
-testing.
+UI now exist in the separate app. Exact retrieval and separately labeled,
+revision-pinned on-device semantic suggestions both remain ephemeral.
+Live-source resolution and revocation are green in deterministic and
+installed-executable synthetic coverage. The installed ad-hoc build also
+passes its bundle seal, both converter and semantic worker self-tests, a
+three-format end-to-end search and mutation-withdrawal test, and launches with
+no open network socket. Native interaction testing is still outstanding.
 
 Next, use the aggregate census to determine whether local OCR, legacy Word,
 WordPerfect, email containers, Apple packages, or cloud hydration is the next
-coverage constraint. Do not add a persistent derivative store, embeddings,
-model generation, or an Open Original action until their separate protection
-and final-fence contracts are proven. Developer ID signing, notarization, and
-native permission and interaction testing remain Peter handoff gates.
+coverage constraint. Do not persist source text or vectors, add downloaded
+models, model generation, or an Open Original action until their separate
+protection and final-fence contracts are proven. Semantic model execution is
+now formally network-denied; an end-to-end human test with networking disabled,
+Developer ID signing, notarization, and native permission and interaction
+testing remain Peter handoff gates.

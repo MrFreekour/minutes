@@ -2,6 +2,7 @@ use minutes_archive_convert::BoundedConverter;
 use minutes_archive_core::approve_roots;
 use minutes_archive_core::retrieval::VaultId;
 use minutes_archive_core::vault::{build_authorized_document_vault, DocumentVaultLimits};
+use minutes_archive_semantic::BoundedSemanticEngine;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -77,6 +78,8 @@ fn main() {
         .expect("usage: document_vault_smoke <minutes-archive-app executable>");
     let converter =
         BoundedConverter::bind(Path::new(&worker_path)).expect("bind embedded converter worker");
+    let semantic_engine =
+        BoundedSemanticEngine::bind(Path::new(&worker_path)).expect("bind semantic worker");
     let temp = TempDir::new().expect("temporary fixture");
     let root = temp.path().join("approved");
     fs::create_dir(&root).expect("approved root");
@@ -96,6 +99,7 @@ fn main() {
         DocumentVaultLimits::default(),
         &AtomicBool::new(false),
         &converter,
+        semantic_engine,
     )
     .expect("build document vault");
     let report = vault.build_report();
@@ -103,6 +107,11 @@ fn main() {
     assert_eq!(report.searchable_pdf_documents, 1);
     assert_eq!(report.docx_documents, 1);
     assert!(report.converter_sandbox_verified);
+    assert!(report.semantic_worker_sandbox_verified);
+    assert!(report.semantic_retrieval_enabled);
+    assert!(report.semantic_provisions_indexed >= 3);
+    assert!(!report.semantic_model_download_requested);
+    assert!(!report.semantic_derivatives_persisted);
     assert!(!report.source_content_persisted);
     assert!(!report.retrieval_index_persisted);
 
@@ -120,6 +129,20 @@ fn main() {
         .evidence
         .iter()
         .any(|card| card.source_anchor.starts_with("paragraph:000002/")));
+    assert!(response.semantic_query_applied);
+
+    let semantic_only = vault
+        .interpret_and_search(
+            "clauses that require a recipient to protect private business material",
+        )
+        .expect("semantic-only search");
+    assert!(semantic_only.evidence.is_empty());
+    assert!(semantic_only.semantic_query_applied);
+    assert!(!semantic_only.semantic_suggestions.is_empty());
+    assert!(semantic_only
+        .semantic_suggestions
+        .iter()
+        .all(|card| card.index_fresh && !card.exact_excerpt.is_empty()));
 
     fs::write(&pdf_path, b"%PDF-mutated").expect("mutate PDF");
     let after_mutation = vault

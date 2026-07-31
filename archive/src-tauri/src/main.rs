@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use minutes_archive_convert::{run_worker_process, BoundedConverter, WORKER_MARKER};
+use minutes_archive_convert::{
+    run_worker_process as run_convert_worker, BoundedConverter,
+    WORKER_MARKER as CONVERT_WORKER_MARKER,
+};
 use minutes_archive_core::retrieval::{LegalSearchResponse, VaultId};
 use minutes_archive_core::vault::{
     build_authorized_document_vault, AuthorizedDocumentVault, DocumentVaultBuildReport,
@@ -9,6 +12,10 @@ use minutes_archive_core::vault::{
 use minutes_archive_core::{
     approve_roots, scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits,
     CensusReport, CensusStatus,
+};
+use minutes_archive_semantic::{
+    run_worker_process as run_semantic_worker, BoundedSemanticEngine,
+    WORKER_MARKER as SEMANTIC_WORKER_MARKER,
 };
 use serde::Serialize;
 use std::fs;
@@ -336,12 +343,15 @@ async fn build_archive_text_vault(
             .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
         let converter =
             BoundedConverter::bind(&worker_executable).map_err(|error| error.to_string())?;
+        let semantic_engine =
+            BoundedSemanticEngine::bind(&worker_executable).map_err(|error| error.to_string())?;
         build_authorized_document_vault(
             vault_id,
             &roots,
             DocumentVaultLimits::default(),
             &cancelled,
             &converter,
+            semantic_engine,
         )
         .map_err(|error| error.to_string())
     })
@@ -378,12 +388,21 @@ fn search_archive_text_vault(
 fn main() {
     let mut arguments = std::env::args();
     let _program = arguments.next();
-    if arguments.next().as_deref() == Some(WORKER_MARKER) {
-        let format = arguments.next().unwrap_or_default();
+    let marker = arguments.next();
+    if matches!(
+        marker.as_deref(),
+        Some(CONVERT_WORKER_MARKER | SEMANTIC_WORKER_MARKER)
+    ) {
+        let operation = arguments.next().unwrap_or_default();
         if arguments.next().is_some() {
             std::process::exit(64);
         }
-        std::process::exit(run_worker_process(&format));
+        let status = match marker.as_deref() {
+            Some(CONVERT_WORKER_MARKER) => run_convert_worker(&operation),
+            Some(SEMANTIC_WORKER_MARKER) => run_semantic_worker(&operation),
+            _ => unreachable!("worker marker was already validated"),
+        };
+        std::process::exit(status);
     }
 
     tauri::Builder::default()

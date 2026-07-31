@@ -86,6 +86,19 @@ const vaultReport = {
   source_content_persisted: false,
   retrieval_index_persisted: false,
   converter_sandbox_verified: true,
+  semantic_worker_sandbox_verified: true,
+  semantic_retrieval_enabled: true,
+  semantic_model: {
+    model_id: "apple-nl-sentence-en-r1",
+    revision: 1,
+    dimension: 512,
+    built_in_os_asset: true,
+    model_download_requested: false,
+  },
+  semantic_provisions_indexed: 4,
+  semantic_provisions_skipped: 0,
+  semantic_derivatives_persisted: false,
+  semantic_model_download_requested: false,
   supported_formats: [".docx", ".md", ".pdf", ".text", ".txt"],
 };
 
@@ -119,7 +132,34 @@ const evidence = {
     },
   ],
   documents: [],
+  semantic_suggestions: [
+    {
+      vault_id: "local-private-vault",
+      document_id: "document-0000000000000002",
+      document_title: "Meaning Similar Agreement",
+      provision_heading: "8. NONDISCLOSURE",
+      source_anchor: "paragraph:000021/section:0001",
+      exact_excerpt:
+        "The recipient must protect all nonpublic business material from disclosure.",
+      sentence_count: 1,
+      source_revision: { sha256: "11", byte_len: 82 },
+      source_converter: "docx-xml-0.41.0-v1",
+      semantic_similarity: 0.31,
+      why_suggested:
+        "Meaning-similar suggestion from a revision-pinned on-device model; review the exact excerpt. This is not a determination of legal sufficiency.",
+      index_fresh: true,
+    },
+  ],
   lexical_candidates_considered: 1,
+  semantic_candidates_considered: 4,
+  semantic_query_applied: true,
+  semantic_model: {
+    model_id: "apple-nl-sentence-en-r1",
+    revision: 1,
+    dimension: 512,
+    built_in_os_asset: true,
+    model_download_requested: false,
+  },
   stale_evidence_withdrawn: 0,
 };
 
@@ -239,6 +279,10 @@ try {
           throw new Error("Timed out waiting for " + label);
         };
         await waitFor(() => !document.querySelector("#setup-view").hidden, "setup");
+        const setupButtonBounds = document
+          .querySelector("#add-locations")
+          .getBoundingClientRect()
+          .toJSON();
         document.querySelector("#add-locations").click();
         await waitFor(() => document.querySelectorAll("#location-list li").length === 1, "location");
         document.querySelector("#run-census").click();
@@ -253,9 +297,13 @@ try {
         document.querySelector("#search-form").dispatchEvent(
           new Event("submit", { bubbles: true, cancelable: true })
         );
-        await waitFor(() => document.querySelectorAll(".evidence-card").length === 1, "evidence");
+        await waitFor(() => document.querySelectorAll(".evidence-card").length === 2, "evidence");
         const body = document.body.innerText;
-        if (!body.includes("Synthetic Agreement") || !body.includes("Source verified")) {
+        if (
+          !body.includes("Synthetic Agreement") ||
+          !body.includes("Source verified") ||
+          !body.toLowerCase().includes("review, not verified legal matches")
+        ) {
           throw new Error("Evidence provenance did not render");
         }
         if (body.includes("/Users/") || body.includes("SYNTHETIC_CONTENT_CANARY")) {
@@ -265,6 +313,7 @@ try {
           locations: document.querySelectorAll("#location-list li").length,
           evidenceCards: document.querySelectorAll(".evidence-card").length,
           searchVisible: !document.querySelector("#search-view").hidden,
+          setupButtonBounds,
         };
       })()
     `,

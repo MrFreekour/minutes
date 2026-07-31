@@ -305,7 +305,13 @@ function renderVaultSummary(report) {
       report.unsupported_files_skipped === 1 ? "" : "s"
     } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
       report.ocr_required_files === 1 ? "" : "s"
-    } require OCR. The index exists only in memory.`;
+    } require OCR. ` +
+    (report.semantic_retrieval_enabled
+      ? `${report.semantic_provisions_indexed.toLocaleString()} provision suggestion vector${
+          report.semantic_provisions_indexed === 1 ? "" : "s"
+        } built with the pinned macOS model inside its network-denied worker. `
+      : "Semantic suggestions are unavailable on this Mac. ") +
+    "All indexes exist only in memory.";
 }
 
 async function buildTextVault() {
@@ -356,14 +362,20 @@ function renderQueryInterpretation(response) {
   }
   if (query.exact_phrase) addQueryChip(`Exact: “${query.exact_phrase}”`);
   if (query.max_sentences) addQueryChip(`At most ${query.max_sentences} sentences`);
+  if (response.semantic_query_applied) addQueryChip("On-device meaning suggestions");
   elements.candidateCount.textContent =
     `${response.lexical_candidates_considered.toLocaleString()} lexical candidate${
       response.lexical_candidates_considered === 1 ? "" : "s"
-    } checked`;
+    } checked` +
+    (response.semantic_query_applied
+      ? ` · ${response.semantic_candidates_considered.toLocaleString()} semantic vector${
+          response.semantic_candidates_considered === 1 ? "" : "s"
+        } ranked`
+      : "");
   elements.queryInterpretation.hidden = false;
 }
 
-function evidenceCard(card, compact = false) {
+function evidenceCard(card, compact = false, semantic = false) {
   if (compact) {
     const item = document.createElement("div");
     item.className = "criterion-evidence";
@@ -382,7 +394,9 @@ function evidenceCard(card, compact = false) {
   const titleBlock = document.createElement("div");
   const kicker = document.createElement("span");
   kicker.className = "evidence-kicker";
-  kicker.textContent = card.provision_heading ?? "Provision";
+  kicker.textContent = semantic
+    ? "Meaning-similar suggestion"
+    : (card.provision_heading ?? "Provision");
   const title = document.createElement("strong");
   title.className = "evidence-title";
   title.textContent = card.document_title;
@@ -408,8 +422,9 @@ function evidenceCard(card, compact = false) {
   meta.append(anchor, sentences, converter);
   const why = document.createElement("p");
   why.className = "evidence-why";
-  why.textContent = card.why_matched;
+  why.textContent = semantic ? card.why_suggested : card.why_matched;
   article.append(header, excerpt, meta, why);
+  if (semantic) article.classList.add("semantic-card");
   return article;
 }
 
@@ -453,8 +468,18 @@ function renderSearchResponse(response) {
   for (const card of response.documents) {
     elements.searchResults.append(documentCard(card));
   }
-  const resultCount = response.evidence.length + response.documents.length;
-  if (resultCount === 0) {
+  const verifiedCount = response.evidence.length + response.documents.length;
+  if (response.semantic_suggestions.length > 0) {
+    const heading = document.createElement("p");
+    heading.className = "semantic-heading";
+    heading.textContent = "Broader recall · review, not verified legal matches";
+    elements.searchResults.append(heading);
+    for (const card of response.semantic_suggestions) {
+      elements.searchResults.append(evidenceCard(card, false, true));
+    }
+  }
+  const suggestionCount = response.semantic_suggestions.length;
+  if (verifiedCount === 0 && suggestionCount === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-results";
     empty.textContent =
@@ -471,9 +496,11 @@ function renderSearchResponse(response) {
         } withdrawn.`
       : "";
   elements.searchStatus.textContent =
-    `${resultCount.toLocaleString()} current ${resultKind}${
-      resultCount === 1 ? "" : "s"
-    } matched every visible constraint.${staleNote}`;
+    `${verifiedCount.toLocaleString()} current ${resultKind}${
+      verifiedCount === 1 ? "" : "s"
+    } matched every visible constraint; ${suggestionCount.toLocaleString()} separately labeled meaning suggestion${
+      suggestionCount === 1 ? "" : "s"
+    }.${staleNote}`;
 }
 
 async function searchVault(event) {
@@ -486,7 +513,8 @@ async function searchVault(event) {
     return;
   }
   elements.searchSubmit.disabled = true;
-  elements.searchStatus.textContent = "Checking lexical candidates and current source revisions…";
+  elements.searchStatus.textContent =
+    "Checking exact constraints, on-device meaning candidates, and current source revisions…";
   try {
     const response = await invoke("search_archive_text_vault", { query });
     renderSearchResponse(response);

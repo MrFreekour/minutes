@@ -217,9 +217,11 @@
                   This explicitly opens searchable <code>.pdf</code>,
                   <code>.docx</code>, <code>.txt</code>, <code>.text</code>,
                   and <code>.md</code> files. PDF and DOCX bytes go to a
-                  bounded, network-denied converter. Source text and the FTS
-                  index stay in memory. Scans, legacy Word, and email are
-                  counted but not searched.
+                  bounded, network-denied converter. Exact search plus the
+                  revision-pinned macOS semantic model run in separate
+                  network-denied workers; source text, FTS rows, and
+                  suggestion vectors stay in memory.
+                  Scans, legacy Word, and email are counted but not searched.
                 </p>
               </div>
               <button id="build-text-vault" class="button button-primary" type="button">
@@ -250,8 +252,9 @@
             <p>
               Reading bounded supported files from the approved locations.
               PDF and DOCX conversion runs in the network-denied worker. The
-              index stays in memory, links remain excluded, and no model is
-              used.
+              index stays in memory, links remain excluded, and the built-in
+              macOS sentence model creates suggestion vectors in its own
+              network-denied worker without a model download.
             </p>
             <div class="progress-track" aria-hidden="true">
               <span></span>
@@ -290,7 +293,9 @@
               </div>
               <p class="search-help">
                 Try “Find documents containing assignment, governing law, and a
-                BAA reference” for document-level conjunction.
+                BAA reference” for document-level conjunction, or describe a
+                clause in ordinary language for separately labeled semantic
+                suggestions.
               </p>
             </form>
 

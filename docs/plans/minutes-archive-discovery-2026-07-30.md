@@ -147,7 +147,9 @@ Before hybrid retrieval is enabled, the implementation must prove:
   through an explicit setup-only network capability; and
 - clearing a vault removes its normalized and retrieval derivatives.
 
-If these properties cannot be established, semantic indexing remains disabled.
+If these properties cannot be established, downloaded-model hybrid semantic
+indexing remains disabled. The later built-in Apple suggestion experiment is a
+separate, ephemeral lane and is never treated as a verified constraint match.
 
 ## Tauri Security Profile
 
@@ -240,18 +242,18 @@ Converters and exact retrieval are evaluated on public or synthetic legal
 documents. Every result opens the correct source location, and adversarial
 documents cannot alter system behavior.
 
-The first exact-retrieval slice is implemented with an in-memory,
-vault-scoped SQLite FTS5 index and deterministic provision-level verification.
-It has no model or persistent attorney derivative. Tests prove exact excerpts
-and anchors, same-provision concept conjunction, sentence limits, explicit
-vault denial, stale-revision withdrawal, transactional source replacement, and
-inert prompt-like source text. Document-level conjunction is now implemented
-as a separate evidence type that groups criteria inside one document, applies
-exclusions across its provisions, and never assembles a match across documents.
-A committed legal fixture exercises the provision and document modes, and an
-overflowing lexical candidate set fails closed. Additional legacy and email
-format conversion, protected persistence, and OCR remain unimplemented Stage 2
-gates.
+The exact-retrieval slice is implemented with an in-memory, vault-scoped SQLite
+FTS5 index and deterministic provision-level verification. The lexical lane
+has no model, and no attorney derivative is persisted. Tests prove exact
+excerpts and anchors, same-provision concept conjunction, sentence limits,
+explicit vault denial, stale-revision withdrawal, transactional source
+replacement, and inert prompt-like source text. Document-level conjunction is
+implemented as a separate evidence type that groups criteria inside one
+document, applies exclusions across its provisions, and never assembles a
+match across documents. A committed legal fixture exercises the provision and
+document modes, and an overflowing lexical candidate set fails closed.
+Additional legacy and email format conversion, protected persistence, and OCR
+remain unimplemented Stage 2 gates.
 
 The separate desktop app now makes content access a distinct post-census
 action. It can build an in-memory index from bounded searchable `.pdf`, `.docx`,
@@ -276,11 +278,46 @@ page or paragraph anchors, retrieves all three, mutates the PDF, and observes
 its evidence withdrawal. Scanned PDFs are reported as OCR-required rather than
 silently treated as searchable.
 
+The app also has a reversible, in-memory semantic-suggestion lane. It pins
+Apple's built-in English `NLEmbedding` sentence model to revision 1, calls no
+asset-request or model-download API, caps each provision input, normalizes and
+bounds the vector count, and binds every vector to a vault, document,
+provision, and current source revision. Meaning-similar excerpts are displayed
+below and separately from deterministic matches with an explicit
+attorney-review warning. They are never represented as satisfying a legal
+constraint. Tests prove model identity, vector bounds, vault denial, exact
+excerpt return, stale-source withdrawal, and a legal paraphrase ranking above
+unrelated text.
+
+Model execution is now isolated from the desktop process. The parent binds and
+re-hashes a private read-only snapshot of the installed app executable, starts
+a persistent length-framed pipe worker, clears its environment, applies
+resource ceilings, and installs the sandbox before constructing the Apple
+model or reading provision text. The macOS profile denies all network access
+and reads or writes under user, volume, and network roots; the worker receives
+text only through a bounded pipe and never receives source paths. Its startup
+self-test must prove that localhost binding and `/etc/passwd` reads fail.
+Provision and query embeddings both use this worker. The vectors remain
+process memory only. A downloaded embedding model, QMD integration, hybrid
+fusion, reranking, answer generation, and durable vector storage remain
+separate gates.
+
+A RustSec audit on 2026-07-30 found vulnerable older `quick-xml` versions in
+the shared workspace lock. The Archive dependency tree's `plist` was updated
+from 1.8.0 to 1.10.0, removing `quick-xml` 0.38.4; both the Archive converter
+and the macOS app tree now resolve `quick-xml` 0.41.0, which contains the
+relevant denial-of-service fixes. `quick-xml` 0.37.5 remains in the whole
+workspace lock through the Windows-only notification path of the main Minutes
+app, so a whole-workspace `cargo audit` still returns nonzero even though that
+crate is absent from the macOS Archive app tree. Informational unmaintained and
+unsound transitive warnings also remain for independent review; this is not a
+claim that the dependency review is complete.
+
 ### Stage 3: Controlled private pilot
 
 The attorney selects a bounded copy or read-only subset after reviewing the
-coverage report. Hybrid retrieval and local generation remain separately
-gated. No cloud provider receives archive content.
+coverage report. Downloaded-model hybrid retrieval and local generation remain
+separately gated. No cloud provider receives archive content.
 
 ## Pilot Success Measures
 

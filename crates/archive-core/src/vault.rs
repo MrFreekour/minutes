@@ -9,7 +9,8 @@
 use crate::retrieval::{
     interpret_legal_query, normalize_converted_document, normalize_text_document,
     CurrentRevisionSet, DocumentId, LegalIndex, LegalQuery, LegalSearchResponse, RetrievalError,
-    SourceRevision, VaultId, MAX_NORMALIZED_DOCUMENT_BYTES,
+    SourceRevision, VaultId, MAX_NORMALIZED_DOCUMENT_BYTES, MAX_QUERY_CHARS,
+    MAX_SEMANTIC_PROVISIONS,
 };
 use crate::{
     cap_identity_matches, cap_metadata_identity_portable, cap_metadata_is_link_or_reparse,
@@ -18,6 +19,9 @@ use crate::{
 };
 use cap_std::fs::{Dir, File};
 use minutes_archive_convert::{BoundedConverter, SourceFormat, WorkerError};
+use minutes_archive_semantic::{
+    BoundedSemanticEngine, SemanticError, SemanticModelMetadata, MAX_SEMANTIC_INPUT_CHARS,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
@@ -80,6 +84,10 @@ pub enum VaultError {
     CandidateBudgetExceeded,
     #[error("the query could not be applied safely")]
     InvalidQuery,
+    #[error("the in-memory semantic index exceeded its bounded pilot capacity")]
+    SemanticBudgetExceeded,
+    #[error("the bounded on-device semantic worker is unavailable")]
+    SemanticUnavailable,
 }
 
 impl From<CensusError> for VaultError {
@@ -106,6 +114,8 @@ impl From<RetrievalError> for VaultError {
             | RetrievalError::ScopeMismatch => Self::InvalidQuery,
             RetrievalError::CandidateBudgetExceeded => Self::CandidateBudgetExceeded,
             RetrievalError::IndexUnavailable => Self::IndexUnavailable,
+            RetrievalError::InvalidSemanticVector => Self::IndexUnavailable,
+            RetrievalError::SemanticBudgetExceeded => Self::SemanticBudgetExceeded,
         }
     }
 }
@@ -131,6 +141,13 @@ pub struct TextVaultBuildReport {
     pub source_content_persisted: bool,
     pub retrieval_index_persisted: bool,
     pub converter_sandbox_verified: bool,
+    pub semantic_worker_sandbox_verified: bool,
+    pub semantic_retrieval_enabled: bool,
+    pub semantic_model: Option<SemanticModelMetadata>,
+    pub semantic_provisions_indexed: u64,
+    pub semantic_provisions_skipped: u64,
+    pub semantic_derivatives_persisted: bool,
+    pub semantic_model_download_requested: bool,
     pub supported_formats: Vec<&'static str>,
 }
 
@@ -165,6 +182,7 @@ pub struct AuthorizedTextVault {
     roots: Vec<AuthorizedVaultRoot>,
     sources: BTreeMap<DocumentId, AuthorizedSource>,
     index: LegalIndex,
+    semantic_engine: Option<BoundedSemanticEngine>,
     build_report: TextVaultBuildReport,
 }
 
@@ -180,6 +198,10 @@ impl std::fmt::Debug for AuthorizedTextVault {
             .field("roots", &self.roots.len())
             .field("sources", &self.sources.len())
             .field("index", &"[private in-memory sqlite]")
+            .field(
+                "semantic_engine",
+                &self.semantic_engine.as_ref().map(|_| "[bounded worker]"),
+            )
             .finish()
     }
 }
@@ -203,6 +225,8 @@ impl AuthorizedTextVault {
 
     pub fn search(&self, query: LegalQuery) -> Result<LegalSearchResponse, VaultError> {
         self.revalidate_roots()?;
+        let has_lexical_constraints =
+            !query.required_concepts.is_empty() || query.exact_phrase.is_some();
 
         let indexed_revisions = self
             .sources
@@ -213,10 +237,80 @@ impl AuthorizedTextVault {
         for (document_id, revision) in indexed_revisions {
             revisions.insert(document_id, revision);
         }
-        let mut response = self
-            .index
-            .search(&self.vault_id, query, &revisions)
-            .map_err(VaultError::from)?;
+        let mut response = if has_lexical_constraints {
+            self.index
+                .search(&self.vault_id, query.clone(), &revisions)
+                .map_err(VaultError::from)?
+        } else {
+            if query.raw.trim().is_empty()
+                || query.raw.chars().count() > MAX_QUERY_CHARS
+                || query.limit == 0
+            {
+                return Err(VaultError::InvalidQuery);
+            }
+            LegalSearchResponse {
+                query: query.clone(),
+                evidence: Vec::new(),
+                documents: Vec::new(),
+                semantic_suggestions: Vec::new(),
+                lexical_candidates_considered: 0,
+                semantic_candidates_considered: 0,
+                semantic_query_applied: false,
+                semantic_model: self.index.semantic_model().cloned(),
+                stale_evidence_withdrawn: 0,
+                stale_document_ids: BTreeSet::new(),
+            }
+        };
+
+        if let (Some(indexed_model), Some(semantic_engine)) =
+            (self.index.semantic_model(), self.semantic_engine.as_ref())
+        {
+            let pinned_model = SemanticModelMetadata::apple_english_sentence_revision_one();
+            if *indexed_model != pinned_model {
+                return Err(VaultError::SemanticUnavailable);
+            }
+            match semantic_engine.embed_once(&query.raw) {
+                Ok(query_vector) => {
+                    let semantic = self
+                        .index
+                        .semantic_search(&self.vault_id, &query_vector, &revisions, query.limit)
+                        .map_err(VaultError::from)?;
+                    let verified = response
+                        .evidence
+                        .iter()
+                        .map(|card| (card.document_id.clone(), card.source_anchor.clone()))
+                        .collect::<BTreeSet<_>>();
+                    response.semantic_suggestions = semantic
+                        .suggestions
+                        .into_iter()
+                        .filter(|card| {
+                            !verified
+                                .contains(&(card.document_id.clone(), card.source_anchor.clone()))
+                        })
+                        .filter(|card| {
+                            query
+                                .max_sentences
+                                .is_none_or(|maximum| card.sentence_count <= maximum)
+                        })
+                        .take(query.limit)
+                        .collect();
+                    response.semantic_candidates_considered = semantic.candidates_considered;
+                    response.semantic_query_applied = true;
+                    response.semantic_model = semantic.model;
+                    response
+                        .stale_document_ids
+                        .extend(semantic.stale_document_ids);
+                    response.stale_evidence_withdrawn = response.stale_document_ids.len() as u64;
+                }
+                Err(_) if !has_lexical_constraints => {
+                    return Err(VaultError::SemanticUnavailable);
+                }
+                Err(_) => {}
+            }
+        }
+        if !has_lexical_constraints && !response.semantic_query_applied {
+            return Err(VaultError::InvalidQuery);
+        }
 
         let result_documents = response
             .evidence
@@ -225,6 +319,12 @@ impl AuthorizedTextVault {
             .chain(
                 response
                     .documents
+                    .iter()
+                    .map(|card| card.document_id.clone()),
+            )
+            .chain(
+                response
+                    .semantic_suggestions
                     .iter()
                     .map(|card| card.document_id.clone()),
             )
@@ -246,9 +346,11 @@ impl AuthorizedTextVault {
         response
             .documents
             .retain(|card| !withdrawn.contains(&card.document_id));
-        response.stale_evidence_withdrawn = response
-            .stale_evidence_withdrawn
-            .saturating_add(withdrawn.len() as u64);
+        response
+            .semantic_suggestions
+            .retain(|card| !withdrawn.contains(&card.document_id));
+        response.stale_document_ids.extend(withdrawn);
+        response.stale_evidence_withdrawn = response.stale_document_ids.len() as u64;
         Ok(response)
     }
 
@@ -332,6 +434,8 @@ struct BuildCounters {
     metadata_errors: u64,
     directory_errors: u64,
     directories_scanned: u64,
+    semantic_provisions_indexed: u64,
+    semantic_provisions_skipped: u64,
 }
 
 pub fn build_authorized_text_vault(
@@ -340,7 +444,7 @@ pub fn build_authorized_text_vault(
     limits: TextVaultLimits,
     cancelled: &AtomicBool,
 ) -> Result<AuthorizedTextVault, VaultError> {
-    build_authorized_vault(vault_id, approved_roots, limits, cancelled, None)
+    build_authorized_vault(vault_id, approved_roots, limits, cancelled, None, None)
 }
 
 pub fn build_authorized_document_vault(
@@ -349,8 +453,16 @@ pub fn build_authorized_document_vault(
     limits: TextVaultLimits,
     cancelled: &AtomicBool,
     converter: &BoundedConverter,
+    semantic_engine: BoundedSemanticEngine,
 ) -> Result<AuthorizedTextVault, VaultError> {
-    build_authorized_vault(vault_id, approved_roots, limits, cancelled, Some(converter))
+    build_authorized_vault(
+        vault_id,
+        approved_roots,
+        limits,
+        cancelled,
+        Some(converter),
+        Some(semantic_engine),
+    )
 }
 
 fn build_authorized_vault(
@@ -359,6 +471,7 @@ fn build_authorized_vault(
     limits: TextVaultLimits,
     cancelled: &AtomicBool,
     converter: Option<&BoundedConverter>,
+    semantic_engine: Option<BoundedSemanticEngine>,
 ) -> Result<AuthorizedTextVault, VaultError> {
     let limits = limits.validate()?;
     validate_approved_roots(approved_roots).map_err(VaultError::from)?;
@@ -384,6 +497,14 @@ fn build_authorized_vault(
     let mut sources = BTreeMap::new();
     let mut identities = HashSet::new();
     let mut counters = BuildCounters::default();
+    let mut semantic_session = semantic_engine
+        .as_ref()
+        .map(BoundedSemanticEngine::open_session)
+        .transpose()
+        .map_err(|_| VaultError::SemanticUnavailable)?;
+    let semantic_model = semantic_session
+        .as_ref()
+        .map(|_| SemanticModelMetadata::apple_english_sentence_revision_one());
 
     while let Some(current) = pending.pop() {
         if cancelled.load(Ordering::Acquire) {
@@ -585,9 +706,62 @@ fn build_authorized_vault(
                     continue;
                 }
             };
-            index
-                .replace_document(&normalized)
-                .map_err(VaultError::from)?;
+            if let Some(session) = semantic_session.as_mut() {
+                let remaining = MAX_SEMANTIC_PROVISIONS
+                    .saturating_sub(counters.semantic_provisions_indexed as usize);
+                let mut embeddings = Vec::with_capacity(normalized.provisions.len());
+                for (position, provision) in normalized.provisions.iter().enumerate() {
+                    if position >= remaining {
+                        counters.semantic_provisions_skipped =
+                            counters.semantic_provisions_skipped.saturating_add(1);
+                        embeddings.push(None);
+                        continue;
+                    }
+                    let text = semantic_provision_text(
+                        &normalized.title,
+                        provision.heading.as_deref(),
+                        &provision.text,
+                    );
+                    match text.as_deref().map(|text| session.embed(text)) {
+                        Some(Ok(vector)) => embeddings.push(Some(vector)),
+                        Some(Err(
+                            SemanticError::InputBudgetExceeded | SemanticError::InvalidVector,
+                        ))
+                        | None => {
+                            counters.semantic_provisions_skipped =
+                                counters.semantic_provisions_skipped.saturating_add(1);
+                            embeddings.push(None);
+                        }
+                        Some(Err(
+                            SemanticError::PlatformUnavailable | SemanticError::ModelUnavailable,
+                        )) => {
+                            return Err(VaultError::SemanticUnavailable);
+                        }
+                        Some(Err(
+                            SemanticError::ExecutableUnavailable
+                            | SemanticError::SecurityBoundaryUnavailable
+                            | SemanticError::WorkerBudgetExceeded
+                            | SemanticError::WorkerFailed,
+                        )) => return Err(VaultError::SemanticUnavailable),
+                    }
+                }
+                let indexed = index
+                    .replace_document_with_semantics(
+                        &normalized,
+                        semantic_model
+                            .clone()
+                            .ok_or(VaultError::SemanticUnavailable)?,
+                        &embeddings,
+                    )
+                    .map_err(VaultError::from)?;
+                counters.semantic_provisions_indexed = counters
+                    .semantic_provisions_indexed
+                    .saturating_add(indexed as u64);
+            } else {
+                index
+                    .replace_document(&normalized)
+                    .map_err(VaultError::from)?;
+            }
             sources.insert(
                 document_id,
                 AuthorizedSource {
@@ -635,6 +809,14 @@ fn build_authorized_vault(
         source_content_persisted: false,
         retrieval_index_persisted: false,
         converter_sandbox_verified: converter.is_some(),
+        semantic_worker_sandbox_verified: semantic_engine.is_some(),
+        semantic_retrieval_enabled: semantic_session.is_some()
+            && counters.semantic_provisions_indexed > 0,
+        semantic_model,
+        semantic_provisions_indexed: counters.semantic_provisions_indexed,
+        semantic_provisions_skipped: counters.semantic_provisions_skipped,
+        semantic_derivatives_persisted: false,
+        semantic_model_download_requested: false,
         supported_formats: if converter.is_some() {
             vec![".docx", ".md", ".pdf", ".text", ".txt"]
         } else {
@@ -646,6 +828,7 @@ fn build_authorized_vault(
         roots,
         sources,
         index,
+        semantic_engine,
         build_report,
     })
 }
@@ -669,6 +852,14 @@ fn source_title(name: &OsStr) -> Option<String> {
     let path = Path::new(name);
     let title = path.file_stem()?.to_string_lossy().trim().to_string();
     (!title.is_empty()).then_some(title)
+}
+
+fn semantic_provision_text(title: &str, heading: Option<&str>, provision: &str) -> Option<String> {
+    let text = match heading {
+        Some(heading) => format!("Title: {title}\nHeading: {heading}\nText: {provision}"),
+        None => format!("Title: {title}\nText: {provision}"),
+    };
+    (text.chars().count() <= MAX_SEMANTIC_INPUT_CHARS).then_some(text)
 }
 
 fn read_bounded(file: &mut File, maximum: usize) -> Result<Vec<u8>, std::io::Error> {

@@ -903,6 +903,19 @@ a:focus-visible {
   margin-top: 14px;
 }
 
+.semantic-heading {
+  margin: 8px 0 -2px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.semantic-card {
+  border-style: dashed;
+}
+
 .evidence-card,
 .document-card {
   padding: 17px;

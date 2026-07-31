@@ -3,6 +3,7 @@ members = [
     "archive/src-tauri",
     "crates/archive-convert",
     "crates/archive-core",
+    "crates/archive-semantic",
     "crates/core",
     "crates/cli",
     "crates/reader",

@@ -3689,6 +3689,7 @@ dependencies = [
  "libc",
  "minutes-archive-convert",
  "minutes-archive-core",
+ "minutes-archive-semantic",
  "serde",
  "serde_json",
  "tauri",
@@ -3721,6 +3722,7 @@ dependencies = [
  "chrono",
  "dirs 6.0.0",
  "minutes-archive-convert",
+ "minutes-archive-semantic",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3728,6 +3730,22 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "minutes-archive-semantic"
+version = "0.24.0"
+dependencies = [
+ "libc",
+ "mach2 0.6.0",
+ "objc2",
+ "objc2-foundation",
+ "objc2-natural-language",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -4270,6 +4288,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-ml"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201b055e6acfa0f9f15568255d3f03ce2b54bc86d1814442dc69138e36813e18"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-core-text"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4318,6 +4346,19 @@ dependencies = [
  "bitflags 2.11.0",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-natural-language"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43f3395c4eda23486f1ca42da8256021a99cf94ebe3cf189bfafeb7e197f8a6d"
+dependencies = [
+ "bitflags 2.11.0",
+ "block2",
+ "objc2",
+ "objc2-core-ml",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -4860,13 +4901,13 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plist"
-version = "1.8.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "740ebea15c5d1428f910cd1a5f52cebf8d25006245ed8ade92702f4943d91e07"
+checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.13.0",
- "quick-xml 0.38.4",
+ "quick-xml 0.41.0",
  "serde",
  "time",
 ]
@@ -5119,15 +5160,6 @@ name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
 dependencies = [
  "memchr",
 ]
