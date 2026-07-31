@@ -153,8 +153,14 @@ pub(crate) fn transcribe_samples(
 /// Apple Speech selectable by normal product configuration. The input is a
 /// fixed synthetic canary and this entrypoint accepts no audio, path, or
 /// executable from the caller.
+///
+/// Returns whether the first probe reported a supported Speech runtime. The
+/// byte transport is proven either way, because the Swift bridge copies and
+/// validates every sample before it can fail. A `false` result means the
+/// framework declined after the bytes arrived, so the receipt must record it
+/// rather than let "accepted" imply the analyzer ran.
 #[cfg(target_os = "macos")]
-pub fn run_signed_transport_acceptance() -> Result<(), String> {
+pub fn run_signed_transport_acceptance() -> Result<bool, String> {
     if crate::pipeline::apple_speech_private_audio_transport_supported() {
         return Err("Apple Speech product selection must remain closed during acceptance".into());
     }
@@ -181,7 +187,7 @@ pub fn run_signed_transport_acceptance() -> Result<(), String> {
     {
         return Err("Apple Speech failure did not preserve the product Whisper fallback".into());
     }
-    Ok(())
+    Ok(response.runtime_supported)
 }
 
 #[cfg(target_os = "macos")]

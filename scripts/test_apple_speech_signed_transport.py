@@ -9,9 +9,11 @@ import os
 import pathlib
 import plistlib
 import re
+import signal
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,6 +26,20 @@ EXPECTED_APP_IDENTIFIERS = {
     "com.useminutes.desktop.dev",
 }
 EXPECTED_WORKER_IDENTIFIER = "com.useminutes.apple-speech-worker"
+
+# The app spends up to two full worker wall clocks (2 x 180s) inside the two
+# authenticated probes, before app launch and two strict nested code-signature
+# validations of the whole bundle. The previous 420s budget left roughly 60s
+# for all of that, so a slow runner would have surfaced as an evidence-free
+# timeout rather than a real result.
+ACCEPTANCE_TIMEOUT_SECONDS = 900
+DIAGNOSTIC_STREAM_LIMIT = 32 * 1024
+DIAGNOSTIC_LOG_LINES = 400
+CRASH_REPORT_DIRECTORIES = (
+    pathlib.Path.home() / "Library/Logs/DiagnosticReports",
+    pathlib.Path("/Library/Logs/DiagnosticReports"),
+)
+CRASH_REPORT_PREFIXES = ("minutes-apple-speech-worker", "minutes-graph-worker", "Minutes")
 
 
 def parse_args() -> argparse.Namespace:
@@ -208,6 +224,115 @@ def canary_patterns() -> tuple[bytes, bytes]:
     return raw_f32, pcm_i16
 
 
+def decode_stream(stream) -> str:
+    """Normalize a captured stream that may be bytes, str, or absent."""
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", "replace")
+    return stream
+
+
+def bounded_stream(stream: str) -> str:
+    """Bound a captured stream so one runaway helper cannot flood the log."""
+    text = decode_stream(stream)
+    if not text:
+        return "<empty>"
+    if len(text) <= DIAGNOSTIC_STREAM_LIMIT:
+        return text
+    return f"<truncated to final {DIAGNOSTIC_STREAM_LIMIT} characters>\n" + text[
+        -DIAGNOSTIC_STREAM_LIMIT:
+    ]
+
+
+def signal_label(returncode) -> str | None:
+    """Render a negative exit status as its terminating signal name."""
+    if returncode is None or returncode >= 0:
+        return None
+    try:
+        return signal.Signals(-returncode).name
+    except ValueError:
+        return f"signal {-returncode}"
+
+
+def unified_log_excerpt(started_at: float) -> str:
+    """Collect helper-scoped unified log entries emitted during the run."""
+    start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at))
+    predicate = (
+        'process == "minutes-apple-speech-worker"'
+        ' OR process == "minutes-graph-worker"'
+        ' OR subsystem == "com.apple.xpc.launchd"'
+    )
+    try:
+        completed = subprocess.run(
+            ["log", "show", "--start", start, "--style", "compact", "--predicate", predicate],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"<unified log unavailable: {error}>"
+    lines = completed.stdout.splitlines()
+    if not lines:
+        return f"<no matching entries; log exited {completed.returncode}>"
+    return "\n".join(lines[:DIAGNOSTIC_LOG_LINES])
+
+
+def crash_report_excerpts(started_at: float) -> list[tuple[pathlib.Path, str]]:
+    """Return crash reports for our own processes written during this run."""
+    reports = []
+    for directory in CRASH_REPORT_DIRECTORIES:
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.suffix not in {".ips", ".crash"}:
+                continue
+            if not entry.name.startswith(CRASH_REPORT_PREFIXES):
+                continue
+            try:
+                if entry.stat().st_mtime < started_at:
+                    continue
+                reports.append((entry, entry.read_text("utf-8", "replace")))
+            except OSError as error:
+                reports.append((entry, f"<unreadable: {error}>"))
+    return reports
+
+
+def emit_failure_diagnostics(started_at: float, returncode, stdout, stderr) -> None:
+    """Print helper failure evidence to stderr.
+
+    Diagnostics must never reach stdout: the workflow tees stdout into
+    ``signed-runtime-provenance.json``, so anything printed there would corrupt
+    the receipt. This is safe to emit in full because the runtime job holds no
+    secrets and the only audio in the process is the synthetic canary, so no
+    signing material and no private utterance can appear here.
+    """
+    def write(line: str) -> None:
+        print(line, file=sys.stderr)
+
+    write("=== signed Apple Speech acceptance diagnostics ===")
+    write(f"exit status: {returncode if returncode is not None else 'timed out'}")
+    terminator = signal_label(returncode)
+    if terminator:
+        write(f"terminated by: {terminator}")
+    write("--- child stdout ---")
+    write(bounded_stream(stdout))
+    write("--- child stderr ---")
+    write(bounded_stream(stderr))
+    write("--- unified log ---")
+    write(unified_log_excerpt(started_at))
+    reports = crash_report_excerpts(started_at)
+    if not reports:
+        write("--- crash reports: none written during this run ---")
+    for path, body in reports:
+        write(f"--- crash report {path} ---")
+        write(bounded_stream(body))
+    write("=== end diagnostics ===")
+    sys.stderr.flush()
+
+
 def main() -> int:
     args = parse_args()
     if re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha) is None:
@@ -237,23 +362,50 @@ def main() -> int:
         watcher.start()
         environment = os.environ.copy()
         environment["TMPDIR"] = str(isolated_temp)
-        result = subprocess.run(
-            [str(executable), "--apple-speech-transport-acceptance"],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=420,
-        )
-        time.sleep(0.1)
-        held_contents = watcher.close()
+        started_at = time.time()
+        try:
+            result = subprocess.run(
+                [str(executable), "--apple-speech-transport-acceptance"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=ACCEPTANCE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as expired:
+            # TimeoutExpired's repr omits the captured streams, so a wedged
+            # helper would otherwise destroy every byte of evidence.
+            emit_failure_diagnostics(
+                started_at,
+                None,
+                decode_stream(expired.stdout),
+                decode_stream(expired.stderr),
+            )
+            raise RuntimeError(
+                "signed Apple Speech transport acceptance timed out after "
+                f"{ACCEPTANCE_TIMEOUT_SECONDS}s"
+            ) from expired
+        finally:
+            time.sleep(0.1)
+            held_contents = watcher.close()
 
     if result.returncode != 0:
+        emit_failure_diagnostics(
+            started_at, result.returncode, result.stdout, result.stderr
+        )
         raise RuntimeError(
             "signed Apple Speech transport acceptance failed with "
             f"exit {result.returncode}: {result.stderr[-2000:]}"
         )
     if "apple-speech-signed-byte-transport=accepted" not in result.stdout:
         raise RuntimeError("signed app did not emit the content-free acceptance receipt")
+    runtime_supported_match = re.search(
+        r"^apple-speech-signed-runtime-supported=(true|false)$",
+        result.stdout,
+        re.MULTILINE,
+    )
+    if runtime_supported_match is None:
+        raise RuntimeError("signed app did not report whether the Speech runtime was supported")
+    runtime_supported = runtime_supported_match.group(1) == "true"
     raw_f32, pcm_i16 = canary_patterns()
     for contents in held_contents:
         if raw_f32 in contents or pcm_i16 in contents:
@@ -273,6 +425,12 @@ def main() -> int:
         "namedAudioCanaryObserved": False,
         "productGateExpectedClosed": True,
         "signedByteTransport": "accepted",
+        # "accepted" attests that the authenticated byte path carried the
+        # canary into the Swift bridge. It does not by itself attest that the
+        # Speech analyzer ran: the bridge reports runtimeSupported false when
+        # the framework declines after the bytes arrive. Record it so the
+        # receipt cannot be read as more than it proves.
+        "runtimeSupported": runtime_supported,
     }
     print(json.dumps(receipt, sort_keys=True))
     return 0

@@ -57,8 +57,9 @@ fn maybe_run_apple_speech_transport_acceptance() -> Option<i32> {
         return Some(64);
     }
     match minutes_core::apple_speech_worker::run_signed_transport_acceptance() {
-        Ok(()) => {
+        Ok(runtime_supported) => {
             println!("apple-speech-signed-byte-transport=accepted");
+            println!("apple-speech-signed-runtime-supported={runtime_supported}");
             Some(0)
         }
         Err(error) => {
