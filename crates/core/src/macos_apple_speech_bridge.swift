@@ -153,6 +153,34 @@ private func failureResponse(
     )
 }
 
+/// Mangled Swift symbols the macOS 26 Speech modules must export before any
+/// Speech-typed expression is evaluated.
+///
+/// The bridge is compiled against a macOS 11 deployment target, so every
+/// macOS 26 Speech symbol is a weak import. `dyld_info -fixups` shows these as
+/// `bind Speech/... [weak-import]`, which resolve to null on a device whose
+/// Speech framework does not export them. `#available` only tests the OS
+/// version, so on such a device it passes and the first Speech-typed
+/// expression traps inside `swift_getTypeByMangledName` with an untrappable
+/// `swift::fatalError` rather than throwing.
+///
+/// Signed acceptance run 30647233333 hit exactly that on a `VirtualMac2,1`
+/// runner reporting Apple Intelligence `deviceNotCapable`, while the same code
+/// path completes on real Apple Silicon at both macOS 26.5 and 26.6. Probing
+/// the symbols keeps that device on the Whisper fallback instead of aborting
+/// the helper.
+private let speechRuntimeSymbols = [
+    "$s6Speech0A8AnalyzerCMa",
+    "$s6Speech14AssetInventoryCMa",
+    "$s6Speech20DictationTranscriberC11ContentHintVMn",
+]
+
+private func speechRuntimeSymbolsResolvable() -> Bool {
+    // RTLD_DEFAULT: search every globally visible image.
+    let handle = UnsafeMutableRawPointer(bitPattern: -2)
+    return speechRuntimeSymbols.allSatisfy { dlsym(handle, $0) != nil }
+}
+
 private func transcribePrivatePCM(
     _ samples: [Float],
     mode: String,
@@ -162,6 +190,11 @@ private func transcribePrivatePCM(
     guard #available(macOS 26.0, *) else {
         throw BridgeError.unsupportedRuntime(
             "SpeechAnalyzer APIs require macOS 26.0 or newer at runtime."
+        )
+    }
+    guard speechRuntimeSymbolsResolvable() else {
+        throw BridgeError.unsupportedRuntime(
+            "SpeechAnalyzer types are unavailable on this device."
         )
     }
     guard let sourceFormat = AVAudioFormat(
