@@ -41,7 +41,38 @@ jobs:
           fi
           tag="acceptance-$CANDIDATE_SHA"
           remote="https://github.com/${GITHUB_REPOSITORY}.git"
-          resolved="$(git ls-remote --refs "$remote" "refs/tags/$tag" | awk '{print $1}')"
+          # `git ls-remote` patterns tail-match across ref namespaces, so a
+          # pattern of "refs/tags/<tag>" also matches a branch literally named
+          # "refs/tags/<tag>" (full ref refs/heads/refs/tags/<tag>). Restrict
+          # to the tag namespace and assert the full ref name exactly, so only
+          # a real, admin-protected tag can authorize a candidate.
+          #
+          # Both patterns are required: "refs/tags/<tag>" does not match the
+          # peeled "refs/tags/<tag>^{}" line that annotated tags carry, and
+          # without it an annotated tag resolves to its tag-object SHA and can
+          # never equal the candidate commit.
+          refs="$(
+            git ls-remote --tags "$remote" \
+              "refs/tags/$tag" "refs/tags/$tag^{}" || true
+          )"
+          exact="$(
+            printf '%s\n' "$refs" | awk -v t="refs/tags/$tag" '$2 == t {print $1}'
+          )"
+          peeled="$(
+            printf '%s\n' "$refs" |
+              awk -v t="refs/tags/$tag^{}" '$2 == t {print $1}'
+          )"
+          if [ "$(printf '%s\n' "$exact" | grep -c .)" -ne 1 ]; then
+            echo "Protected tag $tag must resolve to exactly one refs/tags ref" >&2
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$peeled" | grep -c .)" -gt 1 ]; then
+            echo "Protected tag $tag has ambiguous peeled refs" >&2
+            exit 1
+          fi
+          # Annotated tag -> the peeled line is the commit.
+          # Lightweight tag -> the ref itself is the commit.
+          resolved="${peeled:-$exact}"
           if [ "$resolved" != "$CANDIDATE_SHA" ]; then
             echo "Protected tag $tag does not resolve exactly to $CANDIDATE_SHA" >&2
             exit 1

@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 const EXPECTED_SIGNING_JOB_SHA256 =
   "903c7c962b5eac067fbe423699943969b0405cec732306299366f172f5037894";
 const EXPECTED_PRE_SIGNING_BOUNDARY_SHA256 =
-  "c6fb10e1051bd745f737d4718ad949b9b1a01b585702bfecf354be752ff2e278";
+  "1ddf57258d26c54dab346639d179a4cce64e6d3e333bb92982b38706ac7fe333";
 const EXPECTED_TRIGGER_BLOCK = `on:
   workflow_dispatch:
     inputs:
