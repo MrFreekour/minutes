@@ -137,6 +137,12 @@ def is_mach_o(path: str) -> bool:
         b"\xfe\xed\xfa\xce",  # 32-bit big endian
         b"\xca\xfe\xba\xbe",  # universal
         b"\xbe\xba\xfe\xca",  # universal, swapped
+        # 64-bit universal. Omitting these let a real `lipo -create -fat64`
+        # binary carrying two runnable slices sit in Contents/Resources,
+        # pass every gate and the digest binding, survive ditto and
+        # codesign --deep --strict, and ship inside the notarized bundle.
+        b"\xca\xfe\xba\xbf",  # universal 64
+        b"\xbf\xba\xfe\xca",  # universal 64, swapped
     }
 
 
@@ -181,6 +187,15 @@ def main() -> None:
         # taken before packaging cannot be compared with the one taken after.
         if os.path.basename(entry).startswith("._"):
             reject(f"bundle contains an AppleDouble entry: {entry[len(app):]}")
+        # An ACL is rejected because it "would let the delivered app ship a
+        # world-writable file". Plain mode bits do exactly the same, and a
+        # content-only digest cannot see them, so a permission change across
+        # packaging was undetectable. A world-writable resource in an
+        # installed app is a local content-substitution primitive.
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            reject(f"entry {entry[len(app):]!r} is group- or world-writable ({mode & 0o7777:#o})")
+        if mode & (stat.S_ISUID | stat.S_ISGID):
+            reject(f"entry {entry[len(app):]!r} is setuid or setgid ({mode & 0o7777:#o})")
         if stat.S_ISREG(mode) and is_mach_o(entry):
             mach_o.append(entry)
 
@@ -223,7 +238,9 @@ def main() -> None:
                 for chunk in iter(lambda: handle.read(1 << 20), b""):
                     file_hash.update(chunk)
             kind, payload = "f", file_hash.hexdigest()
-        digest.update(f"{kind}\037{relative}\037{payload}\000".encode())
+        digest.update(
+            f"{kind}\037{relative}\037{os.lstat(entry).st_mode & 0o7777:o}\037{payload}\000".encode()
+        )
 
         # ACLs are invisible to mode bits and to extended attributes, survive
         # ditto, and would let the delivered app ship a world-writable file.
