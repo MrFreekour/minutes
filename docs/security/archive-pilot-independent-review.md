@@ -100,3 +100,7 @@ SHA-256, executable SHA-256, macOS version, test Mac architecture, review date,
 reviewer, methods used, findings with severity, fixes retested, residual risks,
 and a clear approve or do-not-approve decision. The reviewer—not the
 implementation author—owns that decision.
+
+Use `docs/security/archive-pilot-review-record-template.md` as the reviewer-
+owned record. Its initial `NOT REVIEWED` state is intentional and must never be
+treated as approval.

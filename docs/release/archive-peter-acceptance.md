@@ -16,7 +16,9 @@ networking disabled and once with networking enabled under network
 observation.
 
 Do not use Peter's documents for those release tests. Use synthetic legal
-fixtures with distinctive canary text.
+fixtures with distinctive canary text. The release operator creates the
+review folder with `scripts/make-archive-qa-fixtures.sh` and follows
+`docs/release/archive-pilot-signing-and-handoff.md`.
 
 ## Peter's first session
 

@@ -92,6 +92,14 @@ transitive warnings. These facts are recorded, not waived.
   provenance field.
 - `docs/security/archive-pilot-independent-review.md` defines the independent
   review object, adversarial cases, observation checks, and stop-ship criteria.
+- `docs/security/archive-pilot-review-record-template.md` provides a
+  reviewer-owned record that is explicitly `NOT REVIEWED` until completed.
+- `scripts/make-archive-qa-fixtures.sh` creates a deterministic, client-free
+  folder for Finder QA across exact, decoy, PDF, DOCX, unsupported-package,
+  permission, and symlink cases.
+- `docs/release/archive-pilot-signing-and-handoff.md` binds candidate freeze,
+  protected authorization, signing, artifact verification, offline QA,
+  independent review, and delivery-hash confirmation into one operator run.
 - `docs/release/archive-peter-acceptance.md` gives the release operator and
   Peter a Finder-first, no-Terminal pilot run.
 
