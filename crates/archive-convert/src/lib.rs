@@ -486,6 +486,7 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     let mut buffer = Vec::new();
     let mut paragraphs = Vec::new();
     let mut paragraph = String::new();
+    let mut paragraph_ordinal: usize = 0;
     let mut in_text = false;
     let mut output_bytes = 0usize;
 
@@ -500,6 +501,11 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             Ok(Event::Empty(event)) => match local_name(event.name().as_ref()) {
                 b"tab" => paragraph.push('\t'),
                 b"br" | b"cr" => paragraph.push('\n'),
+                // `<w:p/>` is a self-closing empty paragraph and arrives as
+                // Empty rather than Start/End. Word emits these constantly as
+                // spacers, and each one still occupies a paragraph position
+                // in the document a reader is asked to navigate to.
+                b"p" => paragraph_ordinal += 1,
                 _ => {}
             },
             Ok(Event::Text(event)) if in_text => {
@@ -526,6 +532,14 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             Ok(Event::End(event)) => match local_name(event.name().as_ref()) {
                 b"t" => in_text = false,
                 b"p" => {
+                    // Count every <w:p> element, including empty spacers and
+                    // paragraphs inside tables. The anchor previously used
+                    // the number of paragraphs emitted so far, so any dropped
+                    // empty paragraph shifted it: "paragraph:000003" did not
+                    // locate the third paragraph in Word, and the drift grew
+                    // monotonically through the document. A lawyer asked to
+                    // verify a quote at that anchor lands somewhere else.
+                    paragraph_ordinal += 1;
                     let text = normalize_extracted_text(&paragraph);
                     paragraph.clear();
                     if !text.is_empty() {
@@ -536,7 +550,7 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                             return Err(ConversionError::OutputBudgetExceeded);
                         }
                         paragraphs.push(ConvertedBlock {
-                            source_anchor: format!("paragraph:{:06}", paragraphs.len() + 1),
+                            source_anchor: format!("paragraph:{paragraph_ordinal:06}"),
                             text,
                             flow: AnchorFlow::Continue,
                         });
@@ -849,6 +863,38 @@ mod tests {
         assert_eq!(
             document.blocks[1].text,
             "Confidential Information & affiliate data."
+        );
+    }
+
+    #[test]
+    fn docx_paragraph_anchors_survive_empty_spacers_and_table_cells() {
+        // Word documents routinely carry empty spacer paragraphs and
+        // paragraphs inside tables. Anchoring on the count of paragraphs
+        // *emitted* meant every skipped empty paragraph shifted the anchor,
+        // so a lawyer told "paragraph 3" and asked to verify the quote in
+        // Word landed somewhere else, with the drift growing through the
+        // document.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:r><w:t>Recitals paragraph one.</w:t></w:r></w:p>
+            <w:p/>
+            <w:p><w:r><w:t>   </w:t></w:r></w:p>
+            <w:p/>
+            <w:p><w:r><w:t>Seller shall indemnify and hold harmless the Buyer.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        assert_eq!(document.blocks.len(), 2);
+        assert_eq!(document.blocks[0].source_anchor, "paragraph:000001");
+        // Fifth <w:p> in the file, not the second one emitted.
+        assert_eq!(
+            document.blocks[1].source_anchor, "paragraph:000005",
+            "anchor must name the paragraph's position in the document, got {}",
+            document.blocks[1].source_anchor
+        );
+        assert_eq!(
+            document.blocks[1].text,
+            "Seller shall indemnify and hold harmless the Buyer."
         );
     }
 

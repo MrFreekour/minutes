@@ -329,10 +329,22 @@ fn segment_legal_provisions(text: &str) -> Result<Vec<NormalizedProvision>, Retr
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        if !joined.is_empty() {
+        if joined.is_empty() {
+            // A promoted heading with no following body used to be dropped
+            // entirely, so text that is plainly in the document could not be
+            // retrieved at all -- a silent false negative in a tool used for
+            // privilege and discovery review. Keep it as its own provision.
+            //
+            // `heading.take()` also has to run on this path. Leaving it set
+            // carried the discarded heading forward onto the next segment,
+            // attributing it to a provision it does not belong to.
+            if let Some(orphan) = heading.take() {
+                segments.push((None, orphan));
+            }
+        } else {
             segments.push((heading.take(), joined));
-            body.clear();
         }
+        body.clear();
     };
 
     for line in text.lines() {
@@ -1184,14 +1196,21 @@ impl LegalIndex {
                 stale_documents.insert(candidate.document_id);
                 continue;
             }
+            // Positive claims are verified against the body, which is what
+            // `exact_excerpt` shows. Matching them against the heading too
+            // let a card assert that several concepts appeared "in the same
+            // provision" while the citable text supported none of them: a
+            // struck clause under a heading naming its subjects reads as
+            // present. Exclusions stay on heading+body so they remain
+            // conservative in both directions.
             let searchable = candidate.searchable_text();
-            let matched = matched_concepts(&searchable, &query.required_concepts);
+            let matched = matched_concepts(&candidate.body, &query.required_concepts);
             if matched.len() != query.required_concepts.len()
                 || contains_any_concept(&searchable, &query.excluded_concepts)
                 || query
                     .exact_phrase
                     .as_ref()
-                    .is_some_and(|phrase| !contains_case_insensitive(&searchable, phrase))
+                    .is_some_and(|phrase| !contains_case_insensitive(&candidate.body, phrase))
             {
                 continue;
             }
@@ -1239,11 +1258,11 @@ impl LegalIndex {
                 continue;
             }
             let searchable = candidate.searchable_text();
-            let matched = matched_concepts(&searchable, &query.required_concepts);
+            let matched = matched_concepts(&candidate.body, &query.required_concepts);
             let exact_phrase_matched = query
                 .exact_phrase
                 .as_ref()
-                .is_some_and(|phrase| contains_case_insensitive(&searchable, phrase));
+                .is_some_and(|phrase| contains_case_insensitive(&candidate.body, phrase));
             let excluded_concept_matched =
                 contains_any_concept(&searchable, &query.excluded_concepts);
             let positive_evidence = !matched.is_empty() || exact_phrase_matched;
@@ -1743,6 +1762,36 @@ mod tests {
             ),
             Err(RetrievalError::ScopeMismatch)
         ));
+    }
+
+    #[test]
+    fn a_struck_clause_is_not_reported_as_present_from_its_heading_alone() {
+        // Deleting a clause but leaving its heading is routine in negotiated
+        // contracts. Matching required concepts against heading text let the
+        // card assert all four concepts "in the same provision" while its own
+        // exact_excerpt read "Intentionally omitted." -- the app reporting a
+        // protection the agreement does not contain.
+        let struck = document(
+            "struck-agreement",
+            "Struck Agreement",
+            "7. CONFIDENTIALITY, AFFILIATES, COMPELLED DISCLOSURE AND SURVIVAL\nIntentionally omitted.",
+        );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&struck).expect("struck");
+        let revisions = CurrentRevisionSet::from_documents([&struck]);
+
+        let response = index
+            .search(&vault(), sample_query(), &revisions)
+            .expect("search");
+        assert!(
+            response.evidence.is_empty(),
+            "a struck clause must not be reported as present: {:?}",
+            response
+                .evidence
+                .iter()
+                .map(|card| (&card.exact_excerpt, &card.why_matched))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
