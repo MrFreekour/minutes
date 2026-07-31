@@ -27,11 +27,14 @@ fn bound_worker_denies_network_and_personal_files_before_embedding() {
 #[test]
 fn dropping_the_engine_reclaims_its_worker_snapshot() {
     use minutes_archive_semantic::BoundedSemanticEngine;
-    use std::path::Path;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
 
-    fn snapshot_count() -> usize {
+    // Track the specific directory this engine creates. Counting them is
+    // racy: sibling tests in the same binary bind their own engines.
+    fn snapshots() -> HashSet<PathBuf> {
         let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-            return 0;
+            return HashSet::new();
         };
         entries
             .flatten()
@@ -41,20 +44,25 @@ fn dropping_the_engine_reclaims_its_worker_snapshot() {
                     .to_string_lossy()
                     .starts_with("minutes-archive-semantic-")
             })
-            .count()
+            .map(|entry| entry.path())
+            .collect()
     }
 
     let executable = env!("CARGO_BIN_EXE_minutes-archive-semantic");
-    let before = snapshot_count();
+    let before = snapshots();
     let engine = BoundedSemanticEngine::bind(Path::new(executable)).expect("bind");
-    assert!(
-        snapshot_count() > before,
-        "binding must create a private snapshot"
-    );
-    drop(engine);
+    let created = &snapshots() - &before;
     assert_eq!(
-        snapshot_count(),
-        before,
-        "dropping the engine must reclaim its snapshot directory"
+        created.len(),
+        1,
+        "binding must create exactly one private snapshot"
+    );
+    let snapshot = created.into_iter().next().expect("snapshot path");
+    assert!(snapshot.exists(), "snapshot must exist while bound");
+    drop(engine);
+    assert!(
+        !snapshot.exists(),
+        "dropping the engine must reclaim {}",
+        snapshot.display()
     );
 }

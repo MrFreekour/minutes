@@ -36,6 +36,7 @@ printf '%s\n' \
   '  printf "Identifier=com.useminutes.archive\n" >&2' \
   '  printf "Authority=Developer ID Application: Test (63TMLKT8HN)\n" >&2' \
   "  printf \"TeamIdentifier=%s\\n\" \"\${ARCHIVE_TEST_TEAM_ID:-63TMLKT8HN}\" >&2" \
+  "  printf \"CodeDirectory v=20500 flags=%s\\n\" \"\${ARCHIVE_TEST_CS_FLAGS:-0x10000(runtime)}\" >&2" \
   'fi' \
   'exit 0' \
   >"$MOCK_BIN/codesign"
@@ -90,6 +91,14 @@ expect_failure "wrong provenance team" \
 make_artifact
 expect_failure "wrong code-signing team" \
   env PATH="$MOCK_BIN:$PATH" ARCHIVE_TEST_TEAM_ID=WRONGTEAM \
+  "$VERIFIER" "$ARTIFACT_DIR"
+
+make_artifact
+# Without the hardened runtime the forbidden-entitlement list below is moot:
+# DYLD_INSERT_LIBRARIES can inject into the process holding the in-memory
+# index of privileged documents.
+expect_failure "not signed with the hardened runtime" \
+  env PATH="$MOCK_BIN:$PATH" ARCHIVE_TEST_CS_FLAGS="0x2(adhoc)" \
   "$VERIFIER" "$ARTIFACT_DIR"
 
 make_artifact
