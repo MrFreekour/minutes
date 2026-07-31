@@ -455,11 +455,7 @@ fn main() {
                 // been skipped the same way. Dropping the session here runs
                 // that cleanup while the process is still alive.
                 let app_handle = window.app_handle().clone();
-                if let Some(state) = app_handle.try_state::<ArchiveState>() {
-                    if let Ok(mut session) = state.session.lock() {
-                        *session = SessionState::default();
-                    }
-                }
+                purge_session(&app_handle);
                 app_handle.exit(0);
             }
         })
@@ -473,8 +469,38 @@ fn main() {
             build_archive_text_vault,
             search_archive_text_vault,
         ])
-        .run(tauri::generate_context!())
-        .expect("Minutes Archive failed to start");
+        .build(tauri::generate_context!())
+        .expect("Minutes Archive failed to start")
+        .run(|app_handle, event| {
+            // The window-close handler alone is not enough. Cmd-Q maps to
+            // `[NSApp terminate:]`, which never calls `windowShouldClose:`,
+            // so `CloseRequested` never fires -- and Cmd-Q is how most Mac
+            // users quit an app. `Exit` covers that path, the Quit menu item,
+            // and any other route out of the run loop.
+            if matches!(event, tauri::RunEvent::Exit) {
+                purge_session(app_handle);
+            }
+        });
+}
+
+/// Releases everything the session owns while the process is still alive.
+///
+/// `exit(0)` terminates without unwinding, so no destructor runs at exit: the
+/// worker snapshot directories are owned by `TempDir` fields whose cleanup is
+/// `Drop`, and anything written as a destructor later would be skipped the
+/// same way.
+fn purge_session(app_handle: &tauri::AppHandle) {
+    let Some(state) = app_handle.try_state::<ArchiveState>() else {
+        return;
+    };
+    // Recover from poisoning rather than skipping the purge. A panic anywhere
+    // under this lock would otherwise leave the session permanently
+    // un-purgeable, and a poisoned app is precisely the app a user closes.
+    let mut session = state
+        .session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *session = SessionState::default();
 }
 
 #[cfg(test)]

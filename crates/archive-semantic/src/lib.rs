@@ -727,7 +727,21 @@ fn install_platform_sandbox() -> Result<(), SemanticError> {
         fn sandbox_free_error(error_buffer: *mut c_char);
     }
 
-    // Deny by default. The previous profile was `(allow default)` with a few
+    // Deny by default. `mach-lookup` cannot be denied outright -- Apple's
+    // built-in NLEmbedding model fails to load without it -- so the services
+    // that provide an out-of-process persistence or broadcast channel are
+    // denied by name: the pasteboard (which Universal Clipboard would carry
+    // off-device despite `(deny network*)`), the distributed notification
+    // center (any process on the machine can subscribe), and syslog. This is a
+    // denylist and therefore weaker than the file rules below; it is
+    // defence-in-depth rather than the primary control. The primary control is
+    // that this worker never logs, pastes, or broadcasts document-derived text
+    // -- verified by there being no logging or IPC call of any kind in this
+    // crate. Note os_log may reach the unified log without a mach-lookup, so
+    // that discipline, not this profile, is what keeps text out of
+    // /var/db/diagnostics.
+    //
+    // The previous profile was `(allow default)` with a few
     // subpath denies, which left the whole filesystem outside /Users,
     // /Volumes and /Network readable AND writable -- including $TMPDIR and
     // /private/tmp -- while this worker receives verbatim privileged
@@ -741,6 +755,11 @@ fn install_platform_sandbox() -> Result<(), SemanticError> {
 (allow process-info-pidinfo (target self))
 (allow sysctl-read)
 (allow mach-lookup)
+(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))
+(deny mach-lookup (global-name \"com.apple.distributed_notifications@1v3\"))
+(deny mach-lookup (global-name \"com.apple.distributed_notifications@Uv3\"))
+(deny mach-lookup (global-name \"com.apple.system.logger\"))
+(deny mach-lookup (global-name \"com.apple.system.notification_center\"))
 (allow file-read-metadata)
 (allow file-read* (subpath \"/System\"))
 (allow file-read* (subpath \"/usr/lib\"))

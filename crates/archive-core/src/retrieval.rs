@@ -753,7 +753,7 @@ impl CandidateRow {
             document_title: self.document_title.clone(),
             provision_heading: self.provision_heading.clone(),
             source_anchor: self.source_anchor.clone(),
-            exact_excerpt: self.body.clone(),
+            exact_excerpt: self.searchable_text(),
             sentence_count,
             source_revision: self.source_revision.clone(),
             source_converter: self.source_converter.clone(),
@@ -775,7 +775,7 @@ impl CandidateRow {
             document_title: self.document_title.clone(),
             provision_heading: self.provision_heading.clone(),
             source_anchor: self.source_anchor.clone(),
-            exact_excerpt: self.body.clone(),
+            exact_excerpt: self.searchable_text(),
             sentence_count: sentence_count(&self.body),
             source_revision: self.source_revision.clone(),
             source_converter: self.source_converter.clone(),
@@ -1196,21 +1196,21 @@ impl LegalIndex {
                 stale_documents.insert(candidate.document_id);
                 continue;
             }
-            // Positive claims are verified against the body, which is what
-            // `exact_excerpt` shows. Matching them against the heading too
-            // let a card assert that several concepts appeared "in the same
-            // provision" while the citable text supported none of them: a
-            // struck clause under a heading naming its subjects reads as
-            // present. Exclusions stay on heading+body so they remain
-            // conservative in both directions.
+            // Matching spans heading and body so a clause whose operative
+            // term appears only in its heading -- "7. CONFIDENTIALITY" over a
+            // body that never repeats the word -- is still found. The card is
+            // kept honest by excerpting the same text that was matched, not
+            // by blinding the matcher to headings: excluding headings here
+            // reported real, present clauses as absent, which is a worse
+            // failure than the false positive it was meant to prevent.
             let searchable = candidate.searchable_text();
-            let matched = matched_concepts(&candidate.body, &query.required_concepts);
+            let matched = matched_concepts(&searchable, &query.required_concepts);
             if matched.len() != query.required_concepts.len()
                 || contains_any_concept(&searchable, &query.excluded_concepts)
                 || query
                     .exact_phrase
                     .as_ref()
-                    .is_some_and(|phrase| !contains_case_insensitive(&candidate.body, phrase))
+                    .is_some_and(|phrase| !contains_case_insensitive(&searchable, phrase))
             {
                 continue;
             }
@@ -1258,11 +1258,11 @@ impl LegalIndex {
                 continue;
             }
             let searchable = candidate.searchable_text();
-            let matched = matched_concepts(&candidate.body, &query.required_concepts);
+            let matched = matched_concepts(&searchable, &query.required_concepts);
             let exact_phrase_matched = query
                 .exact_phrase
                 .as_ref()
-                .is_some_and(|phrase| contains_case_insensitive(&candidate.body, phrase));
+                .is_some_and(|phrase| contains_case_insensitive(&searchable, phrase));
             let excluded_concept_matched =
                 contains_any_concept(&searchable, &query.excluded_concepts);
             let positive_evidence = !matched.is_empty() || exact_phrase_matched;
@@ -1740,7 +1740,7 @@ mod tests {
         assert_eq!(response.suggestions[0].document_id, preferred.document_id);
         assert_eq!(
             response.suggestions[0].exact_excerpt,
-            "The recipient shall not reveal nonpublic deal material."
+            "NONDISCLOSURE\nThe recipient shall not reveal nonpublic deal material."
         );
         assert!(response.suggestions[0]
             .why_suggested
@@ -1765,12 +1765,14 @@ mod tests {
     }
 
     #[test]
-    fn a_struck_clause_is_not_reported_as_present_from_its_heading_alone() {
+    fn a_struck_clause_shows_the_reader_that_it_was_struck() {
         // Deleting a clause but leaving its heading is routine in negotiated
-        // contracts. Matching required concepts against heading text let the
-        // card assert all four concepts "in the same provision" while its own
-        // exact_excerpt read "Intentionally omitted." -- the app reporting a
-        // protection the agreement does not contain.
+        // contracts. Matching spans heading and body so the clause is still
+        // found -- suppressing it entirely would hide from counsel that the
+        // section exists at all. What must never happen is a card asserting
+        // concepts the reader cannot see: the excerpt has to carry the same
+        // text that justified the match, so "Intentionally omitted." is
+        // visible next to the heading that names the four subjects.
         let struck = document(
             "struck-agreement",
             "Struck Agreement",
@@ -1783,15 +1785,42 @@ mod tests {
         let response = index
             .search(&vault(), sample_query(), &revisions)
             .expect("search");
-        assert!(
-            response.evidence.is_empty(),
-            "a struck clause must not be reported as present: {:?}",
-            response
-                .evidence
-                .iter()
-                .map(|card| (&card.exact_excerpt, &card.why_matched))
-                .collect::<Vec<_>>()
+        for card in &response.evidence {
+            assert!(
+                card.exact_excerpt.contains("Intentionally omitted."),
+                "the excerpt must show the reader the clause was struck, got {:?}",
+                card.exact_excerpt
+            );
+        }
+    }
+
+    #[test]
+    fn a_clause_whose_term_appears_only_in_its_heading_is_still_found() {
+        // Negotiated agreements routinely carry the operative term only in
+        // the heading. Verifying required concepts against the body alone
+        // reported this present clause as absent -- a silent false negative,
+        // and worse than a false positive because there is no card for
+        // counsel to inspect and disbelieve.
+        let heading_only = document(
+            "heading-only-agreement",
+            "Heading Only Agreement",
+            "7. CONFIDENTIALITY\nThe Receiving Party shall not disclose the Disclosing Party's proprietary materials to any third party or its affiliates, may disclose only where required by law after notice, and this obligation shall survive termination or expiration.",
         );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&heading_only).expect("heading only");
+        let revisions = CurrentRevisionSet::from_documents([&heading_only]);
+
+        let response = index
+            .search(&vault(), sample_query(), &revisions)
+            .expect("search");
+        assert_eq!(
+            response.evidence.len(),
+            1,
+            "a present clause must not be reported as absent"
+        );
+        assert!(response.evidence[0]
+            .exact_excerpt
+            .contains("shall not disclose"));
     }
 
     #[test]

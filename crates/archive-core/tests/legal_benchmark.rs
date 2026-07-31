@@ -50,10 +50,12 @@ fn synthetic_legal_benchmark_preserves_scope_structure_and_source_evidence() {
         alpha.document_id
     );
     assert_eq!(provision_response.evidence[0].source_anchor, "section:0001");
-    assert_eq!(
-        provision_response.evidence[0].exact_excerpt,
-        alpha.provisions[0].text
-    );
+    // The excerpt carries whatever justified the match, so a provision with
+    // a heading is excerpted with that heading attached: a card must never
+    // assert a concept the reader cannot see in the text it cites.
+    assert!(provision_response.evidence[0]
+        .exact_excerpt
+        .contains(&alpha.provisions[0].text));
 
     let document_query = LegalQuery {
         raw: "Find documents containing the remembered phrase, assignment, governing law, and a BAA reference.".to_string(),

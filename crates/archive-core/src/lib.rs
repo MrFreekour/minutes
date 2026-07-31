@@ -108,7 +108,9 @@ pub fn approve_roots(roots: &[PathBuf]) -> Result<Vec<ApprovedRoot>, CensusError
         return Err(CensusError::TooManyRoots);
     }
 
-    let home_ancestor_identities = broad_root_identities();
+    let Some(home_ancestor_identities) = broad_root_identities() else {
+        return Err(CensusError::RootTooBroad { location: 1 });
+    };
     let mut approved = Vec::with_capacity(roots.len());
 
     for (index, root) in roots.iter().enumerate() {
@@ -196,11 +198,13 @@ pub fn validate_approved_roots(roots: &[ApprovedRoot]) -> Result<(), CensusError
 /// inode that never appears in the canonical chain. `canonicalize` does not
 /// traverse firmlinks, so that parallel spelling has to be walked explicitly
 /// or the whole data volume stays approvable.
-fn broad_root_identities() -> HashSet<FileIdentity> {
+fn broad_root_identities() -> Option<HashSet<FileIdentity>> {
     let mut identities = HashSet::new();
-    let Some(home) = dirs::home_dir().and_then(|path| fs::canonicalize(path).ok()) else {
-        return identities;
-    };
+    // Fail closed. Returning an empty set when home cannot be resolved
+    // silently disabled the whole check: with HOME unset or pointing at a
+    // missing path, every location except `/` was approved, including the
+    // home directory itself and the entire data volume.
+    let home = dirs::home_dir().and_then(|path| fs::canonicalize(path).ok())?;
     identities.extend(ancestor_identities(&home));
     for prefix in FIRMLINK_VOLUME_PREFIXES {
         let spelling = Path::new(prefix).join(home.strip_prefix("/").unwrap_or(&home));
@@ -208,7 +212,7 @@ fn broad_root_identities() -> HashSet<FileIdentity> {
             identities.extend(ancestor_identities(&spelling));
         }
     }
-    identities
+    Some(identities)
 }
 
 /// Volume prefixes through which the home directory is reachable without
