@@ -80,6 +80,21 @@ Windows-only notification dependency and is not in the macOS Archive app tree.
 The whole workspace also contains informational unmaintained and unsound
 transitive warnings. These facts are recorded, not waived.
 
+## Independent review and handoff packet
+
+- `scripts/verify-archive-pilot-artifact.sh` verifies the downloaded
+  notarized zip, fixed provenance, Developer ID signature, reviewed Team ID and
+  bundle identifier, notarization staple, Gatekeeper acceptance, executable
+  digest, and forbidden-entitlement boundary before the app is opened.
+- `scripts/verify-archive-pilot-artifact.test.sh` exercises its success shape
+  with mocked platform attestations and proves fail-closed behavior for a
+  mismatched zip, wrong provenance team, wrong signature team, and unexpected
+  provenance field.
+- `docs/security/archive-pilot-independent-review.md` defines the independent
+  review object, adversarial cases, observation checks, and stop-ship criteria.
+- `docs/release/archive-peter-acceptance.md` gives the release operator and
+  Peter a Finder-first, no-Terminal pilot run.
+
 ## Unclosed Peter handoff gates
 
 - The current bundle is ad-hoc signed. An Apple Development identity exists in

@@ -51,6 +51,9 @@ node scripts/archive-ui-smoke.mjs
 echo "=== Installed native window lifecycle smoke ==="
 scripts/archive-native-lifecycle-smoke.sh "$APP_PATH"
 
+echo "=== Notarized artifact verifier harness ==="
+scripts/verify-archive-pilot-artifact.test.sh
+
 echo "=== Artifact identity ==="
 codesign -dv --verbose=4 "$APP_PATH" 2>&1 |
   grep -E "^(Identifier|Signature|TeamIdentifier)="
