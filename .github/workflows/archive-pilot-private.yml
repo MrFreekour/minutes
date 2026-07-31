@@ -158,10 +158,12 @@ jobs:
           set -euo pipefail
           # The smoke tests above run candidate-controlled code against the
           # bundle path, so the pre-execution gate constrains nothing about
-          # what is actually packaged. Re-gate immediately before zipping.
+          # what is actually packaged. Re-gate immediately before zipping and
+          # record the digest so the signing job can prove the tree it
+          # receives is the tree that was gated here.
           scripts/archive-bundle-integrity.py \
             "target/release/bundle/macos/Minutes Archive.app" \
-            "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID"
+            "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID" | tee built-gate.txt
 
       - name: Package unsigned candidate
         run: |
@@ -180,6 +182,7 @@ jobs:
             minutes-archive-unsigned.zip
             minutes-archive-unsigned.zip.sha256
             candidate-sha.txt
+            built-gate.txt
           if-no-files-found: error
           retention-days: 1
 
@@ -223,7 +226,19 @@ jobs:
           ditto -x -k payload/minutes-archive-unsigned.zip signed
           scripts/archive-bundle-integrity.py \
             "signed/Minutes Archive.app" \
-            "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID"
+            "$ARCHIVE_EXECUTABLE" "$ARCHIVE_BUNDLE_ID" > extracted-gate.txt
+          cat extracted-gate.txt
+          # The digest is only a control if something compares it. The tree
+          # gated before packaging must be the tree that survives the round
+          # trip, or the earlier gate certified a bundle that does not ship.
+          built="$(awk -F= '/^tree_sha256=/{print $2}' payload/built-gate.txt)"
+          extracted="$(awk -F= '/^tree_sha256=/{print $2}' extracted-gate.txt)"
+          if [ -z "$built" ] || [ "$built" != "$extracted" ]; then
+            echo "Bundle changed across packaging" >&2
+            echo "  built     $built" >&2
+            echo "  extracted $extracted" >&2
+            exit 1
+          fi
 
       # Installed BEFORE the signing identity is unlocked. `brew install` runs
       # unpinned, network-fetched formula code; doing it later would put
