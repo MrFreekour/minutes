@@ -191,10 +191,15 @@ jobs:
     timeout-minutes: 45
     environment: signed-dev-acceptance
     steps:
-      - name: Check out gate scripts only
+      # Deliberately checks out the REVIEWED workflow ref (main), never the
+      # candidate tag. The gate script executes inside the job that later
+      # holds Apple signing secrets, so taking it from candidate-controlled
+      # content would let a malicious candidate poison PATH or shadow
+      # codesign for the steps that follow, even though it runs before the
+      # credentials are imported.
+      - name: Check out reviewed gate script only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: refs/tags/acceptance-${{ needs.authorize-candidate.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
           sparse-checkout: scripts/archive-bundle-integrity.sh
