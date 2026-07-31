@@ -415,7 +415,24 @@ fn looks_like_legal_heading(line: &str) -> bool {
     let uppercase = letter_count >= 4
         && uppercase_count == letter_count
         && line.split_whitespace().count() <= 12;
-    known_prefix || numbered || uppercase
+    // Run-in captions: a short title-case line on its own, ending in a period,
+    // such as "Confidentiality." above the clause body. This is ubiquitous
+    // contract formatting, and treating it as body text made the caption count
+    // as a sentence -- so a genuine three-sentence provision was rejected by a
+    // "no more than three sentences" query, with no result for counsel to
+    // inspect. Capped tightly so an ordinary short sentence is not promoted:
+    // every word must be capitalised, which prose like "The recipient shall."
+    // does not satisfy.
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    let run_in_caption = line.ends_with('.')
+        && letter_count >= 4
+        && (1..=6).contains(&words.len())
+        && words.iter().all(|word| {
+            word.chars()
+                .find(|character| character.is_alphabetic())
+                .is_some_and(char::is_uppercase)
+        });
+    known_prefix || numbered || uppercase || run_in_caption
 }
 
 fn sentence_count(text: &str) -> u32 {
@@ -1792,6 +1809,34 @@ mod tests {
                 card.exact_excerpt
             );
         }
+    }
+
+    #[test]
+    fn a_run_in_caption_is_not_counted_as_a_sentence() {
+        // "Confidentiality." on its own line above the clause body is
+        // ubiquitous contract formatting. Treated as body text it counted as a
+        // sentence, so a genuine three-sentence provision was rejected by a
+        // "no more than three sentences" query and counsel saw no result at
+        // all -- found by running the runbook's own opening question against
+        // the fixture built for it.
+        let captioned = document(
+            "captioned-agreement",
+            "Captioned Agreement",
+            "Confidentiality.\nRecipient may disclose Confidential Information to its affiliates on a need-to-know basis. If disclosure is required by law, Recipient will give prompt notice. These obligations survive termination.",
+        );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&captioned).expect("captioned");
+        let revisions = CurrentRevisionSet::from_documents([&captioned]);
+
+        let response = index
+            .search(&vault(), sample_query(), &revisions)
+            .expect("search");
+        assert_eq!(
+            response.evidence.len(),
+            1,
+            "a three-sentence provision under a run-in caption must satisfy a three-sentence limit"
+        );
+        assert_eq!(response.evidence[0].sentence_count, 3);
     }
 
     #[test]
