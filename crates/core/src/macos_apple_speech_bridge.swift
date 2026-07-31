@@ -472,6 +472,8 @@ private func assetStatusString(_ status: AssetInventory.Status) -> String {
         return "supported"
     case .unsupported:
         return "unsupported"
+    case .downloading:
+        return "downloading"
     @unknown default:
         return "unknown"
     }
