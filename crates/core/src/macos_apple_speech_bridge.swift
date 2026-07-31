@@ -83,6 +83,27 @@ public func minutesAppleSpeechTranscribePCM(
     guard copiedSamples.allSatisfy(\.isFinite) else {
         return nil
     }
+
+    // Answer the capability question here, on the calling thread, before any
+    // Speech-typed work is scheduled. Signed run 30660755527 trapped inside
+    // swift_getTypeByMangledName on the XPC handler thread itself, below this
+    // function and above Task.detached, so a guard inside the async body ran
+    // too late to prevent it. Returning the failure response now keeps the
+    // helper alive and lets the parent fall back to Whisper.
+    if !speechRuntimeSymbolsResolvable() {
+        return encodeResponse(
+            failureResponse(
+                mode: mode,
+                localeIdentifier: locale,
+                ensureAssets: ensureAssetsValue == 1,
+                error: BridgeError.unsupportedRuntime(
+                    "SpeechAnalyzer types are unavailable on this device."
+                )
+            ),
+            responseLength
+        )
+    }
+
     let responseBox = ResponseBox()
     let semaphore = DispatchSemaphore(value: 0)
     Task.detached {
@@ -109,8 +130,28 @@ public func minutesAppleSpeechTranscribePCM(
     guard let data = responseBox.take(), !data.isEmpty else {
         return nil
     }
+    return copyOutResponse(data, responseLength)
+}
+
+/// Encode a response and hand it to the caller using the same ownership
+/// contract as the normal path, so the early capability return frees through
+/// `minutes_apple_speech_free_response` exactly like every other response.
+private func encodeResponse(
+    _ response: BridgeTranscriptionResponse,
+    _ responseLength: UnsafeMutablePointer<Int>
+) -> UnsafeMutablePointer<UInt8>? {
+    guard let data = try? JSONEncoder().encode(response), !data.isEmpty else {
+        return nil
+    }
+    return copyOutResponse(data, responseLength)
+}
+
+private func copyOutResponse(
+    _ data: Data,
+    _ responseLength: UnsafeMutablePointer<Int>
+) -> UnsafeMutablePointer<UInt8> {
     let response = UnsafeMutablePointer<UInt8>.allocate(capacity: data.count)
-    data.copyBytes(to: UnsafeMutableBufferPointer(start: response, count: data.count))
+    _ = data.copyBytes(to: UnsafeMutableBufferPointer(start: response, count: data.count))
     responseLength.pointee = data.count
     return response
 }
