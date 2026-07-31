@@ -73,6 +73,14 @@ const mutations = [
         "          # ref: refs/tags/acceptance-${{ needs.authorize-candidate.outputs.candidate_sha }}\n          ref: ${{ needs.authorize-candidate.outputs.candidate_sha }}",
       ),
   },
+  {
+    name: "persisted successor checkout credential",
+    expected: "signed Apple Speech runtime acceptance must run in a no-secret successor job",
+    source: workflow.replace(
+      "          persist-credentials: false",
+      "          persist-credentials: true",
+    ),
+  },
 ];
 
 try {
