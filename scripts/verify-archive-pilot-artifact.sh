@@ -114,8 +114,20 @@ signed_identifier="$(awk -F= '/^Identifier=/{print $2}' <<<"$identity")"
 grep -Fq "Authority=Developer ID Application:" <<<"$identity" ||
   fail "application is not signed with a Developer ID Application identity"
 
+# The hardened runtime must be on, or the forbidden-entitlement list below is
+# moot: without it, DYLD_INSERT_LIBRARIES can inject into the process holding
+# the in-memory index of privileged documents.
+grep -Fq "flags=0x10000(runtime)" <<<"$identity" ||
+  grep -Eq "flags=0x[0-9a-f]*10000" <<<"$identity" ||
+  fail "application is not signed with the hardened runtime enabled"
+
 entitlements_path="$EXTRACT_ROOT/entitlements.plist"
-codesign -d --entitlements - "$APP_PATH" >"$entitlements_path" 2>/dev/null || true
+# Fail closed. This previously used `|| true` and then skipped the whole loop
+# when the file was empty, so any codesign failure silently reported success
+# on every forbidden entitlement.
+if ! codesign -d --entitlements - "$APP_PATH" >"$entitlements_path" 2>/dev/null; then
+  fail "could not read entitlements; refusing to certify the artifact"
+fi
 if [[ -s "$entitlements_path" ]]; then
   for forbidden_entitlement in \
     "com.apple.security.get-task-allow" \

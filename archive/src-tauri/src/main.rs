@@ -446,7 +446,21 @@ fn main() {
                 if native_lifecycle_selftest {
                     println!("archive_native_close_event=received");
                 }
-                window.app_handle().exit(0);
+                // Release the session explicitly first. `exit(0)` terminates
+                // the process without unwinding, so no destructor ever runs:
+                // the worker snapshot directories are owned by `TempDir`
+                // fields whose cleanup is `Drop`, and they were surviving the
+                // process as two 40 MB copies of the executable in $TMPDIR.
+                // Any future zeroization written as a destructor would have
+                // been skipped the same way. Dropping the session here runs
+                // that cleanup while the process is still alive.
+                let app_handle = window.app_handle().clone();
+                if let Some(state) = app_handle.try_state::<ArchiveState>() {
+                    if let Ok(mut session) = state.session.lock() {
+                        *session = SessionState::default();
+                    }
+                }
+                app_handle.exit(0);
             }
         })
         .invoke_handler(tauri::generate_handler![
