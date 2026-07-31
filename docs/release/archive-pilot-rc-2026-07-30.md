@@ -88,6 +88,14 @@ transitive warnings. These facts are recorded, not waived.
 - No accessible `Developer ID Application` identity was found. Developer ID
   signing, notarization, staple verification, and another installed-artifact
   hash are required before sending the app to Peter.
+- `.github/workflows/signed-archive-acceptance.yml` provides the bounded
+  distribution path after review and merge: it accepts only an exact candidate
+  protected by `acceptance-<sha>`, builds and exercises the app before any
+  credential is unlocked, pauses at the existing reviewed
+  `signed-dev-acceptance` environment, then signs and notarizes only the inert
+  provenance-bound artifact. It cannot be dispatched until the fixed workflow
+  is present on `main`, and the environment reviewer must explicitly approve
+  the signing job.
 - Native Computer Use could not start its host pipe. The deterministic Chrome
   interaction test and installed native window lifecycle test passed, but the
   console session was locked and a human must still click-test the installed
