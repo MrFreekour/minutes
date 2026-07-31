@@ -65,8 +65,8 @@ const mutations = [
     expected: "complete trigger, authorization, and unsigned-build boundary changed",
     source: workflow
       .replace(
-        '          resolved="$(git ls-remote --refs "$remote" "refs/tags/$tag" | awk \'{print $1}\')"',
-        '          # resolved="$(git ls-remote --refs "$remote" "refs/tags/$tag" | awk \'{print $1}\')"\n          resolved="$CANDIDATE_SHA"',
+        '          resolved="${peeled:-$exact}"',
+        '          # resolved="${peeled:-$exact}"\n          resolved="$CANDIDATE_SHA"',
       )
       .replace(
         "          ref: refs/tags/acceptance-${{ needs.authorize-candidate.outputs.candidate_sha }}",
