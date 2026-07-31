@@ -218,17 +218,23 @@ jobs:
           )"
           [[ "$graph_worker_cdhash" =~ ^[0-9a-f]{40}$ ]]
           mkdir -p "$app/Contents/Resources"
+          graph_worker_cdhash_file="$app/Contents/Resources/minutes-graph-worker.cdhash"
+          test -f "$graph_worker_cdhash_file"
+          chmod u+w "$graph_worker_cdhash_file"
           printf '%s\n' "$graph_worker_cdhash" \
-            > "$app/Contents/Resources/minutes-graph-worker.cdhash"
-          chmod 444 "$app/Contents/Resources/minutes-graph-worker.cdhash"
+            > "$graph_worker_cdhash_file"
+          chmod 444 "$graph_worker_cdhash_file"
           apple_speech_worker_cdhash="$(
             codesign -dvvv "$apple_speech_worker" 2>&1 \
               | awk -F= '/^CDHash=/{print tolower($2); exit}'
           )"
           [[ "$apple_speech_worker_cdhash" =~ ^[0-9a-f]{40}$ ]]
+          apple_speech_worker_cdhash_file="$app/Contents/Resources/minutes-apple-speech-worker.cdhash"
+          test -f "$apple_speech_worker_cdhash_file"
+          chmod u+w "$apple_speech_worker_cdhash_file"
           printf '%s\n' "$apple_speech_worker_cdhash" \
-            > "$app/Contents/Resources/minutes-apple-speech-worker.cdhash"
-          chmod 444 "$app/Contents/Resources/minutes-apple-speech-worker.cdhash"
+            > "$apple_speech_worker_cdhash_file"
+          chmod 444 "$apple_speech_worker_cdhash_file"
           app_executable_name="$(
             /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
               "$app/Contents/Info.plist"

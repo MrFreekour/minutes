@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 // boundary and secret-bearing job. Raw regex matches are intentionally not the
 // authority: these goldens make comment/dead-step duplication fail closed.
 const EXPECTED_SIGNING_JOB_SHA256 =
-  "4a5aa3f4aead6d336e57fa862085bffb594940923e93d8f58fab9cae962ef310";
+  "903c7c962b5eac067fbe423699943969b0405cec732306299366f172f5037894";
 const EXPECTED_PRE_SIGNING_BOUNDARY_SHA256 =
   "c6fb10e1051bd745f737d4718ad949b9b1a01b585702bfecf354be752ff2e278";
 const EXPECTED_TRIGGER_BLOCK = `on:
