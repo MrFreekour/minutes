@@ -68,6 +68,27 @@ if find "$app" -type l -print -quit | grep -q .; then
   exit 1
 fi
 
+# Extended attributes are not visible to `find -type f` or `file`, survive
+# `ditto -c -k` and `codesign`, and pass `codesign --verify --deep --strict`.
+# An arbitrary xattr is therefore a covert channel for shipping content inside
+# a signed, notarized bundle that a content-only hash certifies as clean.
+# Resource forks are rejected by codesign as detritus; arbitrary names are not.
+unexpected_xattrs=""
+while IFS= read -r -d '' f; do
+  while IFS= read -r attribute; do
+    [ -n "$attribute" ] || continue
+    case "$attribute" in
+      com.apple.provenance | com.apple.quarantine | com.apple.macl) ;;
+      *) unexpected_xattrs+="$attribute on ${f#"$app"/}"$'\n' ;;
+    esac
+  done < <(xattr "$f" 2>/dev/null)
+done < <(find "$app" -type f -print0)
+if [ -n "$unexpected_xattrs" ]; then
+  echo "REJECT: bundle carries unexpected extended attributes" >&2
+  printf '%s' "$unexpected_xattrs" | sed 's|^|  |' >&2
+  exit 1
+fi
+
 # Hash the whole tree, not one file, so provenance describes everything shipped.
 tree_hash="$(
   find "$app" -type f -print0 | sort -z |
