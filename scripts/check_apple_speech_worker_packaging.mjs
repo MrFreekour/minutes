@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 // comment or dead duplicate cannot silently replace the active boundary.
 const EXPECTED_SOURCE_SHA256 = {
   worker: "951d4b05b826492ff00c169469d03bb80ee97e467c5ee7437b9cba24323dc528",
-  xpc: "b04b0e45b0a3217f1622bf244eb880373396dbaddf6cc3150810a22e4c8c8754",
+  xpc: "53e8f49e57fe4fdabed7de121f83493047fdb8372932c661f5802118a5ecb81f",
   swift: "268bd74f0d6cfea474e00fdf57c5841bf225270253b93819a4a3d4c3e5b88f5e",
   main: "771a49923937ce78471499cd5f1cbd76713cf99ba2ab035282dd4581cfe9259b",
   acceptanceWorkflow:
@@ -106,7 +106,7 @@ function validate(candidate, checkGoldens = true) {
   );
   const appleService = section(
     candidate.xpc,
-    "pub fn run_apple_speech_service_main()",
+    'unsafe extern "C" fn apple_speech_service_connection_handler(',
     "#[cfg(test)]",
     "the Apple Speech service authority must remain independently inspectable",
   );
@@ -284,11 +284,30 @@ function validate(candidate, checkGoldens = true) {
   ordered(
     appleService,
     [
+      'unsafe extern "C" fn apple_speech_service_connection_handler(',
       "service_parent_requirement()",
       "set_peer_requirement(peer, &requirement)",
       "xpc_connection_resume(peer)",
+      "pub fn run_apple_speech_service_main()",
+      "APPLE_SPEECH_SERVICE_NONCE.set(service_nonce)",
+      "xpc_main(apple_speech_service_connection_handler)",
     ],
-    "the worker must authenticate its signed parent before receiving a message",
+    "the worker must use the C connection-handler ABI and authenticate its signed parent before receiving a message",
+  );
+  requireText(
+    candidate.xpc,
+    'type XpcConnectionHandler = unsafe extern "C" fn(XpcObject);',
+    "xpc_main must use the plain C connection-handler ABI",
+  );
+  requireText(
+    candidate.xpc,
+    "fn xpc_main(handler: XpcConnectionHandler) -> !;",
+    "the xpc_main declaration must not reinterpret an Objective-C block as a C callback",
+  );
+  forbid(
+    candidate.xpc,
+    /fn xpc_main\(handler: &Block/,
+    "xpc_main must never receive an Objective-C block",
   );
   for (const value of [
     "service_request_nonce_matches",
@@ -370,6 +389,16 @@ if (process.argv.includes("--self-test")) {
         value.replaceAll(
           "set_peer_requirement(connection.object, &requirement)",
           "drop(requirement)",
+        ),
+      false,
+    ],
+    [
+      "XPC main callback ABI regressed to a block",
+      "xpc",
+      (value) =>
+        value.replace(
+          "fn xpc_main(handler: XpcConnectionHandler) -> !;",
+          "fn xpc_main(handler: &Block<dyn Fn(XpcObject)>) -> !;",
         ),
       false,
     ],

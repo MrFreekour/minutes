@@ -14,7 +14,7 @@ const EXPECTED_SOURCE_SHA256 = {
   packageXpc: "baebd532d240fc26188c431f571d0a44f2ce1e7240c3277284c9ea9e69c1ef82",
   tauri: "f127e92a1a2a635326d13dd766b3e6cc841655bce30ea2d01d67d9f12c15502c",
   entitlements: "7971da95784f3bdeb3ea257b5c1a31317731b513b16c47e2c4e588fc0ac40bae",
-  xpc: "b04b0e45b0a3217f1622bf244eb880373396dbaddf6cc3150810a22e4c8c8754",
+  xpc: "53e8f49e57fe4fdabed7de121f83493047fdb8372932c661f5802118a5ecb81f",
   graphWorker: "804b6bb314b314b8cf61d6f8cd5bfb7f2374ceaa355fc4d12b92fe39c009230e",
   authority: "d16834a0d607266feb888c8958b6b40794eebe5bde50ca0b259f8041764d96c9",
   helperPlist: "543617b03e757520a201bd0a7751cc6aadb48cf0d6b4a44bfc9ef4323a69850f",
@@ -89,8 +89,8 @@ function validate(candidate, checkGoldens = true) {
   );
   const graphServiceXpc = section(
     candidate.xpc,
-    "pub fn run_service_main()",
-    "pub fn run_apple_speech_service_main()",
+    'unsafe extern "C" fn graph_service_connection_handler(',
+    'unsafe extern "C" fn apple_speech_service_connection_handler(',
     "the graph service XPC boundary must remain independently inspectable",
   );
   const graphRunXpc = section(
@@ -297,18 +297,30 @@ function validate(candidate, checkGoldens = true) {
   ordered(
     graphServiceXpc,
     [
-      "pub fn run_service_main()",
-      "prepare_macos_graph_xpc_worker()",
-      "let claimed = Arc::new(AtomicBool::new(false))",
+      'unsafe extern "C" fn graph_service_connection_handler(',
       "service_parent_requirement()",
       "set_peer_requirement(peer, &requirement)",
       "let awaiting_begin",
-      "claim_service_process(&message_claimed)",
+      "claim_service_process(message_claimed)",
       "handle_service_message(message, &message_state)",
       "xpc_connection_send_message(peer_address as XpcObject, reply.0)",
       "xpc_connection_send_barrier(",
+      "pub fn run_service_main()",
+      "prepare_macos_graph_xpc_worker()",
+      "GRAPH_SERVICE_NONCE.set(service_nonce)",
+      "xpc_main(graph_service_connection_handler)",
     ],
-    "the XPC service must install immutable ceilings once, admit one authenticated request, and exit after its terminal reply",
+    "the XPC service must use the C callback ABI, install immutable ceilings once, admit one authenticated request, and exit after its terminal reply",
+  );
+  requirePattern(
+    candidate.xpc,
+    /type XpcConnectionHandler = unsafe extern "C" fn\(XpcObject\);[\s\S]*?fn xpc_main\(handler: XpcConnectionHandler\) -> !;/,
+    "xpc_main must use the plain C connection-handler ABI",
+  );
+  forbidPattern(
+    candidate.xpc,
+    /fn xpc_main\(handler: &Block/,
+    "xpc_main must never reinterpret an Objective-C block as a C callback",
   );
   requirePattern(
     graphRunXpc,
@@ -442,6 +454,11 @@ if (process.argv.includes("--self-test")) {
         "if set_peer_requirement(peer, &requirement).is_err()",
         "if requirement.as_bytes().is_empty()",
       )],
+    ["XPC main callback ABI regressed to a block", "xpc", (value) =>
+      value.replace(
+        "fn xpc_main(handler: XpcConnectionHandler) -> !;",
+        "fn xpc_main(handler: &Block<dyn Fn(XpcObject)>) -> !;",
+      )],
     ["unbounded XPC reply", "xpc", (value) =>
       value.replaceAll("recv_timeout(remaining)", "recv()")],
     ["generic service identity", "xpc", (value) =>
@@ -471,7 +488,7 @@ if (process.argv.includes("--self-test")) {
       )],
     ["service accepts concurrent requests", "xpc", (value) =>
       value.replace(
-        "if awaiting_begin && !claim_service_process(&message_claimed)",
+        "if awaiting_begin && !claim_service_process(message_claimed)",
         "if awaiting_begin && false",
       )],
     ["service process remains reusable", "xpc", (value) =>
@@ -541,7 +558,7 @@ if (process.argv.includes("--self-test")) {
       )],
     ["losing peer disconnect kills owner", "xpc", (value) =>
       value.replace(
-        "ServicePeerEvent::CancelPeer => {\n                    unsafe { xpc_connection_cancel(peer_address as XpcObject) };\n                    return;\n                }",
+        "ServicePeerEvent::CancelPeer => {\n                unsafe { xpc_connection_cancel(peer_address as XpcObject) };\n                return;\n            }",
         "ServicePeerEvent::CancelPeer => unsafe { libc::_exit(72) },",
       )],
     ["stale abort may claim fresh helper", "xpc", (value) =>
