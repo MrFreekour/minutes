@@ -1,3 +1,49 @@
+/* Bundled, not fetched. DESIGN.md specifies Instrument Serif for display and
+   Geist for body, and requires the desktop app to load them from local WOFF2
+   so it works offline -- which for this app is not a preference but part of
+   the boundary it claims: it must not reach the network for anything. Archive
+   shipped with no fonts at all and fell back to Georgia and Iowan Old Style,
+   so it rendered unlike the rest of Minutes. */
+@font-face {
+  font-family: "Instrument Serif";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/InstrumentSerif-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Instrument Serif";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/InstrumentSerif-Italic.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/Geist-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("fonts/Geist-Medium.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("fonts/Geist-SemiBold.woff2") format("woff2");
+}
+
 :root {
   color-scheme: light;
   --ink: #182420;
@@ -14,8 +60,7 @@
   --danger: #8e342f;
   --danger-soft: #f8e9e6;
   --shadow: 0 22px 70px rgba(31, 43, 37, 0.1);
-  font-family:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
 }
 
@@ -83,7 +128,7 @@ a:focus-visible {
   color: #fff;
   border-radius: 8px;
   background: var(--green);
-  font-family: Georgia, "Times New Roman", serif;
+  font-family: "Instrument Serif", Georgia, "Times New Roman", serif;
   font-size: 17px;
 }
 
@@ -140,9 +185,9 @@ a:focus-visible {
 .hero h1 {
   max-width: 760px;
   margin: 0;
-  font-family: Iowan Old Style, Baskerville, Georgia, serif;
+  font-family: "Instrument Serif", Iowan Old Style, Baskerville, Georgia, serif;
   font-size: clamp(38px, 4.2vw, 56px);
-  font-weight: 500;
+  font-weight: 400;
   letter-spacing: -0.038em;
   line-height: 1.02;
 }
@@ -290,9 +335,9 @@ a:focus-visible {
 
 .panel h2 {
   margin-bottom: 9px;
-  font-family: Iowan Old Style, Baskerville, Georgia, serif;
+  font-family: "Instrument Serif", Iowan Old Style, Baskerville, Georgia, serif;
   font-size: 27px;
-  font-weight: 520;
+  font-weight: 400;
   letter-spacing: -0.022em;
 }
 
@@ -680,9 +725,9 @@ a:focus-visible {
 
 .metric strong {
   margin-top: 7px;
-  font-family: Iowan Old Style, Baskerville, Georgia, serif;
+  font-family: "Instrument Serif", Iowan Old Style, Baskerville, Georgia, serif;
   font-size: 22px;
-  font-weight: 500;
+  font-weight: 400;
 }
 
 .result-grid {
@@ -788,9 +833,9 @@ a:focus-visible {
 }
 
 .pilot-strip strong {
-  font-family: Iowan Old Style, Baskerville, Georgia, serif;
+  font-family: "Instrument Serif", Iowan Old Style, Baskerville, Georgia, serif;
   font-size: 17px;
-  font-weight: 540;
+  font-weight: 400;
 }
 
 .pilot-strip p:last-child {
@@ -963,7 +1008,7 @@ a:focus-visible {
   color: #29342f;
   border-left: 3px solid var(--gold);
   background: var(--surface-muted);
-  font-family: Iowan Old Style, Baskerville, Georgia, serif;
+  font-family: "Instrument Serif", Iowan Old Style, Baskerville, Georgia, serif;
   font-size: 13px;
   line-height: 1.58;
   white-space: pre-wrap;
@@ -1002,7 +1047,7 @@ a:focus-visible {
 .criterion-evidence p {
   margin: 6px 0 0;
   color: #39453f;
-  font-family: Iowan Old Style, Baskerville, Georgia, serif;
+  font-family: "Instrument Serif", Iowan Old Style, Baskerville, Georgia, serif;
   font-size: 11px;
   line-height: 1.5;
 }
