@@ -336,10 +336,9 @@ impl Drop for BoundedSemanticSession {
     }
 }
 
-/// A short-lived embedding session. It is intentionally not `Send` or `Sync`;
-/// callers create and use it on the thread performing a bounded vault build or
-/// query, then retain only normalized `Vec<f32>` derivatives.
-pub struct AppleSentenceEmbeddingSession {
+/// Worker-internal access to the pinned Apple model. External callers can only
+/// obtain vectors through `BoundedSemanticEngine`.
+struct AppleSentenceEmbeddingSession {
     #[cfg(target_os = "macos")]
     embedding: objc2::rc::Retained<objc2_natural_language::NLEmbedding>,
 }
@@ -351,15 +350,11 @@ impl std::fmt::Debug for AppleSentenceEmbeddingSession {
 }
 
 impl AppleSentenceEmbeddingSession {
-    pub fn new() -> Result<Self, SemanticError> {
+    fn new() -> Result<Self, SemanticError> {
         platform::new_session()
     }
 
-    pub fn metadata(&self) -> SemanticModelMetadata {
-        SemanticModelMetadata::apple_english_sentence_revision_one()
-    }
-
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>, SemanticError> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, SemanticError> {
         let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.chars().count() > MAX_SEMANTIC_INPUT_CHARS {
             return Err(SemanticError::InputBudgetExceeded);
@@ -408,7 +403,7 @@ mod platform {
     use objc2_natural_language::{NLEmbedding, NLLanguageEnglish};
     use std::ptr::NonNull;
 
-    pub fn new_session() -> Result<AppleSentenceEmbeddingSession, SemanticError> {
+    pub(super) fn new_session() -> Result<AppleSentenceEmbeddingSession, SemanticError> {
         let language = unsafe { NLLanguageEnglish }.ok_or(SemanticError::ModelUnavailable)?;
         let embedding = unsafe {
             NLEmbedding::sentenceEmbeddingForLanguage_revision(
@@ -427,7 +422,7 @@ mod platform {
         Ok(AppleSentenceEmbeddingSession { embedding })
     }
 
-    pub fn embed(
+    pub(super) fn embed(
         session: &AppleSentenceEmbeddingSession,
         text: &str,
     ) -> Result<Vec<f32>, SemanticError> {
@@ -446,11 +441,11 @@ mod platform {
 mod platform {
     use super::*;
 
-    pub fn new_session() -> Result<AppleSentenceEmbeddingSession, SemanticError> {
+    pub(super) fn new_session() -> Result<AppleSentenceEmbeddingSession, SemanticError> {
         Err(SemanticError::PlatformUnavailable)
     }
 
-    pub fn embed(
+    pub(super) fn embed(
         _session: &AppleSentenceEmbeddingSession,
         _text: &str,
     ) -> Result<Vec<f32>, SemanticError> {
@@ -735,10 +730,6 @@ mod tests {
     #[test]
     fn pinned_builtin_model_returns_normalized_vectors() {
         let session = AppleSentenceEmbeddingSession::new().expect("built-in model");
-        assert_eq!(
-            session.metadata(),
-            SemanticModelMetadata::apple_english_sentence_revision_one()
-        );
         let vector = session
             .embed("The recipient shall not disclose proprietary information.")
             .expect("vector");
