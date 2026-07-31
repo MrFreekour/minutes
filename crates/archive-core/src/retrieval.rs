@@ -1768,6 +1768,71 @@ mod tests {
     }
 
     #[test]
+    fn the_documents_own_structure_overrides_the_lexical_rule() {
+        // The retrieval-side half of the structural change had no test at
+        // all: nothing asserted that Some(true) forces a caption or that
+        // Some(false) suppresses the heuristic. Both directions matter --
+        // Some(true) on text that reads like prose, and Some(false) on text
+        // that reads exactly like a caption.
+        let marked = ConvertedDocument {
+            format: SourceFormat::Docx,
+            blocks: vec![
+                minutes_archive_convert::ConvertedBlock {
+                    // Styled as a heading in the file although the words read
+                    // as a cross-reference. Every lexical rule got this wrong.
+                    is_heading: Some(true),
+                    source_anchor: "paragraph:000001".to_string(),
+                    text: "9. See Sections 3 and 4".to_string(),
+                    flow: AnchorFlow::Continue,
+                },
+                minutes_archive_convert::ConvertedBlock {
+                    is_heading: Some(false),
+                    source_anchor: "paragraph:000002".to_string(),
+                    text: "Recipient shall not disclose Confidential Information.".to_string(),
+                    flow: AnchorFlow::Continue,
+                },
+                minutes_archive_convert::ConvertedBlock {
+                    // Reads exactly like a caption; the file says it is not.
+                    is_heading: Some(false),
+                    source_anchor: "paragraph:000003".to_string(),
+                    text: "7. CONFIDENTIALITY AND SURVIVAL".to_string(),
+                    flow: AnchorFlow::Continue,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let normalized = normalize_converted_document(
+            DocumentId::parse("structured-docx").expect("id"),
+            "Structured DOCX",
+            b"PK-synthetic",
+            &marked,
+        )
+        .expect("docx");
+
+        // Some(true) opened a provision even though the words are a
+        // cross-reference.
+        assert_eq!(
+            normalized.provisions[0].heading.as_deref(),
+            Some("9. See Sections 3 and 4")
+        );
+        // Some(false) kept the caption-shaped line as body text, so it did
+        // not open a second provision.
+        assert_eq!(
+            normalized.provisions.len(),
+            1,
+            "a line the document marks as body must not open a provision: {:?}",
+            normalized
+                .provisions
+                .iter()
+                .map(|provision| (&provision.heading, &provision.text))
+                .collect::<Vec<_>>()
+        );
+        assert!(normalized.provisions[0]
+            .text
+            .contains("7. CONFIDENTIALITY AND SURVIVAL"));
+    }
+
+    #[test]
     fn converted_pdf_and_docx_preserve_honest_source_anchors() {
         let pdf = ConvertedDocument {
             format: SourceFormat::Pdf,
