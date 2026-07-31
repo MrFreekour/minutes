@@ -20,6 +20,8 @@ type XpcObject = *mut c_void;
 type PeerRequirementFn = unsafe extern "C" fn(XpcObject, *const c_char) -> c_int;
 type XpcConnectionHandler = unsafe extern "C" fn(XpcObject);
 
+const GRAPH_SUBSYSTEM: &str = "policy graph";
+const APPLE_SPEECH_SUBSYSTEM: &str = "Apple Speech";
 const XPC_SERVICE_NAME: &[u8] = b"com.useminutes.graph-worker\0";
 const APPLE_SPEECH_XPC_SERVICE_NAME: &[u8] = b"com.useminutes.apple-speech-worker\0";
 const COMMAND_KEY: &[u8] = b"command\0";
@@ -126,18 +128,18 @@ fn parent_callback_queue() -> Result<*mut c_void, String> {
     }
 }
 
-fn ensure_transport_available(poisoned: &AtomicBool) -> Result<(), String> {
+fn ensure_transport_available(subsystem: &str, poisoned: &AtomicBool) -> Result<(), String> {
     if poisoned.load(Ordering::Acquire) {
-        Err(
-            "policy graph XPC transport requires an application restart after an unconfirmed service exit"
-                .into(),
-        )
+        Err(format!(
+            "{subsystem} XPC transport requires an application restart after an unconfirmed service exit"
+        ))
     } else {
         Ok(())
     }
 }
 
 fn lock_parent_request<'a>(
+    subsystem: &str,
     lock: &'a Mutex<()>,
     poisoned: &AtomicBool,
     deadline: Instant,
@@ -145,19 +147,18 @@ fn lock_parent_request<'a>(
     loop {
         match lock.try_lock() {
             Ok(guard) => {
-                ensure_transport_available(poisoned)?;
+                ensure_transport_available(subsystem, poisoned)?;
                 return Ok(guard);
             }
             Err(TryLockError::Poisoned(_)) => {
-                return Err("policy graph XPC parent request lock was poisoned".into());
+                return Err(format!("{subsystem} XPC parent request lock was poisoned"));
             }
             Err(TryLockError::WouldBlock) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(
-                        "policy graph XPC parent request admission exceeded its wall-clock budget"
-                            .into(),
-                    );
+                    return Err(format!(
+                        "{subsystem} XPC parent request admission exceeded its wall-clock budget"
+                    ));
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(2)));
             }
@@ -311,6 +312,7 @@ impl Drop for OwnedXpc {
 }
 
 struct Connection {
+    subsystem: &'static str,
     object: XpcObject,
     invalidated: mpsc::Receiver<()>,
     service_nonce: Mutex<Option<[u8; 16]>>,
@@ -321,25 +323,37 @@ struct Connection {
 impl Connection {
     fn wait_for_service_exit(&self, deadline: Instant) -> Result<(), String> {
         if !self.terminal_acknowledged.load(Ordering::Acquire) {
-            return Err("policy graph XPC terminal settlement was not acknowledged".into());
+            return Err(format!(
+                "{} XPC terminal settlement was not acknowledged",
+                self.subsystem
+            ));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("policy graph XPC service exit exceeded its wall-clock budget".into());
+            return Err(format!(
+                "{} XPC service exit exceeded its wall-clock budget",
+                self.subsystem
+            ));
         }
-        self.invalidated
-            .recv_timeout(remaining)
-            .map_err(|_| "policy graph XPC service exit exceeded its wall-clock budget".to_string())
+        self.invalidated.recv_timeout(remaining).map_err(|_| {
+            format!(
+                "{} XPC service exit exceeded its wall-clock budget",
+                self.subsystem
+            )
+        })
     }
 
     fn send_with_reply(&self, message: XpcObject, deadline: Instant) -> Result<OwnedXpc, String> {
         if self.transport_failed.load(Ordering::Acquire) {
-            return Err("policy graph XPC transport ended before the next request".into());
+            return Err(format!(
+                "{} XPC transport ended before the next request",
+                self.subsystem
+            ));
         }
         if let Some(nonce) = *self
             .service_nonce
             .lock()
-            .map_err(|_| "policy graph XPC service nonce lock was poisoned")?
+            .map_err(|_| format!("{} XPC service nonce lock was poisoned", self.subsystem))?
         {
             unsafe {
                 xpc_dictionary_set_data(
@@ -350,15 +364,20 @@ impl Connection {
                 );
             }
         }
-        let reply = match send_with_reply(self.object, parent_callback_queue()?, message, deadline)
-        {
+        let reply = match send_with_reply(
+            self.subsystem,
+            self.object,
+            parent_callback_queue()?,
+            message,
+            deadline,
+        ) {
             Ok(reply) => reply,
             Err(error) => {
                 self.transport_failed.store(true, Ordering::Release);
                 return Err(error);
             }
         };
-        let service_nonce = match service_nonce_from_reply(reply.0) {
+        let service_nonce = match service_nonce_from_reply(self.subsystem, reply.0) {
             Ok(nonce) => nonce,
             Err(error) => {
                 self.transport_failed.store(true, Ordering::Release);
@@ -368,8 +387,8 @@ impl Connection {
         let mut expected_nonce = self
             .service_nonce
             .lock()
-            .map_err(|_| "policy graph XPC service nonce lock was poisoned")?;
-        if let Err(error) = bind_service_nonce(&mut expected_nonce, service_nonce) {
+            .map_err(|_| format!("{} XPC service nonce lock was poisoned", self.subsystem))?;
+        if let Err(error) = bind_service_nonce(self.subsystem, &mut expected_nonce, service_nonce) {
             self.transport_failed.store(true, Ordering::Release);
             return Err(error);
         }
@@ -378,7 +397,10 @@ impl Connection {
             self.terminal_acknowledged.store(true, Ordering::Release);
         }
         if self.transport_failed.load(Ordering::Acquire) && !terminal {
-            return Err("policy graph XPC transport ended before a terminal reply".into());
+            return Err(format!(
+                "{} XPC transport ended before a terminal reply",
+                self.subsystem
+            ));
         }
         Ok(reply)
     }
@@ -387,21 +409,31 @@ impl Connection {
         if self.transport_failed.load(Ordering::Acquire)
             && !self.terminal_acknowledged.load(Ordering::Acquire)
         {
-            return Err("policy graph XPC transport failed before terminal acknowledgement".into());
+            return Err(format!(
+                "{} XPC transport failed before terminal acknowledgement",
+                self.subsystem
+            ));
         }
         if abort && !self.terminal_acknowledged.load(Ordering::Acquire) {
-            let message = OwnedXpc::dictionary()
-                .map_err(|_| "policy graph XPC terminal abort could not be created")?;
+            let message = OwnedXpc::dictionary().map_err(|_| {
+                format!("{} XPC terminal abort could not be created", self.subsystem)
+            })?;
             set_command(message.0, COMMAND_ABORT);
-            let reply = self
-                .send_with_reply(message.0, deadline)
-                .map_err(|_| "policy graph XPC terminal abort was not acknowledged")?;
+            let reply = self.send_with_reply(message.0, deadline).map_err(|_| {
+                format!("{} XPC terminal abort was not acknowledged", self.subsystem)
+            })?;
             if !unsafe { xpc_dictionary_get_bool(reply.0, OK_KEY.as_ptr().cast()) } {
-                return Err("policy graph XPC terminal abort was rejected".into());
+                return Err(format!(
+                    "{} XPC terminal abort was rejected",
+                    self.subsystem
+                ));
             }
         }
         if !self.terminal_acknowledged.load(Ordering::Acquire) {
-            return Err("policy graph XPC terminal settlement was not acknowledged".into());
+            return Err(format!(
+                "{} XPC terminal settlement was not acknowledged",
+                self.subsystem
+            ));
         }
         self.wait_for_service_exit(deadline)
     }
@@ -426,28 +458,39 @@ fn set_command(message: XpcObject, command: &[u8]) {
     }
 }
 
-fn service_nonce_from_reply(reply: XpcObject) -> Result<[u8; 16], String> {
+fn service_nonce_from_reply(subsystem: &str, reply: XpcObject) -> Result<[u8; 16], String> {
     let mut length = 0_usize;
     let data =
         unsafe { xpc_dictionary_get_data(reply, SERVICE_NONCE_KEY.as_ptr().cast(), &mut length) };
     if data.is_null() || length != 16 {
-        return Err("policy graph XPC service reply lacked its exact process nonce".into());
+        return Err(format!(
+            "{subsystem} XPC service reply lacked its exact process nonce"
+        ));
     }
     let mut nonce = [0_u8; 16];
     nonce.copy_from_slice(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) });
     Ok(nonce)
 }
 
-fn bind_service_nonce(expected: &mut Option<[u8; 16]>, observed: [u8; 16]) -> Result<(), String> {
+fn bind_service_nonce(
+    subsystem: &str,
+    expected: &mut Option<[u8; 16]>,
+    observed: [u8; 16],
+) -> Result<(), String> {
     match *expected {
         None => *expected = Some(observed),
         Some(current) if current == observed => {}
-        Some(_) => return Err("policy graph XPC service generation changed mid-request".into()),
+        Some(_) => {
+            return Err(format!(
+                "{subsystem} XPC service generation changed mid-request"
+            ))
+        }
     }
     Ok(())
 }
 
 fn send_with_reply(
+    subsystem: &str,
     connection: XpcObject,
     reply_queue: *mut c_void,
     message: XpcObject,
@@ -455,7 +498,9 @@ fn send_with_reply(
 ) -> Result<OwnedXpc, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err("policy graph XPC operation exceeded its wall-clock budget".into());
+        return Err(format!(
+            "{subsystem} XPC operation exceeded its wall-clock budget"
+        ));
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let handler = RcBlock::new(move |reply: XpcObject| {
@@ -469,11 +514,13 @@ fn send_with_reply(
     }
     let reply = receiver
         .recv_timeout(remaining)
-        .map_err(|_| "policy graph XPC operation exceeded its wall-clock budget".to_string())?;
+        .map_err(|_| format!("{subsystem} XPC operation exceeded its wall-clock budget"))?;
     let reply = reply as XpcObject;
     if !xpc_type_is(reply, "dictionary") {
         unsafe { xpc_release(reply) };
-        return Err("policy graph XPC peer was unavailable or unauthenticated".into());
+        return Err(format!(
+            "{subsystem} XPC peer was unavailable or unauthenticated"
+        ));
     }
     Ok(OwnedXpc(reply))
 }
@@ -492,6 +539,7 @@ fn open_authenticated_connection(
     let (invalidated_sender, invalidated) = mpsc::channel();
     let transport_failed = Arc::new(AtomicBool::new(false));
     let connection = Connection {
+        subsystem: GRAPH_SUBSYSTEM,
         object: connection,
         invalidated,
         service_nonce: Mutex::new(None),
@@ -576,6 +624,7 @@ fn open_apple_speech_authenticated_connection(
     let (invalidated_sender, invalidated) = mpsc::channel();
     let transport_failed = Arc::new(AtomicBool::new(false));
     let connection = Connection {
+        subsystem: APPLE_SPEECH_SUBSYSTEM,
         object: connection,
         invalidated,
         service_nonce: Mutex::new(None),
@@ -653,10 +702,14 @@ pub(crate) fn run(
     if wall_clock.is_zero() {
         return Err("policy graph XPC wall-clock budget must be positive".into());
     }
-    ensure_transport_available(&XPC_SETTLEMENT_FAILED)?;
+    ensure_transport_available(GRAPH_SUBSYSTEM, &XPC_SETTLEMENT_FAILED)?;
     let deadline = Instant::now() + wall_clock;
-    let _request_guard =
-        lock_parent_request(&XPC_PARENT_REQUEST_LOCK, &XPC_SETTLEMENT_FAILED, deadline)?;
+    let _request_guard = lock_parent_request(
+        GRAPH_SUBSYSTEM,
+        &XPC_PARENT_REQUEST_LOCK,
+        &XPC_SETTLEMENT_FAILED,
+        deadline,
+    )?;
     validate_authority_bundle(authority_bundle)?;
     let connection = open_authenticated_connection(exact_cdhash, trusted_distribution, deadline)?;
 
@@ -769,9 +822,10 @@ pub(crate) fn run_apple_speech(
     if wall_clock.is_zero() {
         return Err("Apple Speech XPC wall-clock budget must be positive".into());
     }
-    ensure_transport_available(&APPLE_SPEECH_XPC_SETTLEMENT_FAILED)?;
+    ensure_transport_available(APPLE_SPEECH_SUBSYSTEM, &APPLE_SPEECH_XPC_SETTLEMENT_FAILED)?;
     let deadline = Instant::now() + wall_clock;
     let _request_guard = lock_parent_request(
+        APPLE_SPEECH_SUBSYSTEM,
         &APPLE_SPEECH_XPC_PARENT_REQUEST_LOCK,
         &APPLE_SPEECH_XPC_SETTLEMENT_FAILED,
         deadline,
@@ -1790,9 +1844,9 @@ mod tests {
         let first = [1_u8; 16];
         let second = [2_u8; 16];
         let mut expected = None;
-        bind_service_nonce(&mut expected, first).unwrap();
-        bind_service_nonce(&mut expected, first).unwrap();
-        assert!(bind_service_nonce(&mut expected, second).is_err());
+        bind_service_nonce(GRAPH_SUBSYSTEM, &mut expected, first).unwrap();
+        bind_service_nonce(GRAPH_SUBSYSTEM, &mut expected, first).unwrap();
+        assert!(bind_service_nonce(GRAPH_SUBSYSTEM, &mut expected, second).is_err());
         assert_eq!(expected, Some(first));
     }
 
@@ -1835,6 +1889,7 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             ready_tx.send(()).unwrap();
             lock_parent_request(
+                GRAPH_SUBSYSTEM,
                 &waiter_lock,
                 &waiter_poisoned,
                 Instant::now() + Duration::from_secs(1),

@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 // comment or dead duplicate cannot silently replace the active boundary.
 const EXPECTED_SOURCE_SHA256 = {
   worker: "220a2e2c8fe080ad630d0b114c8b55a79fea7bca9f03e93721163bca811f4c9c",
-  xpc: "53e8f49e57fe4fdabed7de121f83493047fdb8372932c661f5802118a5ecb81f",
+  xpc: "fb8ab0961a66330a5b86d5dbc06b84433167b0d19ad24de7c378fc463c585098",
   swift: "1835ee04fc5937343ab5cf5d2cb17575411010b05c6d2b4ae842d66cbb651d7e",
   main: "95b27313f9f064bc9bad6e4a2f89a81adae5e9894dff156329b9442918f226ea",
   acceptanceWorkflow:

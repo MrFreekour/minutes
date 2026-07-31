@@ -14,7 +14,7 @@ const EXPECTED_SOURCE_SHA256 = {
   packageXpc: "baebd532d240fc26188c431f571d0a44f2ce1e7240c3277284c9ea9e69c1ef82",
   tauri: "f127e92a1a2a635326d13dd766b3e6cc841655bce30ea2d01d67d9f12c15502c",
   entitlements: "7971da95784f3bdeb3ea257b5c1a31317731b513b16c47e2c4e588fc0ac40bae",
-  xpc: "53e8f49e57fe4fdabed7de121f83493047fdb8372932c661f5802118a5ecb81f",
+  xpc: "fb8ab0961a66330a5b86d5dbc06b84433167b0d19ad24de7c378fc463c585098",
   graphWorker: "804b6bb314b314b8cf61d6f8cd5bfb7f2374ceaa355fc4d12b92fe39c009230e",
   authority: "d16834a0d607266feb888c8958b6b40794eebe5bde50ca0b259f8041764d96c9",
   helperPlist: "543617b03e757520a201bd0a7751cc6aadb48cf0d6b4a44bfc9ef4323a69850f",
@@ -344,7 +344,7 @@ function validate(candidate, checkGoldens = true) {
   );
   requirePattern(
     candidate.xpc,
-    /fn ensure_transport_available\(poisoned: &AtomicBool\)[\s\S]*?poisoned\.load\(Ordering::Acquire\)[\s\S]*?requires an application restart after an unconfirmed service exit/,
+    /fn ensure_transport_available\(subsystem: &str, poisoned: &AtomicBool\)[\s\S]*?poisoned\.load\(Ordering::Acquire\)[\s\S]*?requires an application restart after an unconfirmed service exit/,
     "an unconfirmed service exit must fail closed against every later request",
   );
   requirePattern(
@@ -354,7 +354,7 @@ function validate(candidate, checkGoldens = true) {
   );
   requirePattern(
     candidate.xpc,
-    /static XPC_PARENT_REQUEST_LOCK: Mutex<\(\)>[\s\S]*?fn lock_parent_request<'a>\([\s\S]*?lock\.try_lock\(\)[\s\S]*?ensure_transport_available\(poisoned\)\?[\s\S]*?remaining\.is_zero\(\)[\s\S]*?lock_parent_request\(&XPC_PARENT_REQUEST_LOCK, &XPC_SETTLEMENT_FAILED, deadline\)\?/,
+    /static XPC_PARENT_REQUEST_LOCK: Mutex<\(\)>[\s\S]*?fn lock_parent_request<'a>\([\s\S]*?lock\.try_lock\(\)[\s\S]*?ensure_transport_available\(subsystem, poisoned\)\?[\s\S]*?remaining\.is_zero\(\)[\s\S]*?lock_parent_request\([\s\S]*?GRAPH_SUBSYSTEM,[\s\S]*?&XPC_PARENT_REQUEST_LOCK,[\s\S]*?&XPC_SETTLEMENT_FAILED,[\s\S]*?deadline,[\s\S]*?\)\?/,
     "one parent process must serialize graph requests and recheck poison after admission under the same deadline",
   );
   requirePattern(
@@ -369,7 +369,7 @@ function validate(candidate, checkGoldens = true) {
   );
   requirePattern(
     candidate.xpc,
-    /if let Some\(nonce\)[\s\S]*?xpc_dictionary_set_data\([\s\S]*?SERVICE_NONCE_KEY[\s\S]*?bind_service_nonce\(&mut expected_nonce, service_nonce\)/,
+    /if let Some\(nonce\)[\s\S]*?xpc_dictionary_set_data\([\s\S]*?SERVICE_NONCE_KEY[\s\S]*?bind_service_nonce\(self\.subsystem, &mut expected_nonce, service_nonce\)/,
     "every post-handshake request and reply must remain bound to the exact service nonce",
   );
   requirePattern(
@@ -379,7 +379,7 @@ function validate(candidate, checkGoldens = true) {
   );
   requirePattern(
     candidate.xpc,
-    /SERVICE_NONCE_KEY[\s\S]*?service_nonce_from_reply\(reply\.0\)[\s\S]*?bind_service_nonce/,
+    /SERVICE_NONCE_KEY[\s\S]*?service_nonce_from_reply\(self\.subsystem, reply\.0\)[\s\S]*?bind_service_nonce/,
     "terminal acknowledgement and later connection end must be bound to one service generation",
   );
   requirePattern(
@@ -528,12 +528,17 @@ if (process.argv.includes("--self-test")) {
       )],
     ["parent requests overlap", "xpc", (value) =>
       value.replace(
-        "lock_parent_request(&XPC_PARENT_REQUEST_LOCK, &XPC_SETTLEMENT_FAILED, deadline)?;",
+        `lock_parent_request(
+        GRAPH_SUBSYSTEM,
+        &XPC_PARENT_REQUEST_LOCK,
+        &XPC_SETTLEMENT_FAILED,
+        deadline,
+    )?;`,
         "let _request_guard = Mutex::new(()).lock().unwrap();",
       )],
     ["waiter skips poison recheck", "xpc", (value) =>
       value.replace(
-        "ensure_transport_available(poisoned)?;",
+        "ensure_transport_available(subsystem, poisoned)?;",
         "let _ = poisoned;",
       )],
     ["reply callbacks are unordered", "xpc", (value) =>
