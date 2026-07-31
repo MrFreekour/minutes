@@ -522,8 +522,20 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     let mut output_bytes = 0usize;
     // Structural signal for the paragraph currently being assembled.
     let mut heading_style = false;
+    let mut saw_style = false;
     let mut bold = false;
-    let mut run_sizes: Vec<u32> = Vec::new();
+    // `w:pPrChange`/`w:rPrChange` record the properties a tracked change
+    // replaced. Reading them let a revision record override the live style --
+    // a real Heading1 whose change-record said Normal came out as body, and
+    // the reverse. Paragraph-mark formatting (`w:pPr>w:rPr`) needs no special
+    // case: size is weighted by the characters set in it and a pilcrow
+    // contributes none.
+    let mut skip_depth = 0usize;
+    // Characters set at each size in the paragraph. Weighting by text rather
+    // than by run count is what separates a one-character drop cap from the
+    // seventy characters of body text beside it.
+    let mut size_chars: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    let mut current_run_size: Option<u32> = None;
     let mut body_sizes: Vec<u32> = Vec::new();
     // Parallel to `paragraphs`: (styled_as_heading, bold, largest run size).
     // The size a paragraph must exceed to read as a caption is the document's
@@ -534,39 +546,45 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(event)) => {
                 let name = event.name();
-                match local_name(name.as_ref()) {
+                let local = local_name(name.as_ref());
+                if skip_depth > 0 || matches!(local, b"pPrChange" | b"rPrChange") {
+                    skip_depth += 1;
+                }
+                match local {
                     b"t" => in_text = true,
-                    b"pStyle" => {
+                    b"pStyle" if skip_depth == 0 => {
                         if let Some(value) = attribute_value(&event, b"val") {
+                            saw_style = true;
                             heading_style = is_heading_style(&value);
                         }
                     }
-                    b"sz" => {
+                    b"sz" if skip_depth == 0 => {
                         if let Some(value) = attribute_value(&event, b"val") {
                             if let Ok(size) = value.parse::<u32>() {
-                                run_sizes.push(size);
+                                current_run_size = Some(size);
                             }
                         }
                     }
-                    b"b" => bold = true,
+                    b"b" if skip_depth == 0 => bold = boolean_property(&event),
                     _ => {}
                 }
             }
             Ok(Event::Empty(event)) => match local_name(event.name().as_ref()) {
                 // Run and paragraph properties are usually self-closing.
-                b"pStyle" => {
+                b"pStyle" if skip_depth == 0 => {
                     if let Some(value) = attribute_value(&event, b"val") {
+                        saw_style = true;
                         heading_style = is_heading_style(&value);
                     }
                 }
-                b"sz" => {
+                b"sz" if skip_depth == 0 => {
                     if let Some(value) = attribute_value(&event, b"val") {
                         if let Ok(size) = value.parse::<u32>() {
-                            run_sizes.push(size);
+                            current_run_size = Some(size);
                         }
                     }
                 }
-                b"b" => bold = true,
+                b"b" if skip_depth == 0 => bold = boolean_property(&event),
                 b"tab" => paragraph.push('\t'),
                 b"br" | b"cr" => paragraph.push('\n'),
                 // `<w:p/>` is a self-closing empty paragraph and arrives as
@@ -580,6 +598,9 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                 let decoded = event
                     .decode()
                     .map_err(|_| ConversionError::MalformedSource)?;
+                if let Some(size) = current_run_size {
+                    *size_chars.entry(size).or_default() += decoded.chars().count();
+                }
                 paragraph.push_str(&decoded);
             }
             Ok(Event::GeneralRef(reference)) if in_text => {
@@ -598,15 +619,27 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                 }
             }
             Ok(Event::End(event)) => match local_name(event.name().as_ref()) {
+                b"pPrChange" | b"rPrChange" => skip_depth = skip_depth.saturating_sub(1),
                 b"t" => in_text = false,
+                b"r" => current_run_size = None,
                 b"p" => {
                     let paragraph_style = heading_style;
+                    let paragraph_saw_style = saw_style;
                     let paragraph_bold = bold;
-                    let paragraph_sizes = std::mem::take(&mut run_sizes);
+                    let paragraph_sizes = std::mem::take(&mut size_chars);
+                    current_run_size = None;
                     heading_style = false;
+                    saw_style = false;
                     bold = false;
-                    if !paragraph_style && !paragraph_bold {
-                        body_sizes.extend(paragraph_sizes.iter().copied());
+                    skip_depth = 0;
+                    // One entry per paragraph, not per run: a paragraph split
+                    // into many runs by redlining otherwise outvoted whole
+                    // paragraphs and inverted the median.
+                    if !(paragraph_bold || paragraph_style && paragraph_saw_style) {
+                        let size = dominant_size(&paragraph_sizes);
+                        if size > 0 {
+                            body_sizes.push(size);
+                        }
                     }
                     // Count every <w:p> element, including empty spacers and
                     // paragraphs inside tables. The anchor previously used
@@ -625,10 +658,13 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                         if output_bytes > MAX_OUTPUT_BYTES || paragraphs.len() >= MAX_BLOCKS {
                             return Err(ConversionError::OutputBudgetExceeded);
                         }
+                        // The paragraph's own size is its most common run size,
+                        // not the largest: a 36pt drop cap or a superscript
+                        // otherwise promoted an ordinary sentence to a caption.
                         formatting.push((
-                            paragraph_style,
-                            paragraph_bold,
-                            paragraph_sizes.iter().copied().max().unwrap_or(0),
+                            paragraph_style && paragraph_saw_style,
+                            paragraph_saw_style,
+                            dominant_size(&paragraph_sizes),
                         ));
                         paragraphs.push(ConvertedBlock {
                             source_anchor: format!("paragraph:{paragraph_ordinal:06}"),
@@ -653,8 +689,22 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     // this working across templates.
     body_sizes.sort_unstable();
     let body_size = body_sizes.get(body_sizes.len() / 2).copied().unwrap_or(0);
-    for (block, (styled, _bold, size)) in paragraphs.iter_mut().zip(formatting) {
-        block.is_heading = Some(styled || (body_size > 0 && size > body_size));
+    for (block, (styled_heading, _saw_style, size)) in paragraphs.iter_mut().zip(formatting) {
+        // `None` has to mean "this format reported nothing", or the fallback
+        // is dead. Emitting `Some(false)` whenever no style and no size were
+        // read reported absence of signal as a positive claim of body text,
+        // and a real Word agreement collapsed from 21 provisions to 2 -- one
+        // 93-sentence blob -- because nothing could be a caption and the
+        // lexical rule was never consulted.
+        // A size was read for this paragraph and the document's body size is
+        // known, so it can be classified. Otherwise report no signal.
+        block.is_heading = if styled_heading {
+            Some(true)
+        } else if body_size > 0 && size > 0 {
+            Some(size > body_size)
+        } else {
+            None
+        };
     }
 
     Ok(ConvertedDocument {
@@ -670,6 +720,25 @@ fn attribute_value(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8]) -> 
         (local_name(attribute.key.as_ref()) == wanted)
             .then(|| String::from_utf8_lossy(&attribute.value).into_owned())
     })
+}
+
+/// The size a paragraph is actually set in: its most common run size.
+fn dominant_size(sizes: &std::collections::BTreeMap<u32, usize>) -> u32 {
+    sizes
+        .iter()
+        .max_by_key(|(size, chars)| (**chars, **size))
+        .map(|(size, _)| *size)
+        .unwrap_or(0)
+}
+
+/// An OOXML boolean property. `<w:b/>` is on, but `<w:b w:val="0"/>` is off --
+/// Word writes the latter constantly to override a bold style, and reading it
+/// as on excluded those paragraphs from the body-size sample.
+fn boolean_property(event: &quick_xml::events::BytesStart<'_>) -> bool {
+    match attribute_value(event, b"val") {
+        Some(value) => !matches!(value.as_str(), "0" | "false" | "off"),
+        None => true,
+    }
 }
 
 /// Whether a `w:pStyle` value names one of Word's heading styles.
@@ -971,6 +1040,91 @@ mod tests {
         assert_eq!(
             document.blocks[1].text,
             "Confidential Information & affiliate data."
+        );
+    }
+
+    #[test]
+    fn docx_reports_no_signal_rather_than_claiming_body_text() {
+        // The regression this guards: emitting Some(false) whenever no style
+        // and no size were read reported absence of signal as a positive
+        // claim of body text, which killed the lexical fallback for every
+        // DOCX. A real Word agreement collapsed from 21 provisions to 2 --
+        // one 93-sentence blob -- and answerable clauses went from 11 to 1.
+        //
+        // These are the template shapes that produce no direct formatting:
+        // sizes living in styles.xml, a custom firm style, uniform sizing.
+        for (label, body) in [
+            (
+                "no direct size anywhere",
+                r#"<w:p><w:r><w:t>7. CONFIDENTIALITY</w:t></w:r></w:p>
+                   <w:p><w:r><w:t>Recipient shall not disclose.</w:t></w:r></w:p>"#,
+            ),
+            (
+                "custom firm style, not a Word heading style",
+                r#"<w:p><w:pPr><w:pStyle w:val="ArticleHeading"/></w:pPr><w:r><w:t>7. CONFIDENTIALITY</w:t></w:r></w:p>
+                   <w:p><w:r><w:t>Recipient shall not disclose.</w:t></w:r></w:p>"#,
+            ),
+        ] {
+            let bytes = synthetic_docx(&format!(
+                r#"<w:document xmlns:w="urn:test"><w:body>{body}</w:body></w:document>"#
+            ));
+            let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+            for block in &document.blocks {
+                assert_eq!(
+                    block.is_heading, None,
+                    "{label}: absence of signal must be reported as None so the \
+                     lexical fallback still runs, got {:?} for {:?}",
+                    block.is_heading, block.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn docx_bold_off_and_tracked_changes_do_not_invert_the_signal() {
+        // `<w:b w:val="0"/>` means NOT bold; reading it as bold excluded
+        // those paragraphs from the body-size sample and collapsed the
+        // document. `w:pPrChange` records the properties a tracked change
+        // replaced -- reading it let a revision record override the live
+        // style, inverting the flag in both directions.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/><w:pPrChange><w:pPr><w:pStyle w:val="Normal"/></w:pPr></w:pPrChange></w:pPr><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>7. CONFIDENTIALITY</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/><w:b w:val="0"/></w:rPr><w:t>Recipient shall not disclose the information.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/><w:b w:val="0"/></w:rPr><w:t>These duties survive termination of the agreement.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        let marked = |needle: &str| {
+            document
+                .blocks
+                .iter()
+                .find(|block| block.text.contains(needle))
+                .and_then(|block| block.is_heading)
+        };
+        // The live style wins over the change record.
+        assert_eq!(marked("CONFIDENTIALITY"), Some(true));
+        // Bold-off paragraphs still count as body, so the sample is not empty.
+        assert_eq!(marked("shall not disclose"), Some(false));
+    }
+
+    #[test]
+    fn docx_a_drop_cap_does_not_promote_an_ordinary_sentence() {
+        // The paragraph's size is its most common run size, not its largest:
+        // a 36pt drop cap made an operative sentence a caption, and the clause
+        // beneath it was filed underneath that sentence.
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:r><w:rPr><w:sz w:val="72"/></w:rPr><w:t>N</w:t></w:r><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>otwithstanding the foregoing, disclosure compelled by law is permitted.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>Recipient shall give prompt notice.</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>These duties survive termination.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        assert_eq!(
+            document.blocks[0].is_heading,
+            Some(false),
+            "a drop cap must not promote an operative sentence to a caption"
         );
     }
 
