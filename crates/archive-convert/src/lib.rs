@@ -555,7 +555,7 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                     skip_depth += 1;
                 }
                 match local {
-                    b"t" => in_text = true,
+                    b"t" if skip_depth == 0 => in_text = true,
                     b"pStyle" if skip_depth == 0 => {
                         if let Some(value) = attribute_value(&event, b"val") {
                             saw_style = true;
@@ -627,6 +627,13 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             // name left it stuck above zero for the rest of the paragraph,
             // silently suppressing the live style and size.
             Ok(Event::End(event)) if skip_depth > 0 => {
+                // `in_text` must not survive the record either: leaving it set
+                // appended every later text node inside the record to the
+                // paragraph, putting text into an evidence card at an anchor
+                // where the document shows nothing.
+                if local_name(event.name().as_ref()) == b"t" {
+                    in_text = false;
+                }
                 skip_depth -= 1;
                 if local_name(event.name().as_ref()) == b"p" {
                     skip_depth = 0;
@@ -731,15 +738,31 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
         // `None` here means the file did not distinguish this paragraph, and
         // the caller falls back. That makes the signal strictly additive: it
         // can only improve on the heuristic, never replace it with silence.
-        block.is_heading = if styled_heading || (body_size > 0 && size > body_size) {
-            Some(true)
-        } else if body_size > 0 && size > 0 && size < body_size {
-            // Smaller than body text: footnotes and fine print are not
-            // captions, and saying so suppresses a heuristic false positive.
-            Some(false)
-        } else {
-            None
-        };
+        // Only a named heading style, or text set clearly larger than the
+        // body, is a verdict. Everything else is `None`.
+        //
+        // Two earlier attempts reported absence of distinction as a positive
+        // claim, first at `size == body_size` and then at the inequalities.
+        // Smaller-than-body was read as "not a caption", which silenced the
+        // lexical fallback across a 9pt exhibit and took its indemnity,
+        // survival and governing-law clauses from one evidence card each to
+        // none -- the exhibit welded into a single ten-sentence blob. Being
+        // smaller than the body means the file marked it as fine print, not
+        // that the file said it is body text.
+        //
+        // A bare `>` was also too eager: a clause pasted at 12pt into an 11pt
+        // agreement was promoted, which severed it from its own caption and
+        // took a conjunctive query -- one concept in the caption, one in the
+        // body -- from one card to none. The margin is two points, expressed
+        // in the half-points OOXML uses, so an incidental size difference
+        // from a paste or a rider is not read as document structure.
+        const HEADING_SIZE_MARGIN: u32 = 4;
+        block.is_heading =
+            if styled_heading || (body_size > 0 && size >= body_size + HEADING_SIZE_MARGIN) {
+                Some(true)
+            } else {
+                None
+            };
     }
 
     Ok(ConvertedDocument {
