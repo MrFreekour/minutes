@@ -32,6 +32,8 @@ jobs:
         run: |
           node scripts/check_signed_acceptance_policy.mjs
           node scripts/check_signed_acceptance_policy.test.mjs
+          node scripts/check_signed_archive_acceptance_policy.mjs
+          node scripts/check_signed_archive_acceptance_policy.test.mjs
 
       - name: Check graph worker packaging parity
         run: |
