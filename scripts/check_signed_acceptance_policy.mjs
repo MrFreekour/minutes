@@ -7,9 +7,9 @@ import { readFileSync } from "node:fs";
 // boundary and secret-bearing job. Raw regex matches are intentionally not the
 // authority: these goldens make comment/dead-step duplication fail closed.
 const EXPECTED_SIGNING_JOB_SHA256 =
-  "f29213abf408b5e69a381bfbefef7db4896368c1369d8acc38f09f8442c41aad";
+  "4a5aa3f4aead6d336e57fa862085bffb594940923e93d8f58fab9cae962ef310";
 const EXPECTED_PRE_SIGNING_BOUNDARY_SHA256 =
-  "f532d4e841a4be222ccec24b029a4a8f413dcfe6f4688c621475dace9c54c2e6";
+  "c6fb10e1051bd745f737d4718ad949b9b1a01b585702bfecf354be752ff2e278";
 const EXPECTED_TRIGGER_BLOCK = `on:
   workflow_dispatch:
     inputs:
@@ -83,11 +83,45 @@ if (!signingJobFixture) {
     /signed parent is not bound to the exact graph worker/,
     "signed acceptance must verify the final parent-to-helper binding",
   );
+  requirePattern(
+    /apple_speech_worker_bundle="\$app\/Contents\/XPCServices\/com\.useminutes\.apple-speech-worker\.xpc"[\s\S]*?test ! -e "\$app\/Contents\/MacOS\/minutes-apple-speech-worker"[\s\S]*?--entitlements payload\/apple-speech-worker-entitlements\.plist[\s\S]*?--identifier com\.useminutes\.apple-speech-worker[\s\S]*?--sign "\$MINUTES_DEV_SIGNING_IDENTITY" "\$apple_speech_worker_bundle"/,
+    "the nested Apple Speech XPC service must receive only its dedicated App Sandbox identity",
+  );
+  requirePattern(
+    /apple-speech-worker-entitlements\.actual\.plist[\s\S]*?expected = \{"com\.apple\.security\.app-sandbox": True\}[\s\S]*?actual != expected/,
+    "signed acceptance must enforce the Apple Speech worker's exact one-key entitlement allowlist",
+  );
+  requirePattern(
+    /minutes-apple-speech-worker\.cdhash[\s\S]*?observed_apple_cdhash[\s\S]*?test "\$expected_apple_cdhash" = "\$observed_apple_cdhash"/,
+    "signed acceptance must seal and verify the Apple Speech worker's exact CodeDirectory hash",
+  );
+  requirePattern(
+    /MINUTES_APPLE_SPEECH_WORKER_CDHASH_V1=[\s\S]*?contents\.count\(marker\) != 1[\s\S]*?invalid prior parent Apple Speech worker seal[\s\S]*?os\.fsync/,
+    "signed acceptance must bind one exact Apple Speech worker hash into the parent before outer signing",
+  );
+  requirePattern(
+    /signed parent is not bound to the exact Apple Speech worker/,
+    "signed acceptance must verify the final parent-to-Apple-Speech-worker binding",
+  );
 }
 
-const signingJob = source.match(
-  /^  sign-reviewed-artifact:\n([\s\S]*)$/m,
-)?.[1];
+const signingJobMarker = "  sign-reviewed-artifact:\n";
+const signingJobStart = source.indexOf(signingJobMarker);
+const signingJobTail =
+  signingJobStart >= 0
+    ? source.slice(signingJobStart + signingJobMarker.length)
+    : "";
+const nextJobOffset = signingJobTail.search(/^  [a-z][a-z0-9-]*:\n/m);
+const signingJob =
+  signingJobStart < 0
+    ? undefined
+    : nextJobOffset >= 0
+      ? signingJobTail.slice(0, nextJobOffset).replace(/\n$/, "")
+      : signingJobTail;
+const afterSigningJob =
+  signingJobStart >= 0 && nextJobOffset >= 0
+    ? signingJobTail.slice(nextJobOffset)
+    : "";
 if (!signingJob) {
   errors.push("could not isolate the secret-bearing signing job");
 } else {
@@ -135,6 +169,13 @@ if (!signingJob) {
 }
 
 if (!signingJobFixture) {
+  requirePattern(
+    /^  run-signed-runtime:\n[\s\S]*?needs:\n\s+- authorize-candidate\n\s+- sign-reviewed-artifact[\s\S]*?refs\/tags\/acceptance-\$\{\{ needs\.authorize-candidate\.outputs\.candidate_sha \}\}\n\s+fetch-depth: 1\n\s+persist-credentials: false[\s\S]*?test_apple_speech_signed_transport\.py[\s\S]*?signed-runtime-provenance\.json/m,
+    "signed Apple Speech runtime acceptance must run in a no-secret successor job against the exact protected candidate",
+  );
+  if (SECRET_CONTEXT_EXPRESSION.test(afterSigningJob)) {
+    errors.push("post-signing runtime jobs must not receive signing secrets");
+  }
   const beforeSigningJob = source.split(/^  sign-reviewed-artifact:\n/m, 1)[0];
   if (SECRET_CONTEXT_EXPRESSION.test(beforeSigningJob)) {
     errors.push("signing secrets must not be exposed to candidate authorization or build jobs");
