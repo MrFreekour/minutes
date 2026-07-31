@@ -108,7 +108,7 @@ pub fn approve_roots(roots: &[PathBuf]) -> Result<Vec<ApprovedRoot>, CensusError
         return Err(CensusError::TooManyRoots);
     }
 
-    let canonical_home = dirs::home_dir().and_then(|path| fs::canonicalize(path).ok());
+    let home_ancestor_identities = broad_root_identities();
     let mut approved = Vec::with_capacity(roots.len());
 
     for (index, root) in roots.iter().enumerate() {
@@ -129,16 +129,21 @@ pub fn approve_roots(roots: &[PathBuf]) -> Result<Vec<ApprovedRoot>, CensusError
         if !metadata.is_dir() {
             return Err(CensusError::RootNotDirectory { location });
         }
-        if resolved.parent().is_none()
-            || canonical_home
-                .as_ref()
-                .is_some_and(|home| home == &resolved)
-        {
+        let identity = std_metadata_identity(&metadata, &resolved);
+        // Compare identities, not canonical path strings. On macOS
+        // /System/Volumes/Data/Users/<user> is a firmlink, not a symlink, so
+        // `canonicalize` does not reduce it: the home directory reached that
+        // way has a different path string but the same device and inode, and
+        // a string comparison approved it. Refusing every ancestor of home by
+        // identity also covers /Users and /System/Volumes/Data, which are
+        // strictly broader than the home directory this is meant to refuse
+        // and are both reachable from the native folder picker.
+        if resolved.parent().is_none() || home_ancestor_identities.contains(&identity) {
             return Err(CensusError::RootTooBroad { location });
         }
 
         approved.push(ApprovedRoot {
-            identity: std_metadata_identity(&metadata, &resolved),
+            identity,
             canonical_path: resolved,
         });
     }
@@ -164,18 +169,72 @@ pub fn validate_approved_roots(roots: &[ApprovedRoot]) -> Result<(), CensusError
     }
     for left in 0..roots.len() {
         for right in (left + 1)..roots.len() {
-            if roots[left]
-                .canonical_path
-                .starts_with(&roots[right].canonical_path)
-                || roots[right]
-                    .canonical_path
-                    .starts_with(&roots[left].canonical_path)
+            // Containment is decided by walking real parent identities, not
+            // by `starts_with` on canonical path strings. Two roots can be
+            // parent and child on disk while sharing no path prefix, because
+            // a firmlinked path is canonical but not reduced -- the duplicate
+            // check above misses them too, since the firmlink and its target
+            // are distinct inodes. Overlapping roots make the census
+            // double-count every artifact in the intersection.
+            if root_contains(&roots[left], &roots[right])
+                || root_contains(&roots[right], &roots[left])
             {
                 return Err(CensusError::OverlappingRoots);
             }
         }
     }
     Ok(())
+}
+
+/// Collects the identities of every directory that contains the user's home
+/// directory, and so is too broad to approve as a root.
+///
+/// Walking up from the canonical home alone is not sufficient on macOS. The
+/// canonical home is `/Users/<user>`, whose ancestors are only `/Users` and
+/// `/` -- but the same directory is also reachable as
+/// `/System/Volumes/Data/Users/<user>`, and `/System/Volumes/Data` has its own
+/// inode that never appears in the canonical chain. `canonicalize` does not
+/// traverse firmlinks, so that parallel spelling has to be walked explicitly
+/// or the whole data volume stays approvable.
+fn broad_root_identities() -> HashSet<FileIdentity> {
+    let mut identities = HashSet::new();
+    let Some(home) = dirs::home_dir().and_then(|path| fs::canonicalize(path).ok()) else {
+        return identities;
+    };
+    identities.extend(ancestor_identities(&home));
+    for prefix in FIRMLINK_VOLUME_PREFIXES {
+        let spelling = Path::new(prefix).join(home.strip_prefix("/").unwrap_or(&home));
+        if fs::metadata(&spelling).is_ok() {
+            identities.extend(ancestor_identities(&spelling));
+        }
+    }
+    identities
+}
+
+/// Volume prefixes through which the home directory is reachable without
+/// `canonicalize` reducing the path.
+const FIRMLINK_VOLUME_PREFIXES: &[&str] = &["/System/Volumes/Data"];
+
+/// Collects the identity of `start` and of every ancestor directory above it.
+fn ancestor_identities(start: &Path) -> HashSet<FileIdentity> {
+    let mut identities = HashSet::new();
+    let mut current = Some(start.to_path_buf());
+    while let Some(path) = current {
+        if let Ok(metadata) = fs::metadata(&path) {
+            identities.insert(std_metadata_identity(&metadata, &path));
+        }
+        current = match path.parent() {
+            Some(parent) if parent != path => Some(parent.to_path_buf()),
+            _ => None,
+        };
+    }
+    identities
+}
+
+/// Reports whether `ancestor` is `descendant` or contains it on disk,
+/// comparing device and inode rather than path text.
+fn root_contains(ancestor: &ApprovedRoot, descendant: &ApprovedRoot) -> bool {
+    ancestor_identities(&descendant.canonical_path).contains(&ancestor.identity)
 }
 
 /// Compatibility helper for trusted native diagnostics.
@@ -731,7 +790,19 @@ fn extension_for_name(name: &OsStr) -> String {
     {
         return "<other>".to_string();
     }
-    format!(".{extension}")
+    // Only emit extensions the format taxonomy actually recognizes. A
+    // character-class check is not sufficient: legal filing conventions put
+    // the client or matter after the final dot -- "Ltr to A.Weinstein",
+    // "Retainer.Rothschild", "Pleading.SMITH2024" -- and every one of those
+    // tails satisfies the character class. Emitting them verbatim writes
+    // client surnames and matter codes into a census report whose stated
+    // purpose is to be shareable, and which attests `filenames_emitted:
+    // false`. Anything outside the taxonomy is reported as `<other>`.
+    let candidate = format!(".{extension}");
+    if category_for_extension(&candidate) == "other" {
+        return "<other>".to_string();
+    }
+    candidate
 }
 
 fn package_category(extension: &str) -> Option<&'static str> {
@@ -819,6 +890,123 @@ mod tests {
             &AtomicBool::new(false),
         )
         .expect("synthetic census")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn firmlinked_home_and_its_ancestors_are_refused_as_roots() {
+        // /System/Volumes/Data/Users/<user> is a firmlink, not a symlink, so
+        // `canonicalize` does not reduce it to /Users/<user>. Comparing
+        // canonical path strings therefore approved the home directory by the
+        // firmlinked spelling, and approved /Users and /System/Volumes/Data
+        // outright even though both are broader than the home directory the
+        // check exists to refuse.
+        let Some(home) = dirs::home_dir().and_then(|path| fs::canonicalize(path).ok()) else {
+            return;
+        };
+        let firmlinked_home =
+            PathBuf::from("/System/Volumes/Data").join(home.strip_prefix("/").unwrap_or(&home));
+
+        for candidate in [
+            home.clone(),
+            firmlinked_home,
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data"),
+        ] {
+            if fs::metadata(&candidate).is_err() {
+                continue;
+            }
+            let result = approve_roots(std::slice::from_ref(&candidate));
+            assert!(
+                matches!(result, Err(CensusError::RootTooBroad { .. })),
+                "{} must be refused as too broad, got {result:?}",
+                candidate.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn roots_overlapping_only_through_a_firmlink_are_refused() {
+        let Some(home) = dirs::home_dir().and_then(|path| fs::canonicalize(path).ok()) else {
+            return;
+        };
+        let parent = home.join("Sites");
+        if fs::metadata(&parent).is_err() {
+            return;
+        }
+        let Some(child) = fs::read_dir(&parent).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .find(|entry| entry.path().is_dir())
+                .map(|entry| entry.path())
+        }) else {
+            return;
+        };
+        // Same child directory, reached through the data-volume firmlink:
+        // a different inode and a disjoint path prefix, so neither the
+        // duplicate check nor `starts_with` saw the containment.
+        let firmlinked_child =
+            PathBuf::from("/System/Volumes/Data").join(child.strip_prefix("/").unwrap_or(&child));
+        if fs::metadata(&firmlinked_child).is_err() {
+            return;
+        }
+        let result = approve_roots(&[parent.clone(), firmlinked_child.clone()]);
+        assert!(
+            matches!(result, Err(CensusError::OverlappingRoots)),
+            "{} and {} overlap on disk and must be refused, got {result:?}",
+            parent.display(),
+            firmlinked_child.display()
+        );
+    }
+
+    #[test]
+    fn census_never_emits_unrecognized_extensions_from_legal_filing_names() {
+        // Legal filing conventions put the client or matter after the final
+        // dot. Every one of these tails satisfies a lowercase-alphanumeric
+        // character class, so a character-class check emitted them verbatim
+        // into a report that attests `filenames_emitted: false`.
+        let temp = TempDir::new().expect("temp");
+        let root = synthetic_root(&temp, "legal-naming");
+        let identifying = [
+            "Ltr to A.Weinstein",
+            "Retainer.Rothschild",
+            "Notice of Deposition - R.Kelly",
+            "Estate Plan.oconnor",
+            "Pleading.SMITH2024",
+            "Trust.baxter",
+        ];
+        for name in identifying {
+            fs::write(root.join(name), b"x").expect("write");
+        }
+        // A recognized format must still be reported, so the fix cannot be
+        // "report nothing".
+        fs::write(root.join("brief.pdf"), b"x").expect("pdf");
+
+        let report = scan(&root);
+        let serialized = serde_json::to_string(&report).expect("serialize");
+        let lowered = serialized.to_lowercase();
+        for name in identifying {
+            let tail = name.rsplit('.').next().expect("tail").to_lowercase();
+            assert!(
+                !lowered.contains(&tail),
+                "census export leaked the identifying tail {tail:?} from {name:?}: {serialized}"
+            );
+        }
+        assert!(
+            report
+                .formats
+                .iter()
+                .any(|format| format.extension == ".pdf"),
+            "recognized formats must still be reported: {serialized}"
+        );
+        assert!(
+            report
+                .formats
+                .iter()
+                .any(|format| format.extension == "<other>"),
+            "unrecognized extensions must collapse into <other>: {serialized}"
+        );
     }
 
     #[test]

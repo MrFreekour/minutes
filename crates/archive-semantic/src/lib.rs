@@ -595,11 +595,46 @@ pub fn run_worker_process(operation: &str) -> i32 {
 
 fn sandbox_self_test() -> i32 {
     let network_denied = std::net::TcpListener::bind("127.0.0.1:0").is_err();
-    let filesystem_denied = std::fs::read("/etc/passwd").is_err();
-    if network_denied && filesystem_denied {
+    // Probe paths the profile never names. The previous test read
+    // /etc/passwd, which passed only because that exact literal had been
+    // added as a deny -- it could not detect that everything outside three
+    // subtrees was still readable and writable. These probes are chosen so
+    // that a regression to `(allow default)` fails the test.
+    let unnamed_read_denied = std::fs::read("/private/etc/hosts").is_err()
+        && std::fs::read_dir("/Applications").is_err()
+        && std::fs::read_dir("/Library").is_err();
+    // The worker must not be able to persist document-derived text anywhere.
+    let write_denied = ["/private/tmp", "/private/var/tmp"]
+        .iter()
+        .all(|directory| {
+            let probe = std::path::Path::new(directory).join("minutes-archive-sandbox-probe");
+            let denied = std::fs::write(&probe, b"probe").is_err();
+            if !denied {
+                let _ = std::fs::remove_file(&probe);
+            }
+            denied
+        })
+        && std::env::temp_dir()
+            .join("minutes-archive-sandbox-probe")
+            .pipe_write_denied();
+    if network_denied && unnamed_read_denied && write_denied {
         0
     } else {
         71
+    }
+}
+
+trait ProbeWriteDenied {
+    fn pipe_write_denied(&self) -> bool;
+}
+
+impl ProbeWriteDenied for std::path::PathBuf {
+    fn pipe_write_denied(&self) -> bool {
+        let denied = std::fs::write(self, b"probe").is_err();
+        if !denied {
+            let _ = std::fs::remove_file(self);
+        }
+        denied
     }
 }
 
@@ -692,11 +727,27 @@ fn install_platform_sandbox() -> Result<(), SemanticError> {
         fn sandbox_free_error(error_buffer: *mut c_char);
     }
 
+    // Deny by default. The previous profile was `(allow default)` with a few
+    // subpath denies, which left the whole filesystem outside /Users,
+    // /Volumes and /Network readable AND writable -- including $TMPDIR and
+    // /private/tmp -- while this worker receives verbatim privileged
+    // provision text. Reads are allowed only where Apple's built-in
+    // NLEmbedding model and the dyld shared cache live; no write anywhere on
+    // the filesystem is permitted, so document-derived text cannot be
+    // persisted from here at all.
     const PROFILE: &CStr = c"(version 1)
-(allow default)
+(deny default)
 (deny network*)
-(deny file-read* (subpath \"/Users\") (subpath \"/Volumes\") (subpath \"/Network\") (literal \"/etc/passwd\") (literal \"/private/etc/passwd\"))
-(deny file-write* (subpath \"/Users\") (subpath \"/Volumes\") (subpath \"/Network\"))
+(allow process-info-pidinfo (target self))
+(allow sysctl-read)
+(allow mach-lookup)
+(allow file-read-metadata)
+(allow file-read* (subpath \"/System\"))
+(allow file-read* (subpath \"/usr/lib\"))
+(allow file-read* (subpath \"/usr/share\"))
+(allow file-read-data (subpath \"/dev/fd\"))
+(allow file-read-data (literal \"/dev/urandom\") (literal \"/dev/random\"))
+(allow file-write-data (subpath \"/dev/fd\"))
 ";
     let mut error_buffer = ptr::null_mut();
     let status = unsafe { sandbox_init(PROFILE.as_ptr(), 0, &mut error_buffer) };
