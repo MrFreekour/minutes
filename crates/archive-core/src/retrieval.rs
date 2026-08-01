@@ -5,7 +5,7 @@
 //! filesystem path. Source ingestion and revision revalidation happen outside
 //! the index; every search supplies the currently authorized source revisions.
 
-use minutes_archive_convert::{AnchorFlow, ConvertedDocument, SourceFormat};
+use minutes_archive_convert::{ConvertedDocument, SourceFormat};
 use minutes_archive_semantic::{
     cosine_similarity, SemanticModelMetadata, APPLE_ENGLISH_SENTENCE_DIMENSION,
 };
@@ -220,20 +220,24 @@ fn segment_anchored_blocks(
     let mut body_anchor = None::<String>;
     let mut body = Vec::<String>::new();
 
-    // `orphan_pending_heading` is false on page-boundary flushes. Every PDF
-    // block is a HardBoundary, so flush runs at the start and end of every
-    // page; orphaning there severed a caption that fell at a page break from
-    // the clause continuing on the next page. The caption shipped as its own
-    // provision at the wrong page and the clause went headless -- and where
-    // its body did not repeat the term, unfindable. Keep the heading pending
-    // across page boundaries; orphan only when a new heading displaces it or
-    // the document ends.
+    // A page boundary is layout, not structure. It used to flush, which
+    // finalized whatever clause was mid-sentence at the bottom of a page: the
+    // continuation on the next page opened a fresh, headless provision, so a
+    // same-provision query for terms split either side of the break matched
+    // nothing. Preserving only a pending *heading* across the boundary fixed
+    // the rare shape (a caption alone at the foot of a page) and left the
+    // common one broken, because a wrapped body is what PDFs do constantly.
+    // Only a heading or the end of the document closes a provision now.
+    //
+    // The cost is that a PDF with no detectable heading anywhere becomes one
+    // provision instead of one per page. Those documents cannot answer a
+    // sentence-bounded query at page granularity either, so nothing findable
+    // was traded away.
     let flush = |segments: &mut Vec<(Option<String>, String, String)>,
                  heading: &mut Option<String>,
                  heading_anchor: &mut Option<String>,
                  body_anchor: &mut Option<String>,
-                 body: &mut Vec<String>,
-                 orphan_pending_heading: bool| {
+                 body: &mut Vec<String>| {
         let joined = body
             .iter()
             .map(|line| line.trim())
@@ -241,10 +245,6 @@ fn segment_anchored_blocks(
             .collect::<Vec<_>>()
             .join(" ");
         if joined.is_empty() {
-            if !orphan_pending_heading {
-                body.clear();
-                return;
-            }
             // Same defect the text segmenter had: a promoted heading with no
             // following body was dropped and, because `heading.take()` never
             // ran, carried forward onto the next segment. This twin handles
@@ -270,16 +270,6 @@ fn segment_anchored_blocks(
     };
 
     for block in &converted.blocks {
-        if block.flow == AnchorFlow::HardBoundary {
-            flush(
-                &mut segments,
-                &mut heading,
-                &mut heading_anchor,
-                &mut body_anchor,
-                &mut body,
-                false,
-            );
-        }
         // The document's own structure decides, when it reports any. A DOCX
         // paragraph styled Heading1, or set larger than the document's body
         // text, is a caption regardless of how its words read -- and an
@@ -318,7 +308,6 @@ fn segment_anchored_blocks(
                     &mut heading_anchor,
                     &mut body_anchor,
                     &mut body,
-                    true,
                 );
                 heading = Some(caption);
                 heading_anchor = Some(block.source_anchor.clone());
@@ -328,16 +317,6 @@ fn segment_anchored_blocks(
                     body_anchor = Some(block.source_anchor.clone());
                 }
                 body.push(remainder.join(" "));
-            }
-            if block.flow == AnchorFlow::HardBoundary {
-                flush(
-                    &mut segments,
-                    &mut heading,
-                    &mut heading_anchor,
-                    &mut body_anchor,
-                    &mut body,
-                    false,
-                );
             }
             continue;
         }
@@ -357,7 +336,6 @@ fn segment_anchored_blocks(
                     &mut heading_anchor,
                     &mut body_anchor,
                     &mut body,
-                    true,
                 );
                 heading = Some(trimmed.to_string());
                 heading_anchor = Some(block.source_anchor.clone());
@@ -371,16 +349,6 @@ fn segment_anchored_blocks(
                 return Err(RetrievalError::TooManyProvisions);
             }
         }
-        if block.flow == AnchorFlow::HardBoundary {
-            flush(
-                &mut segments,
-                &mut heading,
-                &mut heading_anchor,
-                &mut body_anchor,
-                &mut body,
-                false,
-            );
-        }
     }
     flush(
         &mut segments,
@@ -388,7 +356,6 @@ fn segment_anchored_blocks(
         &mut heading_anchor,
         &mut body_anchor,
         &mut body,
-        true,
     );
     if segments.is_empty() {
         return Err(RetrievalError::InvalidDocumentText);
@@ -1731,6 +1698,7 @@ fn document_why_matched(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minutes_archive_convert::AnchorFlow;
 
     fn vault() -> VaultId {
         VaultId::parse("peter-pilot").expect("vault")
@@ -1983,13 +1951,13 @@ mod tests {
             vec![
                 (
                     None,
-                    "page:000001",
+                    "page:0001",
                     "7. Confidentiality",
                     AnchorFlow::HardBoundary,
                 ),
                 (
                     None,
-                    "page:000002",
+                    "page:0002",
                     "Recipient shall protect Confidential Information.",
                     AnchorFlow::HardBoundary,
                 ),
@@ -2017,7 +1985,56 @@ mod tests {
             "Recipient shall protect Confidential Information."
         );
         // The anchor cites where the clause body is, not where its caption was.
-        assert_eq!(normalized.provisions[0].anchor, "page:000002/section:0001");
+        assert_eq!(normalized.provisions[0].anchor, "page:0002/section:0001");
+    }
+
+    #[test]
+    fn a_clause_whose_body_wraps_a_page_break_stays_one_provision() {
+        // The common shape. A caption sitting alone at the bottom of a page is
+        // rare; a clause body wrapping a page is what PDFs do constantly. If
+        // the boundary finalizes the half-clause, the continuation opens a
+        // fresh headless provision and a same-provision query for terms split
+        // either side of the break matches nothing.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "7. Confidentiality\nRecipient shall protect Confidential Information and",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "shall not disclose it to any third party. This obligation survives termination.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("wrapped-clause").expect("id"),
+            "Wrapped Clause",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        assert_eq!(
+            normalized.provisions.len(),
+            1,
+            "the page break split one clause into two provisions"
+        );
+        assert_eq!(
+            normalized.provisions[0].heading.as_deref(),
+            Some("7. Confidentiality")
+        );
+        assert_eq!(
+            normalized.provisions[0].text,
+            "Recipient shall protect Confidential Information and shall not disclose it to any third party. This obligation survives termination."
+        );
+        // The citation points at where the provision begins, not where it ended.
+        assert_eq!(normalized.provisions[0].anchor, "page:0001/section:0001");
     }
 
     #[test]
@@ -2089,13 +2106,15 @@ mod tests {
 
     #[test]
     fn a_converted_document_with_no_text_is_rejected_rather_than_indexed_empty() {
-        let converted = anchored(
-            SourceFormat::Pdf,
-            vec![
-                (None, "page:000001", "   \n\t\n", AnchorFlow::HardBoundary),
-                (None, "page:000002", "", AnchorFlow::HardBoundary),
-            ],
-        );
+        // `convert_pdf` normalizes each page and skips it when nothing is
+        // left, so a scanned document reaches this function as an empty block
+        // list carrying `ocr_required_or_no_extractable_text` -- not as blocks
+        // of whitespace. Assert against the shape the converter can produce.
+        let converted = ConvertedDocument {
+            format: SourceFormat::Pdf,
+            blocks: Vec::new(),
+            warnings: vec!["ocr_required_or_no_extractable_text".to_string()],
+        };
         let error = normalize_converted_document(
             DocumentId::parse("blank-scan").expect("id"),
             "Blank Scan",
