@@ -12,7 +12,7 @@ use minutes_archive_semantic::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 pub const MAX_NORMALIZED_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
@@ -211,21 +211,92 @@ pub fn normalize_converted_document(
     })
 }
 
+/// A trailing line reduced to its shape, so page-varying footers collide.
+///
+/// "Page 3 of 12" and "Page 4 of 12" are the same running footer; so are the
+/// Bates stamps ACME-00001234 and ACME-00001235.
+fn footer_shape(line: &str) -> String {
+    line.trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_digit() {
+                '#'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// The running headers and footers a document repeats on every page.
+///
+/// Judging a page by its last character read the footer, not the prose.
+/// `pdf_extract` emits text in content-stream order and every mainstream
+/// producer draws the running footer last, so "Page 3 of 12" ends the block
+/// and '2' is not a terminator -- every page looked like it wrapped, and a
+/// footered contract collapsed into one provision. That took back every
+/// regression the soft boundary exists to prevent: same-provision matches
+/// assembled across pages, anchors quoting pages they do not name, provisions
+/// past the semantic input budget, and no per-page cap on excerpt size.
+///
+/// A footer repeats and a clause does not, which is a document-level signal
+/// rather than another guess about what a line looks like.
+fn running_boilerplate(converted: &ConvertedDocument) -> HashSet<String> {
+    let mut counts = HashMap::<String, usize>::new();
+    for block in &converted.blocks {
+        if block.flow != AnchorFlow::HardBoundary {
+            continue;
+        }
+        // Only the last few lines of a page can be a running footer.
+        for line in block
+            .text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .take(2)
+        {
+            *counts.entry(footer_shape(line)).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(shape, seen)| *seen > 1 && !shape.is_empty())
+        .map(|(shape, _)| shape)
+        .collect()
+}
+
 /// Whether a converted block stops mid-sentence and therefore continues.
 ///
 /// A page boundary is layout, not structure, but it is not nothing either. A
 /// page that ends on a terminator ended a clause; a page that stops mid-clause
-/// is a provision wrapping onto the next one.
-fn block_wraps_to_next_page(text: &str) -> bool {
-    match text.trim_end().chars().next_back() {
-        Some(last) => !matches!(last, '.' | '!' | '?' | ':' | ';' | '"' | '\'' | ')' | ']'),
-        None => false,
+/// is a provision wrapping onto the next one. The verdict is taken from the
+/// last line of prose, ignoring any running boilerplate drawn beneath it.
+///
+/// ':' and ';' are deliberately NOT terminators here: in a contract a colon at
+/// the foot of a page is a lead-in to a list that continues overleaf, and
+/// treating it as complete severed the lead-in from its own list.
+fn block_wraps_to_next_page(text: &str, boilerplate: &HashSet<String>) -> bool {
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() || boilerplate.contains(&footer_shape(line)) {
+            continue;
+        }
+        return !matches!(
+            line.chars().next_back(),
+            Some('.') | Some('!') | Some('?') | Some('"') | Some('\'') | Some(')') | Some(']')
+        );
     }
+    false
 }
 
 fn segment_anchored_blocks(
     converted: &ConvertedDocument,
 ) -> Result<Vec<NormalizedProvision>, RetrievalError> {
+    let boilerplate = running_boilerplate(converted);
     let mut segments = Vec::<(Option<String>, String, String)>::new();
     let mut heading = None::<String>;
     let mut heading_anchor = None::<String>;
@@ -336,7 +407,9 @@ fn segment_anchored_blocks(
                 }
                 body.push(remainder.join(" "));
             }
-            if block.flow == AnchorFlow::HardBoundary && !block_wraps_to_next_page(&block.text) {
+            if block.flow == AnchorFlow::HardBoundary
+                && !block_wraps_to_next_page(&block.text, &boilerplate)
+            {
                 flush(
                     &mut segments,
                     &mut heading,
@@ -379,7 +452,9 @@ fn segment_anchored_blocks(
             }
         }
 
-        if block.flow == AnchorFlow::HardBoundary && !block_wraps_to_next_page(&block.text) {
+        if block.flow == AnchorFlow::HardBoundary
+            && !block_wraps_to_next_page(&block.text, &boilerplate)
+        {
             flush(
                 &mut segments,
                 &mut heading,
@@ -590,8 +665,16 @@ fn is_terminating_period(characters: &[char], index: usize, token_start: usize) 
         return false;
     }
     let token = characters[token_start..index].iter().collect::<String>();
-    // "J. Smith", and the first period of "U.S." -- a lone letter is an initial.
-    if token.chars().count() == 1 && token.chars().all(char::is_alphabetic) {
+    // The first period of "U.S." and "J.P." -- a lone letter followed directly
+    // by more of the same token is an initial. Requiring that continuation
+    // matters: "...as set out in Exhibit A. Recipient shall..." is a sentence
+    // end, and swallowing it captioned a four-sentence excerpt "1 sentence".
+    // Where the two readings collide ("J. Smith") this overcounts, which costs
+    // a result rather than asserting a false one.
+    if token.chars().count() == 1
+        && token.chars().all(char::is_alphabetic)
+        && next.is_some_and(|character| !character.is_whitespace())
+    {
         return false;
     }
     let lowered = token.to_lowercase();
@@ -2140,6 +2223,12 @@ mod tests {
             ),
             // a quoted terminator still closes the sentence
             ("He said \"stop.\" Then he left.", 2, "quoted"),
+            // a sentence-final exhibit reference is a boundary, not an initial
+            (
+                "Recipient shall protect it as set out in Exhibit A. Recipient shall return it.",
+                2,
+                "sentence-final exhibit",
+            ),
             ("A genuine one. A genuine two. A genuine three.", 3, "plain"),
         ] {
             assert_eq!(sentence_count(text), expected, "{why}: {text}");
@@ -2169,6 +2258,96 @@ mod tests {
             "7. Confidentiality\nRecipient shall protect it under Section 1.1. This obligation survives termination.",
         );
         assert_eq!(two.provisions[0].sentence_count, 2);
+    }
+
+    #[test]
+    fn a_running_footer_does_not_make_every_page_look_unfinished() {
+        // pdf_extract emits content-stream order and every mainstream producer
+        // draws the running footer last, so the last character of a page is
+        // "Page 3 of 12", not the prose. Judging that character made every
+        // page of a real LibreOffice or Chrome PDF look like it wrapped, and
+        // the whole contract collapsed into one provision.
+        let page = |n: u32, body: &str| {
+            (
+                None,
+                Box::leak(format!("page:{n:04}").into_boxed_str()) as &str,
+                Box::leak(format!("{body}\nPage {n} of 3").into_boxed_str()) as &str,
+                AnchorFlow::HardBoundary,
+            )
+        };
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                page(
+                    1,
+                    "Confidentiality and Compelled Disclosure\nRecipient shall protect Confidential Information. Recipient may disclose it to its affiliates.",
+                ),
+                page(
+                    2,
+                    "Governing Law\nThis Agreement is governed by the laws of the State of New York.",
+                ),
+                page(
+                    3,
+                    "Return and Destruction\nRecipient shall return or destroy the Confidential Information.",
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("footered").expect("id"),
+            "Footered",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        assert_eq!(
+            normalized.provisions.len(),
+            3,
+            "a running footer collapsed the document into one provision"
+        );
+        assert_eq!(normalized.provisions[1].anchor, "page:0002/section:0002");
+        assert!(
+            !normalized.provisions[1]
+                .text
+                .contains("Confidential Information"),
+            "a same-provision match could now be assembled across pages"
+        );
+    }
+
+    #[test]
+    fn a_page_ending_on_a_colon_keeps_its_list() {
+        // A colon at the foot of a page is a lead-in to a list that continues
+        // overleaf. Treating it as page-complete severed the lead-in from the
+        // list -- the same false negative the soft boundary exists to prevent.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "Recipient may use Confidential Information only for the following purposes:",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "evaluating the transaction, and responding to a subpoena or other compelled disclosure.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("colon-list").expect("id"),
+            "Colon List",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+        assert_eq!(
+            normalized.provisions.len(),
+            1,
+            "the list lead-in was severed from its own list"
+        );
     }
 
     #[test]
