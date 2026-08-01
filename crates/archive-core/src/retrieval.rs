@@ -5,7 +5,7 @@
 //! filesystem path. Source ingestion and revision revalidation happen outside
 //! the index; every search supplies the currently authorized source revisions.
 
-use minutes_archive_convert::{ConvertedDocument, SourceFormat};
+use minutes_archive_convert::{AnchorFlow, ConvertedDocument, SourceFormat};
 use minutes_archive_semantic::{
     cosine_similarity, SemanticModelMetadata, APPLE_ENGLISH_SENTENCE_DIMENSION,
 };
@@ -211,6 +211,18 @@ pub fn normalize_converted_document(
     })
 }
 
+/// Whether a converted block stops mid-sentence and therefore continues.
+///
+/// A page boundary is layout, not structure, but it is not nothing either. A
+/// page that ends on a terminator ended a clause; a page that stops mid-clause
+/// is a provision wrapping onto the next one.
+fn block_wraps_to_next_page(text: &str) -> bool {
+    match text.trim_end().chars().next_back() {
+        Some(last) => !matches!(last, '.' | '!' | '?' | ':' | ';' | '"' | '\'' | ')' | ']'),
+        None => false,
+    }
+}
+
 fn segment_anchored_blocks(
     converted: &ConvertedDocument,
 ) -> Result<Vec<NormalizedProvision>, RetrievalError> {
@@ -237,7 +249,8 @@ fn segment_anchored_blocks(
                  heading: &mut Option<String>,
                  heading_anchor: &mut Option<String>,
                  body_anchor: &mut Option<String>,
-                 body: &mut Vec<String>| {
+                 body: &mut Vec<String>,
+                 orphan_pending_heading: bool| {
         let joined = body
             .iter()
             .map(|line| line.trim())
@@ -245,6 +258,10 @@ fn segment_anchored_blocks(
             .collect::<Vec<_>>()
             .join(" ");
         if joined.is_empty() {
+            if !orphan_pending_heading {
+                body.clear();
+                return;
+            }
             // Same defect the text segmenter had: a promoted heading with no
             // following body was dropped and, because `heading.take()` never
             // ran, carried forward onto the next segment. This twin handles
@@ -308,6 +325,7 @@ fn segment_anchored_blocks(
                     &mut heading_anchor,
                     &mut body_anchor,
                     &mut body,
+                    true,
                 );
                 heading = Some(caption);
                 heading_anchor = Some(block.source_anchor.clone());
@@ -317,6 +335,16 @@ fn segment_anchored_blocks(
                     body_anchor = Some(block.source_anchor.clone());
                 }
                 body.push(remainder.join(" "));
+            }
+            if block.flow == AnchorFlow::HardBoundary && !block_wraps_to_next_page(&block.text) {
+                flush(
+                    &mut segments,
+                    &mut heading,
+                    &mut heading_anchor,
+                    &mut body_anchor,
+                    &mut body,
+                    false,
+                );
             }
             continue;
         }
@@ -336,6 +364,7 @@ fn segment_anchored_blocks(
                     &mut heading_anchor,
                     &mut body_anchor,
                     &mut body,
+                    true,
                 );
                 heading = Some(trimmed.to_string());
                 heading_anchor = Some(block.source_anchor.clone());
@@ -349,6 +378,17 @@ fn segment_anchored_blocks(
                 return Err(RetrievalError::TooManyProvisions);
             }
         }
+
+        if block.flow == AnchorFlow::HardBoundary && !block_wraps_to_next_page(&block.text) {
+            flush(
+                &mut segments,
+                &mut heading,
+                &mut heading_anchor,
+                &mut body_anchor,
+                &mut body,
+                false,
+            );
+        }
     }
     flush(
         &mut segments,
@@ -356,6 +396,7 @@ fn segment_anchored_blocks(
         &mut heading_anchor,
         &mut body_anchor,
         &mut body,
+        true,
     );
     if segments.is_empty() {
         return Err(RetrievalError::InvalidDocumentText);
@@ -522,30 +563,79 @@ fn looks_like_legal_heading(line: &str) -> bool {
     known_prefix || numbered || uppercase || run_in_caption
 }
 
+/// Tokens whose trailing period is not a sentence boundary.
+const SENTENCE_ABBREVIATIONS: &[&str] = &[
+    "inc", "corp", "ltd", "co", "llc", "llp", "no", "nos", "art", "sec", "ex", "mr", "mrs", "ms",
+    "dr", "jr", "sr", "st", "vs", "etc", "cf", "al", "u.s", "u.k", "e.g", "i.e", "a.m", "p.m",
+];
+
+/// Whether the `.` at `index` ends a sentence.
+///
+/// Two opposite errors are both silent, because `max_sentences` is a hard
+/// filter. Counting every period inflates the total on the notation contracts
+/// are written in and drops provisions that should match. Requiring a space
+/// after the period undercounts on the format the pilot mainly ingests:
+/// `pdf_extract` emits no space where a sentence ends on a run boundary, so a
+/// kerning pair or a bold span turns "it. Recipient" into "it.Recipient" --
+/// and a six-sentence page then reports one, admitting what the filter exists
+/// to exclude and captioning it with a count the excerpt disproves.
+fn is_terminating_period(characters: &[char], index: usize, token_start: usize) -> bool {
+    // An ellipsis is one mark, not three sentences.
+    if index > 0 && characters[index - 1] == '.' {
+        return false;
+    }
+    let next = characters.get(index + 1).copied();
+    // "Section 1.1", "$1,000.00", "Exhibit A.2" -- a digit continues the token.
+    if next.is_some_and(|character| character.is_ascii_digit()) {
+        return false;
+    }
+    let token = characters[token_start..index].iter().collect::<String>();
+    // "J. Smith", and the first period of "U.S." -- a lone letter is an initial.
+    if token.chars().count() == 1 && token.chars().all(char::is_alphabetic) {
+        return false;
+    }
+    let lowered = token.to_lowercase();
+    if SENTENCE_ABBREVIATIONS
+        .contains(&lowered.trim_matches(|c: char| !c.is_alphanumeric() && c != '.'))
+    {
+        return false;
+    }
+    match next {
+        Some(character) => {
+            character.is_whitespace()
+                || character.is_uppercase()
+                || matches!(character, '"' | '\'' | ')' | ']' | '\u{201d}' | '\u{2019}')
+        }
+        None => true,
+    }
+}
+
 fn sentence_count(text: &str) -> u32 {
-    // A terminator only ends a sentence when something follows it that could
-    // start a new one. Counting every '.' inflated the total on the notation
-    // contracts are written in: "Section 1.1", "$1,000.00", "Exhibit A.2",
-    // "U.S." Each inflated count is a silent false negative, because
-    // `max_sentences` is a hard filter -- a one-sentence clause citing a
-    // subsection reported two, and a genuine three-sentence provision citing
-    // one per sentence reported six and fell out of Peter's standing query.
+    let characters = text.chars().collect::<Vec<_>>();
     let mut count = 0u32;
     let mut saw_content = false;
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        if !character.is_whitespace() {
+    let mut token_start = 0usize;
+    for index in 0..characters.len() {
+        let character = characters[index];
+        if character.is_whitespace() {
+            token_start = index + 1;
+        } else {
             saw_content = true;
         }
-        if saw_content && matches!(character, '.' | '!' | '?') {
-            let ends_here = characters
-                .peek()
-                .is_none_or(|next| next.is_whitespace() || matches!(next, '"' | '\'' | ')' | ']'));
-            if ends_here {
-                count = count.saturating_add(1);
-                saw_content = false;
-            }
+        if !saw_content
+            || !matches!(
+                character,
+                '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}'
+            )
+        {
+            continue;
         }
+        if character == '.' && !is_terminating_period(&characters, index, token_start) {
+            continue;
+        }
+        count = count.saturating_add(1);
+        saw_content = false;
+        token_start = index + 1;
     }
     if saw_content || count == 0 {
         count = count.saturating_add(1);
@@ -1711,7 +1801,6 @@ fn document_why_matched(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minutes_archive_convert::AnchorFlow;
 
     fn vault() -> VaultId {
         VaultId::parse("peter-pilot").expect("vault")
@@ -2002,6 +2091,62 @@ mod tests {
     }
 
     #[test]
+    fn sentence_counting_survives_the_notation_contracts_are_written_in() {
+        // Both directions are silent failures under a hard `max_sentences`
+        // filter: overcounting drops a provision that should match,
+        // undercounting admits one that should not and labels it with a
+        // number its own excerpt disproves.
+        for (text, expected, why) in [
+            // pdf_extract drops the space at a run boundary -- kerning pairs,
+            // bold spans, justified advances. This is the common PDF shape.
+            (
+                "Recipient shall protect it.Recipient shall return it.",
+                2,
+                "run-joined",
+            ),
+            (
+                "Recipient shall protect it. Recipient shall return it.",
+                2,
+                "spaced",
+            ),
+            // internal dotted notation is not a boundary
+            (
+                "Recipient shall comply with Section 1.1 and Exhibit A.2 before paying $1,000.00.",
+                1,
+                "dotted refs",
+            ),
+            // abbreviations are not boundaries
+            (
+                "Recipient shall follow the rules of the U.S. Government at all times.",
+                1,
+                "U.S.",
+            ),
+            ("Beta Systems Inc. shall indemnify the Buyer.", 1, "Inc."),
+            (
+                "The parties may notify advisers, e.g. the auditors, in writing.",
+                1,
+                "e.g.",
+            ),
+            (
+                "The terms set out in Schedule No. 5 continue to apply.",
+                1,
+                "No.",
+            ),
+            // an ellipsis is one mark
+            (
+                "The material remains confidential ... and survives termination.",
+                1,
+                "ellipsis",
+            ),
+            // a quoted terminator still closes the sentence
+            ("He said \"stop.\" Then he left.", 2, "quoted"),
+            ("A genuine one. A genuine two. A genuine three.", 3, "plain"),
+        ] {
+            assert_eq!(sentence_count(text), expected, "{why}: {text}");
+        }
+    }
+
+    #[test]
     fn a_cross_reference_does_not_inflate_the_sentence_count() {
         // `max_sentences` is a hard filter, so every spurious sentence is a
         // silently dropped provision. Contract prose is full of dotted
@@ -2024,6 +2169,108 @@ mod tests {
             "7. Confidentiality\nRecipient shall protect it under Section 1.1. This obligation survives termination.",
         );
         assert_eq!(two.provisions[0].sentence_count, 2);
+    }
+
+    #[test]
+    fn pages_that_end_on_a_terminator_stay_separate_provisions() {
+        // The counterpart to the wrapped clause, and the reason the boundary
+        // is soft rather than absent. `convert_pdf` reports `is_heading: None`
+        // for every block, so a contract whose captions are ordinary title
+        // case trips no lexical rule. Deleting the boundary outright collapsed
+        // such a document into a single provision: it stopped answering a
+        // sentence-bounded query it used to answer, its excerpt quoted pages
+        // its anchor did not name, and a same-provision query began matching
+        // concepts drawn from different pages.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "Confidentiality and Compelled Disclosure\nRecipient shall protect Confidential Information. Recipient may disclose it to its affiliates. Recipient shall give notice before any compelled disclosure.",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "Governing Law\nThis Agreement is governed by the laws of the State of New York.",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0003",
+                    "Return and Destruction\nRecipient shall return or destroy the Confidential Information.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("clean-pages").expect("id"),
+            "Clean Pages",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        assert_eq!(
+            normalized.provisions.len(),
+            3,
+            "pages that ended on a terminator were merged into one provision"
+        );
+        // Each provision is anchored to the page its text is actually on, so
+        // the citation is verifiable where it points.
+        assert_eq!(normalized.provisions[0].anchor, "page:0001/section:0001");
+        assert_eq!(normalized.provisions[1].anchor, "page:0002/section:0002");
+        assert_eq!(normalized.provisions[2].anchor, "page:0003/section:0003");
+        assert!(!normalized.provisions[1]
+            .text
+            .contains("Confidential Information"));
+    }
+
+    #[test]
+    fn the_boundary_flag_is_observed_not_decorative() {
+        // The same three pages delivered as DOCX paragraphs, which the
+        // converter always marks `Continue`, must NOT be split -- otherwise
+        // the flag is dead weight and the page-break tests prove nothing.
+        let blocks = vec![
+            (
+                None,
+                "paragraph:000001",
+                "Recipient shall protect Confidential Information.",
+                AnchorFlow::Continue,
+            ),
+            (
+                None,
+                "paragraph:000002",
+                "Recipient may disclose it to its affiliates.",
+                AnchorFlow::Continue,
+            ),
+        ];
+        let flowing = normalize_converted_document(
+            DocumentId::parse("flowing").expect("id"),
+            "Flowing",
+            b"PK-synthetic",
+            &anchored(SourceFormat::Docx, blocks.clone()),
+        )
+        .expect("normalized");
+        assert_eq!(flowing.provisions.len(), 1);
+
+        let bounded = blocks
+            .into_iter()
+            .map(|(h, a, t, _)| (h, a, t, AnchorFlow::HardBoundary))
+            .collect();
+        let paged = normalize_converted_document(
+            DocumentId::parse("paged").expect("id"),
+            "Paged",
+            b"%PDF-synthetic",
+            &anchored(SourceFormat::Pdf, bounded),
+        )
+        .expect("normalized");
+        assert_eq!(
+            paged.provisions.len(),
+            2,
+            "HardBoundary must change segmentation or the field is dead"
+        );
     }
 
     #[test]
