@@ -1950,6 +1950,186 @@ mod tests {
             .contains("7. CONFIDENTIALITY AND SURVIVAL"));
     }
 
+    fn anchored(
+        format: SourceFormat,
+        blocks: Vec<(Option<bool>, &str, &str, AnchorFlow)>,
+    ) -> ConvertedDocument {
+        ConvertedDocument {
+            format,
+            blocks: blocks
+                .into_iter()
+                .map(|(is_heading, source_anchor, text, flow)| {
+                    minutes_archive_convert::ConvertedBlock {
+                        is_heading,
+                        source_anchor: source_anchor.to_string(),
+                        text: text.to_string(),
+                        flow,
+                    }
+                })
+                .collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_heading_pending_at_a_page_break_still_captions_the_clause_below_it() {
+        // Every PDF block is a HardBoundary, so the flush runs at the start and
+        // end of every page. Orphaning there severed a caption that fell at a
+        // page break from the clause continuing on the next page: the caption
+        // shipped as its own provision at the wrong page and the clause went
+        // headless -- and where its body never repeated the term, unfindable.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:000001",
+                    "7. Confidentiality",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:000002",
+                    "Recipient shall protect Confidential Information.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("page-break").expect("id"),
+            "Page Break",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        assert_eq!(
+            normalized.provisions.len(),
+            1,
+            "the page break split one clause into two"
+        );
+        assert_eq!(
+            normalized.provisions[0].heading.as_deref(),
+            Some("7. Confidentiality")
+        );
+        assert_eq!(
+            normalized.provisions[0].text,
+            "Recipient shall protect Confidential Information."
+        );
+        // The anchor cites where the clause body is, not where its caption was.
+        assert_eq!(normalized.provisions[0].anchor, "page:000002/section:0001");
+    }
+
+    #[test]
+    fn two_adjacent_headings_keep_the_first_instead_of_dropping_it() {
+        // A promoted heading with no following body used to be dropped while
+        // `heading.take()` never ran, so it also carried forward onto the next
+        // segment. Two adjacent headings lost the first one, and a
+        // numbered-list contract -- where every line looks like a heading --
+        // produced no provisions at all and the document was dropped from the
+        // index as a conversion failure.
+        let converted = anchored(
+            SourceFormat::Docx,
+            vec![(
+                None,
+                "paragraph:000001",
+                "7. Confidentiality\n8. Assignment\nNeither party may assign this Agreement.",
+                AnchorFlow::Continue,
+            )],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("adjacent-headings").expect("id"),
+            "Adjacent Headings",
+            b"PK-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        assert_eq!(normalized.provisions.len(), 2);
+        // The displaced heading survives as its own provision rather than
+        // vanishing.
+        assert_eq!(normalized.provisions[0].heading, None);
+        assert_eq!(normalized.provisions[0].text, "7. Confidentiality");
+        // ...and crucially it does not caption the clause that follows it.
+        assert_eq!(
+            normalized.provisions[1].heading.as_deref(),
+            Some("8. Assignment")
+        );
+        assert_eq!(
+            normalized.provisions[1].text,
+            "Neither party may assign this Agreement."
+        );
+    }
+
+    #[test]
+    fn a_trailing_heading_is_kept_as_its_own_provision() {
+        // The same defect at the end of a document: the final flush must orphan
+        // a still-pending heading instead of discarding it.
+        let converted = anchored(
+            SourceFormat::Docx,
+            vec![(
+                None,
+                "paragraph:000001",
+                "Neither party may assign this Agreement.\n9. Governing Law",
+                AnchorFlow::Continue,
+            )],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("trailing-heading").expect("id"),
+            "Trailing Heading",
+            b"PK-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        assert_eq!(normalized.provisions.len(), 2);
+        assert_eq!(normalized.provisions[1].heading, None);
+        assert_eq!(normalized.provisions[1].text, "9. Governing Law");
+    }
+
+    #[test]
+    fn a_converted_document_with_no_text_is_rejected_rather_than_indexed_empty() {
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (None, "page:000001", "   \n\t\n", AnchorFlow::HardBoundary),
+                (None, "page:000002", "", AnchorFlow::HardBoundary),
+            ],
+        );
+        let error = normalize_converted_document(
+            DocumentId::parse("blank-scan").expect("id"),
+            "Blank Scan",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect_err("a document with no extractable text must not normalize");
+        assert!(matches!(error, RetrievalError::InvalidDocumentText));
+    }
+
+    #[test]
+    fn a_block_alternating_headings_and_clauses_past_the_cap_fails_closed() {
+        // MAX_BLOCKS (10_000) bounds the block count, but a single block may
+        // carry arbitrarily many lines, so the per-line path is the only way
+        // past MAX_PROVISIONS_PER_DOCUMENT. It must fail closed rather than
+        // build an unbounded provision list.
+        let mut text = String::new();
+        for ordinal in 0..(MAX_PROVISIONS_PER_DOCUMENT + 2) {
+            text.push_str(&format!("{ordinal}. Confidentiality\nBody clause.\n"));
+        }
+        let converted = anchored(
+            SourceFormat::Docx,
+            vec![(None, "paragraph:000001", &text, AnchorFlow::Continue)],
+        );
+        let error = normalize_converted_document(
+            DocumentId::parse("provision-flood").expect("id"),
+            "Provision Flood",
+            b"PK-synthetic",
+            &converted,
+        )
+        .expect_err("a document past the provision cap must fail closed");
+        assert!(matches!(error, RetrievalError::TooManyProvisions));
+    }
+
     #[test]
     fn converted_pdf_and_docx_preserve_honest_source_anchors() {
         let pdf = ConvertedDocument {
