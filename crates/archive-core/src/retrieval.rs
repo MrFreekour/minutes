@@ -24,6 +24,14 @@ const MAX_FTS_CANDIDATES: usize = 2_000;
 const MAX_DOCUMENT_EVIDENCE_PROVISIONS: usize = 64;
 pub const MAX_SEMANTIC_PROVISIONS: usize = 100_000;
 const MAX_SEMANTIC_CANDIDATES: usize = 400;
+/// Ceiling on a quoted excerpt, in characters.
+///
+/// `exact_excerpt` was the whole provision body with no bound. A provision is
+/// normally a clause, but a document whose captions the lexical rule misses
+/// produces very large ones -- a 200-page PDF measured a single 467,000
+/// character card, rendered straight into `textContent` with no clamp. The
+/// converter's 32 MB output budget was the only ceiling.
+pub const MAX_EXCERPT_CHARS: usize = 4_000;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -1079,6 +1087,7 @@ impl CandidateRow {
         sentence_limit: Option<u32>,
     ) -> EvidenceCard {
         let sentence_count = sentence_count(&self.body);
+        let (excerpt, excerpt_truncated) = bounded_excerpt(&self.body);
         // Concepts present in the heading but absent from the body are not
         // visible in the excerpt, so the card has to say so.
         let body_concepts = matched_concepts(&self.body, &matched);
@@ -1093,11 +1102,17 @@ impl CandidateRow {
             document_title: self.document_title.clone(),
             provision_heading: self.provision_heading.clone(),
             source_anchor: self.source_anchor.clone(),
-            exact_excerpt: self.body.clone(),
+            exact_excerpt: excerpt,
             sentence_count,
             source_revision: self.source_revision.clone(),
             source_converter: self.source_converter.clone(),
-            why_matched: why_matched(&matched, sentence_limit, sentence_count, &heading_only),
+            why_matched: why_matched(
+                &matched,
+                sentence_limit,
+                sentence_count,
+                &heading_only,
+                excerpt_truncated,
+            ),
             matched_concepts: matched,
             lexical_rank: self.lexical_rank,
             index_fresh: true,
@@ -1114,18 +1129,25 @@ impl CandidateRow {
         vault_id: &VaultId,
         semantic_similarity: f32,
     ) -> SemanticEvidenceCard {
+        let (excerpt, excerpt_truncated) = bounded_excerpt(&self.body);
         SemanticEvidenceCard {
             vault_id: vault_id.clone(),
             document_id: self.document_id.clone(),
             document_title: self.document_title.clone(),
             provision_heading: self.provision_heading.clone(),
             source_anchor: self.source_anchor.clone(),
-            exact_excerpt: self.body.clone(),
+            exact_excerpt: excerpt,
             sentence_count: sentence_count(&self.body),
             source_revision: self.source_revision.clone(),
             source_converter: self.source_converter.clone(),
             semantic_similarity,
-            why_suggested: match &self.provision_heading {
+            why_suggested: {
+                let shortened = if excerpt_truncated {
+                    " The quoted text is shortened."
+                } else {
+                    ""
+                };
+                let base = match &self.provision_heading {
                 // The embedding is built from title + heading + text, so the
                 // heading influences similarity, and the UI replaces the
                 // kicker on semantic cards so `provision_heading` is never
@@ -1135,6 +1157,8 @@ impl CandidateRow {
                     "Meaning-similar suggestion from a revision-pinned on-device model; review the exact excerpt. Matched under the provision heading {heading:?}, which is not part of the quoted text. This is not a determination of legal sufficiency."
                 ),
                 None => "Meaning-similar suggestion from a revision-pinned on-device model; review the exact excerpt. This is not a determination of legal sufficiency.".to_string(),
+                };
+                format!("{base}{shortened}")
             },
             index_fresh: true,
         }
@@ -1863,6 +1887,7 @@ fn why_matched(
     maximum_sentences: Option<u32>,
     actual_sentences: u32,
     heading_only: &[LegalConcept],
+    excerpt_truncated: bool,
 ) -> String {
     let mut reasons = concepts
         .iter()
@@ -1871,8 +1896,13 @@ fn why_matched(
     if maximum_sentences.is_some() {
         reasons.push("sentence limit");
     }
+    let truncation = if excerpt_truncated {
+        " The quoted text is shortened; the sentence count describes the whole provision."
+    } else {
+        ""
+    };
     if reasons.is_empty() {
-        return format!("{actual_sentences} sentence lexical match");
+        return format!("{actual_sentences} sentence lexical match.{truncation}");
     }
     // Matching spans the provision heading so a clause whose operative term
     // appears only in its caption is still found, but the excerpt shows the
@@ -1893,10 +1923,24 @@ fn why_matched(
         )
     };
     format!(
-        "Matched {} in the same provision; {actual_sentences} sentence{}.{caveat}",
+        "Matched {} in the same provision; {actual_sentences} sentence{}.{caveat}{truncation}",
         reasons.join(", "),
         if actual_sentences == 1 { "" } else { "s" }
     )
+}
+
+/// Cap a quoted excerpt on a word boundary, reporting whether it was cut.
+///
+/// The caller must disclose the cut. A silently shortened quotation is the
+/// same defect as a silently deleted line: the reader cannot tell that what
+/// they are reading is not what the document says.
+fn bounded_excerpt(body: &str) -> (String, bool) {
+    if body.chars().count() <= MAX_EXCERPT_CHARS {
+        return (body.to_string(), false);
+    }
+    let kept = body.chars().take(MAX_EXCERPT_CHARS).collect::<String>();
+    let cut = kept.rfind(char::is_whitespace).unwrap_or(kept.len());
+    (kept[..cut].trim_end().to_string(), true)
 }
 
 fn document_why_matched(
@@ -2349,6 +2393,35 @@ mod tests {
                 .text
                 .contains("Confidential Information"),
             "a same-provision match could now be assembled across pages"
+        );
+    }
+
+    #[test]
+    fn an_oversized_excerpt_is_bounded_and_says_so() {
+        // A 200-page PDF whose captions the lexical rule misses produced a
+        // single 467,000-character card, rendered straight into textContent.
+        // Bounding it is necessary; bounding it silently would make the
+        // quotation untrustworthy, so the card discloses the cut.
+        let (short, cut) = bounded_excerpt("Recipient shall protect it.");
+        assert!(!cut);
+        assert_eq!(short, "Recipient shall protect it.");
+
+        let long = "Recipient shall protect Confidential Information. ".repeat(400);
+        let (bounded, cut) = bounded_excerpt(&long);
+        assert!(cut, "an oversized excerpt was not bounded");
+        assert!(bounded.chars().count() <= MAX_EXCERPT_CHARS);
+        // The cut lands on a word boundary rather than mid-word.
+        assert!(!bounded.ends_with("Confid"));
+        assert!(long.starts_with(&bounded));
+
+        let reason = why_matched(&[LegalConcept::Confidentiality], Some(3), 9, &[], true);
+        assert!(
+            reason.contains("shortened"),
+            "a shortened quotation was not disclosed: {reason}"
+        );
+        assert!(
+            !why_matched(&[LegalConcept::Confidentiality], Some(3), 9, &[], false)
+                .contains("shortened")
         );
     }
 
