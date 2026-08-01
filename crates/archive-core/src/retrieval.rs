@@ -248,18 +248,27 @@ fn running_boilerplate(converted: &ConvertedDocument) -> HashSet<String> {
         if block.flow != AnchorFlow::HardBoundary {
             continue;
         }
-        // Only the last few lines of a page can be a running footer.
-        for line in block
+        let lines = block
             .text
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .iter()
-            .rev()
-            .take(2)
-        {
-            *counts.entry(footer_shape(line)).or_default() += 1;
+            .collect::<Vec<_>>();
+        // Producers disagree about where furniture lands in the content
+        // stream. Chrome draws the running footer last; LibreOffice draws the
+        // header and footer FIRST, which is why a rule that only looked at the
+        // tail never fired on LibreOffice output at all. Watch both ends.
+        //
+        // A page contributes each shape at most once, or a one-line page would
+        // count itself twice and look repeated.
+        let mut on_this_page = HashSet::new();
+        for line in lines.iter().take(2).chain(lines.iter().rev().take(2)) {
+            if is_running_furniture(line) {
+                on_this_page.insert(footer_shape(line));
+            }
+        }
+        for shape in on_this_page {
+            *counts.entry(shape).or_default() += 1;
         }
     }
     counts
@@ -267,6 +276,17 @@ fn running_boilerplate(converted: &ConvertedDocument) -> HashSet<String> {
         .filter(|(shape, seen)| *seen > 1 && !shape.is_empty())
         .map(|(shape, _)| shape)
         .collect()
+}
+
+/// Whether a line is short enough to be page furniture rather than prose.
+///
+/// Repetition alone is not enough. A sentence can legitimately repeat at the
+/// foot of several pages -- "All other terms and conditions of the Agreement
+/// remain in full force and effect." ends every page of a typical amendment --
+/// and treating that as furniture is how a clause stops being a clause.
+/// Furniture is short: a page number, a stamp, a Bates number, a short title.
+fn is_running_furniture(line: &str) -> bool {
+    line.chars().count() <= 60 && line.split_whitespace().count() <= 8
 }
 
 /// Whether a converted block stops mid-sentence and therefore continues.
@@ -423,17 +443,23 @@ fn segment_anchored_blocks(
         }
         for line in block.text.lines() {
             let trimmed = line.trim();
-            // Running headers and footers are furniture, not content. Left in,
-            // an all-caps stamp ("CONFIDENTIAL") or a Bates number satisfies
-            // the uppercase branch of the lexical heading rule, so the footer
-            // captions the next page's clause and its neighbour becomes a
-            // junk provision of its own.
-            if trimmed.is_empty() || boilerplate.contains(&footer_shape(trimmed)) {
+            if trimmed.is_empty() {
                 continue;
             }
+            // Running furniture may not caption a clause: an all-caps stamp
+            // or a Bates number satisfies the uppercase branch of the lexical
+            // rule, and captioned the next page's clause. Suppressing the
+            // promotion is safe; removing the line was not. Deleting matching
+            // lines from the body erased a sentence repeated at the foot of
+            // several pages -- "All other terms ... remain in full force and
+            // effect" vanished from an amendment, and a liability cap was
+            // quoted to counsel with its carve-out silently removed.
             let is_caption = match structural {
                 Some(marked) => marked,
-                None => looks_like_legal_heading(trimmed),
+                None => {
+                    !boilerplate.contains(&footer_shape(trimmed))
+                        && looks_like_legal_heading(trimmed)
+                }
             };
             if is_caption {
                 flush(
@@ -670,12 +696,19 @@ fn is_terminating_period(characters: &[char], index: usize, token_start: usize) 
         return false;
     }
     let token = characters[token_start..index].iter().collect::<String>();
-    // The first period of "U.S." and "J.P." -- a lone letter followed directly
-    // by more of the same token is an initial. Requiring that continuation
-    // matters: "...as set out in Exhibit A. Recipient shall..." is a sentence
-    // end, and swallowing it captioned a four-sentence excerpt "1 sentence".
-    // Where the two readings collide ("J. Smith") this overcounts, which costs
-    // a result rather than asserting a false one.
+    // A lone letter followed directly by more of the same token is an initial,
+    // which holds the period in "U.S." (helped by the abbreviation list) and
+    // in the first half of "J.P." Requiring that continuation matters:
+    // "...as set out in Exhibit A. Recipient shall..." is a sentence end, and
+    // swallowing it captioned a four-sentence excerpt "1 sentence".
+    //
+    // Known and unfixed: "J. Smith" counts two, and "J.P. Morgan" counts two
+    // because "j.p" is not in the abbreviation list. Both are overcounts, so
+    // they cost a result rather than admitting an over-long provision -- but
+    // the card still prints a sentence count its own excerpt disproves, which
+    // is its own small misstatement. Names are rarer in clause bodies than
+    // exhibit references, which is the only reason this trade is the right
+    // way round.
     if token.chars().count() == 1
         && token.chars().all(char::is_alphabetic)
         && next.is_some_and(|character| !character.is_whitespace())
@@ -2320,11 +2353,141 @@ mod tests {
     }
 
     #[test]
+    fn furniture_is_recognised_at_the_top_of_the_page_too() {
+        // LibreOffice emits the running header and footer FIRST in the content
+        // stream; Chrome emits the footer last. A rule that only inspected the
+        // tail never fired on LibreOffice output at all, so every stamped page
+        // still produced a junk caption. Every fixture here previously put the
+        // furniture at the end, which is why that shipped.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "CONFIDENTIAL\nPage 1 of 2\n7. CONFIDENTIALITY\nRecipient shall protect Confidential Information.",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "CONFIDENTIAL\nPage 2 of 2\n8. GOVERNING LAW\nThis Agreement is governed by New York law.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("top-furniture").expect("id"),
+            "Top Furniture",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        // Each real clause keeps its own caption. A leading stamp that was
+        // promoted instead would caption the clause below it.
+        let caption_of = |needle: &str| {
+            normalized
+                .provisions
+                .iter()
+                .find(|provision| provision.text.contains(needle))
+                .and_then(|provision| provision.heading.clone())
+        };
+        assert_eq!(
+            caption_of("Recipient shall protect").as_deref(),
+            Some("7. CONFIDENTIALITY")
+        );
+        assert_eq!(
+            caption_of("governed by New York law").as_deref(),
+            Some("8. GOVERNING LAW")
+        );
+        for provision in &normalized.provisions {
+            assert_ne!(provision.heading.as_deref(), Some("CONFIDENTIAL"));
+            assert_ne!(provision.heading.as_deref(), Some("Page 1 of 2"));
+        }
+        // The stamp is noise, but it is in the document, so it stays indexed.
+        // It lands in a row of its own rather than captioning a clause: a
+        // cosmetic cost, deliberately preferred to deleting real text.
+        assert!(normalized
+            .provisions
+            .iter()
+            .any(|provision| provision.text.contains("CONFIDENTIAL")));
+    }
+
+    #[test]
+    fn only_short_lines_can_be_page_furniture() {
+        // Repetition alone cannot separate furniture from prose. A closing
+        // sentence repeats on every page of an amendment, and calling it
+        // furniture is what let it be deleted.
+        assert!(is_running_furniture("Page 1 of 12"));
+        assert!(is_running_furniture("CONFIDENTIAL"));
+        assert!(is_running_furniture("ACME-00001234"));
+        assert!(is_running_furniture("- 1 -"));
+        assert!(!is_running_furniture(
+            "All other terms and conditions of the Agreement remain in full force and effect."
+        ));
+        assert!(!is_running_furniture(
+            "Recipient shall protect Confidential Information and shall not disclose it."
+        ));
+    }
+
+    #[test]
+    fn a_sentence_repeated_on_every_page_is_still_indexed() {
+        // The failure this guards is the worst one available to a legal index:
+        // silent deletion. Learning furniture by repetition and then removing
+        // matching lines erased a carve-out repeated at the foot of several
+        // pages, and the cap was then quoted to counsel without it -- an
+        // affirmatively misleading excerpt, not a missing result.
+        //
+        // This carve-out is short enough to look like furniture and repeats on
+        // both pages, so it is exactly the line the heuristic misjudges.
+        let carve_out = "This limit does not apply to fraud.";
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "Neither party shall be liable for indirect loss.\nThis limit does not apply to fraud.\nPage 1 of 2",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "Recipient shall protect Confidential Information.\nThis limit does not apply to fraud.\nPage 2 of 2",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("carve-out").expect("id"),
+            "Carve Out",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        let indexed = normalized
+            .provisions
+            .iter()
+            .filter(|provision| provision.text.contains(carve_out))
+            .count();
+        assert_eq!(
+            indexed, 2,
+            "a repeated carve-out was deleted from the indexed body"
+        );
+        // The page number beside it is furniture and must not caption anything.
+        for provision in &normalized.provisions {
+            assert_ne!(provision.heading.as_deref(), Some("Page 1 of 2"));
+        }
+    }
+
+    #[test]
     fn an_all_caps_stamp_does_not_caption_the_next_clause() {
         // A Bates number or a confidentiality stamp satisfies the uppercase
-        // branch of the lexical heading rule. Left in the text it captioned
-        // the following page's clause and left its neighbour as a junk
-        // provision whose whole body was the stamp.
+        // branch of the lexical heading rule, so it captioned the following
+        // page's clause. Suppress the promotion -- but the line stays in the
+        // body, because deleting it is how real clause text disappeared.
         let converted = anchored(
             SourceFormat::Pdf,
             vec![
@@ -2352,16 +2515,23 @@ mod tests {
 
         assert_eq!(normalized.provisions.len(), 2);
         for provision in &normalized.provisions {
-            assert_ne!(provision.heading.as_deref(), Some("CONFIDENTIAL"));
-            assert!(
-                !provision.text.contains("ACME-0000"),
-                "a Bates stamp reached the excerpt"
+            assert_ne!(
+                provision.heading.as_deref(),
+                Some("CONFIDENTIAL"),
+                "a page stamp captioned a clause"
             );
-            assert!(!provision.text.contains("CONFIDENTIAL"));
         }
-        assert_eq!(
-            normalized.provisions[1].text,
-            "This Agreement is governed by the laws of the State of New York."
+        assert!(normalized.provisions[1]
+            .text
+            .contains("laws of the State of New York"));
+        // The stamp is still indexed. It is noise, but it is text that is
+        // genuinely in the document, and the index must not lie by omission.
+        assert!(
+            normalized
+                .provisions
+                .iter()
+                .any(|provision| provision.text.contains("CONFIDENTIAL")),
+            "page furniture was deleted from the indexed body"
         );
     }
 
