@@ -71,9 +71,8 @@
   --on-dark: #fff;
   --radius-xs: 5px;
   --radius-sm: 8px;
-  --radius-md: 10px;
-  --radius-lg: 12px;
-  --radius-xl: 20px;
+  --radius-md: 12px;
+  --radius-lg: 20px;
   --radius-pill: 999px;
   --shadow: 0 22px 70px rgba(31, 43, 37, 0.1);
   font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -241,7 +240,7 @@ a:focus-visible {
   gap: 12px;
   padding: 13px 12px;
   color: var(--muted-2);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
 }
 
 .step.is-active {
@@ -322,7 +321,7 @@ a:focus-visible {
   padding: 30px;
   overflow: hidden;
   border: 1px solid rgba(201, 199, 189, 0.78);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-lg);
   background: rgba(255, 254, 250, 0.92);
   box-shadow: var(--shadow);
 }
@@ -386,7 +385,7 @@ a:focus-visible {
   flex-shrink: 0;
   white-space: nowrap;
   border: 1px solid transparent;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: 12px;
   font-weight: 680;
@@ -439,7 +438,7 @@ a:focus-visible {
   place-items: center;
   align-content: center;
   border: 1px dashed var(--line-strong);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: rgba(246, 244, 238, 0.58);
   text-align: center;
 }
@@ -501,7 +500,7 @@ a:focus-visible {
   justify-content: space-between;
   padding: 11px 13px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--surface);
 }
 
@@ -564,7 +563,7 @@ a:focus-visible {
   padding: 14px 15px;
   color: var(--green);
   border: 1px solid rgba(45, 114, 89, 0.16);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--green-soft);
 }
 
@@ -717,7 +716,7 @@ a:focus-visible {
   margin-top: 25px;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
 }
 
 .metric {
@@ -757,7 +756,7 @@ a:focus-visible {
 .signals-card {
   padding: 18px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: rgba(255, 254, 250, 0.8);
 }
 
@@ -844,7 +843,7 @@ a:focus-visible {
   margin-top: 14px;
   padding: 18px;
   border: 1px solid rgba(183, 138, 66, 0.28);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: rgba(183, 138, 66, 0.07);
 }
 
@@ -895,7 +894,7 @@ a:focus-visible {
   margin-top: 24px;
   padding: 18px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--surface);
 }
 
@@ -920,7 +919,7 @@ a:focus-visible {
   resize: vertical;
   color: var(--ink);
   border: 1px solid var(--line-strong);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   outline: 0;
   background: var(--surface-bright);
   font: inherit;
@@ -944,7 +943,7 @@ a:focus-visible {
   margin-top: 15px;
   padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--surface-muted);
 }
 
@@ -991,7 +990,7 @@ a:focus-visible {
 .document-card {
   padding: 17px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--surface);
 }
 
@@ -1072,7 +1071,7 @@ a:focus-visible {
   padding: 28px;
   color: var(--muted);
   border: 1px dashed var(--line-strong);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--surface-muted);
   text-align: center;
   font-size: 11px;
@@ -1096,7 +1095,7 @@ a:focus-visible {
   padding: 13px 14px;
   color: var(--danger);
   border: 1px solid rgba(142, 52, 47, 0.2);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--danger-soft);
   box-shadow: 0 10px 30px rgba(92, 35, 31, 0.11);
   font-size: 10px;
