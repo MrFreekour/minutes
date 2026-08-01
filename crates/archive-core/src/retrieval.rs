@@ -32,6 +32,13 @@ const MAX_SEMANTIC_CANDIDATES: usize = 400;
 /// character card, rendered straight into `textContent` with no clamp. The
 /// converter's 32 MB output budget was the only ceiling.
 pub const MAX_EXCERPT_CHARS: usize = 4_000;
+/// An absolute floor on the excerpt bound, checked at compile time.
+///
+/// Expressing this inside a test in terms of MAX_EXCERPT_CHARS would be
+/// self-referential and could not detect a change to it. The largest correctly
+/// segmented provision measured across a real corpus was 2,891 characters, so
+/// any bound at or below that silently cuts ordinary clauses.
+const _: () = assert!(MAX_EXCERPT_CHARS >= 3_000);
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -270,8 +277,13 @@ fn running_boilerplate(converted: &ConvertedDocument) -> HashSet<String> {
         // A page contributes each shape at most once, or a one-line page would
         // count itself twice and look repeated.
         let mut on_this_page = HashSet::new();
-        for line in lines.iter().take(2).chain(lines.iter().rev().take(2)) {
-            if is_running_furniture(line) {
+        // Three lines at each edge, because a LibreOffice furniture band is
+        // routinely header + legend + page number. The length guard filters
+        // which lines count, and must not consume a slot: a long legend at
+        // position 1 previously hid the Bates number at position 2, which then
+        // captioned a real clause.
+        for line in lines.iter().take(3).chain(lines.iter().rev().take(3)) {
+            if is_furniture_shaped(line) {
                 on_this_page.insert(footer_shape(line));
             }
         }
@@ -286,15 +298,25 @@ fn running_boilerplate(converted: &ConvertedDocument) -> HashSet<String> {
         .collect()
 }
 
-/// Whether a line is short enough to be page furniture rather than prose.
+/// Whether a line is short enough to POSSIBLY be page furniture.
+///
+/// This is the secondary net only. The primary signal is that the line repeats
+/// at a page edge across pages, which prose does not; length alone cannot tell
+/// an eleven-word legend from an eleven-word clause sentence, and does not try.
 ///
 /// Repetition alone is not enough. A sentence can legitimately repeat at the
 /// foot of several pages -- "All other terms and conditions of the Agreement
 /// remain in full force and effect." ends every page of a typical amendment --
 /// and treating that as furniture is how a clause stops being a clause.
-/// Furniture is short: a page number, a stamp, a Bates number, a short title.
-fn is_running_furniture(line: &str) -> bool {
-    line.chars().count() <= 60 && line.split_whitespace().count() <= 8
+/// Furniture is short: a page number, a stamp, a Bates number, a production
+/// legend. The bound has to clear a real SEC or protective-order legend --
+/// "Confidential Treatment Requested by Acme Corporation Pursuant to 17 C.F.R.
+/// 200.83" is 80 characters and 11 words, and left in a clause body it lends
+/// it three phantom sentences -- while still rejecting an ordinary closing
+/// sentence like "All other terms and conditions of the Agreement remain in
+/// full force and effect." at 14 words.
+fn is_furniture_shaped(line: &str) -> bool {
+    line.chars().count() <= 100 && line.split_whitespace().count() <= 12
 }
 
 /// Whether a converted block stops mid-sentence and therefore continues.
@@ -454,20 +476,37 @@ fn segment_anchored_blocks(
             if trimmed.is_empty() {
                 continue;
             }
-            // Running furniture may not caption a clause: an all-caps stamp
-            // or a Bates number satisfies the uppercase branch of the lexical
-            // rule, and captioned the next page's clause. Suppressing the
-            // promotion is safe; removing the line was not. Deleting matching
-            // lines from the body erased a sentence repeated at the foot of
-            // several pages -- "All other terms ... remain in full force and
-            // effect" vanished from an amendment, and a liability cap was
-            // quoted to counsel with its carve-out silently removed.
+            // Running furniture belongs to the page, not to any clause, so it
+            // gets a row of its own. Suppressing only its promotion to a
+            // heading left it in the neighbouring body, and because
+            // LibreOffice emits the header and footer FIRST, that body was
+            // always the clause continuing on the next page. A running header
+            // reading "CONFIDENTIALITY" then sat inside an assignment clause
+            // and manufactured a same-provision match for two concepts the
+            // document never combines -- a false quotation under a "Source
+            // verified" pill, and worse than the junk row it replaced. A
+            // footer also lent its sentence to the clause's sentence count.
+            //
+            // Deleting the line is not the alternative: that erased real
+            // carve-outs. It stays indexed, alone.
+            if boilerplate.contains(&footer_shape(trimmed)) {
+                flush(
+                    &mut segments,
+                    &mut heading,
+                    &mut heading_anchor,
+                    &mut body_anchor,
+                    &mut body,
+                    true,
+                );
+                segments.push((None, trimmed.to_string(), block.source_anchor.clone()));
+                if segments.len() > MAX_PROVISIONS_PER_DOCUMENT {
+                    return Err(RetrievalError::TooManyProvisions);
+                }
+                continue;
+            }
             let is_caption = match structural {
                 Some(marked) => marked,
-                None => {
-                    !boilerplate.contains(&footer_shape(trimmed))
-                        && looks_like_legal_heading(trimmed)
-                }
+                None => looks_like_legal_heading(trimmed),
             };
             if is_caption {
                 flush(
@@ -2343,6 +2382,152 @@ mod tests {
     }
 
     #[test]
+    fn the_furniture_window_does_not_reach_into_the_body() {
+        // The window has to be wide enough for a three-line LibreOffice band
+        // and no wider. The repeated sentence below sits at index 3, outside
+        // both the leading and trailing window, and is ordinary clause text.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "CONFIDENTIAL\nProduced subject to the Stipulated Protective Order\nACME-00001234\nEach party shall bear its own costs.\nTermination requires ninety days written notice to the other party.\nRenewal follows automatically unless either party objects in writing.\nPage 1 of 2",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "CONFIDENTIAL\nProduced subject to the Stipulated Protective Order\nACME-00001235\nEach party shall bear its own costs.\nGoverning law is the law of the State of New York without regard to conflicts.\nVenue lies exclusively in the courts sitting in New York County.\nPage 2 of 2",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("deep-repeat").expect("id"),
+            "Deep Repeat",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        // The Bates number sits at index 2 and must be recognised there --
+        // a long legend above it must not consume the slot.
+        for provision in &normalized.provisions {
+            if provision.text.contains("Termination requires")
+                || provision.text.contains("Governing law is")
+            {
+                assert!(
+                    !provision.text.contains("ACME-0000"),
+                    "a Bates number reached a clause body: {}",
+                    provision.text
+                );
+            }
+            assert!(!provision
+                .heading
+                .as_deref()
+                .is_some_and(|heading| heading.starts_with("ACME-")));
+        }
+        // ...while the repeated sentence four lines in stays clause text.
+        assert!(
+            normalized.provisions.iter().any(|provision| {
+                provision
+                    .text
+                    .contains("Each party shall bear its own costs.")
+                    && provision.text.contains("Termination requires")
+            }),
+            "the furniture window reached into the clause body"
+        );
+    }
+
+    #[test]
+    fn a_semantic_card_also_discloses_a_shortened_quotation() {
+        // The lexical card's disclosure was pinned; the semantic card's was
+        // not, so removing it left the suite green.
+        let vault = vault();
+        let long = "Recipient shall protect Confidential Information. ".repeat(400);
+        let candidate = CandidateRow {
+            document_id: DocumentId::parse("long-doc").expect("id"),
+            document_title: "Long Doc".to_string(),
+            provision_heading: None,
+            source_anchor: "page:0001/section:0001".to_string(),
+            body: long.clone(),
+            source_revision: SourceRevision::from_bytes(b"bytes"),
+            source_converter: "pdf-extract-0.12.0-v1".to_string(),
+            lexical_rank: 0.0,
+        };
+        let card = candidate.semantic_evidence_card(&vault, 0.9);
+        assert!(card.exact_excerpt.chars().count() <= MAX_EXCERPT_CHARS);
+        assert!(
+            card.why_suggested.contains("shortened"),
+            "a shortened semantic quotation was not disclosed: {}",
+            card.why_suggested
+        );
+
+        let short = CandidateRow {
+            body: "Recipient shall protect it.".to_string(),
+            ..candidate
+        };
+        assert!(!short
+            .semantic_evidence_card(&vault, 0.9)
+            .why_suggested
+            .contains("shortened"));
+    }
+
+    #[test]
+    fn a_running_header_cannot_manufacture_a_same_provision_match() {
+        // The worst outcome this index can produce. LibreOffice emits the
+        // running header FIRST, so suppressing only its promotion to a heading
+        // left the word "CONFIDENTIALITY" sitting at the top of the assignment
+        // clause's body on the continuation page. A same-provision query for
+        // confidentiality AND assignment then returned that clause, quoting a
+        // conjunction the document does not contain, under a "Source verified"
+        // pill -- and the heading-provenance caveat could not fire, because
+        // the concept really was in the body. The body was furniture.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "CONFIDENTIALITY\nPage 1\n3. TERM\nThis Agreement continues for three years.",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "CONFIDENTIALITY\nPage 2\n4. ASSIGNMENT\nNeither party may assign this Agreement without prior written consent.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("crossfeed").expect("id"),
+            "Crossfeed",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        let assignment = normalized
+            .provisions
+            .iter()
+            .find(|provision| provision.text.contains("may assign"))
+            .expect("assignment clause is indexed");
+        assert!(
+            !assignment.text.contains("CONFIDENTIALITY"),
+            "the running header fed a concept into the assignment clause: {}",
+            assignment.text
+        );
+        assert_eq!(assignment.heading.as_deref(), Some("4. ASSIGNMENT"));
+        // The header is still in the index, in a row that is only itself.
+        assert!(normalized
+            .provisions
+            .iter()
+            .any(|provision| provision.text == "CONFIDENTIALITY"));
+    }
+
+    #[test]
     fn a_running_footer_does_not_make_every_page_look_unfinished() {
         // pdf_extract emits content-stream order and every mainstream producer
         // draws the running footer last, so the last character of a page is
@@ -2382,18 +2567,37 @@ mod tests {
         )
         .expect("normalized");
 
+        // Each page's clause survives as its own row, distinctly anchored.
+        let clause = |needle: &str| {
+            normalized
+                .provisions
+                .iter()
+                .find(|provision| provision.text.contains(needle))
+                .unwrap_or_else(|| panic!("clause {needle:?} is not in the index"))
+        };
         assert_eq!(
-            normalized.provisions.len(),
-            3,
-            "a running footer collapsed the document into one provision"
+            clause("Recipient shall protect").anchor,
+            "page:0001/section:0001"
         );
-        assert_eq!(normalized.provisions[1].anchor, "page:0002/section:0002");
-        assert!(
-            !normalized.provisions[1]
-                .text
-                .contains("Confidential Information"),
-            "a same-provision match could now be assembled across pages"
+        assert_eq!(
+            clause("governed by the laws").anchor,
+            "page:0002/section:0003"
         );
+        assert_eq!(clause("return or destroy").anchor, "page:0003/section:0005");
+        // No clause body carries the footer, so no page's terms can be
+        // combined with another's to satisfy a same-provision query.
+        for provision in &normalized.provisions {
+            if provision.text.contains("Recipient") || provision.text.contains("governed by") {
+                assert!(
+                    !provision.text.contains("Page "),
+                    "a running footer was welded into a clause body: {}",
+                    provision.text
+                );
+            }
+        }
+        assert!(!clause("governed by the laws")
+            .text
+            .contains("Confidential Information"));
     }
 
     #[test]
@@ -2413,6 +2617,14 @@ mod tests {
         // The cut lands on a word boundary rather than mid-word.
         assert!(!bounded.ends_with("Confid"));
         assert!(long.starts_with(&bounded));
+
+        // ...and the cut never lands mid-word.
+        let (word_cut, _) = bounded_excerpt(&"lengthyword ".repeat(MAX_EXCERPT_CHARS));
+        assert!(
+            word_cut.ends_with("lengthyword"),
+            "the excerpt was cut mid-word: {:?}",
+            &word_cut[word_cut.len().saturating_sub(20)..]
+        );
 
         let reason = why_matched(&[LegalConcept::Confidentiality], Some(3), 9, &[], true);
         assert!(
@@ -2488,19 +2700,33 @@ mod tests {
     }
 
     #[test]
-    fn only_short_lines_can_be_page_furniture() {
+    fn only_short_lines_can_possibly_be_page_furniture() {
         // Repetition alone cannot separate furniture from prose. A closing
         // sentence repeats on every page of an amendment, and calling it
         // furniture is what let it be deleted.
-        assert!(is_running_furniture("Page 1 of 12"));
-        assert!(is_running_furniture("CONFIDENTIAL"));
-        assert!(is_running_furniture("ACME-00001234"));
-        assert!(is_running_furniture("- 1 -"));
-        assert!(!is_running_furniture(
+        assert!(is_furniture_shaped("Page 1 of 12"));
+        assert!(is_furniture_shaped("CONFIDENTIAL"));
+        assert!(is_furniture_shaped("ACME-00001234"));
+        assert!(is_furniture_shaped("- 1 -"));
+        // A real production legend is furniture, and long.
+        assert!(is_furniture_shaped(
+            "Confidential Treatment Requested by Acme Corporation Pursuant to 17 C.F.R. 200.83"
+        ));
+        // An ordinary closing sentence is not, however often it repeats.
+        assert!(!is_furniture_shaped(
             "All other terms and conditions of the Agreement remain in full force and effect."
         ));
-        assert!(!is_running_furniture(
-            "Recipient shall protect Confidential Information and shall not disclose it."
+        // Length alone cannot rule this out -- it is the repetition at a page
+        // edge, not the shape, that makes something furniture.
+        //
+        // But a paragraph-length line is never furniture, however often it
+        // repeats: the guard has to keep a real bound.
+        assert!(!is_furniture_shaped(&"word ".repeat(40)));
+        // Few words but far too long: the character bound has to bind on its
+        // own, or a run-joined line of prose passes as furniture.
+        assert!(!is_furniture_shaped(&"x".repeat(150)));
+        assert!(!is_furniture_shaped(
+            "Recipient shall protect Confidential Information disclosed under this Agreement and shall not disclose it to any third party without prior written consent."
         ));
     }
 
@@ -2586,17 +2812,24 @@ mod tests {
         )
         .expect("normalized");
 
-        assert_eq!(normalized.provisions.len(), 2);
         for provision in &normalized.provisions {
             assert_ne!(
                 provision.heading.as_deref(),
                 Some("CONFIDENTIAL"),
                 "a page stamp captioned a clause"
             );
+            if provision.text.contains("Recipient") || provision.text.contains("governed by") {
+                assert!(
+                    !provision.text.contains("CONFIDENTIAL")
+                        && !provision.text.contains("ACME-0000"),
+                    "page furniture was welded into a clause body: {}",
+                    provision.text
+                );
+            }
         }
-        assert!(normalized.provisions[1]
-            .text
-            .contains("laws of the State of New York"));
+        assert!(normalized.provisions.iter().any(|provision| provision.text
+            == "This Agreement is governed by New York law."
+            || provision.text.contains("laws of the State of New York")));
         // The stamp is still indexed. It is noise, but it is text that is
         // genuinely in the document, and the index must not lie by omission.
         assert!(
