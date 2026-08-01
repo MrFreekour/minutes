@@ -423,7 +423,12 @@ fn segment_anchored_blocks(
         }
         for line in block.text.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() {
+            // Running headers and footers are furniture, not content. Left in,
+            // an all-caps stamp ("CONFIDENTIAL") or a Bates number satisfies
+            // the uppercase branch of the lexical heading rule, so the footer
+            // captions the next page's clause and its neighbour becomes a
+            // junk provision of its own.
+            if trimmed.is_empty() || boilerplate.contains(&footer_shape(trimmed)) {
                 continue;
             }
             let is_caption = match structural {
@@ -2311,6 +2316,52 @@ mod tests {
                 .text
                 .contains("Confidential Information"),
             "a same-provision match could now be assembled across pages"
+        );
+    }
+
+    #[test]
+    fn an_all_caps_stamp_does_not_caption_the_next_clause() {
+        // A Bates number or a confidentiality stamp satisfies the uppercase
+        // branch of the lexical heading rule. Left in the text it captioned
+        // the following page's clause and left its neighbour as a junk
+        // provision whose whole body was the stamp.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "Recipient shall protect Confidential Information.\nCONFIDENTIAL\nACME-00001234",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "This Agreement is governed by the laws of the State of New York.\nCONFIDENTIAL\nACME-00001235",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("stamped").expect("id"),
+            "Stamped",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        assert_eq!(normalized.provisions.len(), 2);
+        for provision in &normalized.provisions {
+            assert_ne!(provision.heading.as_deref(), Some("CONFIDENTIAL"));
+            assert!(
+                !provision.text.contains("ACME-0000"),
+                "a Bates stamp reached the excerpt"
+            );
+            assert!(!provision.text.contains("CONFIDENTIAL"));
+        }
+        assert_eq!(
+            normalized.provisions[1].text,
+            "This Agreement is governed by the laws of the State of New York."
         );
     }
 
