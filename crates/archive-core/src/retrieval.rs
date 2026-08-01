@@ -523,15 +523,28 @@ fn looks_like_legal_heading(line: &str) -> bool {
 }
 
 fn sentence_count(text: &str) -> u32 {
+    // A terminator only ends a sentence when something follows it that could
+    // start a new one. Counting every '.' inflated the total on the notation
+    // contracts are written in: "Section 1.1", "$1,000.00", "Exhibit A.2",
+    // "U.S." Each inflated count is a silent false negative, because
+    // `max_sentences` is a hard filter -- a one-sentence clause citing a
+    // subsection reported two, and a genuine three-sentence provision citing
+    // one per sentence reported six and fell out of Peter's standing query.
     let mut count = 0u32;
     let mut saw_content = false;
-    for character in text.chars() {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
         if !character.is_whitespace() {
             saw_content = true;
         }
         if saw_content && matches!(character, '.' | '!' | '?') {
-            count = count.saturating_add(1);
-            saw_content = false;
+            let ends_here = characters
+                .peek()
+                .is_none_or(|next| next.is_whitespace() || matches!(next, '"' | '\'' | ')' | ']'));
+            if ends_here {
+                count = count.saturating_add(1);
+                saw_content = false;
+            }
         }
     }
     if saw_content || count == 0 {
@@ -1986,6 +1999,31 @@ mod tests {
         );
         // The anchor cites where the clause body is, not where its caption was.
         assert_eq!(normalized.provisions[0].anchor, "page:0002/section:0001");
+    }
+
+    #[test]
+    fn a_cross_reference_does_not_inflate_the_sentence_count() {
+        // `max_sentences` is a hard filter, so every spurious sentence is a
+        // silently dropped provision. Contract prose is full of dotted
+        // notation that is not a sentence boundary.
+        let single = document(
+            "cross-reference",
+            "Cross Reference",
+            "7. Confidentiality\nRecipient shall comply with Section 1.1 and Exhibit A.2 before paying $1,000.00 under this Agreement.",
+        );
+        assert_eq!(single.provisions.len(), 1);
+        assert_eq!(
+            single.provisions[0].sentence_count, 1,
+            "dotted notation was counted as a sentence boundary"
+        );
+
+        // ...and a real boundary is still one.
+        let two = document(
+            "two-sentences",
+            "Two Sentences",
+            "7. Confidentiality\nRecipient shall protect it under Section 1.1. This obligation survives termination.",
+        );
+        assert_eq!(two.provisions[0].sentence_count, 2);
     }
 
     #[test]
