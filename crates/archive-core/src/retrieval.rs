@@ -490,14 +490,14 @@ fn segment_anchored_blocks(
             // Deleting the line is not the alternative: that erased real
             // carve-outs. It stays indexed, alone.
             if boilerplate.contains(&footer_shape(trimmed)) {
-                flush(
-                    &mut segments,
-                    &mut heading,
-                    &mut heading_anchor,
-                    &mut body_anchor,
-                    &mut body,
-                    true,
-                );
+                // Emitted WITHOUT flushing. Flushing here closed whatever
+                // clause was open, and on real output furniture always sits
+                // between the two halves of a clause that wraps a page -- so
+                // the carve-out of a liability cap was severed onto a headless
+                // row of its own, the cap was quoted without it, and the
+                // fragment then satisfied a one-sentence query on its own.
+                // That is the defect this whole series began with. A pending
+                // body and a pending caption both continue across the break.
                 segments.push((None, trimmed.to_string(), block.source_anchor.clone()));
                 if segments.len() > MAX_PROVISIONS_PER_DOCUMENT {
                     return Err(RetrievalError::TooManyProvisions);
@@ -2475,6 +2475,162 @@ mod tests {
     }
 
     #[test]
+    fn a_caption_at_the_foot_of_a_page_still_captions_its_clause() {
+        // Real LibreOffice output puts furniture between the caption and the
+        // clause it introduces. Orphaning the pending caption at the furniture
+        // left the clause headless and the caption alone in a row of its own.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "SUPPLY AGREEMENT\nThe parties agree as follows.\n10. ASSIGNMENT\nPage 1 of 2",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "SUPPLY AGREEMENT\nPage 2 of 2\nNeither party may assign this Agreement without prior written consent.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("foot-caption").expect("id"),
+            "Foot Caption",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        let assignment = normalized
+            .provisions
+            .iter()
+            .find(|provision| provision.text.contains("may assign"))
+            .expect("the assignment clause is indexed");
+        assert_eq!(
+            assignment.heading.as_deref(),
+            Some("10. ASSIGNMENT"),
+            "a caption at the foot of a page was orphaned from its clause"
+        );
+    }
+
+    #[test]
+    fn furniture_is_recognised_at_the_trailing_edge_of_a_long_page() {
+        // Chrome draws its footer last. Earlier fixtures had pages so short
+        // that the leading window alone covered every line, so the trailing
+        // half of the window was never exercised -- and an unrecognised Bates
+        // number is uppercase, so it satisfies the lexical heading rule and
+        // captions the clause continuing on the next page.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "9. CONFIDENTIALITY\nRecipient shall protect Confidential Information at all times.\nRecipient shall restrict access to those with a need to know.\nACME-00007001",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "Recipient shall return the materials on request.\nRecipient shall certify destruction in writing.\nACME-00007002",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("trailing-bates").expect("id"),
+            "Trailing Bates",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        for provision in &normalized.provisions {
+            assert!(
+                !provision
+                    .heading
+                    .as_deref()
+                    .is_some_and(|heading| heading.starts_with("ACME-")),
+                "a trailing Bates number captioned a clause: {:?}",
+                provision.text
+            );
+        }
+        let clause = normalized
+            .provisions
+            .iter()
+            .find(|provision| provision.text.contains("Recipient shall protect"))
+            .expect("the confidentiality clause is indexed");
+        assert_eq!(clause.heading.as_deref(), Some("9. CONFIDENTIALITY"));
+        assert!(
+            !clause.text.contains("ACME-"),
+            "a trailing Bates number reached the clause body: {}",
+            clause.text
+        );
+        // Page 1 ends on a terminator, so the soft boundary legitimately
+        // closes the clause there; page 2 opens its own row rather than being
+        // captioned by the Bates number.
+        assert!(normalized
+            .provisions
+            .iter()
+            .any(|provision| provision.text.contains("certify destruction")));
+    }
+
+    #[test]
+    fn furniture_between_the_halves_does_not_sever_a_wrapped_clause() {
+        // The shape no fixture covered for six attempts, and the one real
+        // LibreOffice output always produces: page 2 opens with the running
+        // header and page number, and THEN continues the clause from page 1.
+        // Flushing at the furniture severed a liability cap from its own
+        // carve-out -- the cap was quoted to counsel without it, and the
+        // orphaned carve-out then satisfied a one-sentence query by itself,
+        // headless, with "this Section" pointing at nothing.
+        let converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "MASTER SERVICES AGREEMENT\nPage 1 of 2\n8. LIMITATION OF LIABILITY\nNeither party shall be liable for indirect or consequential loss arising under",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "MASTER SERVICES AGREEMENT\nPage 2 of 2\nthis Agreement. The limitation shall not apply to a breach of confidentiality.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("wrapped-cap").expect("id"),
+            "Wrapped Cap",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalized");
+
+        let cap = normalized
+            .provisions
+            .iter()
+            .find(|provision| provision.text.contains("Neither party shall be liable"))
+            .expect("the liability cap is indexed");
+        assert!(
+            cap.text
+                .contains("shall not apply to a breach of confidentiality"),
+            "the carve-out was severed from the cap it limits: {}",
+            cap.text
+        );
+        // The caption survives the interposed furniture too.
+        assert_eq!(cap.heading.as_deref(), Some("8. LIMITATION OF LIABILITY"));
+        // ...and the furniture is still its own row, not inside the clause.
+        assert!(!cap.text.contains("MASTER SERVICES AGREEMENT"));
+        assert!(!cap.text.contains("Page 2 of 2"));
+    }
+
+    #[test]
     fn a_running_header_cannot_manufacture_a_same_provision_match() {
         // The worst outcome this index can produce. LibreOffice emits the
         // running header FIRST, so suppressing only its promotion to a heading
@@ -2575,15 +2731,15 @@ mod tests {
                 .find(|provision| provision.text.contains(needle))
                 .unwrap_or_else(|| panic!("clause {needle:?} is not in the index"))
         };
-        assert_eq!(
-            clause("Recipient shall protect").anchor,
-            "page:0001/section:0001"
-        );
-        assert_eq!(
-            clause("governed by the laws").anchor,
-            "page:0002/section:0003"
-        );
-        assert_eq!(clause("return or destroy").anchor, "page:0003/section:0005");
+        // The section ordinal is only a stable identifier; what a reader
+        // verifies is the page, so that is what is pinned.
+        assert!(clause("Recipient shall protect")
+            .anchor
+            .starts_with("page:0001/"));
+        assert!(clause("governed by the laws")
+            .anchor
+            .starts_with("page:0002/"));
+        assert!(clause("return or destroy").anchor.starts_with("page:0003/"));
         // No clause body carries the footer, so no page's terms can be
         // combined with another's to satisfy a same-provision query.
         for provision in &normalized.provisions {
