@@ -569,11 +569,14 @@ def main() -> int:
         "namedAudioCanaryObserved": False,
         "productGateExpectedClosed": True,
         "signedByteTransport": "accepted",
-        # "accepted" attests that the authenticated byte path carried the
-        # canary into the Swift bridge. It does not by itself attest that the
-        # Speech analyzer ran: the bridge reports runtimeSupported false when
-        # the framework declines after the bytes arrive. Record it so the
-        # receipt cannot be read as more than it proves.
+        # "accepted" attests that the exact authenticated canary bytes crossed
+        # the parent -> XPC -> worker transport and the worker returned a
+        # content receipt whose checksum matched. It does NOT attest that the
+        # Speech analyzer ran: a hosted runner has no Speech assets and cannot
+        # transcribe, and constructing the analyzer aborts the sandboxed XPC
+        # worker, so acceptance proves the transport and the analyzer is
+        # verified separately on real hardware. runtimeSupported is therefore
+        # false here; a transcript is proven by verify_apple_speech_hardware.sh.
         "runtimeSupported": runtime_supported,
         # The worker derives its peer requirement from the same trusted-
         # distribution verdict, and fails closed when that evaluation cannot
