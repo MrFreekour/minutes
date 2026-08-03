@@ -250,6 +250,20 @@ fn cancel_archive_census(state: State<'_, ArchiveState>) -> Result<bool, String>
     Ok(true)
 }
 
+/// Whether an existing destination is an alias for an inode with other names.
+fn is_multiply_linked(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 fn refuse_link_target(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -258,6 +272,16 @@ fn refuse_link_target(path: &Path) -> Result<(), String> {
         Ok(metadata) if !metadata.is_file() => {
             Err("The report destination must be a regular file.".to_string())
         }
+        // A hard link IS a regular file, so both checks above pass it, and
+        // `O_NOFOLLOW` refuses symlinks only. Truncating it destroys whatever
+        // inode the name is an alias for -- so choosing a report name that
+        // happens to be linked to a client document replaces that document
+        // with census JSON. Same link class as the ingestion boundary, on the
+        // write side, and destructive rather than disclosive.
+        Ok(metadata) if is_multiply_linked(&metadata) => Err(
+            "The report destination is a hard link to another file. Choose a different name."
+                .to_string(),
+        ),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err("The report destination is unavailable.".to_string()),
@@ -746,6 +770,41 @@ fn purge_session(app_handle: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    /// Exporting the census must never overwrite a hard-linked document.
+    ///
+    /// An independent reviewer found that `refuse_link_target` rejects
+    /// symlinks but accepts any regular file, and `O_NOFOLLOW` does not refuse
+    /// a hard link either -- so `truncate(true)` destroys whatever inode the
+    /// destination name is an alias for. Same link class as the ingestion
+    /// escape, but on the write side, and destructive rather than disclosive:
+    /// a client document is replaced by census JSON.
+    #[test]
+    #[cfg(unix)]
+    fn exporting_over_a_hard_link_never_destroys_the_linked_document() {
+        let temp = tempfile::tempdir().expect("temp");
+        let precious = temp.path().join("client-matter.txt");
+        let original = b"PRIVILEGED CLIENT DOCUMENT";
+        std::fs::write(&precious, original).expect("write precious");
+
+        // The operator picks a report name that is an alias for that document.
+        let destination = temp.path().join("archive-census.json");
+        std::fs::hard_link(&precious, &destination).expect("hard link");
+
+        let refusal = refuse_link_target(&destination);
+        assert!(
+            refusal.is_err(),
+            "a multiply linked destination was accepted for truncation"
+        );
+        assert_eq!(
+            std::fs::read(&precious).expect("read back"),
+            original,
+            "the linked client document was modified"
+        );
+
+        // An ordinary new destination is still allowed.
+        assert!(refuse_link_target(&temp.path().join("fresh-report.json")).is_ok());
+    }
+
     /// The interface must not receive a content hash of every match.
     ///
     /// An independent reviewer found `source_revision.sha256` and `byte_len`
