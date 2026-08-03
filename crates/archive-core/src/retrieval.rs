@@ -1151,6 +1151,7 @@ impl CandidateRow {
                 sentence_count,
                 &heading_only,
                 excerpt_truncated,
+                self.provision_heading.is_none(),
             ),
             matched_concepts: matched,
             lexical_rank: self.lexical_rank,
@@ -1927,6 +1928,7 @@ fn why_matched(
     actual_sentences: u32,
     heading_only: &[LegalConcept],
     excerpt_truncated: bool,
+    provision_uncaptioned: bool,
 ) -> String {
     let mut reasons = concepts
         .iter()
@@ -1961,8 +1963,23 @@ fn why_matched(
                 .join(", ")
         )
     };
+    // A provision with no section caption has no boundary the document
+    // declared. Its extent came from the page layout, and where a PDF reports
+    // no structure at all -- one uniform font size and captions no lexical
+    // rule recognises -- that extent can run past the end of one clause. The
+    // conjunction is then asserted across text the document never joined.
+    //
+    // Only said when a conjunction is actually being claimed: a single-concept
+    // match over a slightly long excerpt is not misleading, and a caveat on
+    // every uncaptioned card would be noise the reader learns to skip.
+    let unbounded = if provision_uncaptioned && concepts.len() > 1 {
+        " This provision carries no section caption, so its extent was inferred from the page \
+         layout; check the excerpt that the terms are in one clause."
+    } else {
+        ""
+    };
     format!(
-        "Matched {} in the same provision; {actual_sentences} sentence{}.{caveat}{truncation}",
+        "Matched {} in the same provision; {actual_sentences} sentence{}.{caveat}{truncation}{unbounded}",
         reasons.join(", "),
         if actual_sentences == 1 { "" } else { "s" }
     )
@@ -2757,6 +2774,31 @@ mod tests {
     }
 
     #[test]
+    fn a_conjunction_claimed_on_an_uncaptioned_provision_says_its_extent_was_inferred() {
+        use LegalConcept::{Assignment, Confidentiality};
+        // A provision with no section caption has no boundary the document
+        // declared, so a same-provision conjunction across it may be spanning
+        // two clauses (#26). The card has to say so, the same way it already
+        // discloses a shortened excerpt and a heading-only match.
+        let claimed = why_matched(&[Confidentiality, Assignment], None, 6, &[], false, true);
+        assert!(
+            claimed.contains("no section caption"),
+            "an unverified conjunction was asserted without qualification: {claimed}"
+        );
+
+        // A captioned provision has a boundary the document declared, so the
+        // same claim needs no qualification.
+        assert!(
+            !why_matched(&[Confidentiality, Assignment], None, 6, &[], false, false)
+                .contains("no section caption")
+        );
+        // ...and neither does a single-concept match, captioned or not: the
+        // caveat is about the conjunction, and on every card it would be noise.
+        assert!(!why_matched(&[Confidentiality], None, 6, &[], false, true)
+            .contains("no section caption"));
+    }
+
+    #[test]
     fn an_oversized_excerpt_is_bounded_and_says_so() {
         // A 200-page PDF whose captions the lexical rule misses produced a
         // single 467,000-character card, rendered straight into textContent.
@@ -2782,15 +2824,27 @@ mod tests {
             &word_cut[word_cut.len().saturating_sub(20)..]
         );
 
-        let reason = why_matched(&[LegalConcept::Confidentiality], Some(3), 9, &[], true);
+        let reason = why_matched(
+            &[LegalConcept::Confidentiality],
+            Some(3),
+            9,
+            &[],
+            true,
+            false,
+        );
         assert!(
             reason.contains("shortened"),
             "a shortened quotation was not disclosed: {reason}"
         );
-        assert!(
-            !why_matched(&[LegalConcept::Confidentiality], Some(3), 9, &[], false)
-                .contains("shortened")
-        );
+        assert!(!why_matched(
+            &[LegalConcept::Confidentiality],
+            Some(3),
+            9,
+            &[],
+            false,
+            false
+        )
+        .contains("shortened"));
     }
 
     #[test]
