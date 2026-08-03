@@ -184,7 +184,26 @@ a:focus-visible {
 
 .hero {
   max-width: 790px;
-  padding: 52px 0 38px;
+  padding: 26px 0 20px;
+}
+
+/* Once the operator is past step 1 the hero has done its job. Orientation
+   copy that persists through a search session is just a permanent tax on the
+   working surface: it pushed the search field and its results below the fold
+   on a 640px-tall window, so reading an excerpt meant scrolling away from the
+   query that produced it. */
+.is-working .hero {
+  padding: 18px 0 14px;
+}
+
+.is-working .hero-copy,
+.is-working .eyebrow {
+  display: none;
+}
+
+.is-working .hero h1 {
+  font-size: 22px;
+  letter-spacing: -0.022em;
 }
 
 .eyebrow,
@@ -201,18 +220,21 @@ a:focus-visible {
   max-width: 760px;
   margin: 0;
   font-family: "Instrument Serif", Iowan Old Style, Baskerville, Georgia, serif;
-  font-size: clamp(38px, 4.2vw, 56px);
+  /* DESIGN.md's section-heading scale, not its hero scale. The 56px hero row
+     is for the landing site; this is a desktop tool, where the stated
+     aesthetic is information density. */
+  font-size: clamp(26px, 2.4vw, 32px);
   font-weight: 400;
-  letter-spacing: -0.038em;
-  line-height: 1.02;
+  letter-spacing: -0.03em;
+  line-height: 1.08;
 }
 
 .hero-copy {
   max-width: 660px;
-  margin: 20px 0 0;
+  margin: 10px 0 0;
   color: var(--muted);
-  font-size: 16px;
-  line-height: 1.65;
+  font-size: 15px;
+  line-height: 1.55;
 }
 
 .workspace {

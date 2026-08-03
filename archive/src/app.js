@@ -81,6 +81,8 @@ function showView(name) {
   for (const step of document.querySelectorAll("[data-step]")) {
     step.classList.toggle("is-active", step.dataset.step === activeStep);
   }
+  // Past step 1 the operator is working, not being introduced.
+  document.body.classList.toggle("is-working", activeStep !== "1");
 }
 
 function setLocationControlsDisabled(disabled) {
