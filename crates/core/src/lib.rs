@@ -2,6 +2,7 @@
 
 pub mod apple_fm;
 pub mod apple_speech;
+pub mod apple_speech_worker;
 pub(crate) mod audio_budget;
 pub mod audio_decode_worker;
 pub mod autoresearch;
@@ -46,6 +47,7 @@ pub mod ffmpeg;
 pub mod graph;
 pub mod graph_worker;
 pub mod health;
+pub mod i18n;
 pub mod jobs;
 pub mod knowledge;
 pub mod knowledge_extract;

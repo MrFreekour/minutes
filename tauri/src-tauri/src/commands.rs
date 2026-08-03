@@ -607,11 +607,20 @@ fn parakeet_status_view(config: &Config) -> ParakeetStatusView {
 }
 
 fn apple_speech_status_view() -> serde_json::Value {
+    let transport_available =
+        minutes_core::pipeline::apple_speech_private_audio_transport_supported();
     match minutes_core::apple_speech::probe_capabilities() {
         Ok(report) => serde_json::json!({
             "supported": report.runtime_supported,
             "selectable": false,
-            "unavailable_reason": minutes_core::pipeline::apple_speech_unavailable_reason(),
+            "transport_available": transport_available,
+            "unavailable_reason": if transport_available && report.runtime_supported {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(
+                    minutes_core::pipeline::apple_speech_unavailable_reason().into()
+                )
+            },
             "report": report,
         }),
         Err(error) => serde_json::json!({
@@ -627,6 +636,16 @@ fn live_transcript_fallback_order_view(config: &Config) -> Vec<String> {
     let resolved = config.effective_live_transcript_backend();
     let parakeet_ready = parakeet_status_view(config).ready;
     match resolved {
+        "apple-speech"
+            if minutes_core::pipeline::apple_speech_private_audio_transport_supported() =>
+        {
+            let mut order = vec!["apple-speech".to_string()];
+            if parakeet_ready {
+                order.push("parakeet".to_string());
+            }
+            order.push("whisper".to_string());
+            order
+        }
         "apple-speech" => vec!["whisper".to_string()],
         "parakeet" => {
             if parakeet_ready {
@@ -778,6 +797,20 @@ fn standalone_live_readiness_view(config: &Config) -> SurfaceReadinessView {
             }
         }
         "apple-speech" => {
+            if minutes_core::pipeline::apple_speech_private_audio_transport_supported() {
+                return SurfaceReadinessView {
+                    configured_backend,
+                    resolved_backend: "apple-speech".into(),
+                    ready: true,
+                    model_name: String::new(),
+                    detail: format!(
+                        "Apple Speech uses the authenticated bundled byte-transport service. No named plaintext utterance file is created. Fallback order: {}.",
+                        fallback_order.join(" -> ")
+                    ),
+                    next_action: "none".into(),
+                    fallback_order,
+                };
+            }
             let (detail, next_action) = if whisper_ready {
                 (
                     format!(
@@ -4072,6 +4105,13 @@ fn desktop_recording_consent_required(
 }
 
 fn show_user_notification_nonmodal(app_handle: &tauri::AppHandle, title: &str, body: &str) {
+    // Localize once here so every call site gets translated titles/bodies for
+    // free. Dynamic/interpolated bodies simply fall back to English (no entry).
+    let title = minutes_core::i18n::tr(title);
+    let title = title.as_ref();
+    let body = minutes_core::i18n::tr(body);
+    let body = body.as_ref();
+
     #[cfg(target_os = "macos")]
     {
         let identifier = app_handle.config().identifier.as_str();
@@ -4493,6 +4533,13 @@ fn maybe_show_completion_notification(
 }
 
 pub fn show_user_notification(app_handle: &tauri::AppHandle, title: &str, body: &str) {
+    // Localize once here so every call site gets translated titles/bodies for
+    // free. Dynamic/interpolated bodies simply fall back to English (no entry).
+    let title = minutes_core::i18n::tr(title);
+    let title = title.as_ref();
+    let body = minutes_core::i18n::tr(body);
+    let body = body.as_ref();
+
     #[cfg(target_os = "macos")]
     {
         let identifier = app_handle.config().identifier.as_str();
@@ -5394,6 +5441,54 @@ pub fn cmd_vault_unlink() -> Result<String, String> {
         .save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
     Ok(format!("Vault unlinked (was: {})", old))
+}
+
+/// Returns the resolved UI language (`"en"` or `"zh-CN"`) for the frontend.
+///
+/// Reads the persisted `[ui] language` preference and resolves `"auto"` plus
+/// the `MINUTES_LANG` env override through [`minutes_core::i18n`]. The frontend
+/// calls this once on load to reconcile its client-side cache with the
+/// authoritative config value.
+#[tauri::command]
+pub fn cmd_get_ui_language() -> String {
+    let config = Config::load();
+    locale_tag(minutes_core::i18n::resolve_locale(&config.ui.language))
+}
+
+/// Persists the UI language preference and applies it to the running process.
+///
+/// `language` is `"auto"`, `"en"`, or `"zh-CN"`. After saving, the active
+/// locale is updated so any native shell strings (tray / menus / notifications)
+/// built afterward render in the new language, and the tray + native menu are
+/// rebuilt in place. Returns the resolved locale (`"en"` / `"zh-CN"`) so the
+/// caller can drive `MinutesI18n.setLocale` for the frontend.
+#[tauri::command]
+pub fn cmd_set_ui_language(app: tauri::AppHandle, language: String) -> Result<String, String> {
+    let normalized = match language.as_str() {
+        "auto" | "en" | "zh-CN" => language,
+        other => return Err(format!("Unsupported language: {}", other)),
+    };
+
+    let mut config = Config::load();
+    config.ui.language = normalized;
+    config
+        .save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    let locale = minutes_core::i18n::resolve_locale(&config.ui.language);
+    minutes_core::i18n::set_locale(locale);
+    // Rebuild the native tray/menu so already-visible labels switch language.
+    crate::rebuild_localized_shell(&app);
+
+    Ok(locale_tag(locale))
+}
+
+/// Maps a [`minutes_core::i18n::Locale`] to the tag string the frontend uses.
+fn locale_tag(locale: minutes_core::i18n::Locale) -> String {
+    match locale {
+        minutes_core::i18n::Locale::ZhCn => "zh-CN".to_string(),
+        minutes_core::i18n::Locale::En => "en".to_string(),
+    }
 }
 
 fn is_hidden_or_system_file(path: &std::path::Path) -> bool {
@@ -7358,7 +7453,7 @@ pub fn cmd_delete_meeting(
                 "Archive \"{}\" and its audio recording?\nThey will be moved to the archive folder.",
                 title
             ))
-            .title("Archive Meeting")
+            .title(minutes_core::i18n::tr("Archive Meeting"))
             .kind(MessageDialogKind::Warning)
             .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancel)
             .blocking_show();
@@ -11090,6 +11185,9 @@ pub fn cmd_get_settings() -> serde_json::Value {
             "emails": config.identity.emails,
             "aliases": config.identity.aliases,
         },
+        "ui": {
+            "language": config.ui.language,
+        },
     })
 }
 
@@ -13472,13 +13570,31 @@ mod tests {
         // rather than overwriting. In practice we expect the basename
         // picker to find a free slot. This test forces the no-clobber path
         // to trigger by saturating slots.
-        let ts = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
-        let primary = format!("{}-capture", ts);
-        std::fs::write(failed_dir.join(format!("{}.mov", primary)), b"prior").unwrap();
-        for n in 2..1000 {
-            let alt = format!("{}-capture-{}", ts, n);
-            std::fs::write(failed_dir.join(format!("{}.mov", alt)), b"prior").unwrap();
+        //
+        // The slot names are derived from the current second, and
+        // unique_failed_capture_basename reads the clock itself, so planting
+        // 1000 files can outlast the second it saturated. When that happened
+        // the picker saw a fresh, empty second, found a free slot, and this
+        // test failed for a reason that had nothing to do with the contract
+        // under test. Re-saturate until the clock has not moved across the
+        // plant, so the call below is made inside the second we filled.
+        let now_second = || chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+        let saturate = |ts: &str| {
+            std::fs::write(failed_dir.join(format!("{ts}-capture.mov")), b"prior").unwrap();
+            for n in 2..1000 {
+                std::fs::write(failed_dir.join(format!("{ts}-capture-{n}.mov")), b"prior").unwrap();
+            }
+        };
+        let mut ts = now_second();
+        loop {
+            saturate(&ts);
+            let after = now_second();
+            if after == ts {
+                break;
+            }
+            ts = after;
         }
+        let primary = format!("{ts}-capture");
 
         let mov = dir.path().join("call.mov");
         std::fs::write(&mov, vec![9_u8; 1024]).unwrap();
@@ -16795,7 +16911,7 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         "dictation-overlay",
         WebviewUrl::App("dictation-overlay.html".into()),
     )
-    .title("Dictation")
+    .title(minutes_core::i18n::tr("Dictation"))
     .inner_size(width, height)
     .position(x, y)
     .resizable(false)
@@ -18117,7 +18233,7 @@ pub fn maybe_show_palette_first_run_notice(app: &tauri::AppHandle) {
     let delivery_result = app
         .notification()
         .builder()
-        .title("Minutes command palette")
+        .title(minutes_core::i18n::tr("Minutes command palette"))
         .body(body)
         .show();
 
@@ -19598,7 +19714,7 @@ fn create_or_show_palette_window_inner(app: &tauri::AppHandle) {
         "palette",
         WebviewUrl::App("palette/index.html".into()),
     )
-    .title("Minutes Palette")
+    .title(minutes_core::i18n::tr("Minutes Palette"))
     .inner_size(width, height)
     .resizable(false)
     .decorations(false)

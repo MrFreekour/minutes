@@ -41,7 +41,38 @@ jobs:
           fi
           tag="acceptance-$CANDIDATE_SHA"
           remote="https://github.com/${GITHUB_REPOSITORY}.git"
-          resolved="$(git ls-remote --refs "$remote" "refs/tags/$tag" | awk '{print $1}')"
+          # `git ls-remote` patterns tail-match across ref namespaces, so a
+          # pattern of "refs/tags/<tag>" also matches a branch literally named
+          # "refs/tags/<tag>" (full ref refs/heads/refs/tags/<tag>). Restrict
+          # to the tag namespace and assert the full ref name exactly, so only
+          # a real, admin-protected tag can authorize a candidate.
+          #
+          # Both patterns are required: "refs/tags/<tag>" does not match the
+          # peeled "refs/tags/<tag>^{}" line that annotated tags carry, and
+          # without it an annotated tag resolves to its tag-object SHA and can
+          # never equal the candidate commit.
+          refs="$(
+            git ls-remote --tags "$remote" \
+              "refs/tags/$tag" "refs/tags/$tag^{}" || true
+          )"
+          exact="$(
+            printf '%s\n' "$refs" | awk -v t="refs/tags/$tag" '$2 == t {print $1}'
+          )"
+          peeled="$(
+            printf '%s\n' "$refs" |
+              awk -v t="refs/tags/$tag^{}" '$2 == t {print $1}'
+          )"
+          if [ "$(printf '%s\n' "$exact" | grep -c .)" -ne 1 ]; then
+            echo "Protected tag $tag must resolve to exactly one refs/tags ref" >&2
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$peeled" | grep -c .)" -gt 1 ]; then
+            echo "Protected tag $tag has ambiguous peeled refs" >&2
+            exit 1
+          fi
+          # Annotated tag -> the peeled line is the commit.
+          # Lightweight tag -> the ref itself is the commit.
+          resolved="${peeled:-$exact}"
           if [ "$resolved" != "$CANDIDATE_SHA" ]; then
             echo "Protected tag $tag does not resolve exactly to $CANDIDATE_SHA" >&2
             exit 1
@@ -89,6 +120,7 @@ jobs:
           cp -f tauri/src-tauri/entitlements.plist outer-entitlements.plist
           cp -f tauri/src-tauri/minutes-cli.entitlements cli-entitlements.plist
           cp -f tauri/src-tauri/minutes-graph-worker.entitlements graph-worker-entitlements.plist
+          cp -f tauri/src-tauri/minutes-apple-speech-worker.entitlements apple-speech-worker-entitlements.plist
 
       - name: Upload unsigned candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -101,6 +133,7 @@ jobs:
             outer-entitlements.plist
             cli-entitlements.plist
             graph-worker-entitlements.plist
+            apple-speech-worker-entitlements.plist
           if-no-files-found: error
           retention-days: 1
 
@@ -183,9 +216,14 @@ jobs:
           sidecar="$app/Contents/MacOS/minutes"
           graph_worker_bundle="$app/Contents/XPCServices/com.useminutes.graph-worker.xpc"
           graph_worker="$graph_worker_bundle/Contents/MacOS/minutes-graph-worker"
+          apple_speech_worker_bundle="$app/Contents/XPCServices/com.useminutes.apple-speech-worker.xpc"
+          apple_speech_worker="$apple_speech_worker_bundle/Contents/MacOS/minutes-apple-speech-worker"
           test -d "$graph_worker_bundle"
           test -f "$graph_worker"
           test ! -e "$app/Contents/MacOS/minutes-graph-worker"
+          test -d "$apple_speech_worker_bundle"
+          test -f "$apple_speech_worker"
+          test ! -e "$app/Contents/MacOS/minutes-apple-speech-worker"
           while IFS= read -r nested_executable; do
             if [ "$nested_executable" = "$sidecar" ]; then
               codesign --force --options runtime --timestamp \
@@ -201,15 +239,33 @@ jobs:
             --entitlements payload/graph-worker-entitlements.plist \
             --identifier com.useminutes.graph-worker \
             --sign "$MINUTES_DEV_SIGNING_IDENTITY" "$graph_worker_bundle"
+          codesign --force --options runtime --timestamp \
+            --entitlements payload/apple-speech-worker-entitlements.plist \
+            --identifier com.useminutes.apple-speech-worker \
+            --sign "$MINUTES_DEV_SIGNING_IDENTITY" "$apple_speech_worker_bundle"
           graph_worker_cdhash="$(
             codesign -dvvv "$graph_worker" 2>&1 \
               | awk -F= '/^CDHash=/{print tolower($2); exit}'
           )"
           [[ "$graph_worker_cdhash" =~ ^[0-9a-f]{40}$ ]]
           mkdir -p "$app/Contents/Resources"
+          graph_worker_cdhash_file="$app/Contents/Resources/minutes-graph-worker.cdhash"
+          test -f "$graph_worker_cdhash_file"
+          chmod u+w "$graph_worker_cdhash_file"
           printf '%s\n' "$graph_worker_cdhash" \
-            > "$app/Contents/Resources/minutes-graph-worker.cdhash"
-          chmod 444 "$app/Contents/Resources/minutes-graph-worker.cdhash"
+            > "$graph_worker_cdhash_file"
+          chmod 444 "$graph_worker_cdhash_file"
+          apple_speech_worker_cdhash="$(
+            codesign -dvvv "$apple_speech_worker" 2>&1 \
+              | awk -F= '/^CDHash=/{print tolower($2); exit}'
+          )"
+          [[ "$apple_speech_worker_cdhash" =~ ^[0-9a-f]{40}$ ]]
+          apple_speech_worker_cdhash_file="$app/Contents/Resources/minutes-apple-speech-worker.cdhash"
+          test -f "$apple_speech_worker_cdhash_file"
+          chmod u+w "$apple_speech_worker_cdhash_file"
+          printf '%s\n' "$apple_speech_worker_cdhash" \
+            > "$apple_speech_worker_cdhash_file"
+          chmod 444 "$apple_speech_worker_cdhash_file"
           app_executable_name="$(
             /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
               "$app/Contents/Info.plist"
@@ -246,6 +302,37 @@ jobs:
           if sealed.count(expected) != 1 or sealed.count(marker) != 1:
               raise SystemExit("parent graph-worker seal verification failed")
           PY
+          python3 - "$app_executable" "$apple_speech_worker_cdhash" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          executable = pathlib.Path(sys.argv[1])
+          cdhash = sys.argv[2]
+          if re.fullmatch(r"[0-9a-f]{40}", cdhash) is None:
+              raise SystemExit("invalid Apple Speech worker CodeDirectory hash")
+          marker = b"MINUTES_APPLE_SPEECH_WORKER_CDHASH_V1="
+          expected = marker + cdhash.encode("ascii")
+          contents = executable.read_bytes()
+          if contents.count(marker) != 1:
+              raise SystemExit("ambiguous parent Apple Speech worker seal")
+          offset = contents.index(marker)
+          old = contents[offset:offset + len(marker) + 40]
+          suffix = old[len(marker):]
+          if len(suffix) != 40 or any(
+              byte not in b"0123456789abcdef" for byte in suffix
+          ):
+              raise SystemExit("invalid prior parent Apple Speech worker seal")
+          with executable.open("r+b", buffering=0) as target:
+              target.seek(offset)
+              target.write(expected)
+              target.flush()
+              os.fsync(target.fileno())
+          sealed = executable.read_bytes()
+          if sealed.count(expected) != 1 or sealed.count(marker) != 1:
+              raise SystemExit("parent Apple Speech worker seal verification failed")
+          PY
           codesign --force --options runtime --timestamp \
             --entitlements payload/outer-entitlements.plist \
             --sign "$MINUTES_DEV_SIGNING_IDENTITY" "$app"
@@ -263,8 +350,12 @@ jobs:
           test "$identifier" = "com.useminutes.desktop.dev"
           graph_worker_bundle="$app/Contents/XPCServices/com.useminutes.graph-worker.xpc"
           graph_worker="$graph_worker_bundle/Contents/MacOS/minutes-graph-worker"
+          apple_speech_worker_bundle="$app/Contents/XPCServices/com.useminutes.apple-speech-worker.xpc"
+          apple_speech_worker="$apple_speech_worker_bundle/Contents/MacOS/minutes-apple-speech-worker"
           test ! -e "$app/Contents/MacOS/minutes-graph-worker"
+          test ! -e "$app/Contents/MacOS/minutes-apple-speech-worker"
           codesign --verify --strict --verbose=4 "$graph_worker_bundle"
+          codesign --verify --strict --verbose=4 "$apple_speech_worker_bundle"
           codesign -dv --verbose=4 "$graph_worker" >graph-worker-identity.txt 2>&1
           grep -Fq "Identifier=com.useminutes.graph-worker" graph-worker-identity.txt
           grep -Fq "TeamIdentifier=63TMLKT8HN" graph-worker-identity.txt
@@ -281,6 +372,22 @@ jobs:
                   f"graph worker entitlement allowlist mismatch: {actual!r}"
               )
           PY
+          codesign -dv --verbose=4 "$apple_speech_worker" >apple-speech-worker-identity.txt 2>&1
+          grep -Fq "Identifier=com.useminutes.apple-speech-worker" apple-speech-worker-identity.txt
+          grep -Fq "TeamIdentifier=63TMLKT8HN" apple-speech-worker-identity.txt
+          codesign -d --entitlements :- "$apple_speech_worker" \
+            >apple-speech-worker-entitlements.actual.plist 2>/dev/null
+          python3 - <<'PY'
+          import plistlib
+
+          with open("apple-speech-worker-entitlements.actual.plist", "rb") as source:
+              actual = plistlib.load(source)
+          expected = {"com.apple.security.app-sandbox": True}
+          if actual != expected:
+              raise SystemExit(
+                  f"Apple Speech worker entitlement allowlist mismatch: {actual!r}"
+              )
+          PY
           expected_cdhash="$(
             tr -d '\n' < "$app/Contents/Resources/minutes-graph-worker.cdhash"
           )"
@@ -289,6 +396,14 @@ jobs:
               | awk -F= '/^CDHash=/{print tolower($2); exit}'
           )"
           test "$expected_cdhash" = "$observed_cdhash"
+          expected_apple_cdhash="$(
+            tr -d '\n' < "$app/Contents/Resources/minutes-apple-speech-worker.cdhash"
+          )"
+          observed_apple_cdhash="$(
+            codesign -dvvv "$apple_speech_worker" 2>&1 \
+              | awk -F= '/^CDHash=/{print tolower($2); exit}'
+          )"
+          test "$expected_apple_cdhash" = "$observed_apple_cdhash"
           app_executable_name="$(
             /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
               "$app/Contents/Info.plist"
@@ -303,6 +418,19 @@ jobs:
           contents = pathlib.Path(sys.argv[1]).read_bytes()
           if contents.count(expected) != 1:
               raise SystemExit("signed parent is not bound to the exact graph worker")
+          PY
+          python3 - "$app/Contents/MacOS/$app_executable_name" \
+            "$observed_apple_cdhash" <<'PY'
+          import pathlib
+          import sys
+
+          marker = b"MINUTES_APPLE_SPEECH_WORKER_CDHASH_V1="
+          expected = marker + sys.argv[2].encode("ascii")
+          contents = pathlib.Path(sys.argv[1]).read_bytes()
+          if contents.count(expected) != 1:
+              raise SystemExit(
+                  "signed parent is not bound to the exact Apple Speech worker"
+              )
           PY
           printf 'candidate=%s\nteam_id=%s\nidentifier=%s\n' \
             "$CANDIDATE_SHA" "$team_id" "$identifier" \
@@ -326,5 +454,58 @@ jobs:
             minutes-dev-signed.zip
             minutes-dev-signed.zip.sha256
             signed-dev-provenance.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  run-signed-runtime:
+    name: Run signed Apple Speech byte-transport acceptance
+    needs:
+      - authorize-candidate
+      - sign-reviewed-artifact
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact protected acceptance harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/tags/acceptance-${{ needs.authorize-candidate.outputs.candidate_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact signed candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: minutes-dev-signed-${{ needs.authorize-candidate.outputs.candidate_sha }}
+          path: payload
+
+      - name: Verify and expand exact signed candidate
+        env:
+          CANDIDATE_SHA: ${{ needs.authorize-candidate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          (
+            cd payload
+            shasum -a 256 -c minutes-dev-signed.zip.sha256
+          )
+          mkdir -p runtime
+          ditto -x -k payload/minutes-dev-signed.zip runtime
+          test -d "runtime/Minutes Dev.app"
+
+      - name: Exercise signed byte path under same-UID open holder
+        env:
+          CANDIDATE_SHA: ${{ needs.authorize-candidate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/test_apple_speech_signed_transport.py \
+            --app "runtime/Minutes Dev.app" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            | tee signed-runtime-provenance.json
+
+      - name: Upload content-free signed runtime receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: apple-speech-signed-runtime-${{ needs.authorize-candidate.outputs.candidate_sha }}
+          path: signed-runtime-provenance.json
           if-no-files-found: error
           retention-days: 1
