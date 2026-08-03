@@ -21,12 +21,6 @@ pub const WORKER_MARKER: &str = "--minutes-archive-convert-worker-v1";
 pub const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_BLOCKS: usize = 10_000;
-/// Ceiling on extracted lines held in memory during layout analysis.
-///
-/// Layout needs every line of the document at once to find the margin bands
-/// and the modal line spacing, so unlike the page-at-a-time path it cannot
-/// stream. 400k lines is far more than any real filing and still bounded.
-pub const MAX_LAID_OUT_LINES: usize = 400_000;
 pub const MAX_DOCX_ENTRIES: usize = 2_000;
 pub const MAX_DOCX_XML_BYTES: usize = 24 * 1024 * 1024;
 const WORKER_CPU_SECONDS: u64 = 15;
@@ -439,349 +433,38 @@ pub fn convert_bytes(
     Ok(document)
 }
 
-/// One extracted line with the geometry the page reported for it.
-#[derive(Debug, Clone)]
-struct LaidOutLine {
-    page: u32,
-    /// Baseline, in PDF user space: larger is higher up the page.
-    y: f64,
-    size: f64,
-    /// Right edge of the last glyph, used to tell a caption from body text.
-    right: f64,
-    text: String,
-}
-
-/// Collects lines with their geometry instead of pre-flattened page text.
-///
-/// `extract_text_from_mem_by_pages` returns content-stream order, which is not
-/// reading order: LibreOffice draws the running header and footer FIRST, so
-/// the first line of a page is furniture and the last line of the extracted
-/// text is body. Every heuristic built on that ordering was wrong for one
-/// producer or the other. The baseline is unambiguous for both.
-struct LineCollector {
-    page: u32,
-    line: String,
-    y: f64,
-    size: f64,
-    lines: Vec<LaidOutLine>,
-    budget: usize,
-    /// Right edge of the previous glyph, in text space.
-    last_end: f64,
-    last_y: f64,
-    first_char_of_word: bool,
-}
-
-impl pdf_extract::OutputDev for LineCollector {
-    fn begin_page(
-        &mut self,
-        page_number: u32,
-        _media_box: &pdf_extract::MediaBox,
-        _art_box: Option<(f64, f64, f64, f64)>,
-    ) -> Result<(), pdf_extract::OutputError> {
-        self.page = page_number;
-        Ok(())
-    }
-
-    fn end_page(&mut self) -> Result<(), pdf_extract::OutputError> {
-        self.flush();
-        Ok(())
-    }
-
-    fn output_character(
-        &mut self,
-        trm: &pdf_extract::Transform,
-        width: f64,
-        _spacing: f64,
-        font_size: f64,
-        character: &str,
-    ) -> Result<(), pdf_extract::OutputError> {
-        // Word spacing is not signalled by `end_word`; it has to be measured,
-        // the way pdf_extract's own text output does it. Assembling glyphs
-        // naively produced "T E R M   AND" -- every word split into letters,
-        // which no phrase query could ever match.
-        let scale = (trm.m21 * trm.m21 + trm.m22 * trm.m22).sqrt();
-        let size = font_size * scale;
-        let (x, y) = (trm.m31, trm.m32);
-        if self.first_char_of_word {
-            // A baseline change ends the line. Larger y is higher on the page,
-            // so a new line is a decrease.
-            if (y - self.last_y).abs() > size * 0.5 && !self.line.is_empty() {
-                self.flush();
-            } else if x > self.last_end + size * 0.1 && !self.line.is_empty() {
-                self.line.push(' ');
-            }
-        }
-        if self.line.is_empty() {
-            self.y = y;
-            self.size = size;
-        }
-        if self.budget > 0 {
-            self.line.push_str(character);
-            self.budget = self.budget.saturating_sub(character.len());
-        }
-        self.first_char_of_word = false;
-        self.last_y = y;
-        self.last_end = x + width * size;
-        Ok(())
-    }
-
-    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> {
-        self.first_char_of_word = true;
-        Ok(())
-    }
-
-    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> {
-        Ok(())
-    }
-
-    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> {
-        self.flush();
-        Ok(())
-    }
-}
-
-impl LineCollector {
-    fn flush(&mut self) {
-        let text = self.line.trim().to_string();
-        self.line.clear();
-        if text.is_empty() || self.lines.len() >= MAX_LAID_OUT_LINES {
-            return;
-        }
-        self.lines.push(LaidOutLine {
-            page: self.page,
-            y: self.y,
-            size: self.size,
-            right: self.last_end,
-            text,
-        });
-    }
-}
-
-/// The most common value in `values`, bucketed, weighted by `weights`.
-///
-/// Deterministic on ties: the smallest bucket wins, so a document whose body
-/// and caption sizes are equally represented does not flip between runs.
-fn weighted_mode(samples: &[(f64, usize)], bucket: f64) -> Option<f64> {
-    let mut totals: Vec<(i64, usize)> = Vec::new();
-    for (value, weight) in samples {
-        let key = (value / bucket).round() as i64;
-        match totals.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, total)) => *total += weight,
-            None => totals.push((key, *weight)),
-        }
-    }
-    totals
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-        .map(|(key, _)| key as f64 * bucket)
-}
-
-/// Lines that repeat in the same margin band on more than one page.
-///
-/// A running header or footer is defined by where it sits, not by what it
-/// says. Guessing from length and repetition mislabelled an eleven-word
-/// closing sentence as furniture and missed an eighteen-word firm footer;
-/// the margin band is what the producer actually encoded.
-fn furniture_bands(lines: &[LaidOutLine]) -> (f64, f64) {
-    let mut pages: Vec<u32> = lines.iter().map(|line| line.page).collect();
-    pages.sort_unstable();
-    pages.dedup();
-    if pages.len() < 2 {
-        // One page cannot establish what repeats, so claim no furniture at all
-        // rather than guess. A wrong band would delete real text.
-        return (f64::INFINITY, f64::NEG_INFINITY);
-    }
-    // The body band is the y-range occupied on most pages; anything above the
-    // highest shared body line or below the lowest is margin furniture.
-    let mut tops: Vec<f64> = Vec::new();
-    let mut bottoms: Vec<f64> = Vec::new();
-    for page in &pages {
-        let mut on_page: Vec<&LaidOutLine> =
-            lines.iter().filter(|line| line.page == *page).collect();
-        if on_page.len() < 3 {
-            continue;
-        }
-        on_page.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
-        tops.push(on_page[0].y);
-        bottoms.push(on_page[on_page.len() - 1].y);
-    }
-    if tops.len() < 2 {
-        return (f64::INFINITY, f64::NEG_INFINITY);
-    }
-    let repeated = |values: &mut Vec<f64>| -> Option<f64> {
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let samples: Vec<(f64, usize)> = values.iter().map(|value| (*value, 1)).collect();
-        let candidate = weighted_mode(&samples, 1.0)?;
-        let hits = values
-            .iter()
-            .filter(|value| (**value - candidate).abs() <= 1.0)
-            .count();
-        // Only a band that recurs on most pages is furniture.
-        (hits * 2 > values.len()).then_some(candidate)
-    };
-    let top = repeated(&mut tops.clone()).unwrap_or(f64::INFINITY);
-    let bottom = repeated(&mut bottoms.clone()).unwrap_or(f64::NEG_INFINITY);
-    (top, bottom)
-}
-
 fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
-    let document =
-        pdf_extract::Document::load_mem(bytes).map_err(|_| ConversionError::MalformedSource)?;
-    let mut collector = LineCollector {
-        page: 0,
-        line: String::new(),
-        y: 0.0,
-        size: 0.0,
-        lines: Vec::new(),
-        budget: MAX_OUTPUT_BYTES,
-        last_end: f64::MAX,
-        last_y: 0.0,
-        first_char_of_word: false,
-    };
-    pdf_extract::output_doc(&document, &mut collector)
+    let pages = pdf_extract::extract_text_from_mem_by_pages(bytes)
         .map_err(|_| ConversionError::MalformedSource)?;
-    let mut lines = collector.lines;
-
-    // Reading order is the baseline, descending within a page. Content-stream
-    // order is not reading order for either producer tested.
-    lines.sort_by(|a, b| {
-        a.page
-            .cmp(&b.page)
-            .then_with(|| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
-    let (top_band, bottom_band) = furniture_bands(&lines);
-    let body: Vec<LaidOutLine> = lines
-        .into_iter()
-        .filter(|line| {
-            // Strictly inside the repeating margin bands. Furniture is dropped
-            // from segmentation, but it is NOT dropped from the document: a
-            // page number carries no clause text, and everything that does is
-            // between the bands.
-            line.y < top_band - 0.5 && line.y > bottom_band + 0.5
-        })
-        .collect();
-    if body.is_empty() {
-        return Ok(ConvertedDocument {
-            format: SourceFormat::Pdf,
-            blocks: Vec::new(),
-            warnings: vec!["ocr_required_or_no_extractable_text".to_string()],
-        });
-    }
-
-    // Body size and line spacing are whatever this document uses most, so a
-    // 10pt filing and a 12pt agreement are both measured against themselves.
-    let size_samples: Vec<(f64, usize)> = body
-        .iter()
-        .map(|line| (line.size, line.text.chars().count()))
-        .collect();
-    let body_size = weighted_mode(&size_samples, 0.1).unwrap_or(0.0);
-    let gap_samples: Vec<(f64, usize)> = body
-        .windows(2)
-        .filter(|pair| pair[0].page == pair[1].page)
-        .map(|pair| (pair[0].y - pair[1].y, 1))
-        .filter(|(gap, _)| *gap > 0.0)
-        .collect();
-    let body_gap = weighted_mode(&gap_samples, 0.5).unwrap_or(0.0);
-
-    // The measure this document sets: the widest line its body reaches.
-    let measure = body.iter().map(|line| line.right).fold(0.0f64, f64::max);
-    let mut blocks: Vec<ConvertedBlock> = Vec::new();
-    let mut shapes: Vec<(usize, f64)> = Vec::new();
-    let mut current_lines = 0usize;
-    let mut current_right = 0.0f64;
-    let mut current = String::new();
-    let mut current_anchor = String::new();
-    let mut current_heading: Option<bool> = None;
-    let mut previous: Option<&LaidOutLine> = None;
-
-    for line in &body {
-        // A line set materially larger than the body is a caption the document
-        // itself declares. Never `Some(false)`: a document with one uniform
-        // size reports no structure, and claiming "not a heading" would
-        // suppress the lexical fallback that is all such files have.
-        let is_caption = body_size > 0.0 && line.size >= body_size * 1.15;
-        let starts_paragraph = match previous {
-            None => true,
-            Some(prior) => {
-                prior.page != line.page
-                    || (body_gap > 0.0 && prior.y - line.y > body_gap * 1.35)
-                    || is_caption
-                    || (body_size > 0.0 && prior.size >= body_size * 1.15)
-            }
-        };
-        // Deliberately no cross-page joining here. Whether a paragraph
-        // continues over a page break is not something the page geometry
-        // answers: a clause cut off at the foot of a page and a section that
-        // simply ended early look identical once the words are gone, and
-        // seven successive guesses at it -- last character, fill width,
-        // remaining space -- each fixed one shape and broke another.
-        //
-        // It does not need answering here. The segmenter accumulates
-        // consecutive body blocks into one provision and closes it only at a
-        // heading, so a clause spanning a page is rejoined there, from
-        // structure rather than from a guess.
-        if starts_paragraph && !current.is_empty() {
-            blocks.push(ConvertedBlock {
-                source_anchor: current_anchor.clone(),
-                text: std::mem::take(&mut current),
-                flow: AnchorFlow::Continue,
-                is_heading: current_heading,
-            });
-            shapes.push((current_lines, current_right));
-            current_lines = 0;
-            current_right = 0.0;
-            if blocks.len() > MAX_BLOCKS {
-                return Err(ConversionError::OutputBudgetExceeded);
-            }
-        }
-        if current.is_empty() {
-            current_anchor = format!("page:{:04}", line.page);
-            current_heading = is_caption.then_some(true);
-        } else {
-            current.push(' ');
-        }
-        current.push_str(&line.text);
-        current_lines += 1;
-        current_right = current_right.max(line.right);
-        previous = Some(line);
-    }
-    if !current.is_empty() {
-        blocks.push(ConvertedBlock {
-            source_anchor: current_anchor,
-            text: current,
-            flow: AnchorFlow::Continue,
-            is_heading: current_heading,
-        });
-        shapes.push((current_lines, current_right));
-    }
-
-    // Fallback for documents that report no size variation at all -- plain or
-    // same-size-bold captions, which pdf_extract cannot distinguish from body
-    // because it exposes no font identity. A caption is then a paragraph of
-    // ONE line that stops well short of the measure, while a body paragraph
-    // either runs to the measure or wraps. Applied only when the size rule
-    // found nothing, so a properly styled document is never second-guessed.
-    //
-    // Where it is wrong it promotes a short standalone sentence to a caption:
-    // the text stays indexed and findable, and the provision carries a heading
-    // it should not. That is a visible, checkable error, unlike the silent
-    // conjunction it replaces.
-    if measure > 0.0 && !blocks.iter().any(|block| block.is_heading == Some(true)) {
-        for (block, (lines, right)) in blocks.iter_mut().zip(shapes.iter()) {
-            if *lines == 1 && *right < measure * 0.8 {
-                block.is_heading = Some(true);
-            }
-        }
-    }
-    if blocks.len() > MAX_BLOCKS {
+    if pages.len() > MAX_BLOCKS {
         return Err(ConversionError::OutputBudgetExceeded);
     }
-    for block in &mut blocks {
-        block.text = normalize_extracted_text(&block.text);
+    let mut blocks = Vec::new();
+    let mut output_bytes = 0usize;
+    for (index, page) in pages.into_iter().enumerate() {
+        let text = normalize_extracted_text(&page);
+        if text.is_empty() {
+            continue;
+        }
+        output_bytes = output_bytes
+            .checked_add(text.len())
+            .ok_or(ConversionError::OutputBudgetExceeded)?;
+        if output_bytes > MAX_OUTPUT_BYTES {
+            return Err(ConversionError::OutputBudgetExceeded);
+        }
+        blocks.push(ConvertedBlock {
+            source_anchor: format!("page:{:04}", index + 1),
+            text,
+            flow: AnchorFlow::HardBoundary,
+            // This extractor emits one block per page and does not carry per
+            // span font metrics, so it has no structural signal to report.
+            // `None` says exactly that -- it is not a claim that the page is
+            // body text. Deriving heading levels from the font-size
+            // distribution, the way PyMuPDF4LLM's IdentifyHeaders does, is
+            // deterministic and needs no model, and is the next step here.
+            is_heading: None,
+        });
     }
-    blocks.retain(|block| !block.text.is_empty());
-
     let warnings = if blocks.is_empty() {
         vec!["ocr_required_or_no_extractable_text".to_string()]
     } else {
