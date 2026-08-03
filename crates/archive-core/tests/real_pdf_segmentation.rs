@@ -90,3 +90,64 @@ fn a_real_pdf_keeps_a_wrapped_cap_with_its_carve_out_and_furniture_out_of_the_bo
         }
     }
 }
+
+const LIST_TAIL_MERGE: &[u8] =
+    include_bytes!("../../../tests/fixtures/archive-real-pdf/list-tail-merge.pdf");
+
+#[test]
+fn a_real_pdf_does_not_fabricate_a_same_provision_conjunction() {
+    // The page ends mid-list on an unterminated item and the next page opens an
+    // unrelated Assignment clause under a title-case caption that no lexical
+    // rule recognises, in a document with one uniform font size. Both captions
+    // are invisible to every word-level rule, which is what made the merge
+    // reachable at all. Every page-boundary heuristic tried on this
+    // shape either merged the two -- returning a card that claimed
+    // confidentiality and assignment in the same provision, which the document
+    // does not contain -- or severed a clause that genuinely wrapped.
+    //
+    // The document reports the answer: they are separate paragraphs, and the
+    // running header and footer are in the margin bands. Nothing has to be
+    // inferred from the words.
+    let converted = convert_bytes(SourceFormat::Pdf, LIST_TAIL_MERGE).expect("convert");
+    let normalized = normalize_converted_document(
+        DocumentId::parse("list-tail-merge").expect("id"),
+        "List Tail Merge",
+        LIST_TAIL_MERGE,
+        &converted,
+    )
+    .expect("normalize");
+
+    for provision in &normalized.provisions {
+        let carries_confidentiality = provision.text.contains("Confidential Information");
+        let carries_assignment = provision.text.contains("may assign");
+        assert!(
+            !(carries_confidentiality && carries_assignment),
+            "one provision now spans two unrelated clauses:\n{}",
+            provision.text
+        );
+    }
+
+    assert_eq!(
+        normalized.provisions.len(),
+        2,
+        "the two clauses did not separate into their own provisions"
+    );
+    assert!(normalized
+        .provisions
+        .iter()
+        .any(|provision| provision.text.contains("may assign")));
+
+    // ...and the running furniture is not clause text.
+    for provision in &normalized.provisions {
+        assert!(
+            !provision.text.contains("MUTUAL NON-DISCLOSURE AGREEMENT"),
+            "a running header reached a clause body: {}",
+            provision.text
+        );
+        assert!(
+            !provision.text.contains("Page 1") && !provision.text.contains("Page 2"),
+            "a running footer reached a clause body: {}",
+            provision.text
+        );
+    }
+}
