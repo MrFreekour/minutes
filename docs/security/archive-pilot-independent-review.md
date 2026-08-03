@@ -140,6 +140,14 @@ reviewer, methods used, findings with severity, fixes retested, residual risks,
 and a clear approve or do-not-approve decision. The reviewer—not the
 implementation author—owns that decision.
 
+An author-run adversarial pass was completed before this review and is logged
+in `docs/security/archive-pilot-pre-review-findings.md`. It records five
+findings and their fixes, what was probed and held, the residual risks, and --
+most usefully -- what it did not reach. It is explicitly not an independent
+review and not approval: it was commissioned by the implementer, on the
+implementer's code. Read it to avoid duplicating covered ground, not to
+shorten the review.
+
 Use `docs/security/archive-pilot-review-record-template.md` as the reviewer-
 owned record. Its initial `NOT REVIEWED` state is intentional and must never be
 treated as approval.
