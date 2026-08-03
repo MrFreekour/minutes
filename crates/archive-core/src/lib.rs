@@ -360,6 +360,31 @@ fn cap_metadata_is_link_or_reparse(metadata: &CapMetadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+/// Whether a regular file is an alias to an inode that may live elsewhere.
+///
+/// `is_symlink` is false for a hard link, so the link check above passes one
+/// straight through as an ordinary in-root file. A hard link inside an
+/// approved root can name an inode anywhere on the same volume, including a
+/// directory the operator never approved -- and it was indexed and returned as
+/// evidence. A file with more than one link has no single containing
+/// directory, so no per-root authority can be established for it and the only
+/// honest answer is to refuse it and say so.
+///
+/// Directories are exempt: `.` and `..` give every directory a link count
+/// above one, and directory hard links are not creatable on macOS anyway.
+pub(crate) fn cap_metadata_is_multiply_linked(metadata: &CapMetadata) -> bool {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        metadata.is_file() && metadata.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CensusStatus {
@@ -407,6 +432,7 @@ pub struct CategorySummary {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct CensusSignals {
     pub symlinks_skipped: u64,
+    pub hard_links_skipped: u64,
     pub hidden_artifacts: u64,
     pub icloud_placeholders: u64,
     pub zero_byte_files: u64,
@@ -678,6 +704,11 @@ pub fn scan_approved_roots(
                 continue;
             }
 
+            if cap_metadata_is_multiply_linked(&metadata) {
+                census.signals.hard_links_skipped += 1;
+                continue;
+            }
+
             if metadata.is_dir() {
                 let extension = extension_for_name(&name);
                 if let Some(category) = package_category(&extension) {
@@ -897,6 +928,40 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    #[cfg(unix)]
+    fn a_hard_link_does_not_smuggle_an_outside_file_into_an_approved_root() {
+        // A hard link is not a symlink, so `is_symlink` is false and the link
+        // check passed it through as an ordinary in-root file. An independent
+        // reviewer confirmed the consequence: a root whose only entry was a
+        // hard link to a file outside it indexed that file and returned it as
+        // evidence under a title that looked local.
+        //
+        // A file with more than one link has no single containing directory,
+        // so no per-root authority can be established for it.
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_file = outside.path().join("never-approved.txt");
+        fs::write(&outside_file, b"PRIVILEGED_OUTSIDE_ROOT").expect("outside file");
+
+        let temp = tempfile::tempdir().expect("root");
+        let root = temp.path().join("approved");
+        fs::create_dir(&root).expect("approved root");
+        fs::write(root.join("genuine.txt"), b"in-root").expect("in-root file");
+        fs::hard_link(&outside_file, root.join("looks-local.txt")).expect("hard link");
+
+        let report = scan(&root);
+        assert_eq!(
+            report.signals.hard_links_skipped, 1,
+            "the hard link was not recognised as multiply linked"
+        );
+        assert_eq!(
+            report.summary.regular_files, 1,
+            "an out-of-root inode was counted as an in-root file"
+        );
+        // The bytes of the outside file must not be counted either.
+        assert_eq!(report.summary.regular_file_bytes, "in-root".len() as u64);
+    }
+
     #[test]
     fn firmlinked_home_and_its_ancestors_are_refused_as_roots() {
         // /System/Volumes/Data/Users/<user> is a firmlink, not a symlink, so

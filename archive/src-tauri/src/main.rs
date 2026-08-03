@@ -141,6 +141,10 @@ async fn choose_archive_locations(
         .file()
         .set_title("Choose archive locations")
         .blocking_pick_folders();
+    // AppKit records the chosen directory the moment the panel closes, so
+    // erase it here rather than only at exit -- a crash between the two would
+    // otherwise leave the path on disk.
+    native_panel_state::forget();
     let Some(selected) = selected else {
         let session = state.session.lock().map_err(|_| lock_error())?;
         return Ok(location_summaries(&session.locations));
@@ -308,6 +312,9 @@ async fn export_archive_census(
         .set_title("Save aggregate archive census")
         .set_file_name("archive-census.json")
         .blocking_save_file();
+    // Same mechanism as the open panel: the save panel records its directory
+    // in the app's own preference domain.
+    native_panel_state::forget();
     let Some(selected) = selected else {
         return Ok(false);
     };
@@ -499,6 +506,97 @@ fn main() {
         });
 }
 
+/// Erases the location record AppKit keeps after a native panel is used.
+///
+/// `NSOpenPanel` writes the last directory into the app's own preference
+/// domain as an `NSOSPLastRootDirectory` bookmark. An independent reviewer
+/// decoded that blob and recovered the full path of the approved archive --
+/// volume name, volume UUID, and every directory component -- and it survived
+/// application exit. `~/Library/Preferences` carries no TCC protection, so a
+/// post-install script, a sync agent, a backup, or a forensic image reads the
+/// exact on-disk location of a client archive with no prompt. Folder names in
+/// legal practice are client names.
+///
+/// The app tells the operator on screen that it receives "opaque location
+/// numbers, not folder paths", and it exits on window close so that nothing
+/// privileged outlives the session. This closes the one artifact that did.
+///
+/// No application code writes these keys; AppKit does, so they are removed
+/// after the panel closes and again when the session is purged.
+#[cfg(target_os = "macos")]
+mod native_panel_state {
+    use std::ffi::c_void;
+
+    type CFStringRef = *const c_void;
+    type CFPropertyListRef = *const c_void;
+
+    extern "C" {
+        static kCFPreferencesCurrentApplication: CFStringRef;
+        fn CFStringCreateWithBytes(
+            allocator: *const c_void,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CFStringRef;
+        fn CFPreferencesSetAppValue(
+            key: CFStringRef,
+            value: CFPropertyListRef,
+            application_id: CFStringRef,
+        );
+        fn CFPreferencesAppSynchronize(application_id: CFStringRef) -> u8;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    const UTF8: u32 = 0x0800_0100;
+
+    /// Every key AppKit is known to write from an open or save panel. Removing
+    /// a key the domain does not have is a no-op, so listing the save-panel
+    /// and recent-places keys costs nothing and covers the export path too.
+    const PANEL_KEYS: &[&str] = &[
+        "NSOSPLastRootDirectory",
+        "NSNavLastRootDirectory",
+        "NSNavLastCurrentDirectory",
+        "NSNavRecentPlaces",
+        "NSNavPanelExpandedSizeForOpenMode",
+        "NSNavPanelExpandedSizeForSaveMode",
+        "NSWindow Frame GoToSheet",
+        "NSWindow Frame NSNavPanelAutosaveName",
+    ];
+
+    pub fn forget() {
+        // SAFETY: every pointer is either a CFString this function created and
+        // releases, or the framework-owned current-application constant. A
+        // null value is CFPreferences' documented "remove this key".
+        unsafe {
+            for key in PANEL_KEYS {
+                let cf_key = CFStringCreateWithBytes(
+                    std::ptr::null(),
+                    key.as_ptr(),
+                    key.len() as isize,
+                    UTF8,
+                    0,
+                );
+                if cf_key.is_null() {
+                    continue;
+                }
+                CFPreferencesSetAppValue(
+                    cf_key,
+                    std::ptr::null(),
+                    kCFPreferencesCurrentApplication,
+                );
+                CFRelease(cf_key);
+            }
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod native_panel_state {
+    pub fn forget() {}
+}
+
 /// Releases everything the session owns while the process is still alive.
 ///
 /// `exit(0)` terminates without unwinding, so no destructor runs at exit: the
@@ -526,6 +624,9 @@ fn purge_session(app_handle: &tauri::AppHandle) {
     for snapshot in snapshots.drain(..) {
         let _ = fs::remove_dir_all(&snapshot);
     }
+    drop(snapshots);
+
+    native_panel_state::forget();
 }
 
 #[cfg(test)]

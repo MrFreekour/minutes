@@ -14,8 +14,8 @@ use crate::retrieval::{
 };
 use crate::{
     cap_identity_matches, cap_metadata_identity_portable, cap_metadata_is_link_or_reparse,
-    extension_for_name, open_approved_root, package_category, validate_approved_roots,
-    ApprovedRoot, CensusError, FileIdentity,
+    cap_metadata_is_multiply_linked, extension_for_name, open_approved_root, package_category,
+    validate_approved_roots, ApprovedRoot, CensusError, FileIdentity,
 };
 use cap_std::fs::{Dir, File};
 use minutes_archive_convert::{BoundedConverter, SourceFormat, WorkerError};
@@ -136,6 +136,7 @@ pub struct TextVaultBuildReport {
     pub docx_documents: u64,
     pub duplicate_files_skipped: u64,
     pub symlinks_skipped: u64,
+    pub hard_links_skipped: u64,
     pub metadata_errors: u64,
     pub directory_errors: u64,
     pub source_content_persisted: bool,
@@ -431,6 +432,7 @@ struct BuildCounters {
     docx_documents: u64,
     duplicate_files_skipped: u64,
     symlinks_skipped: u64,
+    hard_links_skipped: u64,
     metadata_errors: u64,
     directory_errors: u64,
     directories_scanned: u64,
@@ -543,6 +545,14 @@ fn build_authorized_vault(
             };
             if cap_metadata_is_link_or_reparse(&metadata) {
                 counters.symlinks_skipped = counters.symlinks_skipped.saturating_add(1);
+                continue;
+            }
+            // A hard link is not a symlink, so the check above passes it
+            // through. Indexing one pulls an inode from outside the approved
+            // root into the vault, where it is returned as evidence under a
+            // title that looks local.
+            if cap_metadata_is_multiply_linked(&metadata) {
+                counters.hard_links_skipped = counters.hard_links_skipped.saturating_add(1);
                 continue;
             }
             if metadata.is_dir() {
@@ -804,6 +814,7 @@ fn build_authorized_vault(
         docx_documents: counters.docx_documents,
         duplicate_files_skipped: counters.duplicate_files_skipped,
         symlinks_skipped: counters.symlinks_skipped,
+        hard_links_skipped: counters.hard_links_skipped,
         metadata_errors: counters.metadata_errors,
         directory_errors: counters.directory_errors,
         source_content_persisted: false,
@@ -953,6 +964,51 @@ mod tests {
         )
         .expect("build");
         (vault, source)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_hard_linked_document_is_never_indexed_or_returned_as_evidence() {
+        // The confirmed escape: an independent reviewer built a root whose only
+        // entry was a hard link to a file outside it, and the vault reported
+        // indexed_documents=1 and returned an evidence card for privileged text
+        // the operator never approved, titled as though it were local.
+        let outside = TempDir::new().expect("outside");
+        let outside_file = outside.path().join("never-approved.txt");
+        fs::write(
+            &outside_file,
+            "7. CONFIDENTIALITY\nPrivileged text from a directory the operator never approved.",
+        )
+        .expect("outside source");
+
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("approved");
+        fs::create_dir(&root).expect("root");
+        fs::write(
+            root.join("genuine.txt"),
+            "7. CONFIDENTIALITY\nConfidential Information includes affiliate data.",
+        )
+        .expect("in-root source");
+        fs::hard_link(&outside_file, root.join("looks-local.txt")).expect("hard link");
+
+        let approved = approve_roots(&[root]).expect("approve");
+        let vault = build_authorized_text_vault(
+            VaultId::parse("hard-link-probe").expect("vault"),
+            &approved,
+            TextVaultLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("build");
+
+        let report = vault.build_report();
+        assert_eq!(
+            report.hard_links_skipped, 1,
+            "the hard link was not refused"
+        );
+        assert_eq!(
+            report.indexed_documents, 1,
+            "an out-of-root inode was indexed as an approved document"
+        );
     }
 
     #[test]
