@@ -395,11 +395,125 @@ async fn build_archive_text_vault(
     Ok(report)
 }
 
+/// What the interface is allowed to see of a search result.
+///
+/// The retrieval types carry more than the interface renders: a SHA-256 of
+/// every matched document's full bytes, its length, the vault and document
+/// ids, lexical rank, matched concepts, and semantic similarity. An
+/// independent reviewer found all of it crossing the IPC boundary and none of
+/// it rendered -- a content hash of every privileged match sitting in the
+/// WebView's JS heap for no purpose, which is a confirmation-of-possession
+/// oracle against a known corpus. With `script-src 'self'` and no remote
+/// content the exploit path is narrow, but the field is gratuitous, and the
+/// app's whole claim is that the interface receives the minimum it needs.
+///
+/// Projecting here rather than trimming the retrieval type keeps the evidence
+/// record complete where it is used for verification, and keeps the boundary
+/// honest by construction: a field added to `EvidenceCard` later does not
+/// silently reach the webview.
+#[derive(serde::Serialize)]
+struct UiEvidenceCard {
+    document_title: String,
+    provision_heading: Option<String>,
+    source_anchor: String,
+    exact_excerpt: String,
+    sentence_count: u32,
+    source_converter: String,
+    why_matched: String,
+    index_fresh: bool,
+}
+
+impl From<&minutes_archive_core::retrieval::EvidenceCard> for UiEvidenceCard {
+    fn from(card: &minutes_archive_core::retrieval::EvidenceCard) -> Self {
+        Self {
+            document_title: card.document_title.clone(),
+            provision_heading: card.provision_heading.clone(),
+            source_anchor: card.source_anchor.clone(),
+            exact_excerpt: card.exact_excerpt.clone(),
+            sentence_count: card.sentence_count,
+            source_converter: card.source_converter.clone(),
+            why_matched: card.why_matched.clone(),
+            index_fresh: card.index_fresh,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct UiSemanticCard {
+    document_title: String,
+    provision_heading: Option<String>,
+    source_anchor: String,
+    exact_excerpt: String,
+    sentence_count: u32,
+    source_converter: String,
+    why_suggested: String,
+    index_fresh: bool,
+}
+
+#[derive(serde::Serialize)]
+struct UiDocumentCard {
+    document_title: String,
+    criterion_evidence: Vec<UiEvidenceCard>,
+    index_fresh: bool,
+}
+
+#[derive(serde::Serialize)]
+struct UiSearchResponse {
+    query: minutes_archive_core::retrieval::LegalQuery,
+    evidence: Vec<UiEvidenceCard>,
+    documents: Vec<UiDocumentCard>,
+    semantic_suggestions: Vec<UiSemanticCard>,
+    lexical_candidates_considered: usize,
+    semantic_candidates_considered: usize,
+    semantic_query_applied: bool,
+    stale_evidence_withdrawn: u64,
+}
+
+impl From<LegalSearchResponse> for UiSearchResponse {
+    fn from(response: LegalSearchResponse) -> Self {
+        Self {
+            query: response.query,
+            evidence: response.evidence.iter().map(UiEvidenceCard::from).collect(),
+            documents: response
+                .documents
+                .iter()
+                .map(|document| UiDocumentCard {
+                    document_title: document.document_title.clone(),
+                    criterion_evidence: document
+                        .criterion_evidence
+                        .iter()
+                        .map(UiEvidenceCard::from)
+                        .collect(),
+                    index_fresh: document.index_fresh,
+                })
+                .collect(),
+            semantic_suggestions: response
+                .semantic_suggestions
+                .iter()
+                .map(|card| UiSemanticCard {
+                    document_title: card.document_title.clone(),
+                    provision_heading: card.provision_heading.clone(),
+                    source_anchor: card.source_anchor.clone(),
+                    exact_excerpt: card.exact_excerpt.clone(),
+                    sentence_count: card.sentence_count,
+                    source_converter: card.source_converter.clone(),
+                    why_suggested: card.why_suggested.clone(),
+                    index_fresh: card.index_fresh,
+                })
+                .collect(),
+            lexical_candidates_considered: response.lexical_candidates_considered,
+            semantic_candidates_considered: response.semantic_candidates_considered,
+            semantic_query_applied: response.semantic_query_applied,
+            stale_evidence_withdrawn: response.stale_evidence_withdrawn,
+        }
+    }
+}
+
 #[tauri::command]
 fn search_archive_text_vault(
     query: String,
     state: State<'_, ArchiveState>,
-) -> Result<LegalSearchResponse, String> {
+) -> Result<UiSearchResponse, String> {
     let session = state.session.lock().map_err(|_| lock_error())?;
     ensure_scan_idle(&session)?;
     let vault = session.text_vault.as_ref().ok_or_else(|| {
@@ -407,6 +521,7 @@ fn search_archive_text_vault(
     })?;
     vault
         .interpret_and_search(query)
+        .map(UiSearchResponse::from)
         .map_err(|error| error.to_string())
 }
 
@@ -631,6 +746,64 @@ fn purge_session(app_handle: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    /// The interface must not receive a content hash of every match.
+    ///
+    /// An independent reviewer found `source_revision.sha256` and `byte_len`
+    /// crossing IPC unrendered. Serializing the projection is the only way to
+    /// prove the boundary: asserting on struct fields would pass even if the
+    /// command went back to returning the retrieval type.
+    #[test]
+    fn the_ui_projection_carries_no_hash_identifier_or_rank() {
+        use minutes_archive_core::retrieval::{
+            interpret_legal_query, normalize_text_document, CurrentRevisionSet, DocumentId,
+            LegalIndex, VaultId,
+        };
+
+        let vault = VaultId::parse("dto-probe").expect("vault");
+        let document = normalize_text_document(
+            DocumentId::parse("probe-doc").expect("id"),
+            "Probe Document",
+            b"7. CONFIDENTIALITY\nRecipient shall protect Confidential Information and its affiliates.",
+        )
+        .expect("normalize");
+        let mut index = LegalIndex::new(vault.clone()).expect("index");
+        index.replace_document(&document).expect("replace");
+        let revisions = CurrentRevisionSet::from_documents([&document]);
+        let query = interpret_legal_query("Find confidentiality provisions covering affiliates.")
+            .expect("query");
+        let response = index.search(&vault, query, &revisions).expect("search");
+        assert!(
+            !response.evidence.is_empty(),
+            "fixture returned no evidence"
+        );
+
+        let full = serde_json::to_string(&response).expect("serialize full");
+        let projected =
+            serde_json::to_string(&UiSearchResponse::from(response)).expect("serialize projection");
+
+        // The full record really does carry these; the projection must not.
+        for field in [
+            "sha256",
+            "byte_len",
+            "vault_id",
+            "document_id",
+            "lexical_rank",
+        ] {
+            assert!(
+                full.contains(field),
+                "fixture no longer exercises {field}; this test would pass vacuously"
+            );
+            assert!(
+                !projected.contains(field),
+                "{field} still reaches the interface"
+            );
+        }
+        // ...while what the interface renders survives.
+        assert!(projected.contains("exact_excerpt"));
+        assert!(projected.contains("why_matched"));
+        assert!(projected.contains("source_anchor"));
+    }
+
     use super::*;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;

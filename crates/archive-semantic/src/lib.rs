@@ -759,6 +759,16 @@ fn install_platform_sandbox() -> Result<(), SemanticError> {
     // NLEmbedding model and the dyld shared cache live; no write anywhere on
     // the filesystem is permitted, so document-derived text cannot be
     // persisted from here at all.
+    //
+    // `com.apple.system.logger` is the LEGACY ASL name. An independent
+    // reviewer replicated this profile and confirmed that logd, diagnosticd
+    // and launchservicesd stayed reachable through it -- and on macOS 26
+    // os_log and NSLog go to logd, not ASL. This worker receives verbatim
+    // privileged provision text and calls into Apple's NLEmbedding, which the
+    // pilot does not control. No leak was observed (the reviewer searched the
+    // unified log by message and by process and found nothing), but the
+    // denies cost nothing because this crate never logs, and a channel that
+    // is open only because nobody used it is not a control.
     const PROFILE: &CStr = c"(version 1)
 (deny default)
 (deny network*)
@@ -769,6 +779,12 @@ fn install_platform_sandbox() -> Result<(), SemanticError> {
 (deny mach-lookup (global-name \"com.apple.distributed_notifications@1v3\"))
 (deny mach-lookup (global-name \"com.apple.distributed_notifications@Uv3\"))
 (deny mach-lookup (global-name \"com.apple.system.logger\"))
+(deny mach-lookup (global-name \"com.apple.logd\"))
+(deny mach-lookup (global-name \"com.apple.logd.events\"))
+(deny mach-lookup (global-name \"com.apple.diagnosticd\"))
+(deny mach-lookup (global-name \"com.apple.analyticsd\"))
+(deny mach-lookup (global-name \"com.apple.ReportCrash\"))
+(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\"))
 (deny mach-lookup (global-name \"com.apple.system.notification_center\"))
 (allow file-read-metadata)
 (allow file-read* (subpath \"/System\"))

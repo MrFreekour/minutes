@@ -752,9 +752,33 @@ pub fn run_worker_process(format: &str) -> i32 {
 }
 
 fn sandbox_self_test() -> i32 {
-    let network_denied = std::net::TcpListener::bind("127.0.0.1:0").is_err();
-    let filesystem_denied = std::fs::read("/etc/passwd").is_err();
-    if network_denied && filesystem_denied {
+    let network_denied = std::net::TcpListener::bind("127.0.0.1:0").is_err()
+        && std::net::TcpStream::connect("127.0.0.1:1").is_err();
+    // Probe paths this profile never names, the way the semantic worker's
+    // test does. Reading /etc/passwd alone was a weak canary: a regression to
+    // `(allow default)` plus a single deny for that literal would have passed
+    // it while leaving the whole filesystem readable and writable. That is the
+    // exact bug already found and fixed in the semantic worker; this test did
+    // not get the same treatment until an independent reviewer said so.
+    //
+    // This profile is `(deny default)` with no filesystem allowance at all, so
+    // every one of these must fail.
+    let unnamed_read_denied = std::fs::read("/private/etc/hosts").is_err()
+        && std::fs::read_dir("/Applications").is_err()
+        && std::fs::read_dir("/Library").is_err()
+        && std::fs::read_dir("/usr/share").is_err();
+    // A converter that could write would be a place to park document bytes.
+    let write_denied = ["/private/tmp", "/private/var/tmp"]
+        .iter()
+        .all(|directory| {
+            let probe = std::path::Path::new(directory).join("minutes-archive-convert-probe");
+            let denied = std::fs::write(&probe, b"probe").is_err();
+            if !denied {
+                let _ = std::fs::remove_file(&probe);
+            }
+            denied
+        });
+    if network_denied && unnamed_read_denied && write_denied {
         0
     } else {
         71
