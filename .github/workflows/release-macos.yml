@@ -53,6 +53,13 @@ jobs:
     name: Build signed + notarized Minutes.app
     needs: release_readiness
     runs-on: macos-latest
+    # Scopes the Apple signing secrets to this workflow instead of leaving
+    # them readable by every workflow in a public repository. The environment
+    # deliberately carries no required reviewer -- it exists to confine the
+    # credentials, not to add an approval step -- and its ref policy allows
+    # `main` and `v*` tags, which is exactly how this workflow is triggered,
+    # so release behaviour is unchanged.
+    environment: production-release
 
     steps:
       - name: Validate exact release tag input
