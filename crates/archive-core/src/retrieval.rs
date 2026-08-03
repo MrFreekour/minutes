@@ -391,6 +391,18 @@ fn segment_anchored_blocks(
             // heading -- produced no provisions at all and the whole document
             // was dropped from the index as a conversion failure.
             if let Some(orphan) = heading.take() {
+                // A caption and its anchor are always set together, so the
+                // fallbacks below are unreachable -- an independent reviewer
+                // confirmed it by replacing all four with `panic!` and running
+                // the suite green. They are kept because a citation is the one
+                // thing this tool must not invent: `unwrap_or_else` here would
+                // emit "source/section:0001", which reads exactly like a real
+                // anchor and points nowhere. The assertions make the invariant
+                // enforced rather than merely believed.
+                debug_assert!(
+                    heading_anchor.is_some(),
+                    "a pending caption must carry the anchor set with it"
+                );
                 let anchor = heading_anchor
                     .take()
                     .or_else(|| body_anchor.take())
@@ -398,6 +410,12 @@ fn segment_anchored_blocks(
                 segments.push((None, orphan, anchor));
             }
         } else {
+            // `joined` is non-empty here, so at least one body line was pushed,
+            // and `body_anchor` is set immediately before every such push.
+            debug_assert!(
+                body_anchor.is_some(),
+                "a non-empty provision body must carry the anchor of its first line"
+            );
             let anchor = body_anchor
                 .take()
                 .or_else(|| heading_anchor.take())
@@ -2183,6 +2201,14 @@ mod tests {
         // Some(false) suppresses the heuristic. Both directions matter --
         // Some(true) on text that reads like prose, and Some(false) on text
         // that reads exactly like a caption.
+        //
+        // On where `Some(false)` comes from: `convert_docx` collapses its
+        // verdict to `Some(true)` or `None` before returning, so the in-process
+        // converter never produces it. `ConvertedDocument` is deserialized from
+        // the sandboxed worker's stdout, though, so `Some(false)` is reachable
+        // across that trust boundary -- which makes this an untrusted-input
+        // case, not a normal-output one. It is the boundary that has to hold
+        // the guarantee, so the case is kept and labelled rather than deleted.
         let marked = ConvertedDocument {
             format: SourceFormat::Docx,
             blocks: vec![
