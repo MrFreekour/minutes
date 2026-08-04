@@ -314,7 +314,7 @@ try {
         if (
           !vaultSummary.includes("2 were aliases or shortcuts") ||
           !vaultSummary.includes("3 have a second name elsewhere on the disk") ||
-          !vaultSummary.includes("5 documents were not indexed")
+          !vaultSummary.includes("5 items were not indexed")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }

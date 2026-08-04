@@ -354,8 +354,11 @@ function describeDroppedSources(report) {
   const detail = dropped
     .map(([count, reason]) => `${count.toLocaleString()} ${reason}`)
     .join(", ");
+  // "items", not "documents": `directory_errors` counts folders, and an alias
+  // can point at one, so the aggregate spans more than files. Calling it a
+  // document count would overstate how many documents are missing.
   return (
-    `${total.toLocaleString()} document${total === 1 ? "" : "s"} ` +
+    `${total.toLocaleString()} item${total === 1 ? "" : "s"} ` +
     `${total === 1 ? "was" : "were"} not indexed and cannot be searched ` +
     `(${detail}). Review these before relying on a negative result. `
   );
