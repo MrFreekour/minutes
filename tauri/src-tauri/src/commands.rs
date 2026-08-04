@@ -10452,6 +10452,23 @@ pub async fn cmd_recall_chat_send(
                 }
             }
 
+            // A reasoning model can stream its entire budget into a `reasoning`
+            // field and finish with every `content` delta empty. Observed
+            // against a real server: 3861 frames, finish_reason "stop", zero
+            // content. Without this the panel just sits blank with no
+            // explanation, which reads as a hang rather than a model choice.
+            if !cancelled.load(Ordering::Relaxed) && full_response.is_empty() {
+                app_clone
+                    .emit_to(
+                        "main",
+                        "recall-chat-error",
+                        "The local model finished without returning any answer text. Reasoning \
+                         models can spend their whole budget thinking; try a shorter question, a \
+                         larger context or token limit, or a non-reasoning model.",
+                    )
+                    .ok();
+            }
+
             if !cancelled.load(Ordering::Relaxed) && !full_response.is_empty() {
                 store_recall_history_if_still_authorized(
                     &history_arc,
@@ -12599,9 +12616,17 @@ mod tests {
             r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
             r#"data: {"choices":[{"delta":{"content":""}}]}"#,
             "data: not json",
+            // Seen in the wild from a reasoning model: chain-of-thought arrives
+            // in `reasoning` while `content` stays empty. Must not be emitted
+            // as answer text.
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning":"Thinking"}}]}"#,
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}"#,
         ] {
             assert_eq!(openai_compatible_stream_delta(quiet), None, "{quiet:?}");
         }
+
+        // Real servers interleave blank separator lines between frames.
+        assert_eq!(openai_compatible_stream_delta(""), None);
     }
 
     #[test]
