@@ -89,18 +89,23 @@ sits in the app's own settings file on your Mac. In a law practice those folder
 names are often client names, which is why this is stated rather than left
 unsaid. Opening Minutes Archive again clears it.
 
-**2. Some PDFs can be searched but cannot answer "in the same clause"
-questions.**
+**2. A PDF whose clauses carry no heading at all cannot answer "in the same
+clause" questions.**
 
-Word documents record where each section begins. Many PDFs do not: if every
-line is the same size and headings are not numbered, there is genuinely no way
-to tell where one clause ends and the next starts.
+Word documents record where each section begins. PDFs do not -- they record
+only where ink sits on the page -- so the app works out where one clause ends
+and the next begins from the layout. It can do that whenever a clause carries a
+heading: a number, a caption in capitals, or a short line of its own set off
+from the text around it. Headings do not need to be bold, larger, or numbered.
 
-For those documents the app will not claim two terms appear in the same clause,
-because it cannot know that. They remain fully searchable -- by exact phrase,
-and by "which documents mention X and Y" -- and the app reports how many
-documents this applies to. This is deliberate: a wrong "same clause" answer to a
-lawyer is worse than no answer.
+What it cannot do is find a boundary that leaves no mark. A PDF written as
+continuous prose, where clauses simply follow one another with no heading of
+any kind, has nothing to find, and the app will not guess.
+
+For those documents the app will not claim two terms appear in the same clause.
+They remain fully searchable -- by exact phrase, and by "which documents mention
+X and Y" -- and the summary reports how many documents this applies to. This is
+deliberate: a wrong "same clause" answer to a lawyer is worse than no answer.
 
 ## Stop and contact the pilot operator
 

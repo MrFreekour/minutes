@@ -84,31 +84,60 @@ are listed so the reviewer tests them deliberately rather than discovering them
 as surprises, and so the boundary between "known and bounded" and "stop-ship"
 is drawn by the reviewer rather than assumed.
 
-**A same-provision conjunction can span two adjacent clauses in a PDF that
-reports no structure.** The segmenter closes a provision at a heading. Where a
-PDF has one uniform font size and section captions that no lexical rule
-recognises -- title case, no numbering -- neither the file nor the text offers
-a boundary, and a provision can run past the end of one clause into the next.
-A conjunction is then asserted across text the document never joined.
+**A clause that carries no heading of any kind cannot be bounded.** The
+segmenter closes a provision at a heading. Where a PDF is written as continuous
+prose, with clauses simply following one another and nothing marking where one
+ends, neither the file nor the layout offers a boundary. Those documents are
+withheld from same-provision search rather than guessed at.
 
-Scope and mitigation, all verified:
+This was previously much broader, and the reason is worth stating because it
+was a defect rather than a limit. The paragraph-break threshold was the median
+gap in the document times 1.3. That assumes most gaps are within-paragraph line
+spacing; it is false for any document whose paragraphs are mostly a single
+line, where the median IS the paragraph gap. The threshold then landed above
+every gap in the document and no boundary could ever be found -- in documents
+whose captions were plainly visible to a reader. The reference is now the font
+size, which no document statistic can distort.
+
+Scope and mitigation, all verified by execution:
 
 - DOCX is unaffected: `w:pStyle` reports the structure directly.
-- PDFs with numbered captions ("7. CONFIDENTIALITY") or real heading styles
-  are unaffected.
-- The excerpt is always displayed, so the reader can see both clauses. This is
-  a visible overstatement, not a hidden one.
-- Cards making a conjunction claim on a provision with no caption now say so:
+- PDFs with numbered captions ("7. CONFIDENTIALITY"), real heading styles, or
+  a larger caption size were unaffected throughout.
+- PDFs set in one uniform size with unnumbered title-case captions are now
+  segmented correctly. `tests/fixtures/archive-real-pdf/uniform-spacing-captions.pdf`
+  covers this and its test no longer asserts withdrawal; it asserts the
+  captions are recovered AND that the confidentiality and assignment clauses
+  stay separate, so the fix cannot pass by over-detecting.
+- Over-detection is guarded in the other direction. Gap width alone cannot
+  distinguish a caption from a signature block, and in a double-spaced document
+  the ordinary paragraph gap exceeds any size-derived threshold. A caption is
+  therefore also required to introduce prose, since a signature line is
+  followed by another short line.
+  `tests/fixtures/archive-real-pdf/double-spaced-signature.pdf` asserts that no
+  signature line becomes a caption and that the real captions in that same
+  document survive.
+- A caption on the first line of a page is still not marked. Treating that
+  position as a paragraph start was tried and reverted: running headers sit
+  there, and it severed a carve-out from the liability cap it limits. Page ends
+  are hard boundaries, so provisions do not run together across the break.
+- The excerpt is always displayed, so any remaining overstatement is visible
+  rather than hidden.
+- Cards making a conjunction claim on a provision with no caption still say so:
   "This provision carries no section caption, so its extent was inferred from
   the page layout; check the excerpt that the terms are in one clause."
 
-A reproduction is checked in at `tests/fixtures/archive-real-pdf/list-tail-merge.pdf`
-with an `#[ignore]`d test in `crates/archive-core/tests/real_pdf_segmentation.rs`.
-A geometric converter that fixed this was built, reviewed, and reverted: it
-silently deleted section captions from documents with no running header, which
-is worse. The reviewer should judge whether the disclosure is sufficient for
-the pilot or whether this is stop-ship under "make a materially broader claim
-than the tested format and location coverage".
+An earlier geometric converter that attempted this was built, reviewed and
+reverted, because it silently deleted section captions from documents with no
+running header. The present change is narrower: it alters only the reference
+the existing gap test measures against, plus the requirement that a caption
+introduce something.
+
+Three of the four conditions are mutation-verified. The gap threshold's exact
+multiplier is not -- widening it to 0.1 changes no fixture -- and the code
+records that rather than implying coverage it does not have. The reviewer
+should judge whether the residual, and that untested multiplier, are acceptable
+for the pilot.
 
 **PDF page-boundary segmentation is layout-derived.** Provision extents in PDFs
 come from page and paragraph layout, not from a structure the file declares.

@@ -107,9 +107,13 @@ re-run or spend effort elsewhere:
    `/Library`, `/Applications`, `/dev`, `/.vol`. Each requires an explicit
    picker choice, and the stated claim is about home and filesystem roots, but
    the refusal reads as more complete than it is.
-6. **Known retrieval limitation**, disclosed separately in the review packet: a
-   same-provision conjunction can span two adjacent clauses in a PDF that
-   reports no structure. See `archive-pilot-independent-review.md`.
+6. **Known retrieval limitation**, disclosed separately in the review packet,
+   now substantially narrowed. The paragraph-break reference was the median gap
+   in the document, which IS the paragraph gap whenever paragraphs are mostly a
+   single line -- so the threshold sat above every gap and no boundary could be
+   found, in documents whose captions were plainly visible. Anchoring to font
+   size recovers them. What remains withheld is the case where a clause carries
+   no heading of any kind. See `archive-pilot-independent-review.md`.
 
 ## Not reached
 
