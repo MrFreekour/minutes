@@ -584,6 +584,14 @@ fn main() {
         .manage(ArchiveState::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
+            // Erase any panel state a PREVIOUS run left behind, before this
+            // one can show a window. The erasure after each panel and at
+            // graceful exit cannot run under SIGKILL or Force Quit, so a
+            // forced termination can leave NSOSPLastRootDirectory on disk. It
+            // cannot be prevented -- AppKit writes it, and no hook runs after
+            // a kill -- but it can be bounded: with this, residue survives
+            // only until the app is next opened, rather than indefinitely.
+            native_panel_state::forget();
             if native_lifecycle_selftest {
                 let window = app.get_webview_window("main").ok_or_else(|| {
                     std::io::Error::other("Archive native lifecycle self-test found no main window")
