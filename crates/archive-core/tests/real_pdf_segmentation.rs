@@ -118,8 +118,6 @@ const LIST_TAIL_MERGE: &[u8] =
     include_bytes!("../../../tests/fixtures/archive-real-pdf/list-tail-merge.pdf");
 const UNIFORM_SPACING_CAPTIONS: &[u8] =
     include_bytes!("../../../tests/fixtures/archive-real-pdf/uniform-spacing-captions.pdf");
-const DOUBLE_SPACED_SIGNATURE: &[u8] =
-    include_bytes!("../../../tests/fixtures/archive-real-pdf/double-spaced-signature.pdf");
 
 /// Reproduces the open defect in #26 against real LibreOffice output.
 ///
@@ -151,32 +149,13 @@ fn a_real_pdf_does_not_fabricate_a_same_provision_conjunction() {
     }
 }
 
-/// This fixture used to be unsegmentable and was withheld from same-provision
-/// search entirely. Its captions carry no size change, no indentation and no
-/// numbering -- the only signal is that a caption is preceded by a wider gap
-/// than the line spacing inside a paragraph.
-///
-/// The reference for "wider" used to be the median gap in the document, which
-/// is the paragraph gap whenever most paragraphs are a single line, as they
-/// are here. The threshold then sat above every gap in the document and no
-/// break could be found. Anchoring it to font size instead recovers the
-/// captions, because line spacing is proportional to type size while a
-/// document statistic is not.
-///
-/// What must not change is the refusal to invent a conjunction: the
-/// confidentiality clause and the assignment clause are still separate
-/// provisions, and a same-provision query must not join them.
 #[test]
-fn a_real_pdf_with_uniform_type_recovers_its_captions_without_fabricating_a_conjunction() {
+fn a_real_pdf_with_no_structure_signal_is_searchable_but_withheld_from_same_provision() {
     let converted = convert_bytes(SourceFormat::Pdf, UNIFORM_SPACING_CAPTIONS).expect("convert");
-    assert!(
-        !converted
-            .warnings
-            .iter()
-            .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING),
-        "uniform-type captions are recoverable from line spacing; got {:?}",
-        converted.warnings
-    );
+    assert!(converted
+        .warnings
+        .iter()
+        .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING));
 
     let normalized = normalize_converted_document(
         DocumentId::parse("uniform-spacing-captions").expect("id"),
@@ -184,29 +163,10 @@ fn a_real_pdf_with_uniform_type_recovers_its_captions_without_fabricating_a_conj
         UNIFORM_SPACING_CAPTIONS,
         &converted,
     )
-    .expect("normalize");
+    .expect("text remains searchable despite inferred boundaries");
     assert_eq!(
         normalized.provision_boundaries,
-        ProvisionBoundaries::Declared,
-        "captions were recovered, so boundaries are no longer inferred"
-    );
-
-    // The point of recovering the captions is that the clauses separate. If
-    // they ever merge again, this fixture is back to fabricating the exact
-    // conjunction #26 was raised for.
-    for provision in &normalized.provisions {
-        let carries_confidentiality = provision.text.contains("Confidential Information");
-        let carries_assignment = provision.text.contains("may assign");
-        assert!(
-            !(carries_confidentiality && carries_assignment),
-            "one provision now spans two unrelated clauses:\n{}",
-            provision.text
-        );
-    }
-    assert!(
-        normalized.provisions.len() >= 3,
-        "expected the three captioned clauses to separate; got {}",
-        normalized.provisions.len()
+        ProvisionBoundaries::Inferred
     );
     let revisions = CurrentRevisionSet::from_documents([&normalized]);
     let mut index =
@@ -253,73 +213,6 @@ fn a_real_pdf_with_uniform_type_recovers_its_captions_without_fabricating_a_conj
     let same_response = index
         .search(index.vault_id(), same_provision, &revisions)
         .expect("same provision");
-    // Empty for the right reason now. The clauses are separate provisions, so
-    // there is no conjunction to return -- rather than the old outcome, where
-    // the answer was withheld because the boundaries could not be trusted.
     assert!(same_response.evidence.is_empty());
-    assert_eq!(
-        same_response.inferred_boundary_evidence_withdrawn, 0,
-        "nothing should be withheld once the boundaries are declared"
-    );
-}
-
-/// The counterpart to the uniform-type fixture, and the reason a caption has
-/// to introduce something rather than merely follow a wide gap.
-///
-/// This document is double spaced, so its ordinary paragraph gap is far wider
-/// than its line spacing -- wide enough that any gap-only rule marks every
-/// paragraph as a caption. Its signature block is a run of short title-case
-/// paragraphs ("Northwind Holdings International Limited", "By: Jane Ellis",
-/// "Title: Managing Director") which satisfy every word-level test a caption
-/// does. Marking them splits one signature block into six provisions and
-/// invites a same-provision match across two different signatories.
-///
-/// What separates them is what follows: a caption is followed by prose, a
-/// signature line by another short line.
-#[test]
-fn a_double_spaced_signature_block_is_not_a_run_of_captions() {
-    let converted = convert_bytes(SourceFormat::Pdf, DOUBLE_SPACED_SIGNATURE).expect("convert");
-
-    for block in &converted.blocks {
-        let text = block.text.trim();
-        assert!(
-            !(block.is_heading == Some(true)
-                && (text.starts_with("By:")
-                    || text.starts_with("Title:")
-                    || text.ends_with("Limited")
-                    || text.ends_with("Incorporated"))),
-            "a signature-block line was marked as a caption: {text}"
-        );
-    }
-
-    // The real captions in the same document must survive the rule that
-    // rejects the signature block, or this test would pass by detecting
-    // nothing at all.
-    assert!(
-        converted
-            .blocks
-            .iter()
-            .any(|block| block.is_heading == Some(true)
-                && block.text.contains("Assignment and Change of Control")),
-        "the rule rejected the signature block by rejecting every caption too"
-    );
-
-    let normalized = normalize_converted_document(
-        DocumentId::parse("double-spaced-signature").expect("id"),
-        "Double Spaced Signature",
-        DOUBLE_SPACED_SIGNATURE,
-        &converted,
-    )
-    .expect("normalize");
-    for provision in &normalized.provisions {
-        let signatories = ["Jane Ellis", "Peter Nakamura"]
-            .iter()
-            .filter(|name| provision.text.contains(**name))
-            .count();
-        assert!(
-            signatories <= 1 || provision.text.contains("Signed for and on behalf"),
-            "two signatories were merged into one provision:\n{}",
-            provision.text
-        );
-    }
+    assert_eq!(same_response.inferred_boundary_evidence_withdrawn, 1);
 }

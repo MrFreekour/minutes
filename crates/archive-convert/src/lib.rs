@@ -611,68 +611,23 @@ impl LayoutPage {
 
         let sizes = raw.iter().map(|(_, _, size)| *size).collect::<Vec<_>>();
         let reference_size = median(sizes).unwrap_or(0.0);
-        // Line spacing is a property of the type, not of the document's
-        // paragraph habits: a set line sits at roughly 1.1-1.5x its font size
-        // and a paragraph break is wider. Deriving the threshold from the
-        // median gap assumed most gaps were within-paragraph line spacing,
-        // which is false for any document whose paragraphs are mostly one line
-        // -- there the median IS the paragraph gap, the threshold lands above
-        // every gap in the document, and no break can ever be detected. That
-        // is the whole reason uniformly formatted contracts reported no
-        // structure at all.
-        //
-        // Honest limit of the evidence: with the conditions below in place,
-        // widening this multiplier all the way down to 0.1 does not change the
-        // output of any fixture, so the exact value is not what separates a
-        // caption from body text -- the word-level tests and the "introduces
-        // prose" rule are. It is kept because it states the real requirement,
-        // that a caption begins a paragraph, and because the shape that would
-        // exercise it (a short title-case line mid-paragraph, followed by a
-        // full line of prose) is one no fixture here contains.
-        //
-        // A floor derived from the smallest observed gap was tried here, to
-        // hold the threshold above the leading of a loosely set document. It
-        // was removed: every fixture produced identical output with and
-        // without it, because the "introduces prose" rule below already
-        // rejects what it was guarding against, and an untested branch that
-        // reads as a safeguard is worse than no branch.
-        let paragraph_break_threshold = reference_size * 1.6;
-        // A caption introduces something. That is what separates it from the
-        // other short title-case paragraph in legal documents -- a signature
-        // block line like "By: Jane Ellis" or a party name -- which is
-        // followed by another short line rather than by prose. Gap alone
-        // cannot tell them apart: in a uniformly formatted contract the gap
-        // before a caption and the gap before a body paragraph are the same
-        // number, so a rule that reads only the gap marks the signature block
-        // as a run of headings and splits it into fabricated provisions.
-        let is_short_line = |text: &str| text.split_whitespace().count() <= 8;
-        let followed_by_prose = raw
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                raw.get(index + 1)
-                    .is_some_and(|(next, _, _)| !is_short_line(next))
-            })
+        let gaps = raw
+            .windows(2)
+            .map(|pair| (pair[1].1 - pair[0].1).max(0.0))
             .collect::<Vec<_>>();
+        let reference_gap = median(
+            gaps.into_iter()
+                .filter(|gap| *gap <= reference_size * 3.0)
+                .collect(),
+        )
+        .unwrap_or(reference_size * 1.35);
         let mut previous_y = None;
         raw.into_iter()
-            .enumerate()
-            .map(|(index, (text, y, size))| {
-                // The first line on a page is deliberately NOT treated as a
-                // paragraph start. It has no preceding line, so it looks like
-                // the strongest possible break -- but a running header sits in
-                // exactly that position on every page, and admitting it marks
-                // furniture as a caption. Tried and reverted: it severed a
-                // carve-out from the cap it limits, which is the fabricated
-                // boundary this whole area exists to prevent. The cost is that
-                // a caption at the top of a page is not flagged here; page
-                // ends are already hard boundaries, so provisions still do not
-                // run together across the break.
+            .map(|(text, y, size)| {
                 let leading_gap = previous_y.map_or(0.0, |previous| y - previous);
                 previous_y = Some(y);
-                let geometric_heading = leading_gap > paragraph_break_threshold
-                    && followed_by_prose[index]
-                    && is_short_line(&text)
+                let geometric_heading = leading_gap > reference_gap * 1.3
+                    && text.split_whitespace().count() <= 8
                     && text.split_whitespace().all(|word| {
                         matches!(
                             word.to_ascii_lowercase().as_str(),
