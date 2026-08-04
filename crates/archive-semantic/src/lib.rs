@@ -34,7 +34,18 @@ pub struct SemanticModelMetadata {
     pub model_id: &'static str,
     pub revision: usize,
     pub dimension: usize,
+    /// Whether THIS crate targets the OS built-in model rather than bundling
+    /// or fetching one. A compile-time property of our call graph, not a
+    /// runtime observation of the operating system.
     pub built_in_os_asset: bool,
+    /// Whether THIS crate calls any model-download API. Also compile-time.
+    ///
+    /// It is deliberately not named as a claim that no download occurs. The
+    /// worker is network-denied, but Apple's asset services are separate
+    /// system processes acting on their own behalf, and on a Mac lacking the
+    /// linguistic asset their behaviour is the OS's to decide, not ours to
+    /// assert. An independent reviewer flagged the old framing as asserted
+    /// rather than measured, and was right.
     pub model_download_requested: bool,
 }
 
