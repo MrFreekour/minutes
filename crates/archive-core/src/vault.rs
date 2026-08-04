@@ -979,6 +979,7 @@ fn relative_source_identity_matches(
 mod tests {
     use super::*;
     use crate::approve_roots;
+    use crate::retrieval::MatchScope;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1169,22 +1170,54 @@ mod tests {
     fn hard_link_created_outside_the_root_after_indexing_withdraws_evidence() {
         let temp = TempDir::new().expect("temp");
         let (vault, source) = build(&temp);
-        let query = "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.";
+        let same_provision = "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.";
+        let anywhere = "Find confidentiality provisions covering affiliates, compelled disclosure, and survival anywhere in the document.";
+        // The two scopes are separate retrieval code paths, so both are
+        // exercised: a fence binding only one leaves the other quoting the
+        // file. Asserted rather than assumed, so a change to query
+        // interpretation cannot quietly collapse this to a single lane.
         assert_eq!(
-            vault
-                .interpret_and_search(query)
-                .expect("search")
-                .evidence
-                .len(),
-            1,
-            "the singly linked source must be evidence before the link is created"
+            interpret_legal_query(same_provision).expect("query").scope,
+            MatchScope::SameProvision
         );
+        assert_eq!(
+            interpret_legal_query(anywhere).expect("query").scope,
+            MatchScope::AnywhereInDocument
+        );
+        // The scopes return through different fields -- provision scope fills
+        // `evidence`, document scope fills `documents` -- so counting only one
+        // silently skips the other lane.
+        let returned =
+            |response: &LegalSearchResponse| response.evidence.len() + response.documents.len();
+        for raw in [same_provision, anywhere] {
+            assert_eq!(
+                returned(&vault.interpret_and_search(raw).expect("search")),
+                1,
+                "the singly linked source must be evidence before the link is created"
+            );
+        }
 
-        fs::hard_link(&source, temp.path().join("outside-the-root.txt")).expect("hard link");
+        let outside = temp.path().join("outside-the-root.txt");
+        fs::hard_link(&source, &outside).expect("hard link");
 
-        let response = vault.interpret_and_search(query).expect("search");
-        assert!(response.evidence.is_empty());
-        assert_eq!(response.stale_evidence_withdrawn, 1);
+        for raw in [same_provision, anywhere] {
+            let response = vault.interpret_and_search(raw).expect("search");
+            assert_eq!(returned(&response), 0, "{raw} still quoted the file");
+            assert_eq!(response.stale_evidence_withdrawn, 1, "{raw}");
+        }
+
+        // Withdrawal must track the current link count rather than latching.
+        // A latched refusal would blank a document permanently the first time
+        // anything on the Mac transiently linked it, which is a worse failure
+        // for counsel than the hole this fence closes.
+        fs::remove_file(&outside).expect("remove the outside link");
+        for raw in [same_provision, anywhere] {
+            assert_eq!(
+                returned(&vault.interpret_and_search(raw).expect("search")),
+                1,
+                "the singly linked document did not recover once the link was gone"
+            );
+        }
     }
 
     #[cfg(unix)]
