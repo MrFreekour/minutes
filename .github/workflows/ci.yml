@@ -600,6 +600,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install workflow-guard dependencies
+        run: python3 -m pip install --quiet pyyaml
+
+      # Repository-scoped signing secrets are readable by any job that names
+      # them, and they cannot be migrated to environment scope: GitHub secrets
+      # are write-only and the source material is not recoverable, so deleting
+      # the repository copies would be irreversible. The approval gate is
+      # enforced here instead.
+      - name: Signing secrets stay behind an approved environment gate
+        run: python3 scripts/check_signing_secret_scope.py
+
+      - name: Signing secret scope negative controls
+        run: python3 -m unittest tests/eval/test_signing_secret_scope.py
+
       - name: Public fixture privacy gate
         run: python3 scripts/check_live_sidekick_fixture_privacy.py
 
