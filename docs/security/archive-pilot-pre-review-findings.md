@@ -63,11 +63,30 @@ re-run or spend effort elsewhere:
 
 ## Residual risks the reviewer should weigh
 
-1. **`SIGKILL` still leaves the panel preference key.** The fix removes it
-   after each panel closes and at graceful exit. A `SIGKILL` runs neither. The
-   key is also written while the app is running — AppKit records it after the
-   modal returns, so the post-panel call cannot win that race. What is
-   guaranteed is that it does not survive a graceful exit.
+1. **A forced kill can leave the approved folder path in the app's preference
+   domain until the next launch.** THIS IS THE ONE OPEN STOP-SHIP FINDING and
+   it needs a human decision, not more code.
+
+   AppKit writes `NSOSPLastRootDirectory` when a native panel closes. The app
+   erases it after each panel, at graceful exit, and — since the third review —
+   at launch, before any window shows. None of those run under `SIGKILL` or
+   Force Quit, and none can: the write is AppKit's and no hook of ours executes
+   after a kill.
+
+   So the residue is now bounded to a single session rather than indefinite:
+   a forced kill leaves the path readable only until the app is next opened.
+   Verified by execution — planting the key and launching erases it.
+
+   What the reviewer must weigh: the artifact is a folder path, not document
+   content, and folder names in legal practice are often client names.
+   `~/Library/Preferences` is not TCC-protected. Reaching it requires a forced
+   termination. Against the packet's criteria it engages "disclose a ... path
+   ... outside the approved local operation"; it does not engage "persist
+   source text or vectors across application exit", which names neither.
+
+   Three independent reviews have now called this a stop-ship. The remaining
+   choices are to accept it as a disclosed, bounded residual and tell Peter, or
+   not to ship. It is not further fixable in this architecture.
 2. **The app ships with no entitlements, so there is no App Sandbox.** The
    parent process is not OS-prevented from networking; the guarantee is code
    discipline plus CSP, not a kernel control. The two workers *are* sandboxed.
@@ -76,9 +95,12 @@ re-run or spend effort elsewhere:
    network access. On a Mac where the linguistic asset is already installed
    nothing is fetched; on one lacking it, the behaviour is the OS's to decide.
    The app's own call graph uses only `NLEmbedding::sentenceEmbeddingForLanguage_revision`.
-4. **`built_in_os_asset` and `model_download_requested` in the build report are
-   compile-time literals**, presented alongside measured fields. They should be
-   renamed or measured.
+4. **`built_in_os_asset` and `model_download_requested` are compile-time
+   literals.** Addressed by narrowing rather than measuring: the interface now
+   says Minutes Archive requests no model download and that macOS manages its
+   own on-device assets, and both fields are documented as properties of this
+   crate's call graph rather than observations of the OS. Measuring the
+   stronger claim needs a Mac lacking the linguistic asset.
 5. **Broad-but-not-home roots remain approvable** — `/Volumes`, `/private/var`,
    `/Library`, `/Applications`, `/dev`, `/.vol`. Each requires an explicit
    picker choice, and the stated claim is about home and filesystem roots, but
