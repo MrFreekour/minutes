@@ -67,6 +67,40 @@ legal conclusions, and Peter reviews the source before use. Meaning-similar
 suggestions are separately labeled and are never presented as proof that a
 clause satisfies the question.
 
+## Two things Peter is told before he starts
+
+These are accepted, disclosed limitations of the pilot, not defects to be
+discovered. The operator states both in plain language when handing over the
+app. Neither should be softened.
+
+**1. If the app is force-quit or crashes, the name of the folder you chose may
+remain on your Mac until you next open the app.**
+
+When you click "choose folder", macOS itself remembers the last folder you
+picked. That is a standard macOS behaviour, not something Minutes Archive asks
+for, and it cannot be switched off. The app erases that record when it closes
+normally, and again the next time it opens. Neither erase can run if the app is
+force-quit or crashes.
+
+What could remain is the folder's NAME -- not any document, not any text from a
+document, and nothing is ever sent anywhere. It sits in the app's own settings
+file on your Mac. In a law practice a folder name is often a client name, which
+is why this is stated rather than left unsaid. Opening Minutes Archive again
+clears it.
+
+**2. Some PDFs can be searched but cannot answer "in the same clause"
+questions.**
+
+Word documents record where each section begins. Many PDFs do not: if every
+line is the same size and headings are not numbered, there is genuinely no way
+to tell where one clause ends and the next starts.
+
+For those documents the app will not claim two terms appear in the same clause,
+because it cannot know that. They remain fully searchable -- by exact phrase,
+and by "which documents mention X and Y" -- and the app reports how many
+documents this applies to. This is deliberate: a wrong "same clause" answer to a
+lawyer is worse than no answer.
+
 ## Stop and contact the pilot operator
 
 Peter should stop the session if macOS shows an unidentified-developer warning,
