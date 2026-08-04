@@ -1629,7 +1629,27 @@ pub use imp_stub::*;
 ///   `example-server` binary resolves. Everything that branches on the
 ///   sidecar must call this, never the raw config field.
 pub fn sidecar_enabled_effective(config: &crate::config::Config) -> bool {
-    match config.transcription.parakeet_sidecar_enabled {
+    // 0.24.1 hotfix (#633): the warm sidecar is disabled unconditionally.
+    //
+    // A reproducible SIGABRT was reported on the `parakeet-sidecar-stderr`
+    // thread, taking down the whole process before a job record existed, so
+    // there was no failed-job state and nothing to retry. The same report
+    // showed orphaned `parakeet-sidecar` processes whose socket filenames
+    // referenced PIDs that no longer matched the running processes, meaning
+    // sidecar lifecycle state already survived a crash incorrectly.
+    //
+    // Batch Parakeet keeps working: `transcribe_with_parakeet` treats a
+    // disabled or failing sidecar as a fall-through to the per-file
+    // subprocess path, which loses the warm-server latency win but not the
+    // engine. Trading that speedup for a process that cannot abort is the
+    // right call until the abort is understood.
+    //
+    // This deliberately ignores an explicit `parakeet_sidecar_enabled = true`:
+    // a crash of the host process is not something a config value should be
+    // able to opt into. `main` supersedes this with the full private-audio
+    // transport gate; this exists so users on the 0.24.x line get a fix
+    // without taking that much larger change.
+    let would_have_enabled = match config.transcription.parakeet_sidecar_enabled {
         Some(explicit) => explicit,
         None => {
             cfg!(feature = "parakeet")
@@ -1637,7 +1657,14 @@ pub fn sidecar_enabled_effective(config: &crate::config::Config) -> bool {
                     || config.effective_live_transcript_backend() == "parakeet")
                 && sidecar_binary_resolves_cached(&config.transcription.parakeet_binary)
         }
+    };
+    if would_have_enabled {
+        tracing::warn!(
+            "parakeet-sidecar: disabled in 0.24.1 (see issue #633); \
+             using the per-file subprocess path instead"
+        );
     }
+    false
 }
 
 /// Positive-result cache for the auto decision's binary probe.
@@ -1697,11 +1724,16 @@ mod effective_tests {
     }
 
     #[test]
-    fn explicit_true_wins_even_without_binary() {
+    fn explicit_true_cannot_re_enable_the_sidecar_in_0_24_1() {
+        // Before the #633 hotfix this asserted the opposite: an explicit
+        // `true` forced the sidecar on. It is deliberately inverted rather
+        // than deleted, because the property under test still matters. A
+        // config value must not be able to opt a user back into a path that
+        // aborts the host process.
         let mut config = Config::default();
         config.transcription.engine = "whisper".into();
         config.transcription.parakeet_sidecar_enabled = Some(true);
-        assert!(sidecar_enabled_effective(&config));
+        assert!(!sidecar_enabled_effective(&config));
     }
 
     #[test]
@@ -1734,6 +1766,13 @@ mod effective_tests {
         std::env::set_var("MINUTES_PARAKEET_SERVER_BINARY", &fake);
         let resolved_on = sidecar_enabled_effective(&config);
         std::env::remove_var("MINUTES_PARAKEET_SERVER_BINARY");
-        assert!(resolved_on, "auto should enable when binary resolves");
+        // Pre-hotfix this asserted `resolved_on`. A resolvable binary is now
+        // the strongest case for auto-enabling and must still stay off, so
+        // this is the test that would catch the hotfix being reverted by
+        // accident.
+        assert!(
+            !resolved_on,
+            "the #633 hotfix must keep the sidecar off even when the binary resolves"
+        );
     }
 }
