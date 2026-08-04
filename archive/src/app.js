@@ -338,6 +338,12 @@ function describeDroppedSources(report) {
     [report.malformed_text_files_skipped, "were malformed"],
     [report.oversized_files_skipped, "exceeded the size budget"],
     [report.duplicate_files_skipped, "were duplicates"],
+    // Both link counters were tallied and never shown. On de-duplicated or
+    // linked storage every file can carry a second name, so the whole archive
+    // is refused and counsel is told only that fewer documents were indexed
+    // than the folder holds -- a silent, total coverage loss.
+    [report.symlinks_skipped, "were aliases or shortcuts"],
+    [report.hard_links_skipped, "have a second name elsewhere on the disk"],
     [report.metadata_errors, "could not be read"],
     [report.directory_errors, "were in unreadable folders"],
   ].filter(([count]) => count > 0);
