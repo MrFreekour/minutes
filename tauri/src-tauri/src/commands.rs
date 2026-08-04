@@ -9819,6 +9819,38 @@ fn recall_openai_compatible_chat_url(raw: &str) -> Result<String, String> {
     Ok(url.into())
 }
 
+/// Whether one server-sent-events line carries reasoning (chain-of-thought)
+/// rather than answer text.
+///
+/// The two local servers disagree on the key: ollama emits `reasoning`, LM
+/// Studio emits `reasoning_content`. Both are recognized. This is used only to
+/// tell the panel that the model is working, never to render as an answer:
+/// reasoning is the model's scratchpad, not its reply.
+fn openai_compatible_stream_is_reasoning(line: &str) -> bool {
+    let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+        return false;
+    };
+    if payload.is_empty() || payload == "[DONE]" {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(delta) = value
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+    else {
+        return false;
+    };
+    ["reasoning", "reasoning_content"].iter().any(|key| {
+        delta
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    })
+}
+
 /// Extract the incremental assistant text from one server-sent-events line of
 /// an OpenAI-compatible stream.
 ///
@@ -10425,12 +10457,31 @@ pub async fn cmd_recall_chat_send(
             let mut body = resp.into_body();
             let reader = BufReader::new(body.as_reader());
             let mut full_response = String::new();
+            // A reasoning model can spend hundreds of frames thinking before a
+            // single word of answer appears (observed: 504 of 508 frames). With
+            // no signal the panel looks hung, so announce once that work is
+            // happening. Announced once rather than per frame: this drives a
+            // status label, not rendered text.
+            let mut announced_thinking = false;
             for line_result in reader.lines() {
                 if cancelled.load(Ordering::Relaxed) {
                     break;
                 }
                 match line_result {
                     Ok(line) => {
+                        if !announced_thinking
+                            && full_response.is_empty()
+                            && openai_compatible_stream_is_reasoning(&line)
+                        {
+                            announced_thinking = true;
+                            app_clone
+                                .emit_to(
+                                    "main",
+                                    "recall-chat-chunk",
+                                    serde_json::json!({"type": "thinking"}),
+                                )
+                                .ok();
+                        }
                         if let Some(text) = openai_compatible_stream_delta(&line) {
                             if cancelled.load(Ordering::Relaxed) {
                                 break;
@@ -12627,6 +12678,33 @@ mod tests {
 
         // Real servers interleave blank separator lines between frames.
         assert_eq!(openai_compatible_stream_delta(""), None);
+    }
+
+    #[test]
+    fn openai_compatible_reasoning_is_detected_for_both_server_dialects() {
+        // ollama emits `reasoning`; LM Studio emits `reasoning_content`. Both
+        // observed against real servers (#650).
+        assert!(openai_compatible_stream_is_reasoning(
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning":"Thinking"}}]}"#
+        ));
+        assert!(openai_compatible_stream_is_reasoning(
+            r#"data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"*"}}]}"#
+        ));
+
+        for not_reasoning in [
+            "data: [DONE]",
+            "",
+            ": keepalive",
+            r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#,
+            r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+            // Present but empty carries no signal that work is happening.
+            r#"data: {"choices":[{"delta":{"reasoning":""}}]}"#,
+        ] {
+            assert!(
+                !openai_compatible_stream_is_reasoning(not_reasoning),
+                "{not_reasoning:?}"
+            );
+        }
     }
 
     #[test]
