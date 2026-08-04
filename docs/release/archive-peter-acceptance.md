@@ -73,8 +73,8 @@ These are accepted, disclosed limitations of the pilot, not defects to be
 discovered. The operator states both in plain language when handing over the
 app. Neither should be softened.
 
-**1. If the app is force-quit or crashes, the name of the folder you chose may
-remain on your Mac until you next open the app.**
+**1. If the app is force-quit or crashes, the location of the folder you chose
+may remain on your Mac until you next open the app.**
 
 When you click "choose folder", macOS itself remembers the last folder you
 picked. That is a standard macOS behaviour, not something Minutes Archive asks
@@ -82,11 +82,12 @@ for, and it cannot be switched off. The app erases that record when it closes
 normally, and again the next time it opens. Neither erase can run if the app is
 force-quit or crashes.
 
-What could remain is the folder's NAME -- not any document, not any text from a
-document, and nothing is ever sent anywhere. It sits in the app's own settings
-file on your Mac. In a law practice a folder name is often a client name, which
-is why this is stated rather than left unsaid. Opening Minutes Archive again
-clears it.
+What could remain is the folder's FULL PATH -- its name, the names of every
+folder above it, and the name and identifier of the disk it is on. It is not any
+document, not any text from a document, and nothing is ever sent anywhere. It
+sits in the app's own settings file on your Mac. In a law practice those folder
+names are often client names, which is why this is stated rather than left
+unsaid. Opening Minutes Archive again clears it.
 
 **2. Some PDFs can be searched but cannot answer "in the same clause"
 questions.**

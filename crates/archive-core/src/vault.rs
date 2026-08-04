@@ -389,7 +389,14 @@ impl AuthorizedTextVault {
         let Ok(before) = file.metadata() else {
             return false;
         };
+        // Link status is rechecked here, not only at indexing. A file that was
+        // singly linked when indexed can be hard-linked from OUTSIDE the
+        // approved root afterwards, and an independent reviewer confirmed the
+        // evidence card kept being returned with nothing withdrawn. Indexing
+        // refused multiply linked files; display did not, so the authority
+        // rule held only at the moment of the build.
         if !cap_identity_matches(&before, source.identity)
+            || cap_metadata_is_multiply_linked(&before)
             || before.len() > MAX_NORMALIZED_DOCUMENT_BYTES as u64
         {
             return false;
@@ -403,7 +410,10 @@ impl AuthorizedTextVault {
         let Ok(after) = file.metadata() else {
             return false;
         };
+        // ...and again after reading, so a link created during the read is
+        // caught too.
         cap_identity_matches(&after, source.identity)
+            && !cap_metadata_is_multiply_linked(&after)
             && after.len() == before.len()
             && SourceRevision::from_bytes(&bytes) == source.indexed_revision
             && relative_source_identity_matches(
@@ -1146,6 +1156,33 @@ mod tests {
                 "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.",
             )
             .expect("search");
+        assert!(response.evidence.is_empty());
+        assert_eq!(response.stale_evidence_withdrawn, 1);
+    }
+
+    // Indexing refuses multiply linked files, but a file singly linked at build
+    // time can be hard-linked from outside the approved root afterwards. An
+    // independent reviewer confirmed the evidence card kept being returned and
+    // nothing was withdrawn, so the root-authority rule held only at build time.
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_created_outside_the_root_after_indexing_withdraws_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, source) = build(&temp);
+        let query = "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.";
+        assert_eq!(
+            vault
+                .interpret_and_search(query)
+                .expect("search")
+                .evidence
+                .len(),
+            1,
+            "the singly linked source must be evidence before the link is created"
+        );
+
+        fs::hard_link(&source, temp.path().join("outside-the-root.txt")).expect("hard link");
+
+        let response = vault.interpret_and_search(query).expect("search");
         assert!(response.evidence.is_empty());
         assert_eq!(response.stale_evidence_withdrawn, 1);
     }
