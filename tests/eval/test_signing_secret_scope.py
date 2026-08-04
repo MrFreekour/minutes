@@ -48,7 +48,7 @@ jobs:
     ),
     (
         "environment that requires no reviewer",
-        "not an approved reviewer-gated environment",
+        "is not one of the environments that confine signing credentials",
         """
 name: Wrong environment
 on:
@@ -115,7 +115,7 @@ jobs:
     ),
     (
         "environment name is an expression that cannot be resolved statically",
-        "not an approved reviewer-gated environment",
+        "is not one of the environments that confine signing credentials",
         """
 name: Expression environment
 on:
@@ -144,6 +144,81 @@ jobs:
     steps:
       - env:
           KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo signing
+""",
+    ),
+]
+
+REFUSALS += [
+    (
+        "dynamic subscript hides the secret name from static analysis",
+        "serialises the whole secrets context",
+        """
+name: Dynamic
+on:
+  workflow_dispatch:
+    inputs:
+      secret_name:
+        required: true
+        type: string
+jobs:
+  sign:
+    runs-on: macos-latest
+    steps:
+      - env:
+          STOLEN: ${{ secrets[inputs.secret_name] }}
+        run: echo signing
+""",
+    ),
+    (
+        "secrets: inherit hands everything to a workflow this file cannot see",
+        "hands the whole secrets context",
+        """
+name: Inherit
+on:
+  workflow_dispatch:
+jobs:
+  call:
+    uses: ./.github/workflows/other.yml
+    secrets: inherit
+""",
+    ),
+    (
+        "a gated job launders a secret into an ungated one via outputs",
+        "publishes signing secret material",
+        """
+name: Laundered output
+on:
+  workflow_dispatch:
+jobs:
+  sign:
+    runs-on: macos-latest
+    environment: signed-dev-acceptance
+    outputs:
+      leaked: ${{ secrets.APPLE_CERTIFICATE }}
+    steps:
+      - run: echo signing
+  consume:
+    needs: sign
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ needs.sign.outputs.leaked }}
+""",
+    ),
+    (
+        "an environment outside the signing set does not confine the credential",
+        "is not one of the environments that confine signing credentials",
+        """
+name: Wrong environment
+on:
+  workflow_dispatch:
+jobs:
+  sign:
+    runs-on: macos-latest
+    environment: Preview
+    steps:
+      - env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         run: echo signing
 """,
     ),
