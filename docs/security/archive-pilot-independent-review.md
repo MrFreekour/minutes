@@ -84,31 +84,54 @@ are listed so the reviewer tests them deliberately rather than discovering them
 as surprises, and so the boundary between "known and bounded" and "stop-ship"
 is drawn by the reviewer rather than assumed.
 
-**A same-provision conjunction can span two adjacent clauses in a PDF that
-reports no structure.** The segmenter closes a provision at a heading. Where a
-PDF has one uniform font size and section captions that no lexical rule
-recognises -- title case, no numbering -- neither the file nor the text offers
-a boundary, and a provision can run past the end of one clause into the next.
-A conjunction is then asserted across text the document never joined.
+**PDF clause extent is inferred, so a same-provision claim is confined to one
+paragraph.** The segmenter closes a provision at a heading. A heading marks
+where a provision begins and never where it ends, so a clause that carries no
+heading the converter can see is absorbed by the clause above it, and a
+provision may hold more than one clause.
 
-Scope and mitigation, all verified:
+An earlier candidate tried to solve this by detecting captions better. It made
+matters worse, and the reason is the core of this limitation. Boundary
+confidence was decided per document: any single heading marked every provision
+in the file trustworthy. A reviewer's document with one administrative line
+("Attention General Counsel") over two unheaded operative clauses therefore
+returned a card asserting a conjunction the document never made. That
+reproduction is now a checked-in regression fixture,
+`tests/fixtures/archive-real-pdf/unheaded-clauses-under-one-notice.pdf`.
 
-- DOCX is unaffected: `w:pStyle` reports the structure directly.
-- PDFs with numbered captions ("7. CONFIDENTIALITY") or real heading styles
-  are unaffected.
-- The excerpt is always displayed, so the reader can see both clauses. This is
-  a visible overstatement, not a hidden one.
-- Cards making a conjunction claim on a provision with no caption now say so:
-  "This provision carries no section caption, so its extent was inferred from
-  the page layout; check the excerpt that the terms are in one clause."
+The fix is at retrieval rather than detection. Every required term must fall
+inside one *clause unit*: the whole provision for a format that declares where
+clauses begin, and one paragraph for a format that reports only layout.
+Paragraph separation is the part of PDF structure that is genuinely observable,
+which is why it is the span the app is willing to stand behind.
 
-A reproduction is checked in at `tests/fixtures/archive-real-pdf/list-tail-merge.pdf`
-with an `#[ignore]`d test in `crates/archive-core/tests/real_pdf_segmentation.rs`.
-A geometric converter that fixed this was built, reviewed, and reverted: it
-silently deleted section captions from documents with no running header, which
-is worse. The reviewer should judge whether the disclosure is sufficient for
-the pilot or whether this is stop-ship under "make a materially broader claim
-than the tested format and location coverage".
+Scope and mitigation, all verified by execution:
+
+- DOCX is unaffected and matches whole provisions: `w:pStyle` declares clause
+  starts, so a conjunction spanning two paragraphs of one clause is real. The
+  converter deliberately reports no paragraph layout for DOCX, and a test in
+  `minutes-archive-convert` asserts that contract, because reporting it would
+  silently narrow every DOCX clause to a single paragraph.
+- Caption recovery from uniformly formatted PDFs is restored, now that it is
+  safe. The paragraph-break reference was the median gap, which IS the
+  paragraph gap when paragraphs are single-line, so the threshold sat above
+  every gap in such a file and no boundary was ever found. It is anchored to
+  font size instead.
+- Over-detection is guarded: gap width alone cannot separate a caption from a
+  signature block, so a caption must also introduce prose.
+  `double-spaced-signature.pdf` asserts no signature line becomes a caption
+  while the real captions in the same document survive.
+- A caption on the first line of a page is still not marked. Treating that
+  position as a paragraph start was tried and reverted: running headers sit
+  there, and it severed a carve-out from the liability cap it limits.
+- The excerpt is always displayed, so any residual overstatement is visible.
+- Cards claiming a conjunction on an uncaptioned provision still say so.
+
+What the reviewer should attack: whether a paragraph is reliably detected in
+real producer output, since a *missed* paragraph split is now the way a
+conjunction could still span two clauses. Over-splitting only withholds an
+answer and is the safe direction; under-splitting is not. Five mutations of the
+rule and its inputs are each caught by the suite.
 
 **PDF page-boundary segmentation is layout-derived.** Provision extents in PDFs
 come from page and paragraph layout, not from a structure the file declares.

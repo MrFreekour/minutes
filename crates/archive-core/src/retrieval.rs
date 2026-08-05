@@ -160,6 +160,14 @@ pub struct NormalizedProvision {
     pub heading: Option<String>,
     pub text: String,
     pub sentence_count: u32,
+    /// The spans within which a same-clause conjunction may be claimed.
+    ///
+    /// One entry for a format that declares where clauses begin, so the whole
+    /// provision matches as a unit. One entry per paragraph for a format that
+    /// reports only layout, because a provision there may hold more than one
+    /// clause with nothing marking the join.
+    #[serde(default)]
+    pub clause_units: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -366,15 +374,59 @@ fn block_wraps_to_next_page(text: &str, boilerplate: &HashSet<String>) -> bool {
     false
 }
 
+/// Group a provision's lines into the units within which a same-clause claim
+/// is allowed.
+///
+/// A PDF reports paragraph layout but never clause structure, so a provision
+/// there may contain more than one clause: the boundary between them left no
+/// mark the converter could see. Retrieval therefore may not claim a
+/// conjunction spanning two of these units. A format that declares its own
+/// structure reports no paragraph layout at all and gets a single unit, so its
+/// provisions keep matching whole.
+fn clause_units(body: &[(String, Option<bool>)]) -> Vec<String> {
+    if body.iter().all(|(_, starts)| starts.is_none()) {
+        let joined = body
+            .iter()
+            .map(|(line, _)| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return if joined.is_empty() {
+            Vec::new()
+        } else {
+            vec![joined]
+        };
+    }
+    let mut units = Vec::<Vec<&str>>::new();
+    for (line, starts) in body {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if starts == &Some(true) || units.is_empty() {
+            units.push(Vec::new());
+        }
+        units
+            .last_mut()
+            .expect("a unit was pushed above when none existed")
+            .push(trimmed);
+    }
+    units
+        .into_iter()
+        .map(|lines| lines.join(" "))
+        .filter(|unit| !unit.is_empty())
+        .collect()
+}
+
 fn segment_anchored_blocks(
     converted: &ConvertedDocument,
 ) -> Result<Vec<NormalizedProvision>, RetrievalError> {
     let boilerplate = running_boilerplate(converted);
-    let mut segments = Vec::<(Option<String>, String, String)>::new();
+    let mut segments = Vec::<(Option<String>, String, String, Vec<String>)>::new();
     let mut heading = None::<String>;
     let mut heading_anchor = None::<String>;
     let mut body_anchor = None::<String>;
-    let mut body = Vec::<String>::new();
+    let mut body = Vec::<(String, Option<bool>)>::new();
     let mut page_lines = Vec::<String>::new();
 
     // A page boundary is layout, not structure. It used to flush, which
@@ -390,18 +442,23 @@ fn segment_anchored_blocks(
     // provision instead of one per page. Those documents cannot answer a
     // sentence-bounded query at page granularity either, so nothing findable
     // was traded away.
-    let flush = |segments: &mut Vec<(Option<String>, String, String)>,
+    let flush = |segments: &mut Vec<(Option<String>, String, String, Vec<String>)>,
                  heading: &mut Option<String>,
                  heading_anchor: &mut Option<String>,
                  body_anchor: &mut Option<String>,
-                 body: &mut Vec<String>,
+                 body: &mut Vec<(String, Option<bool>)>,
                  orphan_pending_heading: bool| {
         let joined = body
             .iter()
-            .map(|line| line.trim())
+            .map(|(line, _)| line.trim())
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
+        // The units within which retrieval may claim a conjunction. A format
+        // that reports paragraph layout gets one unit per paragraph; one that
+        // declares its own clause structure reports nothing here and gets a
+        // single unit spanning the provision.
+        let units = clause_units(body);
         if joined.is_empty() {
             if !orphan_pending_heading {
                 body.clear();
@@ -431,7 +488,8 @@ fn segment_anchored_blocks(
                     .take()
                     .or_else(|| body_anchor.take())
                     .unwrap_or_else(|| "source".to_string());
-                segments.push((None, orphan, anchor));
+                // An orphaned caption is its own single unit.
+                segments.push((None, orphan.clone(), anchor, vec![orphan]));
             }
         } else {
             // `joined` is non-empty here, so at least one body line was pushed,
@@ -444,7 +502,7 @@ fn segment_anchored_blocks(
                 .take()
                 .or_else(|| heading_anchor.take())
                 .unwrap_or_else(|| "source".to_string());
-            segments.push((heading.take(), joined, anchor));
+            segments.push((heading.take(), joined, anchor, units));
         }
         body.clear();
     };
@@ -500,7 +558,7 @@ fn segment_anchored_blocks(
                 if body_anchor.is_none() {
                     body_anchor = Some(block.source_anchor.clone());
                 }
-                body.push(remainder.join(" "));
+                body.push((remainder.join(" "), block.starts_paragraph));
             }
             if block.flow == AnchorFlow::HardBoundary && !page_wraps {
                 flush(
@@ -545,7 +603,12 @@ fn segment_anchored_blocks(
                 // fragment then satisfied a one-sentence query on its own.
                 // That is the defect this whole series began with. A pending
                 // body and a pending caption both continue across the break.
-                segments.push((None, trimmed.to_string(), block.source_anchor.clone()));
+                segments.push((
+                    None,
+                    trimmed.to_string(),
+                    block.source_anchor.clone(),
+                    vec![trimmed.to_string()],
+                ));
                 if segments.len() > MAX_PROVISIONS_PER_DOCUMENT {
                     return Err(RetrievalError::TooManyProvisions);
                 }
@@ -570,7 +633,7 @@ fn segment_anchored_blocks(
                 if body_anchor.is_none() {
                     body_anchor = Some(block.source_anchor.clone());
                 }
-                body.push(trimmed.to_string());
+                body.push((trimmed.to_string(), block.starts_paragraph));
             }
             if segments.len() > MAX_PROVISIONS_PER_DOCUMENT {
                 return Err(RetrievalError::TooManyProvisions);
@@ -608,13 +671,14 @@ fn segment_anchored_blocks(
     Ok(segments
         .into_iter()
         .enumerate()
-        .map(|(index, (heading, text, source_anchor))| {
+        .map(|(index, (heading, text, source_anchor, clause_units))| {
             let ordinal = (index + 1) as u32;
             NormalizedProvision {
                 ordinal,
                 anchor: format!("{source_anchor}/section:{ordinal:04}"),
                 heading,
                 sentence_count: sentence_count(&text),
+                clause_units,
                 text,
             }
         })
@@ -690,6 +754,9 @@ fn segment_legal_provisions(text: &str) -> Result<Vec<NormalizedProvision>, Retr
                 anchor: format!("section:{ordinal:04}"),
                 heading,
                 sentence_count: sentence_count(&text),
+                // Plain text is segmented on blank lines, which is the same
+                // signal a reader uses, so the provision is the unit.
+                clause_units: vec![text.clone()],
                 text,
             }
         })
@@ -1156,10 +1223,33 @@ struct CandidateRow {
     source_revision: SourceRevision,
     source_converter: String,
     provision_boundaries: ProvisionBoundaries,
+    /// See `NormalizedProvision::clause_units`.
+    clause_units: Vec<String>,
     lexical_rank: f64,
 }
 
 impl CandidateRow {
+    /// Each clause unit prefixed with the provision heading.
+    ///
+    /// The heading belongs to every unit it introduces: a clause captioned
+    /// "7. CONFIDENTIALITY" over a body that never repeats the word still
+    /// satisfies a confidentiality term, and dropping the caption here would
+    /// report real clauses as absent.
+    fn units_with_heading(&self) -> Vec<String> {
+        let units = if self.clause_units.is_empty() {
+            std::slice::from_ref(&self.body)
+        } else {
+            self.clause_units.as_slice()
+        };
+        units
+            .iter()
+            .map(|unit| match &self.provision_heading {
+                Some(heading) => format!("{heading}\n{unit}"),
+                None => unit.clone(),
+            })
+            .collect()
+    }
+
     fn searchable_text(&self) -> String {
         match &self.provision_heading {
             Some(heading) => format!("{heading}\n{}", self.body),
@@ -1310,6 +1400,7 @@ impl LegalIndex {
                     anchor UNINDEXED,
                     heading,
                     body,
+                    clause_units UNINDEXED,
                     tokenize = 'unicode61 remove_diacritics 2'
                 );
                 ",
@@ -1556,7 +1647,8 @@ impl LegalIndex {
                     d.revision_sha256,
                     d.revision_bytes,
                     d.converter,
-                    d.provision_boundaries
+                    d.provision_boundaries,
+                    p.clause_units
                 FROM provisions p
                 JOIN documents d ON d.document_id = p.document_id
                 WHERE p.document_id = ?1 AND p.ordinal = ?2
@@ -1568,13 +1660,15 @@ impl LegalIndex {
                         .get::<_, i64>(7)?
                         .try_into()
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, i64::MAX))?;
+                    let body: String = row.get(4)?;
                     Ok(CandidateRow {
                         document_id: DocumentId::parse(row.get::<_, String>(0)?)
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         document_title: row.get(5)?,
                         provision_heading: row.get(3)?,
                         source_anchor: row.get(2)?,
-                        body: row.get(4)?,
+                        clause_units: stored_clause_units(row.get(10).ok(), &body),
+                        body,
                         source_revision: SourceRevision {
                             sha256: row.get(6)?,
                             byte_len: revision_bytes,
@@ -1606,7 +1700,8 @@ impl LegalIndex {
                 d.revision_sha256,
                 d.revision_bytes,
                 d.converter,
-                d.provision_boundaries
+                d.provision_boundaries,
+                p.clause_units
             FROM provisions p
             JOIN documents d ON d.document_id = p.document_id
             WHERE provisions MATCH ?1
@@ -1636,18 +1731,20 @@ impl LegalIndex {
                     .try_into()
                     .map_err(|_| RetrievalError::IndexUnavailable)?,
             };
+            let body: String = row.get(4).map_err(|_| RetrievalError::IndexUnavailable)?;
             candidates.push(CandidateRow {
                 document_id,
                 document_title: row.get(6).map_err(|_| RetrievalError::IndexUnavailable)?,
                 provision_heading: row.get(3).map_err(|_| RetrievalError::IndexUnavailable)?,
                 source_anchor: row.get(2).map_err(|_| RetrievalError::IndexUnavailable)?,
-                body: row.get(4).map_err(|_| RetrievalError::IndexUnavailable)?,
+                body: body.clone(),
                 source_revision: revision,
                 source_converter: row.get(9).map_err(|_| RetrievalError::IndexUnavailable)?,
                 provision_boundaries: provision_boundaries_from_db(
                     row.get(10).map_err(|_| RetrievalError::IndexUnavailable)?,
                 )
                 .map_err(|_| RetrievalError::IndexUnavailable)?,
+                clause_units: stored_clause_units(row.get(11).ok(), &body),
                 lexical_rank: row.get(5).map_err(|_| RetrievalError::IndexUnavailable)?,
             });
         }
@@ -1692,6 +1789,36 @@ impl LegalIndex {
                     .as_ref()
                     .is_some_and(|phrase| !contains_case_insensitive(&searchable, phrase))
             {
+                continue;
+            }
+            // Every required term has to land inside one clause unit, not
+            // merely somewhere in the provision.
+            //
+            // A provision is only as trustworthy as the boundary that closed
+            // it, and in a PDF that boundary is a guess: the file records ink,
+            // not sections, so a clause that begins with no heading the
+            // converter can see is swallowed by the clause above it. An
+            // independent reviewer built the document that turns that into a
+            // false statement -- one administrative line is the only heading,
+            // two unheaded operative clauses sit below it, and a same-clause
+            // query returned a card joining them.
+            //
+            // Improving heading detection cannot fix that, because a caption
+            // marks where a provision starts and never where it ends. What can
+            // is refusing to make the claim across a separation the source did
+            // not declare. A format that declares its structure reports one
+            // unit per provision and is unaffected; a PDF reports one per
+            // paragraph, and paragraph separation is the part of PDF layout
+            // that is actually observable.
+            if !candidate.units_with_heading().iter().any(|unit| {
+                matched_concepts(unit, &query.required_concepts).len()
+                    == query.required_concepts.len()
+                    && query
+                        .exact_phrase
+                        .as_ref()
+                        .is_none_or(|phrase| contains_case_insensitive(unit, phrase))
+            }) {
+                inferred_boundary_documents.insert(candidate.document_id);
                 continue;
             }
             let sentences = sentence_count(&candidate.body);
@@ -1907,8 +2034,8 @@ fn replace_document_transaction(
         transaction
             .execute(
                 "
-                INSERT INTO provisions (document_id, ordinal, anchor, heading, body)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                INSERT INTO provisions (document_id, ordinal, anchor, heading, body, clause_units)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ",
                 params![
                     document.document_id.as_str(),
@@ -1916,11 +2043,59 @@ fn replace_document_transaction(
                     provision.anchor,
                     provision.heading,
                     provision.text,
+                    encode_clause_units(&provision.clause_units),
                 ],
             )
             .map_err(|_| RetrievalError::IndexUnavailable)?;
     }
     Ok(())
+}
+
+/// Encode clause units as their byte lengths.
+///
+/// The units are exactly the provision body partitioned on single spaces --
+/// `units.join(" ") == body` -- so their lengths reconstruct them without
+/// storing the text twice or pulling in a serialiser for a list of integers.
+fn encode_clause_units(units: &[String]) -> String {
+    units
+        .iter()
+        .map(|unit| unit.len().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Rebuild the clause units, falling back to the whole provision.
+///
+/// Falls back whenever the lengths are absent, unparsable, or do not
+/// reconstruct the body exactly -- a row written before this column existed,
+/// or by a build that partitioned differently. One unit spanning the body is
+/// how such a row matched before, so the fallback preserves behaviour instead
+/// of silently refusing every conjunction in it.
+fn stored_clause_units(raw: Option<String>, body: &str) -> Vec<String> {
+    let whole = || vec![body.to_string()];
+    let Some(raw) = raw else { return whole() };
+    if raw.is_empty() {
+        return whole();
+    }
+    let mut units = Vec::new();
+    let mut offset = 0usize;
+    for field in raw.split(',') {
+        let Ok(length) = field.parse::<usize>() else {
+            return whole();
+        };
+        let end = match offset.checked_add(length) {
+            Some(end) if end <= body.len() && body.is_char_boundary(end) => end,
+            _ => return whole(),
+        };
+        units.push(body[offset..end].to_string());
+        // Units were joined with a single space; step over it.
+        offset = end + 1;
+    }
+    // `offset` overshoots by the final separator that was never written.
+    if offset != body.len() + 1 {
+        return whole();
+    }
+    units
 }
 
 fn provision_boundaries_to_db(boundaries: ProvisionBoundaries) -> i64 {
@@ -2209,6 +2384,7 @@ mod tests {
             blocks: vec![
                 minutes_archive_convert::ConvertedBlock {
                     is_heading: Some(true),
+                    starts_paragraph: None,
                     source_anchor: "paragraph:000001".to_string(),
                     text: "7. INDEMNIFICATION.\nProvider shall indemnify the Buyer. This indemnity survives termination."
                         .to_string(),
@@ -2216,6 +2392,7 @@ mod tests {
                 },
                 minutes_archive_convert::ConvertedBlock {
                     is_heading: None,
+                    starts_paragraph: None,
                     source_anchor: "paragraph:000002".to_string(),
                     text: "Signature blocks appear on the following page.".to_string(),
                     flow: AnchorFlow::Continue,
@@ -2278,12 +2455,14 @@ mod tests {
                     // Styled as a heading in the file although the words read
                     // as a cross-reference. Every lexical rule got this wrong.
                     is_heading: Some(true),
+                    starts_paragraph: None,
                     source_anchor: "paragraph:000001".to_string(),
                     text: "9. See Sections 3 and 4".to_string(),
                     flow: AnchorFlow::Continue,
                 },
                 minutes_archive_convert::ConvertedBlock {
                     is_heading: Some(false),
+                    starts_paragraph: None,
                     source_anchor: "paragraph:000002".to_string(),
                     text: "Recipient shall not disclose Confidential Information.".to_string(),
                     flow: AnchorFlow::Continue,
@@ -2291,6 +2470,7 @@ mod tests {
                 minutes_archive_convert::ConvertedBlock {
                     // Reads exactly like a caption; the file says it is not.
                     is_heading: Some(false),
+                    starts_paragraph: None,
                     source_anchor: "paragraph:000003".to_string(),
                     text: "7. CONFIDENTIALITY AND SURVIVAL".to_string(),
                     flow: AnchorFlow::Continue,
@@ -2343,11 +2523,94 @@ mod tests {
                         source_anchor: source_anchor.to_string(),
                         text: text.to_string(),
                         flow,
+                        starts_paragraph: None,
                     }
                 })
                 .collect(),
             warnings: Vec::new(),
         }
+    }
+
+    /// DOCX declares where clauses begin, so its provisions match whole.
+    ///
+    /// A PDF provision is split into paragraph units because its clause extent
+    /// is a guess. DOCX is not a guess -- `w:pStyle` says where a clause
+    /// starts -- so a conjunction spanning two paragraphs of one clause is a
+    /// real conjunction and must still be answered. Reporting paragraph
+    /// granularity for DOCX would silently narrow it to single paragraphs and
+    /// start withholding answers the file supports, which no other test here
+    /// would notice.
+    #[test]
+    fn a_docx_clause_answers_a_conjunction_spanning_two_of_its_paragraphs() {
+        let converted = anchored(
+            SourceFormat::Docx,
+            vec![
+                (
+                    Some(true),
+                    "paragraph:000001",
+                    "7. CONFIDENTIALITY AND ASSIGNMENT",
+                    AnchorFlow::Continue,
+                ),
+                (
+                    Some(false),
+                    "paragraph:000002",
+                    "The Recipient shall protect Confidential Information at all times.",
+                    AnchorFlow::Continue,
+                ),
+                (
+                    Some(false),
+                    "paragraph:000003",
+                    "Neither party may assign this Agreement without consent.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("docx-two-paragraph-clause").expect("id"),
+            "Docx Two Paragraph Clause",
+            b"docx-bytes",
+            &converted,
+        )
+        .expect("normalize");
+        assert_eq!(
+            normalized.provisions.len(),
+            1,
+            "the styled caption should open exactly one clause"
+        );
+        assert_eq!(
+            normalized.provisions[0].clause_units.len(),
+            1,
+            "DOCX declares its clause boundaries, so the provision is one unit"
+        );
+
+        let revisions = CurrentRevisionSet::from_documents([&normalized]);
+        let mut index =
+            LegalIndex::new(VaultId::parse("docx-vault").expect("vault")).expect("index");
+        index.replace_document(&normalized).expect("ingest");
+        let response = index
+            .search(
+                index.vault_id(),
+                LegalQuery {
+                    raw: "confidentiality and assignment in the same provision".to_string(),
+                    scope: MatchScope::SameProvision,
+                    required_concepts: vec![
+                        LegalConcept::Confidentiality,
+                        LegalConcept::Assignment,
+                    ],
+                    excluded_concepts: Vec::new(),
+                    exact_phrase: None,
+                    max_sentences: None,
+                    limit: 10,
+                },
+                &revisions,
+            )
+            .expect("search");
+        assert_eq!(
+            response.evidence.len(),
+            1,
+            "a declared clause spanning two paragraphs must still answer"
+        );
+        assert_eq!(response.inferred_boundary_evidence_withdrawn, 0);
     }
 
     #[test]
@@ -2560,6 +2823,7 @@ mod tests {
             source_revision: SourceRevision::from_bytes(b"bytes"),
             source_converter: "pdf-extract-0.12.0-v1".to_string(),
             provision_boundaries: ProvisionBoundaries::Declared,
+            clause_units: vec![long.clone()],
             lexical_rank: 0.0,
         };
         let card = candidate.semantic_evidence_card(&vault, 0.9);
@@ -3446,12 +3710,14 @@ mod tests {
             blocks: vec![
                 minutes_archive_convert::ConvertedBlock {
                     is_heading: None,
+                    starts_paragraph: None,
                     source_anchor: "page:0001".to_string(),
                     text: "7. CONFIDENTIALITY\nConfidential Information is protected.".to_string(),
                     flow: AnchorFlow::HardBoundary,
                 },
                 minutes_archive_convert::ConvertedBlock {
                     is_heading: None,
+                    starts_paragraph: None,
                     source_anchor: "page:0002".to_string(),
                     text: "8. ASSIGNMENT\nNeither party may assign this Agreement.".to_string(),
                     flow: AnchorFlow::HardBoundary,
@@ -3481,12 +3747,14 @@ mod tests {
             blocks: vec![
                 minutes_archive_convert::ConvertedBlock {
                     is_heading: None,
+                    starts_paragraph: None,
                     source_anchor: "paragraph:000001".to_string(),
                     text: "7. CONFIDENTIALITY".to_string(),
                     flow: AnchorFlow::Continue,
                 },
                 minutes_archive_convert::ConvertedBlock {
                     is_heading: None,
+                    starts_paragraph: None,
                     source_anchor: "paragraph:000002".to_string(),
                     text: "Confidential Information is protected.".to_string(),
                     flow: AnchorFlow::Continue,

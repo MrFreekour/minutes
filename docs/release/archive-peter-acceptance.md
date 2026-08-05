@@ -89,18 +89,26 @@ sits in the app's own settings file on your Mac. In a law practice those folder
 names are often client names, which is why this is stated rather than left
 unsaid. Opening Minutes Archive again clears it.
 
-**2. Some PDFs can be searched but cannot answer "in the same clause"
-questions.**
+**2. In a PDF, "in the same clause" means "in the same paragraph".**
 
-Word documents record where each section begins. Many PDFs do not: if every
-line is the same size and headings are not numbered, there is genuinely no way
-to tell where one clause ends and the next starts.
+Word documents record where each section begins and ends. PDFs do not -- a PDF
+records only where ink sits on the page. The app works out clause headings from
+the layout and does that well, but a heading tells it where a clause *starts*
+and never where it *ends*. If a clause below has no heading the app can see, it
+gets swallowed by the clause above it.
 
-For those documents the app will not claim two terms appear in the same clause,
-because it cannot know that. They remain fully searchable -- by exact phrase,
-and by "which documents mention X and Y" -- and the app reports how many
-documents this applies to. This is deliberate: a wrong "same clause" answer to a
-lawyer is worse than no answer.
+So when you ask whether two things appear in the same clause, the app answers
+only if they appear in the same paragraph. That is the largest span a PDF
+actually proves. If your two terms are in adjacent paragraphs, it will say
+nothing rather than tell you they are in one clause.
+
+Word documents are not limited this way. They say where their clauses begin, so
+a clause spanning several paragraphs is answered in full.
+
+Everything remains searchable either way -- by exact phrase, and by "which
+documents mention X and Y" -- and the summary reports how many documents this
+applies to. This is deliberate: a wrong "same clause" answer to a lawyer is
+worse than no answer.
 
 ## Stop and contact the pilot operator
 

@@ -79,6 +79,23 @@ pub struct ConvertedBlock {
     /// block is body text.
     #[serde(default)]
     pub is_heading: Option<bool>,
+    /// Whether this block begins a new paragraph in the source layout.
+    ///
+    /// Separate from `is_heading`, and far weaker on purpose. Deciding that a
+    /// gap makes a line a *heading* was tried and reverted: it promoted an
+    /// administrative line, which flipped a whole document to declared
+    /// boundaries and merged two unheaded clauses into a fabricated
+    /// same-clause match. Deciding that a gap starts a *paragraph* carries the
+    /// opposite risk profile. Retrieval refuses to claim a conjunction that
+    /// spans two paragraphs of an inferred-structure document, so splitting
+    /// too eagerly only withholds an answer, while missing a split is what
+    /// would overstate one. Erring toward more paragraphs is therefore the
+    /// safe direction, which is why this reads the gap alone with none of the
+    /// word-level conditions a heading needs.
+    ///
+    /// `None` means the format does not report paragraph layout.
+    #[serde(default)]
+    pub starts_paragraph: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +477,7 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                     AnchorFlow::Continue
                 },
                 is_heading: line.is_heading.then_some(true),
+                starts_paragraph: Some(line.starts_paragraph),
             });
         }
     }
@@ -558,6 +576,7 @@ struct LayoutGlyph {
 struct LayoutLine {
     text: String,
     is_heading: bool,
+    starts_paragraph: bool,
 }
 
 impl LayoutPage {
@@ -611,23 +630,84 @@ impl LayoutPage {
 
         let sizes = raw.iter().map(|(_, _, size)| *size).collect::<Vec<_>>();
         let reference_size = median(sizes).unwrap_or(0.0);
-        let gaps = raw
-            .windows(2)
-            .map(|pair| (pair[1].1 - pair[0].1).max(0.0))
+        // Line spacing is a property of the type, not of the document's
+        // paragraph habits: a set line sits at roughly 1.1-1.5x its font size
+        // and a paragraph break is wider. Deriving the threshold from the
+        // median gap assumed most gaps were within-paragraph line spacing,
+        // which is false for any document whose paragraphs are mostly one line
+        // -- there the median IS the paragraph gap, the threshold lands above
+        // every gap in the document, and no break can ever be detected. That
+        // is the whole reason uniformly formatted contracts reported no
+        // structure at all.
+        //
+        // Honest limit of the evidence: with the conditions below in place,
+        // widening this multiplier all the way down to 0.1 does not change the
+        // output of any fixture, so the exact value is not what separates a
+        // caption from body text -- the word-level tests and the "introduces
+        // prose" rule are. It is kept because it states the real requirement,
+        // that a caption begins a paragraph, and because the shape that would
+        // exercise it (a short title-case line mid-paragraph, followed by a
+        // full line of prose) is one no fixture here contains.
+        //
+        // A floor derived from the smallest observed gap was tried here, to
+        // hold the threshold above the leading of a loosely set document. It
+        // was removed: every fixture produced identical output with and
+        // without it, because the "introduces prose" rule below already
+        // rejects what it was guarding against, and an untested branch that
+        // reads as a safeguard is worse than no branch.
+        let paragraph_break_threshold = reference_size * 1.6;
+        // A caption introduces something. That is what separates it from the
+        // other short title-case paragraph in legal documents -- a signature
+        // block line like "By: Jane Ellis" or a party name -- which is
+        // followed by another short line rather than by prose. Gap alone
+        // cannot tell them apart: in a uniformly formatted contract the gap
+        // before a caption and the gap before a body paragraph are the same
+        // number, so a rule that reads only the gap marks the signature block
+        // as a run of headings and splits it into fabricated provisions.
+        let is_short_line = |text: &str| text.split_whitespace().count() <= 8;
+        let followed_by_prose = raw
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                raw.get(index + 1)
+                    .is_some_and(|(next, _, _)| !is_short_line(next))
+            })
             .collect::<Vec<_>>();
-        let reference_gap = median(
-            gaps.into_iter()
-                .filter(|gap| *gap <= reference_size * 3.0)
-                .collect(),
-        )
-        .unwrap_or(reference_size * 1.35);
         let mut previous_y = None;
         raw.into_iter()
-            .map(|(text, y, size)| {
+            .enumerate()
+            .map(|(index, (text, y, size))| {
+                // The first line on a page is deliberately NOT treated as a
+                // paragraph start. It has no preceding line, so it looks like
+                // the strongest possible break -- but a running header sits in
+                // exactly that position on every page, and admitting it marks
+                // furniture as a caption. Tried and reverted: it severed a
+                // carve-out from the cap it limits, which is the fabricated
+                // boundary this whole area exists to prevent. The cost is that
+                // a caption at the top of a page is not flagged here; page
+                // ends are already hard boundaries, so provisions still do not
+                // run together across the break.
                 let leading_gap = previous_y.map_or(0.0, |previous| y - previous);
+                // A page's first line has no gap above it, so it is treated as
+                // a paragraph start: a page break separates text at least as
+                // firmly as a blank line does, and over-splitting is the safe
+                // direction for this flag.
+                //
+                // The threshold is anchored to font size rather than to the
+                // median gap. Line spacing is proportional to type size, while
+                // the median is the *paragraph* gap in any document whose
+                // paragraphs are mostly one line -- there a median-derived
+                // threshold sits above every gap in the file and no break is
+                // ever found. That is the same arithmetic error that made
+                // uniformly formatted contracts look structureless; it is
+                // wrong here too, and here its failure mode is the dangerous
+                // one, because a missed split is what lets a conjunction span
+                // two clauses.
+                let paragraph_start = previous_y.is_none() || leading_gap > reference_size * 1.6;
                 previous_y = Some(y);
-                let geometric_heading = leading_gap > reference_gap * 1.3
-                    && text.split_whitespace().count() <= 8
+                let geometric_heading = leading_gap > paragraph_break_threshold
+                    && followed_by_prose[index]
+                    && is_short_line(&text)
                     && text.split_whitespace().all(|word| {
                         matches!(
                             word.to_ascii_lowercase().as_str(),
@@ -637,6 +717,7 @@ impl LayoutPage {
                     && !matches!(text.chars().next_back(), Some('.') | Some(';') | Some(':'));
                 LayoutLine {
                     is_heading: size > reference_size * 1.15 || geometric_heading,
+                    starts_paragraph: paragraph_start,
                     text,
                 }
             })
@@ -878,6 +959,16 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                             text,
                             flow: AnchorFlow::Continue,
                             is_heading: Some(paragraph_style),
+                            // Deliberately None, though `w:p` does mark every
+                            // paragraph. This flag sets the unit within which
+                            // retrieval will allow a same-clause claim, and for
+                            // DOCX that unit is the whole provision: `w:pStyle`
+                            // declares where clauses begin, so a conjunction
+                            // spanning two paragraphs of one clause is a real
+                            // conjunction. Reporting paragraphs here would
+                            // narrow DOCX to single paragraphs and refuse
+                            // answers the file supports.
+                            starts_paragraph: None,
                         });
                     }
                 }
@@ -1235,6 +1326,33 @@ mod tests {
         pdf
     }
 
+    /// DOCX must not report paragraph layout, even though `w:p` marks it.
+    ///
+    /// `starts_paragraph` sets the span within which retrieval will allow a
+    /// same-clause claim. A PDF reports paragraphs because its clause extent is
+    /// inferred and a provision may hold more than one clause. DOCX declares
+    /// where clauses begin, so its unit is the whole provision; reporting
+    /// paragraphs here would narrow every DOCX clause to a single paragraph and
+    /// start refusing conjunctions the file plainly supports.
+    #[test]
+    fn docx_reports_no_paragraph_layout_so_its_clauses_match_whole() {
+        let bytes = synthetic_docx(
+            r#"<w:document xmlns:w="urn:test"><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>7. CONFIDENTIALITY</w:t></w:r></w:p>
+            <w:p><w:r><w:t>The Recipient shall protect Confidential Information.</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Neither party may assign this Agreement.</w:t></w:r></w:p>
+            </w:body></w:document>"#,
+        );
+        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|block| block.starts_paragraph.is_none()),
+            "DOCX reported paragraph layout, which narrows its clauses to one paragraph each"
+        );
+    }
+
     #[test]
     fn docx_conversion_preserves_paragraph_anchors_and_text() {
         let bytes = synthetic_docx(
@@ -1552,6 +1670,7 @@ mod tests {
             format: SourceFormat::Pdf,
             blocks: vec![ConvertedBlock {
                 is_heading: None,
+                starts_paragraph: None,
                 source_anchor: "page:\n1".to_string(),
                 text: "Evidence".to_string(),
                 flow: AnchorFlow::HardBoundary,

@@ -107,9 +107,14 @@ re-run or spend effort elsewhere:
    `/Library`, `/Applications`, `/dev`, `/.vol`. Each requires an explicit
    picker choice, and the stated claim is about home and filesystem roots, but
    the refusal reads as more complete than it is.
-6. **Known retrieval limitation**, disclosed separately in the review packet: a
-   same-provision conjunction can span two adjacent clauses in a PDF that
-   reports no structure. See `archive-pilot-independent-review.md`.
+6. **Known retrieval limitation**, disclosed in the review packet and
+   restated at retrieval rather than at detection. A PDF heading marks where a
+   provision starts and never where it ends, so a same-provision claim is
+   confined to a single paragraph -- the largest span PDF layout actually
+   proves. DOCX declares its clause starts and matches whole provisions. An
+   attempt to fix this by detecting captions better fabricated a conjunction
+   and was reverted; the reviewer's reproduction is now a regression fixture.
+   See `archive-pilot-independent-review.md`.
 
 ## Not reached
 
