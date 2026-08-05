@@ -489,18 +489,6 @@ fn convert_via_anydoc(
     let document =
         anydoc::to_document(bytes, parser_format).map_err(|_| ConversionError::MalformedSource)?;
 
-    // Whether the source names its own headings decides the span a
-    // same-clause claim may cover. A file that declares them is authoritative:
-    // its clauses match whole. One that does not gets paragraph granularity,
-    // so a conjunction is confined to a single paragraph rather than ranging
-    // over an entire document that reported no structure at all. Word and
-    // OpenDocument carry outline levels; RTF, as this parser reads it, does
-    // not, and takes the conservative path by itself.
-    let declares_headings = document
-        .blocks
-        .iter()
-        .any(|block| matches!(block, anydoc::model::Block::Heading { .. }));
-
     let mut blocks = Vec::new();
     let mut output_bytes = 0usize;
     let mut ordinal = 0usize;
@@ -530,12 +518,27 @@ fn convert_via_anydoc(
             text,
             flow: AnchorFlow::Continue,
             is_heading: Some(is_heading),
-            starts_paragraph: if declares_headings { None } else { Some(true) },
+            starts_paragraph: None,
         });
     }
 
     let warnings = if blocks.is_empty() {
         vec!["ocr_required_or_no_extractable_text".to_string()]
+    } else if format == SourceFormat::Rtf {
+        // RTF is withheld from same-clause answers outright.
+        //
+        // A first attempt keyed this on whether the parsed document contained
+        // a heading, which is the same document-level reasoning that produced
+        // the PDF defect: one outline level anywhere marked the whole file
+        // trustworthy. A reviewer built the RTF that turns that into a wrong
+        // answer, and `\outlinelevel` is in fact recognised, so "RTF declares
+        // no headings" was not true either.
+        //
+        // Word and OpenDocument carry a style system that states which
+        // paragraphs are captions. RTF outline levels are an afterthought most
+        // producers never write, so finding one proves little about the
+        // paragraphs around it.
+        vec![PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()]
     } else {
         Vec::new()
     };
@@ -591,71 +594,32 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     }
     let warnings = if blocks.is_empty() {
         vec!["ocr_required_or_no_extractable_text".to_string()]
-    } else if !pdf_has_usable_structure_signal(&blocks) {
-        // A text-only PDF can be perfectly extractable while still being
-        // unsafe to segment: uniform-size, uniformly-spaced title-case
-        // captions are indistinguishable from body prose here. Do not let
-        // retrieval turn that ambiguity into a fabricated conjunction.
-        vec![PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()]
     } else {
-        Vec::new()
+        // Every PDF is withheld from same-clause answers, not only those with
+        // no visible structure.
+        //
+        // Two rules were tried before this one and both were shown wrong by a
+        // reviewer's document. Trusting a file because it contained a heading
+        // let one administrative line vouch for two unrelated clauses.
+        // Confining the claim to a paragraph instead assumed paragraph breaks
+        // are reliably visible, and they are not: a PDF set at ordinary line
+        // spacing reported starts of `true, true, false` and put two labelled
+        // clauses in one span.
+        //
+        // A caption marks where a clause starts and never where it ends, and
+        // nothing in a PDF marks the end. There is no measurement of the page
+        // that closes that gap, so the claim is not made. Everything else about
+        // PDFs still works -- exact phrase, whole-document search, excerpts and
+        // anchors -- and caption detection still improves how provisions are
+        // titled and cited. What it no longer does is license a statement about
+        // two terms sharing a clause.
+        vec![PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()]
     };
     Ok(ConvertedDocument {
         format: SourceFormat::Pdf,
         blocks,
         warnings,
     })
-}
-
-fn pdf_has_usable_structure_signal(blocks: &[ConvertedBlock]) -> bool {
-    blocks.iter().any(|block| {
-        block.is_heading == Some(true)
-            || block
-                .text
-                .lines()
-                .map(str::trim)
-                .any(pdf_lexical_structure_signal)
-    })
-}
-
-/// Keep this deliberately narrower than title-case detection. A short
-/// title-case sentence is the exact shape that pdf-extract cannot distinguish
-/// from body prose in a uniformly formatted PDF.
-fn pdf_lexical_structure_signal(line: &str) -> bool {
-    if line.is_empty() || line.len() > 180 {
-        return false;
-    }
-    let words = line.split_whitespace().collect::<Vec<_>>();
-    if words.is_empty() || words.len() > 12 {
-        return false;
-    }
-    let lowercase = line.to_ascii_lowercase();
-    let known_prefix = ["section ", "article ", "schedule ", "exhibit "]
-        .iter()
-        .any(|prefix| lowercase.starts_with(prefix));
-    let numbered = line.split_once(['.', ')']).is_some_and(|(prefix, rest)| {
-        !rest.trim().is_empty()
-            && prefix.len() <= 12
-            && prefix
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    });
-    let letters = line.chars().filter(|character| character.is_alphabetic());
-    let (letter_count, uppercase_count) = letters.fold((0usize, 0usize), |counts, character| {
-        (
-            counts.0 + 1,
-            counts.1 + usize::from(character.is_uppercase()),
-        )
-    });
-    let uppercase = letter_count >= 4 && uppercase_count == letter_count;
-    let run_in = line.ends_with('.')
-        && letter_count >= 4
-        && words.iter().all(|word| {
-            word.chars()
-                .find(|character| character.is_alphabetic())
-                .is_some_and(char::is_uppercase)
-        });
-    known_prefix || numbered || uppercase || run_in
 }
 
 #[derive(Debug, Default)]

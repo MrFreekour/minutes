@@ -11,7 +11,9 @@
 //! The fixtures are synthetic, produced by LibreOffice from a short synthetic
 //! NDA. No client material is involved.
 
-use minutes_archive_convert::{convert_bytes, ConversionError, SourceFormat};
+use minutes_archive_convert::{
+    convert_bytes, ConversionError, SourceFormat, PDF_UNSUPPORTED_STRUCTURE_WARNING,
+};
 
 const NDA_DOC: &[u8] = include_bytes!("../../../tests/fixtures/archive-legacy/nda.doc");
 const NDA_ODT: &[u8] = include_bytes!("../../../tests/fixtures/archive-legacy/nda.odt");
@@ -52,31 +54,47 @@ fn an_opendocument_text_reports_its_declared_headings() {
             && block.text.contains("Assignment and Change of Control")));
 }
 
-/// RTF is the counter-case, and it is handled by the rule rather than by a
-/// special case.
+/// RTF is withheld from same-clause answers regardless of what it contains.
 ///
-/// This parser surfaces no outline levels from RTF, so nothing declares where
-/// a clause begins. Reporting no paragraph layout would leave the whole
-/// document as a single span and let a same-clause query join any two terms in
-/// the file. Reporting paragraphs confines the claim to one, which is all an
-/// RTF read this way actually proves.
+/// The first attempt keyed this on whether the parsed document contained a
+/// heading, which is the document-level reasoning that caused the PDF defect:
+/// one outline level anywhere would have vouched for every paragraph in the
+/// file. A reviewer built the RTF that turns that into a wrong answer, and
+/// `\outlinelevel` is in fact recognised by this parser, so the premise that
+/// "RTF declares no headings" was wrong as well.
+///
+/// Word and OpenDocument carry a style system that states which paragraphs are
+/// captions. RTF outline levels are an afterthought most producers never
+/// write, so finding one proves little about the paragraphs around it.
 #[test]
-fn rtf_reports_paragraph_layout_because_it_declares_no_headings() {
+fn rtf_is_withheld_from_same_clause_answers() {
     let document = convert_bytes(SourceFormat::Rtf, NDA_RTF).expect("convert");
     assert!(
         document
-            .blocks
+            .warnings
             .iter()
-            .all(|block| block.is_heading == Some(false)),
-        "this fixture is the no-declared-heading case; if the parser gained \
-         RTF outline support the assertion below no longer tests what it means to"
+            .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING),
+        "RTF must report that its clause boundaries are not declared: {:?}",
+        document.warnings
     );
+}
+
+/// The same holds for an RTF that DOES carry an outline level, which is the
+/// case the first attempt got wrong.
+#[test]
+fn an_rtf_carrying_an_outline_level_is_still_withheld() {
+    let rtf = br"{\rtf1\ansi
+{\pard\outlinelevel0\b 7. CONFIDENTIALITY\par}
+{\pard The Recipient shall protect Confidential Information.\par}
+{\pard Neither party may assign this Agreement.\par}
+}";
+    let document = convert_bytes(SourceFormat::Rtf, rtf).expect("convert");
     assert!(
         document
-            .blocks
+            .warnings
             .iter()
-            .all(|block| block.starts_paragraph == Some(true)),
-        "without declared headings, every block must be its own clause unit"
+            .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING),
+        "an outline level must not license same-clause answers for the whole file"
     );
 }
 

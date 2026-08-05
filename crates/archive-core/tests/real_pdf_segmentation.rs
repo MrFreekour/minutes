@@ -13,7 +13,7 @@
 //! .docx carrying genuine `w:hdr`/`w:ftr` parts and a real PAGE field. It
 //! contains no client material.
 
-use minutes_archive_convert::{convert_bytes, SourceFormat, PDF_UNSUPPORTED_STRUCTURE_WARNING};
+use minutes_archive_convert::{convert_bytes, SourceFormat};
 use minutes_archive_core::retrieval::{
     normalize_converted_document, CurrentRevisionSet, DocumentId, LegalConcept, LegalIndex,
     LegalQuery, MatchScope, ProvisionBoundaries, VaultId,
@@ -123,6 +123,9 @@ const DOUBLE_SPACED_SIGNATURE: &[u8] =
 const UNHEADED_CLAUSES_UNDER_ONE_NOTICE: &[u8] = include_bytes!(
     "../../../tests/fixtures/archive-real-pdf/unheaded-clauses-under-one-notice.pdf"
 );
+const LABELLED_CLAUSES_AT_UNIFORM_SPACING: &[u8] = include_bytes!(
+    "../../../tests/fixtures/archive-real-pdf/labelled-clauses-at-uniform-spacing.pdf"
+);
 
 /// Reproduces the open defect in #26 against real LibreOffice output.
 ///
@@ -154,33 +157,21 @@ fn a_real_pdf_does_not_fabricate_a_same_provision_conjunction() {
     }
 }
 
-/// This fixture used to be unsegmentable and was withheld from same-provision
-/// search entirely. Its captions carry no size change, no indentation and no
-/// numbering -- the only signal is that a caption is preceded by a wider gap
-/// than the line spacing inside a paragraph.
+/// Captions are still recovered from a uniformly formatted PDF; what changed
+/// is what that licenses.
 ///
-/// The reference for "wider" used to be the median gap in the document, which
-/// is the paragraph gap whenever most paragraphs are a single line, as they
-/// are here. The threshold then sat above every gap in the document and no
-/// break could be found. Anchoring it to font size instead recovers the
-/// captions, because line spacing is proportional to type size while a
-/// document statistic is not.
+/// The paragraph-break reference used to be the median gap, which IS the
+/// paragraph gap whenever paragraphs are mostly a single line, so the
+/// threshold sat above every gap in this file and no caption was ever found.
+/// Anchoring it to font size fixes that, and the captions below prove it --
+/// they title the provisions and give the excerpts honest anchors.
 ///
-/// What must not change is the refusal to invent a conjunction: the
-/// confidentiality clause and the assignment clause are still separate
-/// provisions, and a same-provision query must not join them.
+/// They do not license a same-clause answer. A caption marks where a clause
+/// starts and never where it ends, so every PDF is withheld from that claim
+/// regardless of how well its captions read.
 #[test]
-fn a_real_pdf_with_uniform_type_recovers_its_captions_without_fabricating_a_conjunction() {
+fn a_uniformly_typed_pdf_recovers_its_captions_but_still_withholds_same_clause() {
     let converted = convert_bytes(SourceFormat::Pdf, UNIFORM_SPACING_CAPTIONS).expect("convert");
-    assert!(
-        !converted
-            .warnings
-            .iter()
-            .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING),
-        "uniform-type captions are recoverable from line spacing; got {:?}",
-        converted.warnings
-    );
-
     let normalized = normalize_converted_document(
         DocumentId::parse("uniform-spacing-captions").expect("id"),
         "Uniform Spacing Captions",
@@ -188,82 +179,71 @@ fn a_real_pdf_with_uniform_type_recovers_its_captions_without_fabricating_a_conj
         &converted,
     )
     .expect("normalize");
-    assert_eq!(
-        normalized.provision_boundaries,
-        ProvisionBoundaries::Declared,
-        "captions were recovered, so boundaries are no longer inferred"
-    );
 
-    // The point of recovering the captions is that the clauses separate. If
-    // they ever merge again, this fixture is back to fabricating the exact
-    // conjunction #26 was raised for.
-    for provision in &normalized.provisions {
-        let carries_confidentiality = provision.text.contains("Confidential Information");
-        let carries_assignment = provision.text.contains("may assign");
-        assert!(
-            !(carries_confidentiality && carries_assignment),
-            "one provision now spans two unrelated clauses:\n{}",
-            provision.text
-        );
-    }
+    assert!(
+        normalized
+            .provisions
+            .iter()
+            .any(|provision| provision.heading.as_deref()
+                == Some("Assignment and Change of Control")),
+        "captions were not recovered: {:?}",
+        normalized
+            .provisions
+            .iter()
+            .map(|provision| provision.heading.as_deref())
+            .collect::<Vec<_>>()
+    );
     assert!(
         normalized.provisions.len() >= 3,
-        "expected the three captioned clauses to separate; got {}",
+        "the captioned clauses did not separate: {}",
         normalized.provisions.len()
     );
+    assert_eq!(
+        normalized.provision_boundaries,
+        ProvisionBoundaries::Inferred,
+        "a PDF never declares where its clauses end, however clear its captions"
+    );
+
     let revisions = CurrentRevisionSet::from_documents([&normalized]);
     let mut index =
         LegalIndex::new(VaultId::parse("fixture-vault").expect("vault")).expect("index");
     index.replace_document(&normalized).expect("ingest");
 
-    let exact = LegalQuery {
-        raw: "remember the exact phrase".to_string(),
-        scope: MatchScope::AnywhereInDocument,
-        required_concepts: Vec::new(),
-        excluded_concepts: Vec::new(),
-        exact_phrase: Some("Confidential Information".to_string()),
-        max_sentences: None,
-        limit: 10,
-    };
-    let exact_response = index
-        .search(index.vault_id(), exact, &revisions)
+    // Still findable the honest ways.
+    let exact = index
+        .search(
+            index.vault_id(),
+            LegalQuery {
+                raw: "remember the exact phrase".to_string(),
+                scope: MatchScope::AnywhereInDocument,
+                required_concepts: Vec::new(),
+                excluded_concepts: Vec::new(),
+                exact_phrase: Some("Confidential Information".to_string()),
+                max_sentences: None,
+                limit: 10,
+            },
+            &revisions,
+        )
         .expect("exact phrase");
-    assert_eq!(exact_response.documents.len(), 1);
+    assert_eq!(exact.documents.len(), 1);
 
-    let document_scope = LegalQuery {
-        raw: "find documents containing confidentiality and assignment".to_string(),
-        scope: MatchScope::AnywhereInDocument,
-        required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
-        excluded_concepts: Vec::new(),
-        exact_phrase: None,
-        max_sentences: None,
-        limit: 10,
-    };
-    let document_response = index
-        .search(index.vault_id(), document_scope, &revisions)
-        .expect("document conjunction");
-    assert_eq!(document_response.documents.len(), 1);
-
-    let same_provision = LegalQuery {
-        raw: "find a confidentiality provision containing assignment".to_string(),
-        scope: MatchScope::SameProvision,
-        required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
-        excluded_concepts: Vec::new(),
-        exact_phrase: None,
-        max_sentences: None,
-        limit: 10,
-    };
-    let same_response = index
-        .search(index.vault_id(), same_provision, &revisions)
-        .expect("same provision");
-    // Empty for the right reason now. The clauses are separate provisions, so
-    // there is no conjunction to return -- rather than the old outcome, where
-    // the answer was withheld because the boundaries could not be trusted.
-    assert!(same_response.evidence.is_empty());
-    assert_eq!(
-        same_response.inferred_boundary_evidence_withdrawn, 0,
-        "nothing should be withheld once the boundaries are declared"
-    );
+    let same_clause = index
+        .search(
+            index.vault_id(),
+            LegalQuery {
+                raw: "find a confidentiality provision containing assignment".to_string(),
+                scope: MatchScope::SameProvision,
+                required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
+                excluded_concepts: Vec::new(),
+                exact_phrase: None,
+                max_sentences: None,
+                limit: 10,
+            },
+            &revisions,
+        )
+        .expect("same clause");
+    assert!(same_clause.evidence.is_empty());
+    assert_eq!(same_clause.inferred_boundary_evidence_withdrawn, 1);
 }
 
 /// The counterpart to the uniform-type fixture, and the reason a caption has
@@ -407,5 +387,59 @@ fn unheaded_clauses_under_one_notice_do_not_answer_a_same_clause_query() {
         documents.documents.len(),
         1,
         "the document itself must stay findable"
+    );
+}
+
+/// The document that retired the paragraph fence.
+///
+/// A reviewer produced it with ReportLab: two separately labelled clauses,
+/// confidentiality and assignment, set at ordinary line spacing. The converter
+/// read paragraph starts as `true, true, false` and put both clauses in one
+/// span, so a rule that confined a same-clause answer to a paragraph still
+/// joined them.
+///
+/// The lesson is that paragraph separation is not reliably visible in a PDF
+/// either, so it cannot carry a safety property. No PDF licenses a same-clause
+/// answer now, whatever its layout suggests.
+#[test]
+fn labelled_clauses_at_uniform_spacing_do_not_answer_a_same_clause_query() {
+    let converted =
+        convert_bytes(SourceFormat::Pdf, LABELLED_CLAUSES_AT_UNIFORM_SPACING).expect("convert");
+    let normalized = normalize_converted_document(
+        DocumentId::parse("labelled-clauses").expect("id"),
+        "Labelled Clauses",
+        LABELLED_CLAUSES_AT_UNIFORM_SPACING,
+        &converted,
+    )
+    .expect("normalize");
+    assert_eq!(
+        normalized.provision_boundaries,
+        ProvisionBoundaries::Inferred,
+        "a PDF never declares where its clauses end"
+    );
+
+    let revisions = CurrentRevisionSet::from_documents([&normalized]);
+    let mut index =
+        LegalIndex::new(VaultId::parse("fixture-vault").expect("vault")).expect("index");
+    index.replace_document(&normalized).expect("ingest");
+    let response = index
+        .search(
+            index.vault_id(),
+            LegalQuery {
+                raw: "confidentiality and assignment in the same provision".to_string(),
+                scope: MatchScope::SameProvision,
+                required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
+                excluded_concepts: Vec::new(),
+                exact_phrase: None,
+                max_sentences: None,
+                limit: 10,
+            },
+            &revisions,
+        )
+        .expect("same clause");
+    assert!(
+        response.evidence.is_empty(),
+        "two labelled clauses were reported as one:\n{}",
+        response.evidence[0].exact_excerpt
     );
 }

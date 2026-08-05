@@ -95,28 +95,31 @@ sits in the app's own settings file on your Mac. In a law practice those folder
 names are often client names, which is why this is stated rather than left
 unsaid. Opening Minutes Archive again clears it.
 
-**2. For some files, "in the same clause" means "in the same paragraph".**
+**2. PDFs and RTFs never answer "in the same clause".**
 
 Word and OpenDocument files record where each section begins. PDF and RTF do
-not -- a PDF records only where ink sits on the page. For those, the app works
-out clause headings from the layout, and does that well, but a heading tells it
-where a clause *starts* and never where it *ends*. A clause below with no
-heading the app can see gets swallowed by the clause above it.
+not -- a PDF records only where ink sits on the page.
 
-So for a PDF or an RTF, when you ask whether two things appear in the same
-clause, the app answers only if they appear in the same paragraph. That is the
-largest span those files actually prove. If your two terms sit in adjacent
-paragraphs, it will say nothing rather than tell you they are in one clause.
+The app reads clause captions out of a PDF's layout, and does that well: your
+results are titled and cited by clause. But a caption shows where a clause
+*starts* and never where it *ends*, and nothing in the page marks the end. Two
+attempts were made to work around that and an independent reviewer defeated
+both, each time with a document that produced a confident and wrong answer. So
+the app no longer makes that claim about a PDF or an RTF at all.
 
-Word and OpenDocument files are not limited this way. They state where their
-clauses begin, so a clause spanning several paragraphs is answered in full.
-The same agreement saved as `.doc` and as `.rtf` can therefore answer
-differently, and that is not a bug: the RTF genuinely does not record where the
-clause ends.
+Everything else about them still works: exact phrase, "which documents mention
+X and Y", excerpts, and page or section citations. What you will not get is
+"these two things are in the same clause".
 
-Everything remains searchable either way -- by exact phrase, and by "which
-documents mention X and Y" -- and the summary reports how many documents this
-applies to. This is deliberate: a wrong "same clause" answer to a lawyer is
+**Word and OpenDocument answer it, with one thing to know.** Those files state
+where their sections begin, so the app trusts them. What a Word heading proves
+is that a *section* starts there -- not that everything beneath it is a single
+legal clause. If an agreement puts several numbered sub-clauses under one Word
+heading without styling them as headings themselves, the app treats that whole
+section as one clause and may report two of those sub-clauses as sharing it.
+Read the excerpt, which is always shown, before relying on such an answer.
+
+This is deliberate throughout: a wrong "same clause" answer to a lawyer is
 worse than no answer.
 
 ## Stop and contact the pilot operator
