@@ -96,11 +96,22 @@ of two separately labelled clauses at ordinary line spacing reported starts of
 as `unheaded-clauses-under-one-notice.pdf` and
 `labelled-clauses-at-uniform-spacing.pdf`.
 
-RTF is withheld on the same basis. The first attempt keyed on whether the
-parsed file contained a heading -- the same document-level reasoning -- and
-`\outlinelevel` is in fact recognised, so a single outline level switched a
-whole file to whole-provision matching. `an_rtf_carrying_an_outline_level_is_still_withheld`
+RTF is withheld on the same basis, and the accurate statement is that its
+structure signals are not trusted as complete clause boundaries rather than
+that it records none: `\outlinelevel` IS recognised by this parser. The first
+attempt keyed on whether the parsed file contained a heading -- the same
+document-level reasoning -- so a single outline level switched a whole file to
+whole-provision matching. `an_rtf_carrying_an_outline_level_is_still_withheld`
 pins that closed.
+
+The prohibition is enforced on `SourceFormat`, not on a converter warning. It
+previously read a warning string, which let a reviewer pass a markerless PDF
+`ConvertedDocument` through the public normalizer and obtain declared
+boundaries and a same-clause answer; ingestion was safe only because the
+shipped converters always set it.
+`a_markerless_pdf_or_rtf_document_still_cannot_declare_its_boundaries` covers
+that, and the paragraph-unit machinery that made the bypass reachable is
+deleted rather than left in place looking like policy.
 
 What remains for PDFs: exact phrase, whole-document search, excerpts, and page
 or section anchors. Caption recovery from uniformly formatted PDFs is retained

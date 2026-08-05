@@ -333,18 +333,6 @@ fn unheaded_clauses_under_one_notice_do_not_answer_a_same_clause_query() {
     )
     .expect("normalize");
 
-    // The paragraphs must survive as separate units even when they land in one
-    // provision; that separation is the whole basis for the refusal.
-    let units: usize = normalized
-        .provisions
-        .iter()
-        .map(|provision| provision.clause_units.len())
-        .sum();
-    assert!(
-        units >= 4,
-        "paragraph units collapsed, so the refusal below would be vacuous: {units}"
-    );
-
     let revisions = CurrentRevisionSet::from_documents([&normalized]);
     let mut index =
         LegalIndex::new(VaultId::parse("fixture-vault").expect("vault")).expect("index");

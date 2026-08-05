@@ -91,23 +91,6 @@ pub struct ConvertedBlock {
     /// block is body text.
     #[serde(default)]
     pub is_heading: Option<bool>,
-    /// Whether this block begins a new paragraph in the source layout.
-    ///
-    /// Separate from `is_heading`, and far weaker on purpose. Deciding that a
-    /// gap makes a line a *heading* was tried and reverted: it promoted an
-    /// administrative line, which flipped a whole document to declared
-    /// boundaries and merged two unheaded clauses into a fabricated
-    /// same-clause match. Deciding that a gap starts a *paragraph* carries the
-    /// opposite risk profile. Retrieval refuses to claim a conjunction that
-    /// spans two paragraphs of an inferred-structure document, so splitting
-    /// too eagerly only withholds an answer, while missing a split is what
-    /// would overstate one. Erring toward more paragraphs is therefore the
-    /// safe direction, which is why this reads the gap alone with none of the
-    /// word-level conditions a heading needs.
-    ///
-    /// `None` means the format does not report paragraph layout.
-    #[serde(default)]
-    pub starts_paragraph: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,7 +501,6 @@ fn convert_via_anydoc(
             text,
             flow: AnchorFlow::Continue,
             is_heading: Some(is_heading),
-            starts_paragraph: None,
         });
     }
 
@@ -588,7 +570,6 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                     AnchorFlow::Continue
                 },
                 is_heading: line.is_heading.then_some(true),
-                starts_paragraph: Some(line.starts_paragraph),
             });
         }
     }
@@ -648,7 +629,6 @@ struct LayoutGlyph {
 struct LayoutLine {
     text: String,
     is_heading: bool,
-    starts_paragraph: bool,
 }
 
 impl LayoutPage {
@@ -760,22 +740,6 @@ impl LayoutPage {
                 // ends are already hard boundaries, so provisions still do not
                 // run together across the break.
                 let leading_gap = previous_y.map_or(0.0, |previous| y - previous);
-                // A page's first line has no gap above it, so it is treated as
-                // a paragraph start: a page break separates text at least as
-                // firmly as a blank line does, and over-splitting is the safe
-                // direction for this flag.
-                //
-                // The threshold is anchored to font size rather than to the
-                // median gap. Line spacing is proportional to type size, while
-                // the median is the *paragraph* gap in any document whose
-                // paragraphs are mostly one line -- there a median-derived
-                // threshold sits above every gap in the file and no break is
-                // ever found. That is the same arithmetic error that made
-                // uniformly formatted contracts look structureless; it is
-                // wrong here too, and here its failure mode is the dangerous
-                // one, because a missed split is what lets a conjunction span
-                // two clauses.
-                let paragraph_start = previous_y.is_none() || leading_gap > reference_size * 1.6;
                 previous_y = Some(y);
                 let geometric_heading = leading_gap > paragraph_break_threshold
                     && followed_by_prose[index]
@@ -789,7 +753,6 @@ impl LayoutPage {
                     && !matches!(text.chars().next_back(), Some('.') | Some(';') | Some(':'));
                 LayoutLine {
                     is_heading: size > reference_size * 1.15 || geometric_heading,
-                    starts_paragraph: paragraph_start,
                     text,
                 }
             })
@@ -1040,7 +1003,6 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                             // conjunction. Reporting paragraphs here would
                             // narrow DOCX to single paragraphs and refuse
                             // answers the file supports.
-                            starts_paragraph: None,
                         });
                     }
                 }
@@ -1398,33 +1360,6 @@ mod tests {
         pdf
     }
 
-    /// DOCX must not report paragraph layout, even though `w:p` marks it.
-    ///
-    /// `starts_paragraph` sets the span within which retrieval will allow a
-    /// same-clause claim. A PDF reports paragraphs because its clause extent is
-    /// inferred and a provision may hold more than one clause. DOCX declares
-    /// where clauses begin, so its unit is the whole provision; reporting
-    /// paragraphs here would narrow every DOCX clause to a single paragraph and
-    /// start refusing conjunctions the file plainly supports.
-    #[test]
-    fn docx_reports_no_paragraph_layout_so_its_clauses_match_whole() {
-        let bytes = synthetic_docx(
-            r#"<w:document xmlns:w="urn:test"><w:body>
-            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>7. CONFIDENTIALITY</w:t></w:r></w:p>
-            <w:p><w:r><w:t>The Recipient shall protect Confidential Information.</w:t></w:r></w:p>
-            <w:p><w:r><w:t>Neither party may assign this Agreement.</w:t></w:r></w:p>
-            </w:body></w:document>"#,
-        );
-        let document = convert_bytes(SourceFormat::Docx, &bytes).expect("convert");
-        assert!(
-            document
-                .blocks
-                .iter()
-                .all(|block| block.starts_paragraph.is_none()),
-            "DOCX reported paragraph layout, which narrows its clauses to one paragraph each"
-        );
-    }
-
     #[test]
     fn docx_conversion_preserves_paragraph_anchors_and_text() {
         let bytes = synthetic_docx(
@@ -1742,7 +1677,6 @@ mod tests {
             format: SourceFormat::Pdf,
             blocks: vec![ConvertedBlock {
                 is_heading: None,
-                starts_paragraph: None,
                 source_anchor: "page:\n1".to_string(),
                 text: "Evidence".to_string(),
                 flow: AnchorFlow::HardBoundary,

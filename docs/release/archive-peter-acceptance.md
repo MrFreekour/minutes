@@ -98,11 +98,14 @@ unsaid. Opening Minutes Archive again clears it.
 **2. PDFs and RTFs never answer "in the same clause".**
 
 Word and OpenDocument files record where each section begins. PDF and RTF do
-not -- a PDF records only where ink sits on the page.
+not. A PDF records only where ink sits on the page; RTF can carry an outline
+marker, but so few programs write one that the app does not treat it as a
+reliable statement of where clauses divide.
 
-The app reads clause captions out of a PDF's layout, and does that well: your
-results are titled and cited by clause. But a caption shows where a clause
-*starts* and never where it *ends*, and nothing in the page marks the end. Two
+The app reads clause captions out of a PDF's layout, and often recovers them
+well enough to title and cite a result by clause -- though not always, and it
+does not promise to. What it can never do is tell where a clause *ends*: a
+caption shows where one starts, and nothing in the page marks the finish. Two
 attempts were made to work around that and an independent reviewer defeated
 both, each time with a document that produced a confident and wrong answer. So
 the app no longer makes that claim about a PDF or an RTF at all.

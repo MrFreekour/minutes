@@ -319,7 +319,7 @@ function renderVaultSummary(report) {
     // does not care about.
     `${inferredBoundaryDocuments.toLocaleString()} indexed document${
       inferredBoundaryDocuments === 1 ? "" : "s"
-    } cannot answer same-clause questions because the file reports no section structure. ` +
+    } cannot answer same-clause questions because the file does not record where a clause ends. ` +
     (report.semantic_retrieval_enabled
       ? `${report.semantic_provisions_indexed.toLocaleString()} provision suggestion vector${
           report.semantic_provisions_indexed === 1 ? "" : "s"
@@ -562,7 +562,7 @@ function renderSearchResponse(response) {
     (response.inferred_boundary_evidence_withdrawn ?? 0) > 0
       ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} searchable document${
           response.inferred_boundary_evidence_withdrawn === 1 ? "" : "s"
-        } report no section structure, so they were excluded from same-clause questions.`
+        } do not record where a clause ends, so they were excluded from same-clause questions.`
       : "";
   elements.searchStatus.textContent =
     `${verifiedCount.toLocaleString()} current ${resultKind}${

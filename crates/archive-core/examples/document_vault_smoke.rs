@@ -120,11 +120,19 @@ fn main() {
             "Find confidentiality provisions under three sentences covering affiliates.",
         )
         .expect("search");
-    assert_eq!(response.evidence.len(), 3);
-    assert!(response
-        .evidence
-        .iter()
-        .any(|card| card.source_anchor.starts_with("page:0001/")));
+    // Two, not three: the PDF is withheld from same-clause answers because a
+    // PDF never records where a clause ends. The formats that state where
+    // their sections begin still answer, and the PDF is still reachable by
+    // exact phrase and whole-document search below.
+    assert_eq!(response.evidence.len(), 2);
+    assert!(
+        !response
+            .evidence
+            .iter()
+            .any(|card| card.source_anchor.starts_with("page:")),
+        "a PDF answered a same-clause query"
+    );
+    assert_eq!(response.inferred_boundary_evidence_withdrawn, 1);
     assert!(response
         .evidence
         .iter()

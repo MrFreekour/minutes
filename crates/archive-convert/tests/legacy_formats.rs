@@ -34,14 +34,6 @@ fn a_word_97_document_reports_its_declared_headings() {
         headings.contains(&"7. Confidentiality and Permitted Exceptions"),
         "declared headings were lost: {headings:?}"
     );
-    assert!(
-        document
-            .blocks
-            .iter()
-            .all(|block| block.starts_paragraph.is_none()),
-        "a format that declares its clause starts must not report paragraph \
-         layout, or its clauses narrow to one paragraph each"
-    );
 }
 
 #[test]
