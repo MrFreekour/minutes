@@ -7,10 +7,10 @@ import { existsSync, readFileSync } from "node:fs";
 // These whole-file hashes prevent dead/comment-only duplicate code from
 // satisfying the structural checks below.
 const EXPECTED_SOURCE_SHA256 = {
-  release: "2310494f4a559274b1204c3c1a4bc080d9d2798ea8262fbf22d5022fbb48343c",
+  release: "d63ea2ec2626b254a804e3ce12be61d0abfb0436ee7158f863e31b3e5cd1d54d",
   acceptance: "8ae35943181c6d0f248f580587b894c53db9c30257f307c5aa5264a83f13969d",
-  build: "6a1933306c99ccbfc6c5cb35a577389fbe79f08333e855661dc1994f0f9718b1",
-  dev: "b308c3088597f154a247cbfb299cd8b4da432378b4a41b3309fb0a2a15beff3c",
+  build: "9ca0741767b8e2fc49c4ffd200d5c5c43d13ddf0ebfd88fa2d6116d0cb3656ec",
+  dev: "3c6d77c6c92f40e646c51eb87a345d47ad66b496d18c053bf342daa844f7839a",
   packageXpc: "baebd532d240fc26188c431f571d0a44f2ce1e7240c3277284c9ea9e69c1ef82",
   tauri: "f127e92a1a2a635326d13dd766b3e6cc841655bce30ea2d01d67d9f12c15502c",
   entitlements: "7971da95784f3bdeb3ea257b5c1a31317731b513b16c47e2c4e588fc0ac40bae",

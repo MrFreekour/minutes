@@ -105,7 +105,14 @@ echo "=== Building ${DEV_PRODUCT_NAME}.app ==="
 # The calendar-events Swift helper is compiled and staged into
 # tauri/src-tauri/resources/ by tauri/src-tauri/build.rs, and Tauri bundles it
 # into the .app automatically via tauri.conf.json.
-run_with_ort_retry cargo tauri build --bundles app --config "$DEV_CONFIG" --features "$MINUTES_BUILD_FEATURES" --no-sign
+# Run from the app crate, not the repo root. Two tauri.conf.json files now
+# exist (archive/src-tauri and tauri/src-tauri) and the CLI resolves the
+# first it finds, which is the archive app. From the root this builds the
+# wrong package and fails on features it does not have.
+( cd "$ROOT_DIR/tauri/src-tauri" \
+  && run_with_ort_retry cargo tauri build --bundles app \
+       --config "$ROOT_DIR/$DEV_CONFIG" \
+       --features "$MINUTES_BUILD_FEATURES" --no-sign )
 # Inside-out signing (#311): sign every nested executable FIRST (the CLI
 # sidecar with its own entitlements), then the outer bundle WITHOUT --deep.
 # --deep re-signs nested code with the outer entitlements (clobbering the
