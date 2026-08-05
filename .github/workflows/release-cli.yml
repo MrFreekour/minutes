@@ -116,6 +116,51 @@ jobs:
         with:
           files: ${{ matrix.asset }}
 
+      # Additive second artifact for Linux only: the same CLI plus the sherpa
+      # engine and its shared libraries, as a tarball. The bare binary above is
+      # unchanged, so existing installs and the Homebrew formula are unaffected.
+      #
+      # sherpa-onnx links dynamically on Linux, so the binary needs
+      # libsherpa-onnx-c-api.so and libonnxruntime.so beside it. `$ORIGIN`
+      # runpath makes the loader look next to the executable rather than in the
+      # build tree. Static linkage is deliberately not used here: sherpa-rs-sys
+      # demands a global `-C relocation-model=dynamic-no-pic`, which produces a
+      # non-PIE binary and loses ASLR for every Linux user (#645).
+      - name: Build sherpa-enabled Linux archive
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN"
+        run: |
+          set -euo pipefail
+          cargo build --release -p minutes-cli \
+            --features ${{ matrix.features }},engine-sherpa \
+            --target ${{ matrix.target }}
+          out="minutes-linux-x64-sherpa"
+          rm -rf "$out" && mkdir -p "$out"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$out/minutes"
+          # sherpa-rs-sys drops its shared libraries into the target profile dir.
+          find "target/${{ matrix.target }}/release" -maxdepth 1 -name '*.so' -exec cp {} "$out/" \;
+          test -f "$out/libsherpa-onnx-c-api.so" \
+            || { echo "sherpa shared library missing from the archive"; exit 1; }
+          # Prove it loads outside the build tree, which a build-only check
+          # cannot catch: the failure mode is loader search paths.
+          ( cd /tmp && env -u LD_LIBRARY_PATH "$GITHUB_WORKSPACE/$out/minutes" --version )
+          tar czf "$out.tar.gz" "$out"
+
+      - name: Upload sherpa archive artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: minutes-linux-x64-sherpa.tar.gz
+          path: minutes-linux-x64-sherpa.tar.gz
+
+      - name: Upload sherpa archive release asset
+        uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/') && matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          files: minutes-linux-x64-sherpa.tar.gz
+
   checksums:
     name: Publish CLI checksums
     needs: [release_readiness, build]
