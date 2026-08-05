@@ -305,7 +305,10 @@ function renderVaultSummary(report) {
       report.indexed_documents === 1 ? "" : "s"
     } indexed (${formatBytes(report.indexed_bytes)}). ` +
     `${report.searchable_pdf_documents.toLocaleString()} PDF, ` +
-    `${report.docx_documents.toLocaleString()} DOCX. ` +
+    // One number for every word-processor format. The distinction that
+    // matters to counsel is how much became searchable, not which container
+    // it arrived in.
+    `${report.docx_documents.toLocaleString()} Word or OpenDocument. ` +
     `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
       report.unsupported_files_skipped === 1 ? "" : "s"
     } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
@@ -374,7 +377,7 @@ async function buildTextVault() {
     elements.queryInterpretation.hidden = true;
     elements.searchStatus.textContent =
       report.indexed_documents === 0
-        ? "No searchable PDF, DOCX, TXT, or Markdown documents were found in the approved locations."
+        ? "No searchable PDF, Word, OpenDocument, RTF, TXT, or Markdown documents were found in the approved locations."
         : "Enter a legal retrieval question. Results are exact source excerpts, not generated answers.";
     showView("search");
     if (report.indexed_documents > 0) {

@@ -56,11 +56,17 @@ cloud item, or protected location was unavailable.
 
 ## Expected pilot limitations
 
-The initial searchable formats are searchable PDF, DOCX, TXT, TEXT, and
-Markdown. Scanned PDFs are reported as requiring OCR. Legacy Word, WordPerfect,
-Pages packages, PST/OLM/MSG mail containers, spreadsheets, presentations,
-encrypted documents, and other unsupported formats remain coverage signals,
-not searchable claims.
+The searchable formats are searchable PDF, Word (`.docx` and legacy `.doc`),
+OpenDocument Text (`.odt`), Rich Text Format (`.rtf`), TXT, TEXT, and Markdown.
+Scanned PDFs are reported as requiring OCR.
+
+WordPerfect, Pages packages, PST/OLM/MSG mail containers, spreadsheets,
+presentations, macro-enabled documents (`.docm`), encrypted documents, and
+other unsupported formats remain coverage signals, not searchable claims.
+Spreadsheets and presentations are excluded deliberately rather than for want
+of a parser: this tool segments prose into clauses and quotes them as evidence,
+and a worksheet has no clauses to find, so putting one through would produce
+confident-looking results assembled from cell text.
 
 Search results are research assistance. They are exact retrieved excerpts, not
 legal conclusions, and Peter reviews the source before use. Meaning-similar
@@ -89,21 +95,24 @@ sits in the app's own settings file on your Mac. In a law practice those folder
 names are often client names, which is why this is stated rather than left
 unsaid. Opening Minutes Archive again clears it.
 
-**2. In a PDF, "in the same clause" means "in the same paragraph".**
+**2. For some files, "in the same clause" means "in the same paragraph".**
 
-Word documents record where each section begins and ends. PDFs do not -- a PDF
-records only where ink sits on the page. The app works out clause headings from
-the layout and does that well, but a heading tells it where a clause *starts*
-and never where it *ends*. If a clause below has no heading the app can see, it
-gets swallowed by the clause above it.
+Word and OpenDocument files record where each section begins. PDF and RTF do
+not -- a PDF records only where ink sits on the page. For those, the app works
+out clause headings from the layout, and does that well, but a heading tells it
+where a clause *starts* and never where it *ends*. A clause below with no
+heading the app can see gets swallowed by the clause above it.
 
-So when you ask whether two things appear in the same clause, the app answers
-only if they appear in the same paragraph. That is the largest span a PDF
-actually proves. If your two terms are in adjacent paragraphs, it will say
-nothing rather than tell you they are in one clause.
+So for a PDF or an RTF, when you ask whether two things appear in the same
+clause, the app answers only if they appear in the same paragraph. That is the
+largest span those files actually prove. If your two terms sit in adjacent
+paragraphs, it will say nothing rather than tell you they are in one clause.
 
-Word documents are not limited this way. They say where their clauses begin, so
-a clause spanning several paragraphs is answered in full.
+Word and OpenDocument files are not limited this way. They state where their
+clauses begin, so a clause spanning several paragraphs is answered in full.
+The same agreement saved as `.doc` and as `.rtf` can therefore answer
+differently, and that is not a bug: the RTF genuinely does not record where the
+clause ends.
 
 Everything remains searchable either way -- by exact phrase, and by "which
 documents mention X and Y" -- and the summary reports how many documents this

@@ -238,6 +238,12 @@ pub fn normalize_converted_document(
         converter: match converted.format {
             SourceFormat::Pdf => "pdf-extract-0.12.0-v1",
             SourceFormat::Docx => "docx-xml-0.41.0-v1",
+            // Named with the exact parser version, like the others: a card
+            // cites the converter that produced its excerpt, and these are
+            // pinned so the citation stays true.
+            SourceFormat::Doc => "anydoc-0.1.3-doc-v1",
+            SourceFormat::Odt => "anydoc-0.1.3-odt-v1",
+            SourceFormat::Rtf => "anydoc-0.1.3-rtf-v1",
         }
         .to_string(),
         provision_boundaries: if converted

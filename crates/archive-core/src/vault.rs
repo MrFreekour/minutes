@@ -826,6 +826,16 @@ fn build_authorized_vault(
                 SourceKind::Converted(SourceFormat::Docx) => {
                     counters.docx_documents = counters.docx_documents.saturating_add(1);
                 }
+                // Counted with DOCX rather than in a category of their own.
+                // The number exists so counsel can see how much of a folder
+                // became searchable, and "word-processor documents" is the
+                // distinction that carries meaning there; splitting out the
+                // container format would not change any decision.
+                SourceKind::Converted(SourceFormat::Doc)
+                | SourceKind::Converted(SourceFormat::Odt)
+                | SourceKind::Converted(SourceFormat::Rtf) => {
+                    counters.docx_documents = counters.docx_documents.saturating_add(1);
+                }
                 SourceKind::Text => {}
             }
             counters.indexed_bytes = counters
@@ -866,7 +876,9 @@ fn build_authorized_vault(
         semantic_derivatives_persisted: false,
         semantic_model_download_requested: false,
         supported_formats: if converter.is_some() {
-            vec![".docx", ".md", ".pdf", ".text", ".txt"]
+            vec![
+                ".doc", ".docx", ".md", ".odt", ".pdf", ".rtf", ".text", ".txt",
+            ]
         } else {
             vec![".md", ".text", ".txt"]
         },
@@ -892,6 +904,14 @@ fn source_kind(name: &OsStr, converter_available: bool) -> Option<SourceKind> {
         ".md" | ".text" | ".txt" => Some(SourceKind::Text),
         ".pdf" if converter_available => Some(SourceKind::Converted(SourceFormat::Pdf)),
         ".docx" if converter_available => Some(SourceKind::Converted(SourceFormat::Docx)),
+        // Word 97-2003, OpenDocument Text and RTF. A thirty-year practice
+        // keeps most of its older agreements in these, and until now they were
+        // counted as unsupported and never read. `.docm` is deliberately
+        // absent: it is a macro-enabled container, and nothing here needs to
+        // open one to answer a question about a clause.
+        ".doc" if converter_available => Some(SourceKind::Converted(SourceFormat::Doc)),
+        ".odt" if converter_available => Some(SourceKind::Converted(SourceFormat::Odt)),
+        ".rtf" if converter_available => Some(SourceKind::Converted(SourceFormat::Rtf)),
         _ => None,
     }
 }

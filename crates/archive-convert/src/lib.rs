@@ -34,6 +34,12 @@ const MAX_WORKER_STDERR_BYTES: usize = 4 * 1024;
 pub enum SourceFormat {
     Pdf,
     Docx,
+    /// Binary Word 97-2003.
+    Doc,
+    /// OpenDocument Text.
+    Odt,
+    /// Rich Text Format.
+    Rtf,
 }
 
 impl SourceFormat {
@@ -41,6 +47,9 @@ impl SourceFormat {
         match value {
             "pdf" => Ok(Self::Pdf),
             "docx" => Ok(Self::Docx),
+            "doc" => Ok(Self::Doc),
+            "odt" => Ok(Self::Odt),
+            "rtf" => Ok(Self::Rtf),
             _ => Err(ConversionError::UnsupportedFormat),
         }
     }
@@ -49,6 +58,9 @@ impl SourceFormat {
         match self {
             Self::Pdf => "pdf",
             Self::Docx => "docx",
+            Self::Doc => "doc",
+            Self::Odt => "odt",
+            Self::Rtf => "rtf",
         }
     }
 }
@@ -446,9 +458,105 @@ pub fn convert_bytes(
     let document = match format {
         SourceFormat::Pdf => convert_pdf(bytes)?,
         SourceFormat::Docx => convert_docx(bytes)?,
+        SourceFormat::Doc => convert_via_anydoc(bytes, anydoc::Format::Doc, format)?,
+        SourceFormat::Odt => convert_via_anydoc(bytes, anydoc::Format::Odt, format)?,
+        SourceFormat::Rtf => convert_via_anydoc(bytes, anydoc::Format::Rtf, format)?,
     };
     document.validate()?;
     Ok(document)
+}
+
+/// Convert the word-processor formats that carry legal prose.
+///
+/// Scope is deliberately narrower than the library's. Spreadsheets,
+/// presentations, EPUB and CSV are not routed here: this app segments prose
+/// into clauses and quotes them as evidence, and a worksheet has no clauses to
+/// find. Feeding one through would produce confident-looking cards built from
+/// cell text. PDF is not routed here either -- `to_document` does not support
+/// it, and the existing path keeps glyph geometry, which is the only structure
+/// a PDF has and which Markdown would discard.
+///
+/// The parser is treated as hostile, as every parser here is: it runs in the
+/// converter worker under `(deny default)` seatbelt with `RLIMIT_AS` and
+/// `RLIMIT_CPU` already bound, and only bytes cross that boundary. That matters
+/// more than usual for these formats, whose containers are classic exploit
+/// carriers, and for a dependency this new.
+fn convert_via_anydoc(
+    bytes: &[u8],
+    parser_format: anydoc::Format,
+    format: SourceFormat,
+) -> Result<ConvertedDocument, ConversionError> {
+    let document =
+        anydoc::to_document(bytes, parser_format).map_err(|_| ConversionError::MalformedSource)?;
+
+    // Whether the source names its own headings decides the span a
+    // same-clause claim may cover. A file that declares them is authoritative:
+    // its clauses match whole. One that does not gets paragraph granularity,
+    // so a conjunction is confined to a single paragraph rather than ranging
+    // over an entire document that reported no structure at all. Word and
+    // OpenDocument carry outline levels; RTF, as this parser reads it, does
+    // not, and takes the conservative path by itself.
+    let declares_headings = document
+        .blocks
+        .iter()
+        .any(|block| matches!(block, anydoc::model::Block::Heading { .. }));
+
+    let mut blocks = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut ordinal = 0usize;
+    for block in &document.blocks {
+        let (text, is_heading) = match block {
+            anydoc::model::Block::Heading { content, .. } => (inline_text(content), true),
+            anydoc::model::Block::Paragraph(content) => (inline_text(content), false),
+            // Everything else -- tables, lists, code, rules, images -- is
+            // skipped rather than flattened. A table rendered as a run of
+            // sentences reads like prose and would be quoted as a clause.
+            _ => continue,
+        };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        output_bytes = output_bytes
+            .checked_add(text.len())
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ConversionError::OutputBudgetExceeded)?;
+        if output_bytes > MAX_OUTPUT_BYTES || blocks.len() >= MAX_BLOCKS {
+            return Err(ConversionError::OutputBudgetExceeded);
+        }
+        ordinal += 1;
+        blocks.push(ConvertedBlock {
+            source_anchor: format!("paragraph:{ordinal:06}"),
+            text,
+            flow: AnchorFlow::Continue,
+            is_heading: Some(is_heading),
+            starts_paragraph: if declares_headings { None } else { Some(true) },
+        });
+    }
+
+    let warnings = if blocks.is_empty() {
+        vec!["ocr_required_or_no_extractable_text".to_string()]
+    } else {
+        Vec::new()
+    };
+    Ok(ConvertedDocument {
+        format,
+        blocks,
+        warnings,
+    })
+}
+
+/// Flatten inline runs to their text, following links into their content.
+fn inline_text(inlines: &[anydoc::model::Inline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            anydoc::model::Inline::Text { text, .. } => out.push_str(text),
+            anydoc::model::Inline::Link { content, .. } => out.push_str(&inline_text(content)),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
