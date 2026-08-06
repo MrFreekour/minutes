@@ -142,7 +142,18 @@ async function chooseLocations() {
   hideError();
   setLocationControlsDisabled(true);
   try {
-    renderLocations(await invoke("choose_archive_locations"));
+    const choice = await invoke("choose_archive_locations");
+    renderLocations(choice.locations);
+    // Folders already covered by an approved location are folded in rather
+    // than refused. Say so plainly: they were chosen on purpose, and silence
+    // here reads as the app having ignored them.
+    if (choice.folded > 0) {
+      elements.setupStatus.textContent = `${elements.setupStatus.textContent} ${
+        choice.folded === 1 ? "One folder was" : `${choice.folded} folders were`
+      } already inside a folder you approved, so ${
+        choice.folded === 1 ? "it is" : "they are"
+      } covered by that one.`;
+    }
     lastReport = null;
     vaultReport = null;
   } catch (error) {

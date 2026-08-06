@@ -112,11 +112,13 @@ jobs:
             -p minutes-archive-semantic \
             -p minutes-archive-convert \
             -p minutes-archive-core \
+            -p minutes-archive-ocr \
             -p minutes-archive-app
           cargo clippy \
             -p minutes-archive-semantic \
             -p minutes-archive-convert \
             -p minutes-archive-core \
+            -p minutes-archive-ocr \
             -p minutes-archive-app \
             --all-targets -- -D warnings
 

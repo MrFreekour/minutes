@@ -211,7 +211,13 @@ const mockScript = `
             report: null,
             textVaultReport: null,
           },
-          choose_archive_locations: [{ id: 1, label: "Approved location 1" }],
+          choose_archive_locations: {
+            locations: [{ id: 1, label: "Approved location 1" }],
+            // One of the chosen folders was already inside an approved one.
+            // The interface must show the location it kept, not refuse the
+            // batch and clear the list.
+            folded: 1,
+          },
           remove_archive_location: [],
           run_archive_census: census,
           cancel_archive_census: true,
@@ -322,6 +328,12 @@ try {
           .toJSON();
         document.querySelector("#add-locations").click();
         await waitFor(() => document.querySelectorAll("#location-list li").length === 1, "location");
+        // A folder folded into one that already covers it is accounted for on
+        // screen. Silence here was the bug: the owner picked those folders
+        // deliberately, and saying nothing reads as the app ignoring them.
+        if (!document.querySelector("#setup-status").textContent.includes("already inside a folder you approved")) {
+          throw new Error("The folded location was not accounted for");
+        }
         document.querySelector("#run-census").click();
         await waitFor(() => !document.querySelector("#results-view").hidden, "census result");
         if (!document.querySelector("#result-summary").textContent.includes("without reading")) {

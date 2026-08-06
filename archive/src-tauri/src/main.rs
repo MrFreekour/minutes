@@ -11,8 +11,8 @@ use minutes_archive_core::vault::{
     DocumentVaultLimits,
 };
 use minutes_archive_core::{
-    approve_roots, scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits,
-    CensusReport, CensusStatus,
+    authorize_roots, reduce_approved_roots, scan_approved_roots, validate_approved_roots,
+    ApprovedRoot, CensusLimits, CensusReport, CensusStatus,
 };
 use minutes_archive_ocr::{BoundedTranscriber, WORKER_MARKER as OCR_WORKER_MARKER};
 use minutes_archive_semantic::{
@@ -98,6 +98,19 @@ impl Default for ArchiveState {
 struct LocationSummary {
     id: u64,
     label: String,
+}
+
+/// The result of a folder-picker round.
+///
+/// `folded` counts the chosen folders that some approved location already
+/// covers. They are not failures and not losses -- every document beneath them
+/// is still indexed through the containing location -- but the owner picked
+/// them deliberately and is owed an account of where they went.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocationChoice {
+    locations: Vec<LocationSummary>,
+    folded: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,7 +225,7 @@ fn archive_bootstrap(state: State<'_, ArchiveState>) -> Result<BootstrapState, S
 async fn choose_archive_locations(
     app: tauri::AppHandle,
     state: State<'_, ArchiveState>,
-) -> Result<Vec<LocationSummary>, String> {
+) -> Result<LocationChoice, String> {
     {
         let session = state.session.lock().map_err(|_| lock_error())?;
         ensure_scan_idle(&session)?;
@@ -228,7 +241,10 @@ async fn choose_archive_locations(
     native_panel_state::forget();
     let Some(selected) = selected else {
         let session = state.session.lock().map_err(|_| lock_error())?;
-        return Ok(location_summaries(&session.locations));
+        return Ok(LocationChoice {
+            folded: 0,
+            locations: location_summaries(&session.locations),
+        });
     };
 
     let selected = selected
@@ -238,27 +254,55 @@ async fn choose_archive_locations(
                 .map_err(|_| "The selected location is not a local folder.".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let new_roots = approve_roots(&selected).map_err(safe_census_error)?;
+    let new_roots = authorize_roots(&selected).map_err(safe_census_error)?;
 
     let mut session = state.session.lock().map_err(|_| lock_error())?;
     ensure_scan_idle(&session)?;
+
+    // A folder chosen twice, or chosen inside one that is already approved, is
+    // folded into the location that covers it. Refusing the batch instead
+    // discarded every other folder the owner had just picked and left them
+    // with an empty list and the word "overlap".
+    //
+    // Existing locations come first so that re-choosing an approved folder
+    // keeps the location already on screen, id and all, rather than replacing
+    // it with an identical one.
+    let existing = session.locations.len();
     let mut combined = session
         .locations
         .iter()
         .map(|location| location.root.clone())
         .collect::<Vec<_>>();
     combined.extend(new_roots.iter().cloned());
-    validate_approved_roots(&combined).map_err(safe_census_error)?;
+    let kept = reduce_approved_roots(&combined);
+    let folded = combined.len().saturating_sub(kept.len());
 
-    for root in new_roots {
-        session.locations.push(ApprovedLocation {
-            id: state.next_location_id.fetch_add(1, Ordering::Relaxed),
-            root,
-        });
+    let surviving = kept
+        .iter()
+        .map(|&index| combined[index].clone())
+        .collect::<Vec<_>>();
+    validate_approved_roots(&surviving).map_err(safe_census_error)?;
+
+    let mut locations = Vec::with_capacity(kept.len());
+    for index in kept {
+        match session.locations.get(index) {
+            Some(location) if index < existing => locations.push(ApprovedLocation {
+                id: location.id,
+                root: location.root.clone(),
+            }),
+            _ => locations.push(ApprovedLocation {
+                id: state.next_location_id.fetch_add(1, Ordering::Relaxed),
+                root: combined[index].clone(),
+            }),
+        }
     }
+    session.locations = locations;
     session.last_report = None;
     session.text_vault = None;
-    Ok(location_summaries(&session.locations))
+    Ok(LocationChoice {
+        folded,
+        locations: location_summaries(&session.locations),
+    })
 }
 
 #[tauri::command]
@@ -1082,6 +1126,8 @@ fn purge_session(app_handle: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    use minutes_archive_core::approve_roots;
+
     /// Exporting the census must never overwrite a hard-linked document.
     ///
     /// An independent reviewer found that `refuse_link_target` rejects
