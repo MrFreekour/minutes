@@ -488,6 +488,34 @@ struct UiSemanticCard {
     index_fresh: bool,
 }
 
+/// A passage read out of an image, kept apart from every card that quotes a
+/// source. The field names differ from `UiEvidenceCard` on purpose: the
+/// interface cannot render one as the other by reaching for `exact_excerpt`.
+#[derive(serde::Serialize)]
+struct UiTranscribedCard {
+    document_title: String,
+    page_anchor: String,
+    transcribed_text: String,
+    lowest_line_confidence: f32,
+    transcriber: String,
+    why_transcribed: String,
+    index_fresh: bool,
+}
+
+impl From<&minutes_archive_core::retrieval::TranscribedCard> for UiTranscribedCard {
+    fn from(card: &minutes_archive_core::retrieval::TranscribedCard) -> Self {
+        Self {
+            document_title: card.document_title.clone(),
+            page_anchor: card.page_anchor.clone(),
+            transcribed_text: card.transcribed_text.clone(),
+            lowest_line_confidence: card.lowest_line_confidence,
+            transcriber: card.transcriber.clone(),
+            why_transcribed: card.why_transcribed.clone(),
+            index_fresh: card.index_fresh,
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct UiDocumentCard {
     document_title: String,
@@ -501,6 +529,7 @@ struct UiSearchResponse {
     evidence: Vec<UiEvidenceCard>,
     documents: Vec<UiDocumentCard>,
     semantic_suggestions: Vec<UiSemanticCard>,
+    transcriptions: Vec<UiTranscribedCard>,
     lexical_candidates_considered: usize,
     semantic_candidates_considered: usize,
     semantic_query_applied: bool,
@@ -539,6 +568,11 @@ impl From<LegalSearchResponse> for UiSearchResponse {
                     why_suggested: card.why_suggested.clone(),
                     index_fresh: card.index_fresh,
                 })
+                .collect(),
+            transcriptions: response
+                .transcriptions
+                .iter()
+                .map(UiTranscribedCard::from)
                 .collect(),
             lexical_candidates_considered: response.lexical_candidates_considered,
             semantic_candidates_considered: response.semantic_candidates_considered,

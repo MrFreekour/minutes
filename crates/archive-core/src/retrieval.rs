@@ -169,6 +169,9 @@ pub struct NormalizedDocument {
     pub revision: SourceRevision,
     pub converter: String,
     pub provision_boundaries: ProvisionBoundaries,
+    /// Whether this document's characters came from the file or from reading
+    /// an image of it. Decided at conversion and never inferred later.
+    pub text_provenance: TextProvenance,
     pub provisions: Vec<NormalizedProvision>,
 }
 
@@ -199,6 +202,7 @@ pub fn normalize_text_document(
         revision: SourceRevision::from_bytes(bytes),
         converter: "utf8-text-v1".to_string(),
         provision_boundaries: ProvisionBoundaries::Declared,
+        text_provenance: TextProvenance::Extracted,
         provisions,
     })
 }
@@ -251,6 +255,10 @@ pub fn normalize_converted_document(
         // PDF and RTF record where text sits, not where a clause ends, so
         // neither can ever declare a boundary. Word, OpenDocument and DOCX
         // state where their sections begin and are trusted for it.
+        // Every format handled here hands over characters the author wrote.
+        // A transcription reaches the index through its own entry point, so
+        // this can never be reached with `Transcribed` by accident.
+        text_provenance: TextProvenance::Extracted,
         provision_boundaries: match converted.format {
             SourceFormat::Pdf | SourceFormat::Rtf => ProvisionBoundaries::Inferred,
             SourceFormat::Docx | SourceFormat::Doc | SourceFormat::Odt => {
@@ -1113,12 +1121,74 @@ pub struct EvidenceCard {
     pub index_fresh: bool,
 }
 
+/// How the text under a document was obtained.
+///
+/// A file either carries its own characters or it does not. A PDF, a Word
+/// document and a text file all hand over text the author wrote. A scan hands
+/// over an image, and any text is a machine's reading of it.
+///
+/// This is a property of the source, decided once at conversion, and it is the
+/// only thing that decides whether a passage may be quoted as evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextProvenance {
+    /// The characters came from the file.
+    Extracted,
+    /// The characters are a reading of an image and may be wrong.
+    Transcribed,
+}
+
+/// A passage read out of an image.
+///
+/// Deliberately NOT an `EvidenceCard`, and deliberately not convertible into
+/// one. This tool's value is that an excerpt is the exact language in the
+/// source, at a citable anchor. A scan cannot support that claim: the
+/// characters are a machine's reading, and on the material a long-running
+/// practice actually holds -- faxes, stamped exhibits, photocopied signature
+/// pages -- the reading is sometimes wrong.
+///
+/// So the distinction is carried by the type rather than by a flag someone has
+/// to remember to check. There is no `From<TranscribedCard> for EvidenceCard`,
+/// nothing that flattens the two into one list, and the field that carries
+/// these is separate in the response. Code that wants to present a
+/// transcription as a quotation has to be written on purpose.
+///
+/// It also never answers a same-clause question. That claim needs to know
+/// where a clause begins and ends, and a reading of a page image establishes
+/// neither.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TranscribedCard {
+    pub vault_id: VaultId,
+    pub document_id: DocumentId,
+    pub document_title: String,
+    /// Where on the page this was read, not a section anchor. A transcription
+    /// has no structure to cite.
+    pub page_anchor: String,
+    /// The machine's reading. Named so it cannot be mistaken at a call site
+    /// for `EvidenceCard::exact_excerpt`.
+    pub transcribed_text: String,
+    /// What the recogniser reported for this passage, lowest across the lines
+    /// it spans, in 0.0..=1.0.
+    pub lowest_line_confidence: f32,
+    pub source_revision: SourceRevision,
+    /// The recogniser and revision that produced it, so a card can be traced
+    /// to what read it.
+    pub transcriber: String,
+    pub matched_concepts: Vec<LegalConcept>,
+    /// Always states that this is a reading of an image and must be checked
+    /// against the page.
+    pub why_transcribed: String,
+    pub index_fresh: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LegalSearchResponse {
     pub query: LegalQuery,
     pub evidence: Vec<EvidenceCard>,
     pub documents: Vec<DocumentEvidenceCard>,
     pub semantic_suggestions: Vec<SemanticEvidenceCard>,
+    /// Passages read out of images. Never merged into `evidence`.
+    pub transcriptions: Vec<TranscribedCard>,
     pub lexical_candidates_considered: usize,
     pub semantic_candidates_considered: usize,
     pub semantic_query_applied: bool,
@@ -1180,6 +1250,9 @@ struct CandidateRow {
     source_revision: SourceRevision,
     source_converter: String,
     provision_boundaries: ProvisionBoundaries,
+    /// Carried on every candidate so no retrieval path can reach a passage
+    /// without knowing whether it was read from an image.
+    text_provenance: TextProvenance,
     lexical_rank: f64,
 }
 
@@ -1191,17 +1264,37 @@ impl CandidateRow {
         }
     }
 
+    /// Witness that this candidate's characters came from the file.
+    ///
+    /// `evidence_card` lives on the witness rather than here, so quoting a
+    /// passage as an exact excerpt is not something a caller can do without
+    /// first establishing that there is a source text to quote. A
+    /// transcription cannot produce this, and there is no other route to an
+    /// `EvidenceCard`.
+    fn as_extracted(&self) -> Option<ExtractedText<'_>> {
+        match self.text_provenance {
+            TextProvenance::Extracted => Some(ExtractedText(self)),
+            TextProvenance::Transcribed => None,
+        }
+    }
+}
+
+/// A candidate whose text is the author's, not a machine's reading of a page.
+struct ExtractedText<'a>(&'a CandidateRow);
+
+impl ExtractedText<'_> {
     fn evidence_card(
         &self,
         vault_id: &VaultId,
         matched: Vec<LegalConcept>,
         sentence_limit: Option<u32>,
     ) -> EvidenceCard {
-        let sentence_count = sentence_count(&self.body);
-        let (excerpt, excerpt_truncated) = bounded_excerpt(&self.body);
+        let this = self.0;
+        let sentence_count = sentence_count(&this.body);
+        let (excerpt, excerpt_truncated) = bounded_excerpt(&this.body);
         // Concepts present in the heading but absent from the body are not
         // visible in the excerpt, so the card has to say so.
-        let body_concepts = matched_concepts(&self.body, &matched);
+        let body_concepts = matched_concepts(&this.body, &matched);
         let heading_only = matched
             .iter()
             .copied()
@@ -1209,24 +1302,24 @@ impl CandidateRow {
             .collect::<Vec<_>>();
         EvidenceCard {
             vault_id: vault_id.clone(),
-            document_id: self.document_id.clone(),
-            document_title: self.document_title.clone(),
-            provision_heading: self.provision_heading.clone(),
-            source_anchor: self.source_anchor.clone(),
+            document_id: this.document_id.clone(),
+            document_title: this.document_title.clone(),
+            provision_heading: this.provision_heading.clone(),
+            source_anchor: this.source_anchor.clone(),
             exact_excerpt: excerpt,
             sentence_count,
-            source_revision: self.source_revision.clone(),
-            source_converter: self.source_converter.clone(),
+            source_revision: this.source_revision.clone(),
+            source_converter: this.source_converter.clone(),
             why_matched: why_matched(
                 &matched,
                 sentence_limit,
                 sentence_count,
                 &heading_only,
                 excerpt_truncated,
-                self.provision_heading.is_none(),
+                this.provision_heading.is_none(),
             ),
             matched_concepts: matched,
-            lexical_rank: self.lexical_rank,
+            lexical_rank: this.lexical_rank,
             index_fresh: true,
         }
     }
@@ -1236,22 +1329,26 @@ impl CandidateRow {
     /// similarity, and the UI replaces the kicker on these cards so
     /// `provision_heading` is never rendered. Without this the reader sees a
     /// body-only quotation and no indication the heading contributed.
+    /// A meaning-similar suggestion also quotes an excerpt, so it lives on
+    /// the witness too: nothing that reproduces text may be built from a
+    /// transcription.
     fn semantic_evidence_card(
         &self,
         vault_id: &VaultId,
         semantic_similarity: f32,
     ) -> SemanticEvidenceCard {
-        let (excerpt, excerpt_truncated) = bounded_excerpt(&self.body);
+        let this = self.0;
+        let (excerpt, excerpt_truncated) = bounded_excerpt(&this.body);
         SemanticEvidenceCard {
             vault_id: vault_id.clone(),
-            document_id: self.document_id.clone(),
-            document_title: self.document_title.clone(),
-            provision_heading: self.provision_heading.clone(),
-            source_anchor: self.source_anchor.clone(),
+            document_id: this.document_id.clone(),
+            document_title: this.document_title.clone(),
+            provision_heading: this.provision_heading.clone(),
+            source_anchor: this.source_anchor.clone(),
             exact_excerpt: excerpt,
-            sentence_count: sentence_count(&self.body),
-            source_revision: self.source_revision.clone(),
-            source_converter: self.source_converter.clone(),
+            sentence_count: sentence_count(&this.body),
+            source_revision: this.source_revision.clone(),
+            source_converter: this.source_converter.clone(),
             semantic_similarity,
             why_suggested: {
                 let shortened = if excerpt_truncated {
@@ -1259,7 +1356,7 @@ impl CandidateRow {
                 } else {
                     ""
                 };
-                let base = match &self.provision_heading {
+                let base = match &this.provision_heading {
                 // The embedding is built from title + heading + text, so the
                 // heading influences similarity, and the UI replaces the
                 // kicker on semantic cards so `provision_heading` is never
@@ -1326,7 +1423,10 @@ impl LegalIndex {
                     revision_sha256 TEXT NOT NULL,
                     revision_bytes INTEGER NOT NULL,
                     converter TEXT NOT NULL,
-                    provision_boundaries INTEGER NOT NULL
+                    provision_boundaries INTEGER NOT NULL,
+                    -- 0 extracted, 1 transcribed. NOT NULL and no default, so
+                    -- a row cannot enter the index without stating which it is.
+                    text_provenance INTEGER NOT NULL
                 ) STRICT;
                 CREATE VIRTUAL TABLE provisions USING fts5(
                     document_id UNINDEXED,
@@ -1548,7 +1648,12 @@ impl LegalIndex {
                 stale_documents.insert(candidate.document_id);
                 continue;
             }
-            suggestions.push(candidate.semantic_evidence_card(&self.vault_id, similarity));
+            // A transcription has no source text to suggest. It reaches the
+            // reader as a `TranscribedCard` and nowhere else.
+            let Some(extracted) = candidate.as_extracted() else {
+                continue;
+            };
+            suggestions.push(extracted.semantic_evidence_card(&self.vault_id, similarity));
             if suggestions.len() >= limit {
                 break;
             }
@@ -1580,7 +1685,8 @@ impl LegalIndex {
                     d.revision_sha256,
                     d.revision_bytes,
                     d.converter,
-                    d.provision_boundaries
+                    d.provision_boundaries,
+                    d.text_provenance
                 FROM provisions p
                 JOIN documents d ON d.document_id = p.document_id
                 WHERE p.document_id = ?1 AND p.ordinal = ?2
@@ -1606,6 +1712,8 @@ impl LegalIndex {
                         },
                         source_converter: row.get(8)?,
                         provision_boundaries: provision_boundaries_from_db(row.get(9)?)?,
+                        text_provenance: text_provenance_from_db(row.get(10)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         lexical_rank: 0.0,
                     })
                 },
@@ -1631,7 +1739,8 @@ impl LegalIndex {
                 d.revision_sha256,
                 d.revision_bytes,
                 d.converter,
-                d.provision_boundaries
+                d.provision_boundaries,
+                d.text_provenance
             FROM provisions p
             JOIN documents d ON d.document_id = p.document_id
             WHERE provisions MATCH ?1
@@ -1674,6 +1783,9 @@ impl LegalIndex {
                     row.get(10).map_err(|_| RetrievalError::IndexUnavailable)?,
                 )
                 .map_err(|_| RetrievalError::IndexUnavailable)?,
+                text_provenance: text_provenance_from_db(
+                    row.get(11).map_err(|_| RetrievalError::IndexUnavailable)?,
+                )?,
                 lexical_rank: row.get(5).map_err(|_| RetrievalError::IndexUnavailable)?,
             });
         }
@@ -1728,7 +1840,13 @@ impl LegalIndex {
                 continue;
             }
 
-            evidence.push(candidate.evidence_card(&self.vault_id, matched, query.max_sentences));
+            // Unreachable for a transcription: those are refused above,
+            // before any matching. The witness is what makes that a compile
+            // error rather than a rule someone has to remember.
+            let Some(extracted) = candidate.as_extracted() else {
+                continue;
+            };
+            evidence.push(extracted.evidence_card(&self.vault_id, matched, query.max_sentences));
             if evidence.len() >= query.limit {
                 break;
             }
@@ -1739,6 +1857,7 @@ impl LegalIndex {
             evidence,
             documents: Vec::new(),
             semantic_suggestions: Vec::new(),
+            transcriptions: Vec::new(),
             lexical_candidates_considered,
             semantic_candidates_considered: 0,
             semantic_query_applied: false,
@@ -1793,12 +1912,20 @@ impl LegalIndex {
             entry.exact_phrase_matched |= exact_phrase_matched;
             entry.excluded_concept_matched |= excluded_concept_matched;
             if positive_evidence {
+                // A document-scope card also carries excerpts, so it is built
+                // through the witness like the others.
+                let extracted = candidate.as_extracted();
+                if extracted.is_none() {
+                    continue;
+                }
                 if entry.criterion_evidence.len() < MAX_DOCUMENT_EVIDENCE_PROVISIONS {
-                    entry.criterion_evidence.push(candidate.evidence_card(
-                        &self.vault_id,
-                        matched,
-                        None,
-                    ));
+                    entry.criterion_evidence.push(
+                        extracted.expect("checked immediately above").evidence_card(
+                            &self.vault_id,
+                            matched,
+                            None,
+                        ),
+                    );
                 } else {
                     entry.criterion_evidence_truncated = true;
                 }
@@ -1859,6 +1986,7 @@ impl LegalIndex {
             evidence: Vec::new(),
             documents: document_evidence,
             semantic_suggestions: Vec::new(),
+            transcriptions: Vec::new(),
             lexical_candidates_considered,
             semantic_candidates_considered: 0,
             semantic_query_applied: false,
@@ -1909,14 +2037,15 @@ fn replace_document_transaction(
     transaction
         .execute(
             "
-            INSERT INTO documents (document_id, title, revision_sha256, revision_bytes, converter, provision_boundaries)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO documents (document_id, title, revision_sha256, revision_bytes, converter, provision_boundaries, text_provenance)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(document_id) DO UPDATE SET
                 title = excluded.title,
                 revision_sha256 = excluded.revision_sha256,
                 revision_bytes = excluded.revision_bytes,
                 converter = excluded.converter,
-                provision_boundaries = excluded.provision_boundaries
+                provision_boundaries = excluded.provision_boundaries,
+                text_provenance = excluded.text_provenance
             ",
             params![
                 document.document_id.as_str(),
@@ -1926,6 +2055,7 @@ fn replace_document_transaction(
                     .map_err(|_| RetrievalError::InvalidDocumentText)?,
                 document.converter,
                 provision_boundaries_to_db(document.provision_boundaries),
+                text_provenance_to_db(document.text_provenance),
             ],
         )
         .map_err(|_| RetrievalError::IndexUnavailable)?;
@@ -1947,6 +2077,22 @@ fn replace_document_transaction(
             .map_err(|_| RetrievalError::IndexUnavailable)?;
     }
     Ok(())
+}
+
+/// 0 extracted, 1 transcribed.
+fn text_provenance_to_db(provenance: TextProvenance) -> i64 {
+    match provenance {
+        TextProvenance::Extracted => 0,
+        TextProvenance::Transcribed => 1,
+    }
+}
+
+fn text_provenance_from_db(value: i64) -> Result<TextProvenance, RetrievalError> {
+    match value {
+        0 => Ok(TextProvenance::Extracted),
+        1 => Ok(TextProvenance::Transcribed),
+        _ => Err(RetrievalError::IndexUnavailable),
+    }
 }
 
 fn provision_boundaries_to_db(boundaries: ProvisionBoundaries) -> i64 {
@@ -2393,6 +2539,87 @@ mod tests {
     /// function, and got declared boundaries and a same-clause answer. File
     /// ingestion was safe only because the shipped converters set the warning
     /// every time -- an invariant a refactor could drop is not an invariant.
+    /// A transcription is never quoted, on any retrieval path.
+    ///
+    /// Built before OCR exists, and that is the point. The failure to avoid is
+    /// a transcription reaching a reader as an exact excerpt because the
+    /// distinction had not been built yet and the deadline was close. The
+    /// `ExtractedText` witness makes it a compile error rather than a rule,
+    /// and this asserts the behaviour a reader would actually see.
+    #[test]
+    fn a_transcribed_document_is_never_returned_as_exact_evidence() {
+        let mut normalized = normalize_text_document(
+            DocumentId::parse("scanned-exhibit").expect("id"),
+            "Scanned Exhibit",
+            b"7. CONFIDENTIALITY\nConfidential Information includes affiliate data. \
+              Neither party may assign this Agreement.\n",
+        )
+        .expect("normalize");
+        // Stands in for what an OCR converter will produce.
+        normalized.text_provenance = TextProvenance::Transcribed;
+
+        let revisions = CurrentRevisionSet::from_documents([&normalized]);
+        let mut index =
+            LegalIndex::new(VaultId::parse("scan-vault").expect("vault")).expect("index");
+        index.replace_document(&normalized).expect("ingest");
+
+        for scope in [MatchScope::SameProvision, MatchScope::AnywhereInDocument] {
+            let response = index
+                .search(
+                    index.vault_id(),
+                    LegalQuery {
+                        raw: "confidentiality".to_string(),
+                        scope,
+                        required_concepts: vec![LegalConcept::Confidentiality],
+                        excluded_concepts: Vec::new(),
+                        exact_phrase: None,
+                        max_sentences: None,
+                        limit: 10,
+                    },
+                    &revisions,
+                )
+                .expect("search");
+            assert!(
+                response.evidence.is_empty(),
+                "{scope:?} quoted a transcription as exact evidence"
+            );
+            assert!(
+                response
+                    .documents
+                    .iter()
+                    .all(|document| document.criterion_evidence.is_empty()),
+                "{scope:?} carried transcribed excerpts on a document card"
+            );
+        }
+
+        // And the same document, extracted, does answer -- so the assertions
+        // above cannot pass merely because nothing matched.
+        normalized.text_provenance = TextProvenance::Extracted;
+        let revisions = CurrentRevisionSet::from_documents([&normalized]);
+        let mut index =
+            LegalIndex::new(VaultId::parse("control-vault").expect("vault")).expect("index");
+        index.replace_document(&normalized).expect("ingest");
+        let control = index
+            .search(
+                index.vault_id(),
+                LegalQuery {
+                    raw: "confidentiality".to_string(),
+                    scope: MatchScope::SameProvision,
+                    required_concepts: vec![LegalConcept::Confidentiality],
+                    excluded_concepts: Vec::new(),
+                    exact_phrase: None,
+                    max_sentences: None,
+                    limit: 10,
+                },
+                &revisions,
+            )
+            .expect("search");
+        assert!(
+            !control.evidence.is_empty(),
+            "the control must match, or the refusal above proves nothing"
+        );
+    }
+
     #[test]
     fn a_markerless_pdf_or_rtf_document_still_cannot_declare_its_boundaries() {
         for format in [SourceFormat::Pdf, SourceFormat::Rtf] {
@@ -2743,9 +2970,13 @@ mod tests {
             source_revision: SourceRevision::from_bytes(b"bytes"),
             source_converter: "pdf-extract-0.12.0-v1".to_string(),
             provision_boundaries: ProvisionBoundaries::Declared,
+            text_provenance: TextProvenance::Extracted,
             lexical_rank: 0.0,
         };
-        let card = candidate.semantic_evidence_card(&vault, 0.9);
+        let card = candidate
+            .as_extracted()
+            .expect("extracted text")
+            .semantic_evidence_card(&vault, 0.9);
         assert!(card.exact_excerpt.chars().count() <= MAX_EXCERPT_CHARS);
         assert!(
             card.why_suggested.contains("shortened"),
@@ -2758,6 +2989,8 @@ mod tests {
             ..candidate
         };
         assert!(!short
+            .as_extracted()
+            .expect("extracted text")
             .semantic_evidence_card(&vault, 0.9)
             .why_suggested
             .contains("shortened"));

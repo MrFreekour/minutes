@@ -1008,6 +1008,46 @@ a:focus-visible {
   border-style: dashed;
 }
 
+/* A transcription must not read as a quotation. It carries the dashed border
+   the semantic suggestions use -- the established signal here for "not
+   verified" -- plus its own heading and a confidence line on every card. */
+.transcription-heading {
+  margin: 8px 0 -2px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.transcription-card {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  background: var(--surface);
+}
+
+.transcription-anchor,
+.transcription-why {
+  margin: 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.transcribed-text {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 2px dashed var(--muted);
+  color: var(--ink);
+  font-style: italic;
+}
+
+.transcription-confidence {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .evidence-card,
 .document-card {
   padding: 17px;

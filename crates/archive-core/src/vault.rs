@@ -256,6 +256,7 @@ impl AuthorizedTextVault {
                 evidence: Vec::new(),
                 documents: Vec::new(),
                 semantic_suggestions: Vec::new(),
+                transcriptions: Vec::new(),
                 lexical_candidates_considered: 0,
                 semantic_candidates_considered: 0,
                 semantic_query_applied: false,

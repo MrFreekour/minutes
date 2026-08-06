@@ -523,6 +523,44 @@ function documentCard(card) {
   return article;
 }
 
+// Deliberately not `evidenceCard` with a flag. A transcription has no exact
+// excerpt and no section anchor, and giving it the same builder is how it would
+// eventually acquire the same styling and be read as a quotation.
+function transcribedCard(card) {
+  const article = document.createElement("article");
+  // Its own class, not `evidence-card`. Sharing the base class is how a
+  // transcription would inherit quotation styling by default the next time
+  // someone edits it.
+  article.className = "transcription-card";
+
+  const title = document.createElement("h3");
+  title.textContent = card.document_title;
+  article.append(title);
+
+  const anchor = document.createElement("p");
+  anchor.className = "transcription-anchor";
+  anchor.textContent = `${card.page_anchor} · read by ${card.transcriber}`;
+  article.append(anchor);
+
+  const text = document.createElement("blockquote");
+  text.className = "transcribed-text";
+  text.textContent = card.transcribed_text;
+  article.append(text);
+
+  const confidence = document.createElement("p");
+  confidence.className = "transcription-confidence";
+  const percent = Math.round((card.lowest_line_confidence ?? 0) * 100);
+  confidence.textContent = `Lowest line confidence ${percent}%. Check this against the page before relying on it.`;
+  article.append(confidence);
+
+  const why = document.createElement("p");
+  why.className = "transcription-why";
+  why.textContent = card.why_transcribed;
+  article.append(why);
+
+  return article;
+}
+
 function renderSearchResponse(response) {
   renderQueryInterpretation(response);
   elements.searchResults.replaceChildren();
@@ -542,7 +580,21 @@ function renderSearchResponse(response) {
       elements.searchResults.append(evidenceCard(card, false, true));
     }
   }
-  const suggestionCount = response.semantic_suggestions.length;
+  // Transcriptions render through their own builder, never `evidenceCard`.
+  // A reading of a scan is not a quotation and must not look like one: no
+  // exact-excerpt styling, its own heading, and the confidence on every card.
+  const transcriptions = response.transcriptions ?? [];
+  if (transcriptions.length > 0) {
+    const heading = document.createElement("p");
+    heading.className = "transcription-heading";
+    heading.textContent =
+      "Read from scanned images · a machine's reading, not the document's own text";
+    elements.searchResults.append(heading);
+    for (const card of transcriptions) {
+      elements.searchResults.append(transcribedCard(card));
+    }
+  }
+  const suggestionCount = response.semantic_suggestions.length + transcriptions.length;
   if (verifiedCount === 0 && suggestionCount === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-results";

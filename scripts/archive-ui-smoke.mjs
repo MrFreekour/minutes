@@ -152,6 +152,23 @@ const evidence = {
       index_fresh: true,
     },
   ],
+  transcriptions: [
+    {
+      vault_id: "local-private-vault",
+      document_id: "document-0000000000000003",
+      document_title: "Scanned Exhibit C",
+      page_anchor: "page:0004",
+      transcribed_text:
+        "CONFIDENTIALITY. The Recipient shall protect Confidential Information.",
+      lowest_line_confidence: 0.62,
+      source_revision: { sha256: "22", byte_len: 91 },
+      transcriber: "apple-vision-text-r3",
+      matched_concepts: ["confidentiality"],
+      why_transcribed:
+        "Read from a scanned image. These characters are a machine's reading of the page, not the document's own text; check them against the source before relying on them.",
+      index_fresh: true,
+    },
+  ],
   lexical_candidates_considered: 1,
   semantic_candidates_considered: 4,
   semantic_query_applied: true,
@@ -310,6 +327,33 @@ try {
         ) {
           throw new Error("Evidence provenance or session-disposal notice did not render");
         }
+        // A transcription must render as its own thing: never inside an
+        // exact-excerpt element, and always carrying its confidence.
+        const transcriptionCards = document.querySelectorAll(".transcription-card");
+        if (transcriptionCards.length !== 1) {
+          throw new Error("the transcription did not render as its own card");
+        }
+        const transcription = transcriptionCards[0];
+        if (!transcription.querySelector(".transcribed-text")) {
+          throw new Error("a transcription rendered without its transcription styling");
+        }
+        if (transcription.classList.contains("evidence-card")) {
+          throw new Error("a transcription carried the evidence-card class");
+        }
+        if (transcription.querySelector(".evidence-excerpt")) {
+          throw new Error("a transcription rendered as an exact excerpt");
+        }
+        if (!transcription.textContent.includes("62%")) {
+          throw new Error("a transcription rendered without its confidence");
+        }
+        // Asserted on the heading element, not on the page. The card's own
+        // disclosure carries the same words, so a body-wide check passed even
+        // with the heading replaced by "Results".
+        const transcriptionHeading = document.querySelector(".transcription-heading");
+        if (!transcriptionHeading || !transcriptionHeading.textContent.includes("machine's reading")) {
+          throw new Error("the transcription heading did not disclose what it is");
+        }
+
         const vaultSummary = document.querySelector("#vault-summary").textContent;
         if (
           !vaultSummary.includes("2 were aliases or shortcuts") ||
