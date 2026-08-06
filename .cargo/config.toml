@@ -3,3 +3,22 @@
 # The cc crate defaults to 10.13 for some targets, causing build failures.
 # Setting this ensures the correct -mmacosx-version-min flag. (See #14)
 MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
+
+# Statically link the MSVC C and C++ runtimes on Windows.
+#
+# Without this, every published Windows artifact imports VCRUNTIME140.dll,
+# VCRUNTIME140_1.dll, MSVCP140.dll and MSVCP140_1.dll, which ship in the Visual
+# C++ Redistributable rather than in Windows. On a machine that has never had
+# it, the process fails to start with STATUS_DLL_NOT_FOUND and prints nothing
+# at all: no window, no error, no exit message. Verified on a clean Windows 11
+# 26100 VM against the released v0.24.0 CLI and desktop binaries (#657).
+#
+# CI never caught it because GitHub's windows runners ship the redistributable.
+#
+# The C++ side has to agree: a /MT Rust runtime against a /MD whisper.cpp is a
+# link-time mismatch. The `cc` crate reads crt-static from
+# CARGO_CFG_TARGET_FEATURE and switches to /MT, and `cmake` inherits its flags,
+# so this should propagate to the bundled whisper.cpp build. That propagation
+# is the risky part of this change and is what the Windows CI jobs verify.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
