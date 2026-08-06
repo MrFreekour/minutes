@@ -454,6 +454,12 @@ function renderVaultSummary(report) {
           report.semantic_provisions_indexed === 1 ? "" : "s"
         } built with the pinned macOS model inside its network-denied worker. `
       : "Semantic suggestions are unavailable on this Mac. ") +
+    // Partial suggestion coverage is not the same as none, and it has to be
+    // said. Exact search is complete either way; a reader who assumes the
+    // suggestions swept the whole archive would be wrong.
+    (report.semantic_coverage_partial
+      ? "The on-device suggestion model stopped partway through this build, so meaning-based suggestions cover only part of the archive. Exact search covers all of it. "
+      : "") +
     describeDroppedSources(report) +
     // A partial index must say so on its face. It is a real index and worth
     // having, but a reader who thinks it covers the whole folder will draw a

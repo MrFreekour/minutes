@@ -21,7 +21,7 @@ use cap_std::fs::{Dir, File};
 use minutes_archive_convert::{BoundedConverter, SourceFormat};
 use minutes_archive_ocr::BoundedTranscriber;
 use minutes_archive_semantic::{
-    BoundedSemanticEngine, BoundedSemanticSession, SemanticError, SemanticModelMetadata,
+    BoundedSemanticEngine, SemanticEmbedder, SemanticError, SemanticModelMetadata,
     MAX_SEMANTIC_INPUT_CHARS,
 };
 use serde::Serialize;
@@ -204,6 +204,15 @@ pub struct TextVaultBuildReport {
     pub semantic_provisions_indexed: u64,
     pub semantic_provisions_skipped: u64,
     pub semantic_unavailable: bool,
+    /// The semantic worker died partway through, so suggestions cover only the
+    /// documents read before it went.
+    ///
+    /// Distinct from `semantic_unavailable`, which means there were never any
+    /// suggestions. Partial coverage has to be said out loud: exact search is
+    /// complete either way, but a reader who assumes suggestions swept the
+    /// whole archive would be wrong, and this tool's job is to never let a
+    /// result read as more complete than it is.
+    pub semantic_coverage_partial: bool,
     pub semantic_derivatives_persisted: bool,
     pub semantic_model_download_requested: bool,
     pub supported_formats: Vec<&'static str>,
@@ -590,6 +599,7 @@ struct BuildCounters {
     semantic_provisions_indexed: u64,
     semantic_provisions_skipped: u64,
     semantic_unavailable: bool,
+    semantic_coverage_partial: bool,
 }
 
 /// Live counts for a build in flight.
@@ -638,6 +648,7 @@ pub fn build_authorized_text_vault(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -669,6 +680,7 @@ pub fn build_authorized_document_vault(
         transcriber,
         progress,
         semantic_engine,
+        None,
     )
 }
 
@@ -682,6 +694,14 @@ fn build_authorized_vault(
     transcriber: Option<&BoundedTranscriber>,
     progress: Option<&BuildProgress>,
     semantic_engine: Option<BoundedSemanticEngine>,
+    // Stands in for the worker session, for tests only.
+    //
+    // The failure worth testing is a worker that answers for a while and then
+    // stops -- it discarded a complete index in the field. With only a real
+    // worker to test against, every run has either a healthy worker or none,
+    // and the case in between is unreachable. Production passes `None` and
+    // opens a real sandboxed session below.
+    injected_embedder: Option<&mut dyn SemanticEmbedder>,
 ) -> Result<AuthorizedTextVault, VaultError> {
     let limits = limits.validate()?;
     validate_approved_roots(approved_roots).map_err(VaultError::from)?;
@@ -732,6 +752,12 @@ fn build_authorized_vault(
             counters.semantic_unavailable = true;
             None
         }
+    };
+    let mut semantic_session: Option<&mut dyn SemanticEmbedder> = match injected_embedder {
+        Some(embedder) => Some(embedder),
+        None => semantic_session
+            .as_mut()
+            .map(|session| session as &mut dyn SemanticEmbedder),
     };
     let semantic_model = semantic_session
         .as_ref()
@@ -901,7 +927,7 @@ fn build_authorized_vault(
                     &mut index,
                     &mut sources,
                     &mut counters,
-                    semantic_session.as_mut(),
+                    &mut semantic_session,
                     semantic_model.as_ref(),
                     progress,
                 )?;
@@ -1027,7 +1053,7 @@ fn build_authorized_vault(
                     &mut index,
                     &mut sources,
                     &mut counters,
-                    semantic_session.as_mut(),
+                    &mut semantic_session,
                     semantic_model.as_ref(),
                     progress,
                 )?;
@@ -1046,7 +1072,7 @@ fn build_authorized_vault(
         &mut index,
         &mut sources,
         &mut counters,
-        semantic_session.as_mut(),
+        &mut semantic_session,
         semantic_model.as_ref(),
         progress,
     )?;
@@ -1092,6 +1118,7 @@ fn build_authorized_vault(
         semantic_provisions_indexed: counters.semantic_provisions_indexed,
         semantic_provisions_skipped: counters.semantic_provisions_skipped,
         semantic_unavailable: counters.semantic_unavailable,
+        semantic_coverage_partial: counters.semantic_coverage_partial,
         semantic_derivatives_persisted: false,
         semantic_model_download_requested: false,
         supported_formats: if converter.is_some() {
@@ -1242,7 +1269,7 @@ fn index_extracted_batch(
     index: &mut LegalIndex,
     sources: &mut BTreeMap<DocumentId, AuthorizedSource>,
     counters: &mut BuildCounters,
-    mut semantic_session: Option<&mut BoundedSemanticSession>,
+    semantic_session: &mut Option<&mut dyn SemanticEmbedder>,
     semantic_model: Option<&SemanticModelMetadata>,
     progress: Option<&BuildProgress>,
 ) -> Result<(), VaultError> {
@@ -1304,6 +1331,19 @@ fn index_extracted_batch(
                 return Err(VaultError::ConverterUnavailable)
             }
         };
+        // A semantic worker that dies partway through must not cost the
+        // operator the index.
+        //
+        // Binding the engine was already optional -- a Mac without Apple's
+        // linguistic asset still gets exact search -- but the engine failing
+        // *during* a build returned `Err`, which discards everything. On a real
+        // archive that is sixteen thousand documents and twenty-two minutes of
+        // reading thrown away because an optional aid stopped working, and the
+        // operator is told only "the bounded on-device semantic worker is
+        // unavailable". Exact evidence is the product; suggestions are the aid.
+        if counters.semantic_coverage_partial {
+            *semantic_session = None;
+        }
         if let Some(session) = semantic_session.as_deref_mut() {
             let remaining = MAX_SEMANTIC_PROVISIONS
                 .saturating_sub(counters.semantic_provisions_indexed as usize);
@@ -1330,31 +1370,47 @@ fn index_extracted_batch(
                             counters.semantic_provisions_skipped.saturating_add(1);
                         embeddings.push(None);
                     }
+                    // The worker itself is gone, not just unhappy with one
+                    // provision. Stop asking it -- retrying a dead worker once
+                    // per provision for the rest of the archive is its own
+                    // stall -- and index everything from here without
+                    // suggestions.
                     Some(Err(
-                        SemanticError::PlatformUnavailable | SemanticError::ModelUnavailable,
-                    )) => {
-                        return Err(VaultError::SemanticUnavailable);
-                    }
-                    Some(Err(
-                        SemanticError::ExecutableUnavailable
+                        SemanticError::PlatformUnavailable
+                        | SemanticError::ModelUnavailable
+                        | SemanticError::ExecutableUnavailable
                         | SemanticError::SecurityBoundaryUnavailable
                         | SemanticError::WorkerBudgetExceeded
                         | SemanticError::WorkerFailed,
-                    )) => return Err(VaultError::SemanticUnavailable),
+                    )) => {
+                        counters.semantic_coverage_partial = true;
+                        counters.semantic_provisions_skipped =
+                            counters.semantic_provisions_skipped.saturating_add(1);
+                        embeddings.push(None);
+                    }
+                }
+                if counters.semantic_coverage_partial {
+                    break;
                 }
             }
-            let indexed = index
-                .replace_document_with_semantics(
-                    &normalized,
-                    semantic_model
-                        .cloned()
-                        .ok_or(VaultError::SemanticUnavailable)?,
-                    &embeddings,
-                )
-                .map_err(VaultError::from)?;
-            counters.semantic_provisions_indexed = counters
-                .semantic_provisions_indexed
-                .saturating_add(indexed as u64);
+            match semantic_model.cloned() {
+                Some(model) => {
+                    let indexed = index
+                        .replace_document_with_semantics(&normalized, model, &embeddings)
+                        .map_err(VaultError::from)?;
+                    counters.semantic_provisions_indexed = counters
+                        .semantic_provisions_indexed
+                        .saturating_add(indexed as u64);
+                }
+                // No pinned model means nothing can be stored as a suggestion,
+                // which is a reason to index without them, not to refuse.
+                None => {
+                    counters.semantic_coverage_partial = true;
+                    index
+                        .replace_document(&normalized)
+                        .map_err(VaultError::from)?;
+                }
+            }
         } else {
             index
                 .replace_document(&normalized)
@@ -1535,6 +1591,40 @@ mod tests {
     use crate::retrieval::MatchScope;
     use std::fs;
     use tempfile::TempDir;
+
+    /// A semantic worker that answers a few times and then stops for good.
+    ///
+    /// This is the shape of the failure that reached the owner: the engine
+    /// bound, the sandbox verified, embeddings came back for a while, and then
+    /// the worker went away partway through a sixteen-thousand-document build.
+    struct FailingEmbedder {
+        answers_before_failing: usize,
+        calls: usize,
+        failure: SemanticError,
+    }
+
+    impl FailingEmbedder {
+        fn new(failure: SemanticError) -> Self {
+            Self {
+                answers_before_failing: 1,
+                calls: 0,
+                failure,
+            }
+        }
+    }
+
+    impl SemanticEmbedder for FailingEmbedder {
+        fn embed(&mut self, _text: &str) -> Result<Vec<f32>, SemanticError> {
+            self.calls += 1;
+            if self.calls > self.answers_before_failing {
+                return Err(self.failure.clone());
+            }
+            // Unit-length and the right shape; the values do not matter here.
+            let mut vector = vec![0.0f32; 512];
+            vector[0] = 1.0;
+            Ok(vector)
+        }
+    }
 
     fn build(temp: &TempDir) -> (AuthorizedTextVault, PathBuf) {
         let root = temp.path().join("approved");
@@ -1808,6 +1898,82 @@ mod tests {
     /// reading. An index of what fits, labelled as partial, is worth having.
     /// Cancellation still discards, because there the operator asked to stop
     /// and half an index they did not ask for is not a favour.
+    /// A semantic worker that dies partway through must cost suggestions, not
+    /// the index.
+    ///
+    /// This is the failure the owner hit twice. `BoundedSemanticEngine::bind`
+    /// succeeding was already treated as optional, so a Mac with no linguistic
+    /// asset still got exact search -- but the worker failing *during* a build
+    /// returned `Err`, and the whole index was discarded. On the real archive
+    /// that was 16,621 documents and twenty-two minutes of reading thrown away
+    /// for an optional aid, reported as "the bounded on-device semantic worker
+    /// is unavailable".
+    ///
+    /// Nothing in the suite could reach it: every test had either a healthy
+    /// worker or no worker at all, and the interesting case is the one in
+    /// between. That is what the injected embedder exists for.
+    #[test]
+    fn a_semantic_worker_that_dies_midway_costs_suggestions_not_the_index() {
+        for failure in [
+            SemanticError::WorkerFailed,
+            SemanticError::PlatformUnavailable,
+            SemanticError::ModelUnavailable,
+            SemanticError::SecurityBoundaryUnavailable,
+            SemanticError::WorkerBudgetExceeded,
+        ] {
+            let temp = TempDir::new().expect("temp");
+            let root = temp.path().join("approved");
+            fs::create_dir(&root).expect("root");
+            for index in 0..12 {
+                fs::write(
+                    root.join(format!("matter-{index:02}.txt")),
+                    "ASSIGNMENT\nNeither party may assign this Agreement.\n\
+                     CONFIDENTIALITY\nEach party shall protect Confidential Information.",
+                )
+                .expect("document");
+            }
+            let approved = approve_roots(&[root]).expect("approve");
+
+            // Answers for the first document, then never again.
+            let mut embedder = FailingEmbedder::new(failure.clone());
+            let vault = build_authorized_vault(
+                VaultId::parse("half-semantic").expect("vault"),
+                &approved,
+                TextVaultLimits::default(),
+                &AtomicBool::new(false),
+                None,
+                None,
+                None,
+                None,
+                Some(&mut embedder),
+            )
+            .unwrap_or_else(|error| {
+                panic!("a dying semantic worker discarded the whole index: {error:?}")
+            });
+
+            let report = vault.build_report();
+            assert_eq!(
+                report.indexed_documents, 12,
+                "{failure:?} cost documents that have nothing to do with semantics"
+            );
+            assert!(
+                report.semantic_coverage_partial,
+                "{failure:?} degraded silently; partial suggestion coverage must be reported"
+            );
+
+            // The product is exact evidence, and it must be untouched.
+            let response = vault
+                .interpret_and_search(
+                    "Find assignment provisions within three sentences covering assign.",
+                )
+                .expect("exact search still works without the semantic worker");
+            assert!(
+                !response.evidence.is_empty(),
+                "{failure:?} left exact search unable to answer"
+            );
+        }
+    }
+
     /// An excluded folder is not entered, and every namesake is kept.
     ///
     /// The only unit of choice was a whole approved root, so a notes vault

@@ -104,6 +104,9 @@ const vaultReport = {
   converter_sandbox_verified: true,
   semantic_worker_sandbox_verified: true,
   semantic_retrieval_enabled: true,
+  // The worker died partway through this build. Partial suggestion coverage
+  // must be stated, not inferred from a smaller vector count.
+  semantic_coverage_partial: true,
   semantic_model: {
     model_id: "apple-nl-sentence-en-r1",
     revision: 1,
@@ -441,7 +444,8 @@ try {
           !vaultSummary.includes("3 folders were too deep to enter") ||
           !vaultSummary.includes("9,000 were blocked by macOS permissions") ||
           !vaultSummary.includes("12 were scans the text recognizer could not read") ||
-          !vaultSummary.includes("2 changed while being read")
+          !vaultSummary.includes("2 changed while being read") ||
+          !vaultSummary.includes("suggestion model stopped partway")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }
