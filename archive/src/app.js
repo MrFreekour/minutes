@@ -31,6 +31,7 @@ const elements = {
   categoryList: document.querySelector("#category-list"),
   signalsList: document.querySelector("#signals-list"),
   vaultSummary: document.querySelector("#vault-summary"),
+  buildForecast: document.querySelector("#build-forecast"),
   searchForm: document.querySelector("#search-form"),
   searchQuery: document.querySelector("#search-query"),
   searchSubmit: document.querySelector("#search-submit"),
@@ -183,6 +184,40 @@ function createSignal(label, value) {
   return row;
 }
 
+// Say how long this will take BEFORE anyone commits to waiting.
+//
+// The census already knows the counts, so there is no reason to discover the
+// cost an hour in. The estimate is deliberately coarse and labelled as one:
+// scans dominate, each needing its own recognizer process, and a wrong precise
+// number is worse than an honest rough one.
+function renderBuildForecast(report) {
+  const forecast = elements.buildForecast;
+  if (!forecast) return;
+  const categories = report.categories ?? [];
+  const countFor = (name) =>
+    categories.find((category) => category.category === name)?.artifacts ?? 0;
+  const scans = countFor("image_or_scan");
+  const pdfs = countFor("pdf");
+  const wordProcessing = countFor("word_processing");
+  // Measured on this machine: about 0.4s per scanned page, and about 0.5s per
+  // document that needs a converter process.
+  const seconds = scans * 0.4 + (pdfs + wordProcessing) * 0.5;
+  if (seconds < 60) {
+    forecast.hidden = true;
+    return;
+  }
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  const parts = [];
+  if (scans > 0) parts.push(`${scans.toLocaleString()} scans`);
+  if (pdfs > 0) parts.push(`${pdfs.toLocaleString()} PDFs`);
+  if (wordProcessing > 0) parts.push(`${wordProcessing.toLocaleString()} Word documents`);
+  forecast.textContent =
+    `Roughly ${minutes} minute${minutes === 1 ? "" : "s"} to build, mostly ` +
+    `${parts.join(", ")}. Each is opened in its own sandboxed process. ` +
+    `The index is held in memory and rebuilt each session.`;
+  forecast.hidden = false;
+}
+
 function renderReport(report) {
   lastReport = report;
   const status = report.status.replaceAll("_", " ");
@@ -195,6 +230,7 @@ function renderReport(report) {
         ? "The census was cancelled. Partial counts were discarded from export."
         : "The census stopped at a safety boundary. Review the aggregate signals.";
 
+  renderBuildForecast(report);
   elements.metricArtifacts.textContent = report.summary.artifacts.toLocaleString();
   elements.metricLocations.textContent = report.summary.approved_locations.toLocaleString();
   elements.metricBytes.textContent = formatBytes(report.summary.regular_file_bytes);
@@ -340,11 +376,17 @@ function renderVaultSummary(report) {
     // having, but a reader who thinks it covers the whole folder will draw a
     // false conclusion from a negative result.
     (report.budget_reached
-      ? `This index is PARTIAL: a size or count limit was reached and ${(
+      ? `This index is PARTIAL: a limit was reached. ${(
           report.documents_left_unread ?? 0
-        ).toLocaleString()} further document${
+        ).toLocaleString()} document${
           report.documents_left_unread === 1 ? " was" : "s were"
-        } not read. Narrow the approved folders and rebuild before relying on a negative result. `
+        } not read` +
+        ((report.directories_left_unread ?? 0) > 0
+          ? `, and ${report.directories_left_unread.toLocaleString()} folder${
+              report.directories_left_unread === 1 ? " was" : "s were"
+            } too deep to enter`
+          : "") +
+        ". Narrow the approved folders and rebuild before relying on a negative result. "
       : "") +
     "All indexes exist only in memory.";
 }

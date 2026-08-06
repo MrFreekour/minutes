@@ -1011,6 +1011,12 @@ a:focus-visible {
 /* A transcription must not read as a quotation. It carries the dashed border
    the semantic suggestions use -- the established signal here for "not
    verified" -- plus its own heading and a confidence line on every card. */
+.build-forecast {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .indexing-progress {
   margin: 8px 0 0;
   color: var(--muted);

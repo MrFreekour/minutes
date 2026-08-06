@@ -50,6 +50,9 @@ const census = {
   categories: [
     { category: "plain_text", artifacts: 3, regular_file_bytes: 3072 },
     { category: "pdf", artifacts: 1, regular_file_bytes: 1024 },
+    // Enough scans that the forecast crosses its one-minute threshold, so the
+    // assertion below tests the estimate rather than the hidden state.
+    { category: "image_or_scan", artifacts: 400, regular_file_bytes: 40960 },
   ],
   age_buckets: {},
   size_buckets: {},
@@ -84,6 +87,7 @@ const vaultReport = {
   transcribed_documents: 4,
   budget_reached: true,
   documents_left_unread: 5000,
+  directories_left_unread: 3,
   symlinks_skipped: 2,
   hard_links_skipped: 3,
   metadata_errors: 0,
@@ -357,6 +361,15 @@ try {
           throw new Error("the transcription heading did not disclose what it is");
         }
 
+        // The wait must be stated before anyone commits to it.
+        const forecast = document.querySelector("#build-forecast");
+        if (!forecast || forecast.hidden) {
+          throw new Error("no build-time forecast was shown for a folder of 400 scans");
+        }
+        if (!forecast.textContent.includes("400 scans")) {
+          throw new Error("the forecast did not say what dominates: " + forecast.textContent);
+        }
+
         const vaultSummary = document.querySelector("#vault-summary").textContent;
         if (
           !vaultSummary.includes("2 were aliases or shortcuts") ||
@@ -364,7 +377,8 @@ try {
           !vaultSummary.includes("5 items were not indexed") ||
           !vaultSummary.includes("4 scanned pages read by text recognition") ||
           !vaultSummary.includes("This index is PARTIAL") ||
-          !vaultSummary.includes("5,000 further documents were not read")
+          !vaultSummary.includes("5,000 documents were not read") ||
+          !vaultSummary.includes("3 folders were too deep to enter")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }

@@ -44,9 +44,13 @@ pub struct TextVaultLimits {
 impl Default for TextVaultLimits {
     fn default() -> Self {
         Self {
-            max_documents: 50_000,
-            max_total_bytes: 2 * 1024 * 1024 * 1024,
-            max_directories: 100_000,
+            // A thirty-year practice is simply bigger than the numbers first
+            // chosen here. These bound one session; nothing about correctness
+            // or privacy rests on them, and the old 50,000 / 2 GiB stopped
+            // short of a real archive of 16,620 artifacts across two folders.
+            max_documents: 500_000,
+            max_total_bytes: 32 * 1024 * 1024 * 1024,
+            max_directories: 1_000_000,
             max_depth: 128,
         }
     }
@@ -143,6 +147,8 @@ pub struct TextVaultBuildReport {
     /// the approved folders. The index is real but partial.
     pub budget_reached: bool,
     pub documents_left_unread: u64,
+    /// Folders not descended into, because the tree was deeper than the limit.
+    pub directories_left_unread: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
     pub transcribed_documents: u64,
     pub metadata_errors: u64,
@@ -446,6 +452,7 @@ struct BuildCounters {
     /// Set when a limit stopped the build short of the whole folder.
     budget_reached: bool,
     documents_left_unread: u64,
+    directories_left_unread: u64,
     transcribed_documents: u64,
     indexed_bytes: u64,
     unsupported_files_skipped: u64,
@@ -608,8 +615,11 @@ fn build_authorized_vault(
         if cancelled.load(Ordering::Acquire) {
             return Err(VaultError::Cancelled);
         }
+        // Partial, like the count and byte limits. No limit in this build
+        // discards what has already been read.
         if counters.directories_scanned >= limits.max_directories {
-            return Err(VaultError::BuildBudgetExceeded);
+            counters.budget_reached = true;
+            continue;
         }
         let entries = match current.directory.entries() {
             Ok(entries) => entries,
@@ -657,8 +667,13 @@ fn build_authorized_vault(
                         counters.unsupported_files_skipped.saturating_add(1);
                     continue;
                 }
+                // A tree deeper than the limit is not descended into, and the
+                // build carries on rather than failing over one branch.
                 if current.depth >= limits.max_depth {
-                    return Err(VaultError::BuildBudgetExceeded);
+                    counters.budget_reached = true;
+                    counters.directories_left_unread =
+                        counters.directories_left_unread.saturating_add(1);
+                    continue;
                 }
                 let expected = cap_metadata_identity_portable(&metadata);
                 let child = match entry.open_dir() {
@@ -1008,6 +1023,7 @@ fn build_authorized_vault(
         hard_links_skipped: counters.hard_links_skipped,
         budget_reached: counters.budget_reached,
         documents_left_unread: counters.documents_left_unread,
+        directories_left_unread: counters.directories_left_unread,
         transcribed_documents: counters.transcribed_documents,
         metadata_errors: counters.metadata_errors,
         directory_errors: counters.directory_errors,
