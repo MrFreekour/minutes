@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Capability-bound local archive inventory and retrieval primitives"
 
 [dependencies]
+libc = "0.2"
 cap-std = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }

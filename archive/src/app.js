@@ -415,6 +415,10 @@ function describeDroppedSources(report) {
     // is not the same problem at all.
     [report.permission_denied, "were blocked by macOS permissions"],
     [report.unopenable, "could not be opened for another reason"],
+    [
+      report.open_file_limit_reached,
+      "were not reached before the app ran out of open files (restart and index a smaller folder)",
+    ],
     [report.scans_unreadable, "were scans the text recognizer could not read"],
     [report.entries_unstattable, "could not be examined at all"],
     [report.identity_unavailable, "had no stable identity to pin"],

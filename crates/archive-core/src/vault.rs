@@ -34,8 +34,11 @@ use thiserror::Error;
 
 pub const DOCUMENT_VAULT_SCHEMA: &str = "minutes.archive-document-vault.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No longer `Copy`: the exclusion list owns its paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextVaultLimits {
+    /// Folders, relative to an approved root, that the build must not enter.
+    pub excluded_paths: Vec<PathBuf>,
     pub max_documents: usize,
     pub max_total_bytes: u64,
     pub max_directories: u64,
@@ -45,6 +48,7 @@ pub struct TextVaultLimits {
 impl Default for TextVaultLimits {
     fn default() -> Self {
         Self {
+            excluded_paths: Vec::new(),
             // A thirty-year practice is simply bigger than the numbers first
             // chosen here. These bound one session; nothing about correctness
             // or privacy rests on them, and the old 50,000 / 2 GiB stopped
@@ -157,6 +161,8 @@ pub struct TextVaultBuildReport {
     pub permission_denied: u64,
     /// Could not be opened for some reason that is NOT permissions.
     pub unopenable: u64,
+    /// The process ran out of file descriptors before reaching these.
+    pub open_file_limit_reached: u64,
     /// Page images the recognizer could not read, or that held no text.
     pub scans_unreadable: u64,
     /// The entry could not be stat'd at all.
@@ -167,6 +173,8 @@ pub struct TextVaultBuildReport {
     pub changed_while_reading: u64,
     /// Folders not descended into, because the tree was deeper than the limit.
     pub directories_left_unread: u64,
+    /// Folders the operator chose not to index.
+    pub excluded_directories: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
     pub transcribed_documents: u64,
     pub metadata_errors: u64,
@@ -540,11 +548,13 @@ struct BuildCounters {
     documents_left_unread: u64,
     permission_denied: u64,
     unopenable: u64,
+    open_file_limit_reached: u64,
     scans_unreadable: u64,
     entries_unstattable: u64,
     identity_unavailable: u64,
     changed_while_reading: u64,
     directories_left_unread: u64,
+    excluded_directories: u64,
     transcribed_documents: u64,
     indexed_bytes: u64,
     unsupported_files_skipped: u64,
@@ -767,6 +777,23 @@ fn build_authorized_vault(
                         counters.unsupported_files_skipped.saturating_add(1);
                     continue;
                 }
+                // Folders the operator excluded are not entered at all.
+                //
+                // The only unit of choice used to be a whole approved folder,
+                // so a notes vault with 2,873 screenshots and recordings under
+                // one subfolder had to be indexed whole or not at all. Matched
+                // on the relative path from the approved root, so excluding
+                // "attachments" excludes that folder and everything under it
+                // without touching a folder of the same name elsewhere.
+                let relative = current.relative_path.join(&name);
+                if limits
+                    .excluded_paths
+                    .iter()
+                    .any(|excluded| relative == *excluded || relative.starts_with(excluded))
+                {
+                    counters.excluded_directories = counters.excluded_directories.saturating_add(1);
+                    continue;
+                }
                 // A tree deeper than the limit is not descended into, and the
                 // build carries on rather than failing over one branch.
                 if current.depth >= limits.max_depth {
@@ -888,10 +915,31 @@ fn build_authorized_vault(
                     // denied" on the strength of a guess, and a real archive
                     // then reported 10,418 of them -- a number stated as a
                     // cause without ever measuring one.
-                    if error.kind() == std::io::ErrorKind::PermissionDenied {
-                        counters.permission_denied = counters.permission_denied.saturating_add(1);
-                    } else {
-                        counters.unopenable = counters.unopenable.saturating_add(1);
+                    match error.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            counters.permission_denied =
+                                counters.permission_denied.saturating_add(1);
+                        }
+                        // Named exactly, because it was twice reported as a
+                        // permissions problem and sent the owner looking at
+                        // Full Disk Access for files that were never
+                        // unreadable. The vault holds one descriptor per
+                        // indexed document for the live-source fence, so a low
+                        // ceiling stops a build dead: on a real archive of
+                        // 16,620 files it indexed 237 -- the GUI soft limit is
+                        // 256 -- and called the other 10,418 a permissions
+                        // failure.
+                        _ if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EMFILE) | Some(libc::ENFILE)
+                        ) =>
+                        {
+                            counters.open_file_limit_reached =
+                                counters.open_file_limit_reached.saturating_add(1);
+                        }
+                        _ => {
+                            counters.unopenable = counters.unopenable.saturating_add(1);
+                        }
                     }
                     continue;
                 }
@@ -1008,11 +1056,13 @@ fn build_authorized_vault(
         documents_left_unread: counters.documents_left_unread,
         permission_denied: counters.permission_denied,
         unopenable: counters.unopenable,
+        open_file_limit_reached: counters.open_file_limit_reached,
         scans_unreadable: counters.scans_unreadable,
         entries_unstattable: counters.entries_unstattable,
         identity_unavailable: counters.identity_unavailable,
         changed_while_reading: counters.changed_while_reading,
         directories_left_unread: counters.directories_left_unread,
+        excluded_directories: counters.excluded_directories,
         transcribed_documents: counters.transcribed_documents,
         metadata_errors: counters.metadata_errors,
         directory_errors: counters.directory_errors,
@@ -1742,6 +1792,50 @@ mod tests {
     /// reading. An index of what fits, labelled as partial, is worth having.
     /// Cancellation still discards, because there the operator asked to stop
     /// and half an index they did not ask for is not a favour.
+    /// An excluded folder is not entered, and a folder of the same name
+    /// elsewhere is untouched.
+    ///
+    /// The only unit of choice was a whole approved root, so a notes vault
+    /// with thousands of screenshots under one subfolder had to be taken whole
+    /// or not at all.
+    #[test]
+    fn an_excluded_folder_is_not_entered_and_its_namesake_is_kept() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("approved");
+        fs::create_dir_all(root.join("attachments")).expect("attachments");
+        fs::create_dir_all(root.join("matters/attachments")).expect("nested namesake");
+        fs::write(root.join("keep.txt"), "ASSIGNMENT\nNo assignment.").expect("keep");
+        fs::write(
+            root.join("attachments/skip.txt"),
+            "ASSIGNMENT\nNo assignment.",
+        )
+        .expect("skip");
+        fs::write(
+            root.join("matters/attachments/keep-too.txt"),
+            "ASSIGNMENT\nNo assignment.",
+        )
+        .expect("namesake");
+
+        let approved = approve_roots(&[root]).expect("approve");
+        let vault = build_authorized_text_vault(
+            VaultId::parse("excluding").expect("vault"),
+            &approved,
+            TextVaultLimits {
+                excluded_paths: vec![PathBuf::from("attachments")],
+                ..TextVaultLimits::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("build");
+
+        let report = vault.build_report();
+        assert_eq!(report.excluded_directories, 1);
+        assert_eq!(
+            report.indexed_documents, 2,
+            "the excluded folder was entered, or its namesake was wrongly skipped"
+        );
+    }
+
     #[test]
     fn a_budget_yields_a_partial_index_while_cancellation_discards() {
         let temp = TempDir::new().expect("temp");

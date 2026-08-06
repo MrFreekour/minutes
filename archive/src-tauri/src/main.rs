@@ -782,7 +782,53 @@ fn run_signed_worker_selftest() -> i32 {
     0
 }
 
+/// Raise the open-file ceiling before anything opens a document.
+///
+/// The vault holds one descriptor per indexed document for the lifetime of the
+/// session -- that is what the live-source fence re-reads through to prove an
+/// excerpt still matches its source, and it is the reason a card can say the
+/// source was verified. macOS gives a GUI application a soft limit of 256, so
+/// an archive of any size stopped dead at roughly 237 documents and every
+/// subsequent open failed. On a real folder of 16,620 files that meant 10,418
+/// were reported unreadable when nothing was wrong with any of them.
+///
+/// The hard limit is unlimited, so this only lifts the soft one. Failing is not
+/// fatal: the build then stops at whatever ceiling remains and says so.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // Enough for a very large archive plus the app's own descriptors, without
+    // asking for an unbounded number.
+    const WANTED: libc::rlim_t = 200_000;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    if limit.rlim_cur >= WANTED {
+        return;
+    }
+    let target = if limit.rlim_max == libc::RLIM_INFINITY {
+        WANTED
+    } else {
+        WANTED.min(limit.rlim_max)
+    };
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    // Best effort. A lower ceiling is reported honestly at the point it bites.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_NOFILE, &raised);
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+
 fn main() {
+    raise_open_file_limit();
     let mut arguments = std::env::args();
     let _program = arguments.next();
     let marker = arguments.next();
