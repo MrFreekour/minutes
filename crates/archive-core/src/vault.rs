@@ -9,8 +9,8 @@
 use crate::retrieval::{
     interpret_legal_query, normalize_converted_document, normalize_text_document,
     normalize_transcribed_document, CurrentRevisionSet, DocumentId, LegalIndex, LegalQuery,
-    LegalSearchResponse, ProvisionBoundaries, RetrievalError, SourceRevision, VaultId,
-    MAX_NORMALIZED_DOCUMENT_BYTES, MAX_QUERY_CHARS, MAX_SEMANTIC_PROVISIONS,
+    LegalSearchResponse, NormalizedDocument, ProvisionBoundaries, RetrievalError, SourceRevision,
+    VaultId, MAX_NORMALIZED_DOCUMENT_BYTES, MAX_QUERY_CHARS, MAX_SEMANTIC_PROVISIONS,
 };
 use crate::{
     cap_identity_matches, cap_metadata_identity_portable, cap_metadata_is_link_or_reparse,
@@ -21,7 +21,8 @@ use cap_std::fs::{Dir, File};
 use minutes_archive_convert::{BoundedConverter, SourceFormat};
 use minutes_archive_ocr::BoundedTranscriber;
 use minutes_archive_semantic::{
-    BoundedSemanticEngine, SemanticError, SemanticModelMetadata, MAX_SEMANTIC_INPUT_CHARS,
+    BoundedSemanticEngine, BoundedSemanticSession, SemanticError, SemanticModelMetadata,
+    MAX_SEMANTIC_INPUT_CHARS,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -486,6 +487,47 @@ struct PendingDirectory {
     depth: u32,
 }
 
+/// A document that has passed every identity check and been read, waiting for
+/// the one expensive step: conversion or transcription.
+///
+/// It carries the whole of what the cheap tail needs, because a batch is
+/// drained after the walk has already moved on from the folder the document
+/// came from.
+struct PendingDocument {
+    document_id: DocumentId,
+    title: String,
+    bytes: Vec<u8>,
+    source_kind: SourceKind,
+    identity: FileIdentity,
+    file: File,
+    /// The length seen after the read, which is what `indexed_bytes` counts.
+    source_len: u64,
+    root_index: usize,
+    relative_path: PathBuf,
+}
+
+/// How many documents to extract at once.
+///
+/// Two cores are held back: one for the walk that keeps the batch fed, and one
+/// so the Mac stays usable while a build of tens of thousands of documents
+/// runs. Twelve is the ceiling because past that the sandboxed workers are
+/// contending for memory bandwidth rather than adding throughput, and every
+/// one of them is a process.
+fn extraction_batch_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get().saturating_sub(2))
+        .unwrap_or(1)
+        .clamp(1, 12)
+}
+
+/// A batch also stops at a byte ceiling.
+///
+/// A single document may be up to `MAX_NORMALIZED_DOCUMENT_BYTES`, so a batch
+/// counted only by document count could hold a multiple of that in memory at
+/// once alongside the text each conversion returns. The sequential walk never
+/// held more than one source's bytes; this bounds how far that goes.
+const MAX_PENDING_EXTRACTION_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 struct BuildCounters {
     indexed_documents: u64,
@@ -633,6 +675,14 @@ fn build_authorized_vault(
     let mut sources = BTreeMap::new();
     let mut identities = HashSet::new();
     let mut counters = BuildCounters::default();
+    let batch_size = extraction_batch_size();
+    let mut pending_documents: Vec<PendingDocument> = Vec::with_capacity(batch_size);
+    let mut pending_bytes: u64 = 0;
+    // Document ids used to be `indexed_documents + 1`, which tied an opaque
+    // identifier to a counter that now moves in a different place. They are
+    // handed out here instead, monotonically, and a document that fails
+    // extraction simply leaves a gap. Nothing reads meaning out of them.
+    let mut next_document_number: u64 = 0;
     // Semantic suggestions are an optional aid, explicitly labelled in the UI
     // as review-not-verified, while exact evidence is the product. Failing the
     // whole build when Apple's on-device model is unavailable left the
@@ -778,6 +828,35 @@ fn build_authorized_vault(
             // labelled as partial, is worth having; an error after an hour is
             // worth nothing. The counters below are what the summary uses to
             // say so.
+            //
+            // A budget is decided by the counters, and the counters only move
+            // when a batch reaches the tail below. So when the documents
+            // already waiting could carry the build over a limit, drain them
+            // first: the check that follows then sees exactly the numbers a
+            // sequential walk would have put in front of it.
+            if counters
+                .indexed_documents
+                .saturating_add(pending_documents.len() as u64) as usize
+                >= limits.max_documents
+                || counters
+                    .indexed_bytes
+                    .saturating_add(pending_bytes)
+                    .saturating_add(metadata.len())
+                    > limits.max_total_bytes
+            {
+                index_extracted_batch(
+                    &mut pending_documents,
+                    &mut pending_bytes,
+                    converter,
+                    transcriber,
+                    &mut index,
+                    &mut sources,
+                    &mut counters,
+                    semantic_session.as_mut(),
+                    semantic_model.as_ref(),
+                    progress,
+                )?;
+            }
             if counters.indexed_documents as usize >= limits.max_documents
                 || counters.indexed_bytes.saturating_add(metadata.len()) > limits.max_total_bytes
             {
@@ -838,219 +917,63 @@ fn build_authorized_vault(
                 continue;
             }
 
-            let document_number = counters.indexed_documents.saturating_add(1);
-            let document_id = DocumentId::parse(format!("document-{document_number:016x}"))
+            next_document_number = next_document_number.saturating_add(1);
+            let document_id = DocumentId::parse(format!("document-{next_document_number:016x}"))
                 .map_err(VaultError::from)?;
             let Some(title) = source_title(&name) else {
                 counters.malformed_text_files_skipped =
                     counters.malformed_text_files_skipped.saturating_add(1);
                 continue;
             };
-            let normalized = match source_kind {
-                SourceKind::Text => normalize_text_document(document_id.clone(), title, &bytes),
-                SourceKind::Converted(format) => {
-                    let Some(converter) = converter else {
-                        return Err(VaultError::ConverterUnavailable);
-                    };
-                    let converted = match converter.convert(format, &bytes) {
-                        Ok(converted) => converted,
-                        // Every conversion failure is a coverage gap, never a
-                        // reason to lose the build.
-                        //
-                        // This used to abort on any error that was not a
-                        // refusal or a timeout, so one document the worker
-                        // could not handle discarded everything indexed before
-                        // it. A folder of 32,605 artifacts spent six minutes
-                        // reading and returned "the bounded document converter
-                        // is unavailable" and nothing else. That is the
-                        // opposite of how the rest of this build behaves:
-                        // unreadable, malformed, oversized and duplicate files
-                        // are all counted and reported so the gap is visible.
-                        // A worker that fell over on one file is the same kind
-                        // of fact.
-                        Err(_) => {
-                            counters.conversion_failures =
-                                counters.conversion_failures.saturating_add(1);
-                            continue;
-                        }
-                    };
-                    if converted.blocks.is_empty()
-                        && converted
-                            .warnings
-                            .iter()
-                            .any(|warning| warning == "ocr_required_or_no_extractable_text")
-                    {
-                        counters.ocr_required_files = counters.ocr_required_files.saturating_add(1);
-                        continue;
-                    }
-                    normalize_converted_document(document_id.clone(), title, &bytes, &converted)
-                }
-                SourceKind::Scanned => {
-                    let Some(transcriber) = transcriber else {
-                        // Unreachable: a scan is only classified as one when a
-                        // recogniser exists. Counted rather than failing the
-                        // build, so a bad classification cannot lose a folder.
-                        counters.ocr_required_files = counters.ocr_required_files.saturating_add(1);
-                        continue;
-                    };
-                    let page = match transcriber.transcribe(&bytes) {
-                        Ok(page) => page,
-                        Err(_) => {
-                            // A scan that cannot be read is still a coverage
-                            // gap the reader should see, and it is the same
-                            // gap as a PDF with no text layer.
-                            counters.ocr_required_files =
-                                counters.ocr_required_files.saturating_add(1);
-                            continue;
-                        }
-                    };
-                    let text = page
-                        .lines
-                        .iter()
-                        .map(|line| line.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if text.trim().is_empty() {
-                        // A photograph, a blank scan, a separator sheet.
-                        counters.ocr_required_files = counters.ocr_required_files.saturating_add(1);
-                        continue;
-                    }
-                    normalize_transcribed_document(
-                        document_id.clone(),
-                        title,
-                        &bytes,
-                        minutes_archive_ocr::TRANSCRIBER,
-                        &[(1, text, page.lowest_confidence())],
-                    )
-                }
-            };
-            let normalized = match normalized {
-                Ok(document) => document,
-                Err(_) => {
-                    match source_kind {
-                        SourceKind::Text => {
-                            counters.malformed_text_files_skipped =
-                                counters.malformed_text_files_skipped.saturating_add(1);
-                        }
-                        SourceKind::Converted(_) => {
-                            counters.conversion_failures =
-                                counters.conversion_failures.saturating_add(1);
-                        }
-                        SourceKind::Scanned => {
-                            counters.ocr_required_files =
-                                counters.ocr_required_files.saturating_add(1);
-                        }
-                    }
-                    continue;
-                }
-            };
-            if let Some(session) = semantic_session.as_mut() {
-                let remaining = MAX_SEMANTIC_PROVISIONS
-                    .saturating_sub(counters.semantic_provisions_indexed as usize);
-                let mut embeddings = Vec::with_capacity(normalized.provisions.len());
-                for (position, provision) in normalized.provisions.iter().enumerate() {
-                    if position >= remaining {
-                        counters.semantic_provisions_skipped =
-                            counters.semantic_provisions_skipped.saturating_add(1);
-                        embeddings.push(None);
-                        continue;
-                    }
-                    let text = semantic_provision_text(
-                        &normalized.title,
-                        provision.heading.as_deref(),
-                        &provision.text,
-                    );
-                    match text.as_deref().map(|text| session.embed(text)) {
-                        Some(Ok(vector)) => embeddings.push(Some(vector)),
-                        Some(Err(
-                            SemanticError::InputBudgetExceeded | SemanticError::InvalidVector,
-                        ))
-                        | None => {
-                            counters.semantic_provisions_skipped =
-                                counters.semantic_provisions_skipped.saturating_add(1);
-                            embeddings.push(None);
-                        }
-                        Some(Err(
-                            SemanticError::PlatformUnavailable | SemanticError::ModelUnavailable,
-                        )) => {
-                            return Err(VaultError::SemanticUnavailable);
-                        }
-                        Some(Err(
-                            SemanticError::ExecutableUnavailable
-                            | SemanticError::SecurityBoundaryUnavailable
-                            | SemanticError::WorkerBudgetExceeded
-                            | SemanticError::WorkerFailed,
-                        )) => return Err(VaultError::SemanticUnavailable),
-                    }
-                }
-                let indexed = index
-                    .replace_document_with_semantics(
-                        &normalized,
-                        semantic_model
-                            .clone()
-                            .ok_or(VaultError::SemanticUnavailable)?,
-                        &embeddings,
-                    )
-                    .map_err(VaultError::from)?;
-                counters.semantic_provisions_indexed = counters
-                    .semantic_provisions_indexed
-                    .saturating_add(indexed as u64);
-            } else {
-                index
-                    .replace_document(&normalized)
-                    .map_err(VaultError::from)?;
-            }
-            sources.insert(
+            // Everything above is cheap and touches shared state; the one
+            // expensive step is deferred to a batch so it can run on more than
+            // one core.
+            pending_bytes = pending_bytes.saturating_add(post_read_metadata.len());
+            pending_documents.push(PendingDocument {
                 document_id,
-                AuthorizedSource {
-                    root_index: current.root_index,
-                    relative_path: current.relative_path.join(&name),
-                    identity,
-                    file,
-                    indexed_revision: normalized.revision,
-                },
-            );
-            counters.indexed_documents = document_number;
-            if let Some(progress) = progress {
-                progress.note_indexed();
+                title,
+                bytes,
+                source_kind,
+                identity,
+                file,
+                source_len: post_read_metadata.len(),
+                root_index: current.root_index,
+                relative_path: current.relative_path.join(&name),
+            });
+            if pending_documents.len() >= batch_size
+                || pending_bytes >= MAX_PENDING_EXTRACTION_BYTES
+            {
+                index_extracted_batch(
+                    &mut pending_documents,
+                    &mut pending_bytes,
+                    converter,
+                    transcriber,
+                    &mut index,
+                    &mut sources,
+                    &mut counters,
+                    semantic_session.as_mut(),
+                    semantic_model.as_ref(),
+                    progress,
+                )?;
             }
-            if normalized.provision_boundaries == ProvisionBoundaries::Inferred {
-                counters.inferred_boundary_documents =
-                    counters.inferred_boundary_documents.saturating_add(1);
-            }
-            match source_kind {
-                SourceKind::Converted(SourceFormat::Pdf) => {
-                    counters.searchable_pdf_documents =
-                        counters.searchable_pdf_documents.saturating_add(1);
-                }
-                SourceKind::Converted(SourceFormat::Docx) => {
-                    counters.docx_documents = counters.docx_documents.saturating_add(1);
-                }
-                // Counted with DOCX rather than in a category of their own.
-                // The number exists so counsel can see how much of a folder
-                // became searchable, and "word-processor documents" is the
-                // distinction that carries meaning there; splitting out the
-                // container format would not change any decision.
-                SourceKind::Converted(SourceFormat::Doc)
-                | SourceKind::Converted(SourceFormat::Odt)
-                | SourceKind::Converted(SourceFormat::Rtf) => {
-                    counters.docx_documents = counters.docx_documents.saturating_add(1);
-                }
-                // Counted separately from the word-processor formats: a scan
-                // that was read is searchable, but only as a transcription,
-                // and lumping it in with documents that carry their own text
-                // would overstate what the archive can actually quote.
-                SourceKind::Scanned => {
-                    counters.transcribed_documents =
-                        counters.transcribed_documents.saturating_add(1);
-                }
-                SourceKind::Text => {}
-            }
-            counters.indexed_bytes = counters
-                .indexed_bytes
-                .saturating_add(post_read_metadata.len());
         }
     }
+
+    // Whatever the walk ended holding. Cancellation is deliberately not
+    // rechecked here: the entry loop is where a stop is answered, and a build
+    // that reached this line was not cancelled.
+    index_extracted_batch(
+        &mut pending_documents,
+        &mut pending_bytes,
+        converter,
+        transcriber,
+        &mut index,
+        &mut sources,
+        &mut counters,
+        semantic_session.as_mut(),
+        semantic_model.as_ref(),
+        progress,
+    )?;
 
     let build_report = TextVaultBuildReport {
         schema: DOCUMENT_VAULT_SCHEMA,
@@ -1108,6 +1031,294 @@ fn build_authorized_vault(
         semantic_engine,
         build_report,
     })
+}
+
+/// Why a document produced no text.
+///
+/// One variant per counter the build keeps, so extraction can run away from
+/// the counters and still leave the report a sequential build produced.
+#[derive(Debug)]
+enum ExtractionOutcome {
+    MalformedText,
+    ConversionFailed,
+    OcrRequired,
+    /// Not a coverage gap and not counted: `source_kind` only classifies a
+    /// convertible format when a converter exists, so reaching this means the
+    /// build was misconfigured. Carried back rather than counted because that
+    /// is what the sequential build did with it -- fail, do not quietly skip.
+    ConverterUnavailable,
+}
+
+/// The one expensive step, with no access to the index, the counters, or
+/// anything else the build shares.
+///
+/// Pulled out so a batch of documents can go through it at once. Each
+/// conversion and each transcription already spawns its own fresh sandboxed
+/// worker process, which is why running several at a time does not weaken the
+/// isolation: it is the same guarantee several times over, no worker
+/// outliving its document and none able to see another's bytes.
+fn extract_document(
+    document_id: &DocumentId,
+    title: &str,
+    bytes: &[u8],
+    source_kind: SourceKind,
+    converter: Option<&BoundedConverter>,
+    transcriber: Option<&BoundedTranscriber>,
+) -> Result<NormalizedDocument, ExtractionOutcome> {
+    let normalized = match source_kind {
+        SourceKind::Text => normalize_text_document(document_id.clone(), title, bytes),
+        SourceKind::Converted(format) => {
+            let Some(converter) = converter else {
+                return Err(ExtractionOutcome::ConverterUnavailable);
+            };
+            let converted = match converter.convert(format, bytes) {
+                Ok(converted) => converted,
+                // Every conversion failure is a coverage gap, never a reason
+                // to lose the build.
+                //
+                // This used to abort on any error that was not a refusal or a
+                // timeout, so one document the worker could not handle
+                // discarded everything indexed before it. A folder of 32,605
+                // artifacts spent six minutes reading and returned "the
+                // bounded document converter is unavailable" and nothing else.
+                // That is the opposite of how the rest of this build behaves:
+                // unreadable, malformed, oversized and duplicate files are all
+                // counted and reported so the gap is visible. A worker that
+                // fell over on one file is the same kind of fact.
+                Err(_) => return Err(ExtractionOutcome::ConversionFailed),
+            };
+            if converted.blocks.is_empty()
+                && converted
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "ocr_required_or_no_extractable_text")
+            {
+                return Err(ExtractionOutcome::OcrRequired);
+            }
+            normalize_converted_document(document_id.clone(), title, bytes, &converted)
+        }
+        SourceKind::Scanned => {
+            let Some(transcriber) = transcriber else {
+                // Unreachable: a scan is only classified as one when a
+                // recogniser exists. Counted rather than failing the build, so
+                // a bad classification cannot lose a folder.
+                return Err(ExtractionOutcome::OcrRequired);
+            };
+            let page = match transcriber.transcribe(bytes) {
+                Ok(page) => page,
+                // A scan that cannot be read is still a coverage gap the
+                // reader should see, and it is the same gap as a PDF with no
+                // text layer.
+                Err(_) => return Err(ExtractionOutcome::OcrRequired),
+            };
+            let text = page
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.trim().is_empty() {
+                // A photograph, a blank scan, a separator sheet.
+                return Err(ExtractionOutcome::OcrRequired);
+            }
+            normalize_transcribed_document(
+                document_id.clone(),
+                title,
+                bytes,
+                minutes_archive_ocr::TRANSCRIBER,
+                &[(1, text, page.lowest_confidence())],
+            )
+        }
+    };
+    normalized.map_err(|_| match source_kind {
+        SourceKind::Text => ExtractionOutcome::MalformedText,
+        SourceKind::Converted(_) => ExtractionOutcome::ConversionFailed,
+        SourceKind::Scanned => ExtractionOutcome::OcrRequired,
+    })
+}
+
+/// Extract a batch at once, then index the results one at a time, in the order
+/// the walk found them.
+///
+/// The split is the whole point. Extraction is a sandboxed process per
+/// document -- about half a second for a converted format, longer for a scan
+/// -- and a real archive of 16,620 artifacts spent twenty-five minutes doing
+/// that on one core while eleven sat idle. Everything after it is cheap and
+/// touches state that is not shared safely: the index, the source map, the
+/// counters, and a semantic session that is one worker.
+#[allow(clippy::too_many_arguments)]
+fn index_extracted_batch(
+    pending_documents: &mut Vec<PendingDocument>,
+    pending_bytes: &mut u64,
+    converter: Option<&BoundedConverter>,
+    transcriber: Option<&BoundedTranscriber>,
+    index: &mut LegalIndex,
+    sources: &mut BTreeMap<DocumentId, AuthorizedSource>,
+    counters: &mut BuildCounters,
+    mut semantic_session: Option<&mut BoundedSemanticSession>,
+    semantic_model: Option<&SemanticModelMetadata>,
+    progress: Option<&BuildProgress>,
+) -> Result<(), VaultError> {
+    *pending_bytes = 0;
+    let batch = std::mem::take(pending_documents);
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let extracted: Vec<Result<NormalizedDocument, ExtractionOutcome>> =
+        std::thread::scope(|scope| {
+            let workers = batch
+                .iter()
+                .map(|pending| {
+                    scope.spawn(move || {
+                        extract_document(
+                            &pending.document_id,
+                            &pending.title,
+                            &pending.bytes,
+                            pending.source_kind,
+                            converter,
+                            transcriber,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| match worker.join() {
+                    Ok(outcome) => outcome,
+                    // A worker thread does nothing but extract, so a panic
+                    // there is the same bug it would have been inline. Let it
+                    // out rather than record it as a coverage gap.
+                    Err(panic) => std::panic::resume_unwind(panic),
+                })
+                .collect()
+        });
+
+    for (pending, extracted) in batch.into_iter().zip(extracted) {
+        let normalized = match extracted {
+            Ok(normalized) => normalized,
+            Err(ExtractionOutcome::MalformedText) => {
+                counters.malformed_text_files_skipped =
+                    counters.malformed_text_files_skipped.saturating_add(1);
+                continue;
+            }
+            Err(ExtractionOutcome::ConversionFailed) => {
+                counters.conversion_failures = counters.conversion_failures.saturating_add(1);
+                continue;
+            }
+            Err(ExtractionOutcome::OcrRequired) => {
+                counters.ocr_required_files = counters.ocr_required_files.saturating_add(1);
+                continue;
+            }
+            Err(ExtractionOutcome::ConverterUnavailable) => {
+                return Err(VaultError::ConverterUnavailable)
+            }
+        };
+        if let Some(session) = semantic_session.as_deref_mut() {
+            let remaining = MAX_SEMANTIC_PROVISIONS
+                .saturating_sub(counters.semantic_provisions_indexed as usize);
+            let mut embeddings = Vec::with_capacity(normalized.provisions.len());
+            for (position, provision) in normalized.provisions.iter().enumerate() {
+                if position >= remaining {
+                    counters.semantic_provisions_skipped =
+                        counters.semantic_provisions_skipped.saturating_add(1);
+                    embeddings.push(None);
+                    continue;
+                }
+                let text = semantic_provision_text(
+                    &normalized.title,
+                    provision.heading.as_deref(),
+                    &provision.text,
+                );
+                match text.as_deref().map(|text| session.embed(text)) {
+                    Some(Ok(vector)) => embeddings.push(Some(vector)),
+                    Some(Err(
+                        SemanticError::InputBudgetExceeded | SemanticError::InvalidVector,
+                    ))
+                    | None => {
+                        counters.semantic_provisions_skipped =
+                            counters.semantic_provisions_skipped.saturating_add(1);
+                        embeddings.push(None);
+                    }
+                    Some(Err(
+                        SemanticError::PlatformUnavailable | SemanticError::ModelUnavailable,
+                    )) => {
+                        return Err(VaultError::SemanticUnavailable);
+                    }
+                    Some(Err(
+                        SemanticError::ExecutableUnavailable
+                        | SemanticError::SecurityBoundaryUnavailable
+                        | SemanticError::WorkerBudgetExceeded
+                        | SemanticError::WorkerFailed,
+                    )) => return Err(VaultError::SemanticUnavailable),
+                }
+            }
+            let indexed = index
+                .replace_document_with_semantics(
+                    &normalized,
+                    semantic_model
+                        .cloned()
+                        .ok_or(VaultError::SemanticUnavailable)?,
+                    &embeddings,
+                )
+                .map_err(VaultError::from)?;
+            counters.semantic_provisions_indexed = counters
+                .semantic_provisions_indexed
+                .saturating_add(indexed as u64);
+        } else {
+            index
+                .replace_document(&normalized)
+                .map_err(VaultError::from)?;
+        }
+        let source_kind = pending.source_kind;
+        let source_len = pending.source_len;
+        sources.insert(
+            pending.document_id,
+            AuthorizedSource {
+                root_index: pending.root_index,
+                relative_path: pending.relative_path,
+                identity: pending.identity,
+                file: pending.file,
+                indexed_revision: normalized.revision,
+            },
+        );
+        counters.indexed_documents = counters.indexed_documents.saturating_add(1);
+        if let Some(progress) = progress {
+            progress.note_indexed();
+        }
+        if normalized.provision_boundaries == ProvisionBoundaries::Inferred {
+            counters.inferred_boundary_documents =
+                counters.inferred_boundary_documents.saturating_add(1);
+        }
+        match source_kind {
+            SourceKind::Converted(SourceFormat::Pdf) => {
+                counters.searchable_pdf_documents =
+                    counters.searchable_pdf_documents.saturating_add(1);
+            }
+            SourceKind::Converted(SourceFormat::Docx) => {
+                counters.docx_documents = counters.docx_documents.saturating_add(1);
+            }
+            // Counted with DOCX rather than in a category of their own. The
+            // number exists so counsel can see how much of a folder became
+            // searchable, and "word-processor documents" is the distinction
+            // that carries meaning there; splitting out the container format
+            // would not change any decision.
+            SourceKind::Converted(SourceFormat::Doc)
+            | SourceKind::Converted(SourceFormat::Odt)
+            | SourceKind::Converted(SourceFormat::Rtf) => {
+                counters.docx_documents = counters.docx_documents.saturating_add(1);
+            }
+            // Counted separately from the word-processor formats: a scan that
+            // was read is searchable, but only as a transcription, and lumping
+            // it in with documents that carry their own text would overstate
+            // what the archive can actually quote.
+            SourceKind::Scanned => {
+                counters.transcribed_documents = counters.transcribed_documents.saturating_add(1);
+            }
+            SourceKind::Text => {}
+        }
+        counters.indexed_bytes = counters.indexed_bytes.saturating_add(source_len);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1560,5 +1771,90 @@ mod tests {
             vault.interpret_and_search("Find confidentiality provisions."),
             Err(VaultError::RootChanged)
         );
+    }
+
+    /// A folder bigger than one extraction batch counts every document once.
+    ///
+    /// Extraction now happens away from the walk, in batches, so the counters
+    /// move somewhere other than where the file was read. Every other fixture
+    /// here is smaller than a batch and so never crosses that seam. This one
+    /// does, and it mixes in sources that cannot be normalized so a failure
+    /// lands on the right counter after the reordering too.
+    #[test]
+    fn a_folder_larger_than_one_extraction_batch_counts_every_document_once() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("approved");
+        fs::create_dir(&root).expect("root");
+        for index in 0..64u32 {
+            fs::write(
+                root.join(format!("precedent-{index:03}.txt")),
+                "7. CONFIDENTIALITY\nConfidential Information includes affiliate data.",
+            )
+            .expect("source");
+        }
+        for index in 0..3u32 {
+            // Read without complaint, then refused by normalization: not UTF-8.
+            fs::write(
+                root.join(format!("mojibake-{index}.txt")),
+                [0xff, 0xfe, 0x9f, 0x0a],
+            )
+            .expect("malformed source");
+        }
+
+        let approved = approve_roots(&[root]).expect("approve");
+        let vault = build_authorized_text_vault(
+            VaultId::parse("batched").expect("vault"),
+            &approved,
+            TextVaultLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("build");
+
+        let report = vault.build_report();
+        assert_eq!(report.indexed_documents, 64);
+        assert_eq!(report.malformed_text_files_skipped, 3);
+        assert!(!report.budget_reached);
+        assert_eq!(report.documents_left_unread, 0);
+        assert!(!vault
+            .interpret_and_search("Find documents containing confidentiality.")
+            .expect("search")
+            .documents
+            .is_empty());
+    }
+
+    /// A limit smaller than one batch still stops on the document it names.
+    ///
+    /// Documents wait in a batch before they reach the counters a budget is
+    /// measured against, so the build drains the batch before deciding. Without
+    /// that, a limit of five would let a whole batch of twelve through.
+    #[test]
+    fn a_budget_smaller_than_one_extraction_batch_stops_at_the_limit() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("approved");
+        fs::create_dir(&root).expect("root");
+        for index in 0..40u32 {
+            fs::write(
+                root.join(format!("precedent-{index:03}.txt")),
+                "7. CONFIDENTIALITY\nConfidential Information includes affiliate data.",
+            )
+            .expect("source");
+        }
+
+        let approved = approve_roots(&[root]).expect("approve");
+        let vault = build_authorized_text_vault(
+            VaultId::parse("batched-budget").expect("vault"),
+            &approved,
+            TextVaultLimits {
+                max_documents: 5,
+                ..TextVaultLimits::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("a budget must not throw away what was already read");
+
+        let report = vault.build_report();
+        assert_eq!(report.indexed_documents, 5);
+        assert!(report.budget_reached);
+        assert_eq!(report.documents_left_unread, 35);
     }
 }
