@@ -13,7 +13,7 @@
 //! .docx carrying genuine `w:hdr`/`w:ftr` parts and a real PAGE field. It
 //! contains no client material.
 
-use minutes_archive_convert::{convert_bytes, SourceFormat, PDF_UNSUPPORTED_STRUCTURE_WARNING};
+use minutes_archive_convert::{convert_bytes, SourceFormat};
 use minutes_archive_core::retrieval::{
     normalize_converted_document, CurrentRevisionSet, DocumentId, LegalConcept, LegalIndex,
     LegalQuery, MatchScope, ProvisionBoundaries, VaultId,
@@ -118,6 +118,14 @@ const LIST_TAIL_MERGE: &[u8] =
     include_bytes!("../../../tests/fixtures/archive-real-pdf/list-tail-merge.pdf");
 const UNIFORM_SPACING_CAPTIONS: &[u8] =
     include_bytes!("../../../tests/fixtures/archive-real-pdf/uniform-spacing-captions.pdf");
+const DOUBLE_SPACED_SIGNATURE: &[u8] =
+    include_bytes!("../../../tests/fixtures/archive-real-pdf/double-spaced-signature.pdf");
+const UNHEADED_CLAUSES_UNDER_ONE_NOTICE: &[u8] = include_bytes!(
+    "../../../tests/fixtures/archive-real-pdf/unheaded-clauses-under-one-notice.pdf"
+);
+const LABELLED_CLAUSES_AT_UNIFORM_SPACING: &[u8] = include_bytes!(
+    "../../../tests/fixtures/archive-real-pdf/labelled-clauses-at-uniform-spacing.pdf"
+);
 
 /// Reproduces the open defect in #26 against real LibreOffice output.
 ///
@@ -149,44 +157,208 @@ fn a_real_pdf_does_not_fabricate_a_same_provision_conjunction() {
     }
 }
 
+/// Captions are still recovered from a uniformly formatted PDF; what changed
+/// is what that licenses.
+///
+/// The paragraph-break reference used to be the median gap, which IS the
+/// paragraph gap whenever paragraphs are mostly a single line, so the
+/// threshold sat above every gap in this file and no caption was ever found.
+/// Anchoring it to font size fixes that, and the captions below prove it --
+/// they title the provisions and give the excerpts honest anchors.
+///
+/// They do not license a same-clause answer. A caption marks where a clause
+/// starts and never where it ends, so every PDF is withheld from that claim
+/// regardless of how well its captions read.
 #[test]
-fn a_real_pdf_with_no_structure_signal_is_searchable_but_withheld_from_same_provision() {
+fn a_uniformly_typed_pdf_recovers_its_captions_but_still_withholds_same_clause() {
     let converted = convert_bytes(SourceFormat::Pdf, UNIFORM_SPACING_CAPTIONS).expect("convert");
-    assert!(converted
-        .warnings
-        .iter()
-        .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING));
-
     let normalized = normalize_converted_document(
         DocumentId::parse("uniform-spacing-captions").expect("id"),
         "Uniform Spacing Captions",
         UNIFORM_SPACING_CAPTIONS,
         &converted,
     )
-    .expect("text remains searchable despite inferred boundaries");
+    .expect("normalize");
+
+    assert!(
+        normalized
+            .provisions
+            .iter()
+            .any(|provision| provision.heading.as_deref()
+                == Some("Assignment and Change of Control")),
+        "captions were not recovered: {:?}",
+        normalized
+            .provisions
+            .iter()
+            .map(|provision| provision.heading.as_deref())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        normalized.provisions.len() >= 3,
+        "the captioned clauses did not separate: {}",
+        normalized.provisions.len()
+    );
     assert_eq!(
         normalized.provision_boundaries,
-        ProvisionBoundaries::Inferred
+        ProvisionBoundaries::Inferred,
+        "a PDF never declares where its clauses end, however clear its captions"
     );
+
     let revisions = CurrentRevisionSet::from_documents([&normalized]);
     let mut index =
         LegalIndex::new(VaultId::parse("fixture-vault").expect("vault")).expect("index");
     index.replace_document(&normalized).expect("ingest");
 
-    let exact = LegalQuery {
-        raw: "remember the exact phrase".to_string(),
-        scope: MatchScope::AnywhereInDocument,
-        required_concepts: Vec::new(),
+    // Still findable the honest ways.
+    let exact = index
+        .search(
+            index.vault_id(),
+            LegalQuery {
+                raw: "remember the exact phrase".to_string(),
+                scope: MatchScope::AnywhereInDocument,
+                required_concepts: Vec::new(),
+                excluded_concepts: Vec::new(),
+                exact_phrase: Some("Confidential Information".to_string()),
+                max_sentences: None,
+                limit: 10,
+            },
+            &revisions,
+        )
+        .expect("exact phrase");
+    assert_eq!(exact.documents.len(), 1);
+
+    let same_clause = index
+        .search(
+            index.vault_id(),
+            LegalQuery {
+                raw: "find a confidentiality provision containing assignment".to_string(),
+                scope: MatchScope::SameProvision,
+                required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
+                excluded_concepts: Vec::new(),
+                exact_phrase: None,
+                max_sentences: None,
+                limit: 10,
+            },
+            &revisions,
+        )
+        .expect("same clause");
+    assert!(same_clause.evidence.is_empty());
+    assert_eq!(same_clause.inferred_boundary_evidence_withdrawn, 1);
+}
+
+/// The counterpart to the uniform-type fixture, and the reason a caption has
+/// to introduce something rather than merely follow a wide gap.
+///
+/// This document is double spaced, so its ordinary paragraph gap is far wider
+/// than its line spacing -- wide enough that any gap-only rule marks every
+/// paragraph as a caption. Its signature block is a run of short title-case
+/// paragraphs ("Northwind Holdings International Limited", "By: Jane Ellis",
+/// "Title: Managing Director") which satisfy every word-level test a caption
+/// does. Marking them splits one signature block into six provisions and
+/// invites a same-provision match across two different signatories.
+///
+/// What separates them is what follows: a caption is followed by prose, a
+/// signature line by another short line.
+#[test]
+fn a_double_spaced_signature_block_is_not_a_run_of_captions() {
+    let converted = convert_bytes(SourceFormat::Pdf, DOUBLE_SPACED_SIGNATURE).expect("convert");
+
+    for block in &converted.blocks {
+        let text = block.text.trim();
+        assert!(
+            !(block.is_heading == Some(true)
+                && (text.starts_with("By:")
+                    || text.starts_with("Title:")
+                    || text.ends_with("Limited")
+                    || text.ends_with("Incorporated"))),
+            "a signature-block line was marked as a caption: {text}"
+        );
+    }
+
+    // The real captions in the same document must survive the rule that
+    // rejects the signature block, or this test would pass by detecting
+    // nothing at all.
+    assert!(
+        converted
+            .blocks
+            .iter()
+            .any(|block| block.is_heading == Some(true)
+                && block.text.contains("Assignment and Change of Control")),
+        "the rule rejected the signature block by rejecting every caption too"
+    );
+
+    let normalized = normalize_converted_document(
+        DocumentId::parse("double-spaced-signature").expect("id"),
+        "Double Spaced Signature",
+        DOUBLE_SPACED_SIGNATURE,
+        &converted,
+    )
+    .expect("normalize");
+    for provision in &normalized.provisions {
+        let signatories = ["Jane Ellis", "Peter Nakamura"]
+            .iter()
+            .filter(|name| provision.text.contains(**name))
+            .count();
+        assert!(
+            signatories <= 1 || provision.text.contains("Signed for and on behalf"),
+            "two signatories were merged into one provision:\n{}",
+            provision.text
+        );
+    }
+}
+
+/// Built by an independent reviewer to break an earlier attempt at this, and
+/// kept because it is the sharpest statement of why clause extent in a PDF
+/// cannot be trusted.
+///
+/// The document holds one administrative line, "Attention General Counsel",
+/// and two unheaded operative clauses below it -- confidentiality, then
+/// assignment. Any rule that promotes the notice to a heading marks the whole
+/// file as structured, and the two clauses, having nothing between them the
+/// converter can see, become one provision. A same-clause query then returns a
+/// card joining terms the document never joined.
+///
+/// Better heading detection cannot fix it: a caption marks where a provision
+/// begins and never where it ends. Refusing the claim across a separation the
+/// source did not declare can, and does.
+#[test]
+fn unheaded_clauses_under_one_notice_do_not_answer_a_same_clause_query() {
+    let converted =
+        convert_bytes(SourceFormat::Pdf, UNHEADED_CLAUSES_UNDER_ONE_NOTICE).expect("convert");
+    let normalized = normalize_converted_document(
+        DocumentId::parse("unheaded-clauses").expect("id"),
+        "Unheaded Clauses",
+        UNHEADED_CLAUSES_UNDER_ONE_NOTICE,
+        &converted,
+    )
+    .expect("normalize");
+
+    let revisions = CurrentRevisionSet::from_documents([&normalized]);
+    let mut index =
+        LegalIndex::new(VaultId::parse("fixture-vault").expect("vault")).expect("index");
+    index.replace_document(&normalized).expect("ingest");
+
+    let same_clause = LegalQuery {
+        raw: "find a confidentiality provision containing assignment".to_string(),
+        scope: MatchScope::SameProvision,
+        required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
         excluded_concepts: Vec::new(),
-        exact_phrase: Some("Confidential Information".to_string()),
+        exact_phrase: None,
         max_sentences: None,
         limit: 10,
     };
-    let exact_response = index
-        .search(index.vault_id(), exact, &revisions)
-        .expect("exact phrase");
-    assert_eq!(exact_response.documents.len(), 1);
+    let response = index
+        .search(index.vault_id(), same_clause, &revisions)
+        .expect("same clause");
+    assert!(
+        response.evidence.is_empty(),
+        "a conjunction was asserted across two unheaded clauses:\n{}",
+        response.evidence[0].exact_excerpt
+    );
+    assert_eq!(response.inferred_boundary_evidence_withdrawn, 1);
 
+    // Still findable the honest ways: both terms are in the document, and
+    // withholding the same-clause claim must not withhold the document.
     let document_scope = LegalQuery {
         raw: "find documents containing confidentiality and assignment".to_string(),
         scope: MatchScope::AnywhereInDocument,
@@ -196,23 +368,66 @@ fn a_real_pdf_with_no_structure_signal_is_searchable_but_withheld_from_same_prov
         max_sentences: None,
         limit: 10,
     };
-    let document_response = index
+    let documents = index
         .search(index.vault_id(), document_scope, &revisions)
-        .expect("document conjunction");
-    assert_eq!(document_response.documents.len(), 1);
+        .expect("document scope");
+    assert_eq!(
+        documents.documents.len(),
+        1,
+        "the document itself must stay findable"
+    );
+}
 
-    let same_provision = LegalQuery {
-        raw: "find a confidentiality provision containing assignment".to_string(),
-        scope: MatchScope::SameProvision,
-        required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
-        excluded_concepts: Vec::new(),
-        exact_phrase: None,
-        max_sentences: None,
-        limit: 10,
-    };
-    let same_response = index
-        .search(index.vault_id(), same_provision, &revisions)
-        .expect("same provision");
-    assert!(same_response.evidence.is_empty());
-    assert_eq!(same_response.inferred_boundary_evidence_withdrawn, 1);
+/// The document that retired the paragraph fence.
+///
+/// A reviewer produced it with ReportLab: two separately labelled clauses,
+/// confidentiality and assignment, set at ordinary line spacing. The converter
+/// read paragraph starts as `true, true, false` and put both clauses in one
+/// span, so a rule that confined a same-clause answer to a paragraph still
+/// joined them.
+///
+/// The lesson is that paragraph separation is not reliably visible in a PDF
+/// either, so it cannot carry a safety property. No PDF licenses a same-clause
+/// answer now, whatever its layout suggests.
+#[test]
+fn labelled_clauses_at_uniform_spacing_do_not_answer_a_same_clause_query() {
+    let converted =
+        convert_bytes(SourceFormat::Pdf, LABELLED_CLAUSES_AT_UNIFORM_SPACING).expect("convert");
+    let normalized = normalize_converted_document(
+        DocumentId::parse("labelled-clauses").expect("id"),
+        "Labelled Clauses",
+        LABELLED_CLAUSES_AT_UNIFORM_SPACING,
+        &converted,
+    )
+    .expect("normalize");
+    assert_eq!(
+        normalized.provision_boundaries,
+        ProvisionBoundaries::Inferred,
+        "a PDF never declares where its clauses end"
+    );
+
+    let revisions = CurrentRevisionSet::from_documents([&normalized]);
+    let mut index =
+        LegalIndex::new(VaultId::parse("fixture-vault").expect("vault")).expect("index");
+    index.replace_document(&normalized).expect("ingest");
+    let response = index
+        .search(
+            index.vault_id(),
+            LegalQuery {
+                raw: "confidentiality and assignment in the same provision".to_string(),
+                scope: MatchScope::SameProvision,
+                required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
+                excluded_concepts: Vec::new(),
+                exact_phrase: None,
+                max_sentences: None,
+                limit: 10,
+            },
+            &revisions,
+        )
+        .expect("same clause");
+    assert!(
+        response.evidence.is_empty(),
+        "two labelled clauses were reported as one:\n{}",
+        response.evidence[0].exact_excerpt
+    );
 }

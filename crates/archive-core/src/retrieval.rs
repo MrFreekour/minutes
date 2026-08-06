@@ -230,16 +230,40 @@ pub fn normalize_converted_document(
         converter: match converted.format {
             SourceFormat::Pdf => "pdf-extract-0.12.0-v1",
             SourceFormat::Docx => "docx-xml-0.41.0-v1",
+            // Named with the exact parser version, like the others: a card
+            // cites the converter that produced its excerpt, and these are
+            // pinned so the citation stays true.
+            SourceFormat::Doc => "anydoc-0.1.3-doc-v1",
+            SourceFormat::Odt => "anydoc-0.1.3-odt-v1",
+            SourceFormat::Rtf => "anydoc-0.1.3-rtf-v1",
         }
         .to_string(),
-        provision_boundaries: if converted
-            .warnings
-            .iter()
-            .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING)
-        {
-            ProvisionBoundaries::Inferred
-        } else {
-            ProvisionBoundaries::Declared
+        // Decided by format, not by a warning string.
+        //
+        // This used to read a warning the converter attaches, which made a
+        // hard rule depend on a value any caller could omit: a reviewer built
+        // a markerless PDF `ConvertedDocument`, passed it through this public
+        // function, and got `Declared` and a same-clause answer. File ingestion
+        // was safe only because the shipped converters happen to set the
+        // warning every time. An invariant that a refactor can drop is not an
+        // invariant.
+        //
+        // PDF and RTF record where text sits, not where a clause ends, so
+        // neither can ever declare a boundary. Word, OpenDocument and DOCX
+        // state where their sections begin and are trusted for it.
+        provision_boundaries: match converted.format {
+            SourceFormat::Pdf | SourceFormat::Rtf => ProvisionBoundaries::Inferred,
+            SourceFormat::Docx | SourceFormat::Doc | SourceFormat::Odt => {
+                if converted
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == PDF_UNSUPPORTED_STRUCTURE_WARNING)
+                {
+                    ProvisionBoundaries::Inferred
+                } else {
+                    ProvisionBoundaries::Declared
+                }
+            }
         },
         provisions,
     })
@@ -1568,13 +1592,14 @@ impl LegalIndex {
                         .get::<_, i64>(7)?
                         .try_into()
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, i64::MAX))?;
+                    let body: String = row.get(4)?;
                     Ok(CandidateRow {
                         document_id: DocumentId::parse(row.get::<_, String>(0)?)
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         document_title: row.get(5)?,
                         provision_heading: row.get(3)?,
                         source_anchor: row.get(2)?,
-                        body: row.get(4)?,
+                        body,
                         source_revision: SourceRevision {
                             sha256: row.get(6)?,
                             byte_len: revision_bytes,
@@ -1636,12 +1661,13 @@ impl LegalIndex {
                     .try_into()
                     .map_err(|_| RetrievalError::IndexUnavailable)?,
             };
+            let body: String = row.get(4).map_err(|_| RetrievalError::IndexUnavailable)?;
             candidates.push(CandidateRow {
                 document_id,
                 document_title: row.get(6).map_err(|_| RetrievalError::IndexUnavailable)?,
                 provision_heading: row.get(3).map_err(|_| RetrievalError::IndexUnavailable)?,
                 source_anchor: row.get(2).map_err(|_| RetrievalError::IndexUnavailable)?,
-                body: row.get(4).map_err(|_| RetrievalError::IndexUnavailable)?,
+                body: body.clone(),
                 source_revision: revision,
                 source_converter: row.get(9).map_err(|_| RetrievalError::IndexUnavailable)?,
                 provision_boundaries: provision_boundaries_from_db(
@@ -2348,6 +2374,163 @@ mod tests {
                 .collect(),
             warnings: Vec::new(),
         }
+    }
+
+    /// DOCX declares where clauses begin, so its provisions match whole.
+    ///
+    /// A PDF provision is split into paragraph units because its clause extent
+    /// is a guess. DOCX is not a guess -- `w:pStyle` says where a clause
+    /// starts -- so a conjunction spanning two paragraphs of one clause is a
+    /// real conjunction and must still be answered. Reporting paragraph
+    /// granularity for DOCX would silently narrow it to single paragraphs and
+    /// start withholding answers the file supports, which no other test here
+    /// would notice.
+    /// The PDF/RTF prohibition holds for any caller, not just the converter.
+    ///
+    /// It used to be read off a warning string the converter attaches, which
+    /// made a hard rule depend on a value a caller could omit. A reviewer built
+    /// a PDF `ConvertedDocument` with no warning, passed it through this public
+    /// function, and got declared boundaries and a same-clause answer. File
+    /// ingestion was safe only because the shipped converters set the warning
+    /// every time -- an invariant a refactor could drop is not an invariant.
+    #[test]
+    fn a_markerless_pdf_or_rtf_document_still_cannot_declare_its_boundaries() {
+        for format in [SourceFormat::Pdf, SourceFormat::Rtf] {
+            let converted = anchored(
+                format,
+                vec![
+                    (
+                        Some(true),
+                        "page:0001",
+                        "7. CONFIDENTIALITY",
+                        AnchorFlow::Continue,
+                    ),
+                    (
+                        Some(false),
+                        "page:0001",
+                        "The Recipient shall protect Confidential Information.",
+                        AnchorFlow::Continue,
+                    ),
+                    (
+                        Some(false),
+                        "page:0001",
+                        "Neither party may assign this Agreement.",
+                        AnchorFlow::HardBoundary,
+                    ),
+                ],
+            );
+            assert!(
+                converted.warnings.is_empty(),
+                "this fixture exists to carry no warning"
+            );
+            let normalized = normalize_converted_document(
+                DocumentId::parse("markerless").expect("id"),
+                "Markerless",
+                b"bytes",
+                &converted,
+            )
+            .expect("normalize");
+            assert_eq!(
+                normalized.provision_boundaries,
+                ProvisionBoundaries::Inferred,
+                "{format:?} declared boundaries with no warning present"
+            );
+
+            let revisions = CurrentRevisionSet::from_documents([&normalized]);
+            let mut index =
+                LegalIndex::new(VaultId::parse("markerless-vault").expect("vault")).expect("index");
+            index.replace_document(&normalized).expect("ingest");
+            let response = index
+                .search(
+                    index.vault_id(),
+                    LegalQuery {
+                        raw: "confidentiality and assignment in the same provision".to_string(),
+                        scope: MatchScope::SameProvision,
+                        required_concepts: vec![
+                            LegalConcept::Confidentiality,
+                            LegalConcept::Assignment,
+                        ],
+                        excluded_concepts: Vec::new(),
+                        exact_phrase: None,
+                        max_sentences: None,
+                        limit: 10,
+                    },
+                    &revisions,
+                )
+                .expect("search");
+            assert!(
+                response.evidence.is_empty(),
+                "{format:?} answered a same-clause query"
+            );
+        }
+    }
+
+    #[test]
+    fn a_docx_clause_answers_a_conjunction_spanning_two_of_its_paragraphs() {
+        let converted = anchored(
+            SourceFormat::Docx,
+            vec![
+                (
+                    Some(true),
+                    "paragraph:000001",
+                    "7. CONFIDENTIALITY AND ASSIGNMENT",
+                    AnchorFlow::Continue,
+                ),
+                (
+                    Some(false),
+                    "paragraph:000002",
+                    "The Recipient shall protect Confidential Information at all times.",
+                    AnchorFlow::Continue,
+                ),
+                (
+                    Some(false),
+                    "paragraph:000003",
+                    "Neither party may assign this Agreement without consent.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        let normalized = normalize_converted_document(
+            DocumentId::parse("docx-two-paragraph-clause").expect("id"),
+            "Docx Two Paragraph Clause",
+            b"docx-bytes",
+            &converted,
+        )
+        .expect("normalize");
+        assert_eq!(
+            normalized.provisions.len(),
+            1,
+            "the styled caption should open exactly one clause"
+        );
+
+        let revisions = CurrentRevisionSet::from_documents([&normalized]);
+        let mut index =
+            LegalIndex::new(VaultId::parse("docx-vault").expect("vault")).expect("index");
+        index.replace_document(&normalized).expect("ingest");
+        let response = index
+            .search(
+                index.vault_id(),
+                LegalQuery {
+                    raw: "confidentiality and assignment in the same provision".to_string(),
+                    scope: MatchScope::SameProvision,
+                    required_concepts: vec![
+                        LegalConcept::Confidentiality,
+                        LegalConcept::Assignment,
+                    ],
+                    excluded_concepts: Vec::new(),
+                    exact_phrase: None,
+                    max_sentences: None,
+                    limit: 10,
+                },
+                &revisions,
+            )
+            .expect("search");
+        assert_eq!(
+            response.evidence.len(),
+            1,
+            "a declared clause spanning two paragraphs must still answer"
+        );
+        assert_eq!(response.inferred_boundary_evidence_withdrawn, 0);
     }
 
     #[test]

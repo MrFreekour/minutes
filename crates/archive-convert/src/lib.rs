@@ -34,6 +34,12 @@ const MAX_WORKER_STDERR_BYTES: usize = 4 * 1024;
 pub enum SourceFormat {
     Pdf,
     Docx,
+    /// Binary Word 97-2003.
+    Doc,
+    /// OpenDocument Text.
+    Odt,
+    /// Rich Text Format.
+    Rtf,
 }
 
 impl SourceFormat {
@@ -41,6 +47,9 @@ impl SourceFormat {
         match value {
             "pdf" => Ok(Self::Pdf),
             "docx" => Ok(Self::Docx),
+            "doc" => Ok(Self::Doc),
+            "odt" => Ok(Self::Odt),
+            "rtf" => Ok(Self::Rtf),
             _ => Err(ConversionError::UnsupportedFormat),
         }
     }
@@ -49,6 +58,9 @@ impl SourceFormat {
         match self {
             Self::Pdf => "pdf",
             Self::Docx => "docx",
+            Self::Doc => "doc",
+            Self::Odt => "odt",
+            Self::Rtf => "rtf",
         }
     }
 }
@@ -429,9 +441,107 @@ pub fn convert_bytes(
     let document = match format {
         SourceFormat::Pdf => convert_pdf(bytes)?,
         SourceFormat::Docx => convert_docx(bytes)?,
+        SourceFormat::Doc => convert_via_anydoc(bytes, anydoc::Format::Doc, format)?,
+        SourceFormat::Odt => convert_via_anydoc(bytes, anydoc::Format::Odt, format)?,
+        SourceFormat::Rtf => convert_via_anydoc(bytes, anydoc::Format::Rtf, format)?,
     };
     document.validate()?;
     Ok(document)
+}
+
+/// Convert the word-processor formats that carry legal prose.
+///
+/// Scope is deliberately narrower than the library's. Spreadsheets,
+/// presentations, EPUB and CSV are not routed here: this app segments prose
+/// into clauses and quotes them as evidence, and a worksheet has no clauses to
+/// find. Feeding one through would produce confident-looking cards built from
+/// cell text. PDF is not routed here either -- `to_document` does not support
+/// it, and the existing path keeps glyph geometry, which is the only structure
+/// a PDF has and which Markdown would discard.
+///
+/// The parser is treated as hostile, as every parser here is: it runs in the
+/// converter worker under `(deny default)` seatbelt with `RLIMIT_AS` and
+/// `RLIMIT_CPU` already bound, and only bytes cross that boundary. That matters
+/// more than usual for these formats, whose containers are classic exploit
+/// carriers, and for a dependency this new.
+fn convert_via_anydoc(
+    bytes: &[u8],
+    parser_format: anydoc::Format,
+    format: SourceFormat,
+) -> Result<ConvertedDocument, ConversionError> {
+    let document =
+        anydoc::to_document(bytes, parser_format).map_err(|_| ConversionError::MalformedSource)?;
+
+    let mut blocks = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut ordinal = 0usize;
+    for block in &document.blocks {
+        let (text, is_heading) = match block {
+            anydoc::model::Block::Heading { content, .. } => (inline_text(content), true),
+            anydoc::model::Block::Paragraph(content) => (inline_text(content), false),
+            // Everything else -- tables, lists, code, rules, images -- is
+            // skipped rather than flattened. A table rendered as a run of
+            // sentences reads like prose and would be quoted as a clause.
+            _ => continue,
+        };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        output_bytes = output_bytes
+            .checked_add(text.len())
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ConversionError::OutputBudgetExceeded)?;
+        if output_bytes > MAX_OUTPUT_BYTES || blocks.len() >= MAX_BLOCKS {
+            return Err(ConversionError::OutputBudgetExceeded);
+        }
+        ordinal += 1;
+        blocks.push(ConvertedBlock {
+            source_anchor: format!("paragraph:{ordinal:06}"),
+            text,
+            flow: AnchorFlow::Continue,
+            is_heading: Some(is_heading),
+        });
+    }
+
+    let warnings = if blocks.is_empty() {
+        vec!["ocr_required_or_no_extractable_text".to_string()]
+    } else if format == SourceFormat::Rtf {
+        // RTF is withheld from same-clause answers outright.
+        //
+        // A first attempt keyed this on whether the parsed document contained
+        // a heading, which is the same document-level reasoning that produced
+        // the PDF defect: one outline level anywhere marked the whole file
+        // trustworthy. A reviewer built the RTF that turns that into a wrong
+        // answer, and `\outlinelevel` is in fact recognised, so "RTF declares
+        // no headings" was not true either.
+        //
+        // Word and OpenDocument carry a style system that states which
+        // paragraphs are captions. RTF outline levels are an afterthought most
+        // producers never write, so finding one proves little about the
+        // paragraphs around it.
+        vec![PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()]
+    } else {
+        Vec::new()
+    };
+    Ok(ConvertedDocument {
+        format,
+        blocks,
+        warnings,
+    })
+}
+
+/// Flatten inline runs to their text, following links into their content.
+fn inline_text(inlines: &[anydoc::model::Inline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            anydoc::model::Inline::Text { text, .. } => out.push_str(text),
+            anydoc::model::Inline::Link { content, .. } => out.push_str(&inline_text(content)),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
@@ -465,71 +575,32 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
     }
     let warnings = if blocks.is_empty() {
         vec!["ocr_required_or_no_extractable_text".to_string()]
-    } else if !pdf_has_usable_structure_signal(&blocks) {
-        // A text-only PDF can be perfectly extractable while still being
-        // unsafe to segment: uniform-size, uniformly-spaced title-case
-        // captions are indistinguishable from body prose here. Do not let
-        // retrieval turn that ambiguity into a fabricated conjunction.
-        vec![PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()]
     } else {
-        Vec::new()
+        // Every PDF is withheld from same-clause answers, not only those with
+        // no visible structure.
+        //
+        // Two rules were tried before this one and both were shown wrong by a
+        // reviewer's document. Trusting a file because it contained a heading
+        // let one administrative line vouch for two unrelated clauses.
+        // Confining the claim to a paragraph instead assumed paragraph breaks
+        // are reliably visible, and they are not: a PDF set at ordinary line
+        // spacing reported starts of `true, true, false` and put two labelled
+        // clauses in one span.
+        //
+        // A caption marks where a clause starts and never where it ends, and
+        // nothing in a PDF marks the end. There is no measurement of the page
+        // that closes that gap, so the claim is not made. Everything else about
+        // PDFs still works -- exact phrase, whole-document search, excerpts and
+        // anchors -- and caption detection still improves how provisions are
+        // titled and cited. What it no longer does is license a statement about
+        // two terms sharing a clause.
+        vec![PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()]
     };
     Ok(ConvertedDocument {
         format: SourceFormat::Pdf,
         blocks,
         warnings,
     })
-}
-
-fn pdf_has_usable_structure_signal(blocks: &[ConvertedBlock]) -> bool {
-    blocks.iter().any(|block| {
-        block.is_heading == Some(true)
-            || block
-                .text
-                .lines()
-                .map(str::trim)
-                .any(pdf_lexical_structure_signal)
-    })
-}
-
-/// Keep this deliberately narrower than title-case detection. A short
-/// title-case sentence is the exact shape that pdf-extract cannot distinguish
-/// from body prose in a uniformly formatted PDF.
-fn pdf_lexical_structure_signal(line: &str) -> bool {
-    if line.is_empty() || line.len() > 180 {
-        return false;
-    }
-    let words = line.split_whitespace().collect::<Vec<_>>();
-    if words.is_empty() || words.len() > 12 {
-        return false;
-    }
-    let lowercase = line.to_ascii_lowercase();
-    let known_prefix = ["section ", "article ", "schedule ", "exhibit "]
-        .iter()
-        .any(|prefix| lowercase.starts_with(prefix));
-    let numbered = line.split_once(['.', ')']).is_some_and(|(prefix, rest)| {
-        !rest.trim().is_empty()
-            && prefix.len() <= 12
-            && prefix
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    });
-    let letters = line.chars().filter(|character| character.is_alphabetic());
-    let (letter_count, uppercase_count) = letters.fold((0usize, 0usize), |counts, character| {
-        (
-            counts.0 + 1,
-            counts.1 + usize::from(character.is_uppercase()),
-        )
-    });
-    let uppercase = letter_count >= 4 && uppercase_count == letter_count;
-    let run_in = line.ends_with('.')
-        && letter_count >= 4
-        && words.iter().all(|word| {
-            word.chars()
-                .find(|character| character.is_alphabetic())
-                .is_some_and(char::is_uppercase)
-        });
-    known_prefix || numbered || uppercase || run_in
 }
 
 #[derive(Debug, Default)]
@@ -611,23 +682,68 @@ impl LayoutPage {
 
         let sizes = raw.iter().map(|(_, _, size)| *size).collect::<Vec<_>>();
         let reference_size = median(sizes).unwrap_or(0.0);
-        let gaps = raw
-            .windows(2)
-            .map(|pair| (pair[1].1 - pair[0].1).max(0.0))
+        // Line spacing is a property of the type, not of the document's
+        // paragraph habits: a set line sits at roughly 1.1-1.5x its font size
+        // and a paragraph break is wider. Deriving the threshold from the
+        // median gap assumed most gaps were within-paragraph line spacing,
+        // which is false for any document whose paragraphs are mostly one line
+        // -- there the median IS the paragraph gap, the threshold lands above
+        // every gap in the document, and no break can ever be detected. That
+        // is the whole reason uniformly formatted contracts reported no
+        // structure at all.
+        //
+        // Honest limit of the evidence: with the conditions below in place,
+        // widening this multiplier all the way down to 0.1 does not change the
+        // output of any fixture, so the exact value is not what separates a
+        // caption from body text -- the word-level tests and the "introduces
+        // prose" rule are. It is kept because it states the real requirement,
+        // that a caption begins a paragraph, and because the shape that would
+        // exercise it (a short title-case line mid-paragraph, followed by a
+        // full line of prose) is one no fixture here contains.
+        //
+        // A floor derived from the smallest observed gap was tried here, to
+        // hold the threshold above the leading of a loosely set document. It
+        // was removed: every fixture produced identical output with and
+        // without it, because the "introduces prose" rule below already
+        // rejects what it was guarding against, and an untested branch that
+        // reads as a safeguard is worse than no branch.
+        let paragraph_break_threshold = reference_size * 1.6;
+        // A caption introduces something. That is what separates it from the
+        // other short title-case paragraph in legal documents -- a signature
+        // block line like "By: Jane Ellis" or a party name -- which is
+        // followed by another short line rather than by prose. Gap alone
+        // cannot tell them apart: in a uniformly formatted contract the gap
+        // before a caption and the gap before a body paragraph are the same
+        // number, so a rule that reads only the gap marks the signature block
+        // as a run of headings and splits it into fabricated provisions.
+        let is_short_line = |text: &str| text.split_whitespace().count() <= 8;
+        let followed_by_prose = raw
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                raw.get(index + 1)
+                    .is_some_and(|(next, _, _)| !is_short_line(next))
+            })
             .collect::<Vec<_>>();
-        let reference_gap = median(
-            gaps.into_iter()
-                .filter(|gap| *gap <= reference_size * 3.0)
-                .collect(),
-        )
-        .unwrap_or(reference_size * 1.35);
         let mut previous_y = None;
         raw.into_iter()
-            .map(|(text, y, size)| {
+            .enumerate()
+            .map(|(index, (text, y, size))| {
+                // The first line on a page is deliberately NOT treated as a
+                // paragraph start. It has no preceding line, so it looks like
+                // the strongest possible break -- but a running header sits in
+                // exactly that position on every page, and admitting it marks
+                // furniture as a caption. Tried and reverted: it severed a
+                // carve-out from the cap it limits, which is the fabricated
+                // boundary this whole area exists to prevent. The cost is that
+                // a caption at the top of a page is not flagged here; page
+                // ends are already hard boundaries, so provisions still do not
+                // run together across the break.
                 let leading_gap = previous_y.map_or(0.0, |previous| y - previous);
                 previous_y = Some(y);
-                let geometric_heading = leading_gap > reference_gap * 1.3
-                    && text.split_whitespace().count() <= 8
+                let geometric_heading = leading_gap > paragraph_break_threshold
+                    && followed_by_prose[index]
+                    && is_short_line(&text)
                     && text.split_whitespace().all(|word| {
                         matches!(
                             word.to_ascii_lowercase().as_str(),
@@ -878,6 +994,15 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
                             text,
                             flow: AnchorFlow::Continue,
                             is_heading: Some(paragraph_style),
+                            // Deliberately None, though `w:p` does mark every
+                            // paragraph. This flag sets the unit within which
+                            // retrieval will allow a same-clause claim, and for
+                            // DOCX that unit is the whole provision: `w:pStyle`
+                            // declares where clauses begin, so a conjunction
+                            // spanning two paragraphs of one clause is a real
+                            // conjunction. Reporting paragraphs here would
+                            // narrow DOCX to single paragraphs and refuse
+                            // answers the file supports.
                         });
                     }
                 }

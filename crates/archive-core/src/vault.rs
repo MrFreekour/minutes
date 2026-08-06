@@ -389,7 +389,14 @@ impl AuthorizedTextVault {
         let Ok(before) = file.metadata() else {
             return false;
         };
+        // Link status is rechecked here, not only at indexing. A file that was
+        // singly linked when indexed can be hard-linked from OUTSIDE the
+        // approved root afterwards, and an independent reviewer confirmed the
+        // evidence card kept being returned with nothing withdrawn. Indexing
+        // refused multiply linked files; display did not, so the authority
+        // rule held only at the moment of the build.
         if !cap_identity_matches(&before, source.identity)
+            || cap_metadata_is_multiply_linked(&before)
             || before.len() > MAX_NORMALIZED_DOCUMENT_BYTES as u64
         {
             return false;
@@ -403,7 +410,10 @@ impl AuthorizedTextVault {
         let Ok(after) = file.metadata() else {
             return false;
         };
+        // ...and again after reading, so a link created during the read is
+        // caught too.
         cap_identity_matches(&after, source.identity)
+            && !cap_metadata_is_multiply_linked(&after)
             && after.len() == before.len()
             && SourceRevision::from_bytes(&bytes) == source.indexed_revision
             && relative_source_identity_matches(
@@ -816,6 +826,16 @@ fn build_authorized_vault(
                 SourceKind::Converted(SourceFormat::Docx) => {
                     counters.docx_documents = counters.docx_documents.saturating_add(1);
                 }
+                // Counted with DOCX rather than in a category of their own.
+                // The number exists so counsel can see how much of a folder
+                // became searchable, and "word-processor documents" is the
+                // distinction that carries meaning there; splitting out the
+                // container format would not change any decision.
+                SourceKind::Converted(SourceFormat::Doc)
+                | SourceKind::Converted(SourceFormat::Odt)
+                | SourceKind::Converted(SourceFormat::Rtf) => {
+                    counters.docx_documents = counters.docx_documents.saturating_add(1);
+                }
                 SourceKind::Text => {}
             }
             counters.indexed_bytes = counters
@@ -856,7 +876,9 @@ fn build_authorized_vault(
         semantic_derivatives_persisted: false,
         semantic_model_download_requested: false,
         supported_formats: if converter.is_some() {
-            vec![".docx", ".md", ".pdf", ".text", ".txt"]
+            vec![
+                ".doc", ".docx", ".md", ".odt", ".pdf", ".rtf", ".text", ".txt",
+            ]
         } else {
             vec![".md", ".text", ".txt"]
         },
@@ -882,6 +904,14 @@ fn source_kind(name: &OsStr, converter_available: bool) -> Option<SourceKind> {
         ".md" | ".text" | ".txt" => Some(SourceKind::Text),
         ".pdf" if converter_available => Some(SourceKind::Converted(SourceFormat::Pdf)),
         ".docx" if converter_available => Some(SourceKind::Converted(SourceFormat::Docx)),
+        // Word 97-2003, OpenDocument Text and RTF. A thirty-year practice
+        // keeps most of its older agreements in these, and until now they were
+        // counted as unsupported and never read. `.docm` is deliberately
+        // absent: it is a macro-enabled container, and nothing here needs to
+        // open one to answer a question about a clause.
+        ".doc" if converter_available => Some(SourceKind::Converted(SourceFormat::Doc)),
+        ".odt" if converter_available => Some(SourceKind::Converted(SourceFormat::Odt)),
+        ".rtf" if converter_available => Some(SourceKind::Converted(SourceFormat::Rtf)),
         _ => None,
     }
 }
@@ -969,6 +999,7 @@ fn relative_source_identity_matches(
 mod tests {
     use super::*;
     use crate::approve_roots;
+    use crate::retrieval::MatchScope;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1148,6 +1179,65 @@ mod tests {
             .expect("search");
         assert!(response.evidence.is_empty());
         assert_eq!(response.stale_evidence_withdrawn, 1);
+    }
+
+    // Indexing refuses multiply linked files, but a file singly linked at build
+    // time can be hard-linked from outside the approved root afterwards. An
+    // independent reviewer confirmed the evidence card kept being returned and
+    // nothing was withdrawn, so the root-authority rule held only at build time.
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_created_outside_the_root_after_indexing_withdraws_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, source) = build(&temp);
+        let same_provision = "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.";
+        let anywhere = "Find confidentiality provisions covering affiliates, compelled disclosure, and survival anywhere in the document.";
+        // The two scopes are separate retrieval code paths, so both are
+        // exercised: a fence binding only one leaves the other quoting the
+        // file. Asserted rather than assumed, so a change to query
+        // interpretation cannot quietly collapse this to a single lane.
+        assert_eq!(
+            interpret_legal_query(same_provision).expect("query").scope,
+            MatchScope::SameProvision
+        );
+        assert_eq!(
+            interpret_legal_query(anywhere).expect("query").scope,
+            MatchScope::AnywhereInDocument
+        );
+        // The scopes return through different fields -- provision scope fills
+        // `evidence`, document scope fills `documents` -- so counting only one
+        // silently skips the other lane.
+        let returned =
+            |response: &LegalSearchResponse| response.evidence.len() + response.documents.len();
+        for raw in [same_provision, anywhere] {
+            assert_eq!(
+                returned(&vault.interpret_and_search(raw).expect("search")),
+                1,
+                "the singly linked source must be evidence before the link is created"
+            );
+        }
+
+        let outside = temp.path().join("outside-the-root.txt");
+        fs::hard_link(&source, &outside).expect("hard link");
+
+        for raw in [same_provision, anywhere] {
+            let response = vault.interpret_and_search(raw).expect("search");
+            assert_eq!(returned(&response), 0, "{raw} still quoted the file");
+            assert_eq!(response.stale_evidence_withdrawn, 1, "{raw}");
+        }
+
+        // Withdrawal must track the current link count rather than latching.
+        // A latched refusal would blank a document permanently the first time
+        // anything on the Mac transiently linked it, which is a worse failure
+        // for counsel than the hole this fence closes.
+        fs::remove_file(&outside).expect("remove the outside link");
+        for raw in [same_provision, anywhere] {
+            assert_eq!(
+                returned(&vault.interpret_and_search(raw).expect("search")),
+                1,
+                "the singly linked document did not recover once the link was gone"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -202,6 +202,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           MINUTES_REQUIRE_REAL_CLI_SIDECAR: "1"
+        # Run from the app's package directory: the repo root is a virtual
+        # workspace, so cargo resolves --features against every member, and
+        # minutes-archive-app has neither parakeet nor metal.
+        working-directory: tauri/src-tauri
         run: cargo tauri build --features parakeet,metal,engine-sherpa --bundles app
 
       - name: Sign graph helper inside-out and notarize the final exact app

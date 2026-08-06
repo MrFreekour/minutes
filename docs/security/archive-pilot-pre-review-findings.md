@@ -26,6 +26,8 @@ been probed, what was found, what was changed in response, and — most usefully
 | E2 | Low | A SHA-256 of every matched document's full bytes, plus byte length, ids, and rank, crossed the IPC boundary unrendered. | Fixed in `07bf42c0`. The command returns a projection of the eight fields the interface reads. |
 | I2 | Low | The semantic worker's `mach-lookup` denylist named only the legacy ASL service, leaving `logd`, `diagnosticd` and `launchservicesd` reachable. No leak was observed. | Fixed in `07bf42c0`. |
 | I3 | Low | The converter's sandbox self-test probed only `TcpListener::bind` and a read of `/etc/passwd`, so a regression to `(allow default)` plus one deny would have passed it. | Fixed in `07bf42c0`, matching the hardening the semantic worker already had. |
+| R4 | High | The I1 hard-link fix bound only indexing. A file singly linked at build time and hard-linked from outside the approved root **afterwards** kept being returned as evidence, with `stale_evidence_withdrawn` at zero — the root-authority rule held at build time only. Reviewer executed the exploit end to end. | Fixed. `source_is_current` now rechecks link count before and after reading. The regression test reproduces the reviewer's sequence and fails when both checks are removed. |
+| R5 | Medium | The Peter disclosure said only the folder's *name* could persist, but the app's own security comment — and finding E1 — record the bookmark as carrying every path component, the volume name, and the volume UUID. The disclosure understated the artifact it exists to disclose. | Fixed. The handover text now says full path, parent-folder names, and disk identifier. |
 
 ## What was probed and held
 
@@ -105,9 +107,14 @@ re-run or spend effort elsewhere:
    `/Library`, `/Applications`, `/dev`, `/.vol`. Each requires an explicit
    picker choice, and the stated claim is about home and filesystem roots, but
    the refusal reads as more complete than it is.
-6. **Known retrieval limitation**, disclosed separately in the review packet: a
-   same-provision conjunction can span two adjacent clauses in a PDF that
-   reports no structure. See `archive-pilot-independent-review.md`.
+6. **Known retrieval limitation**, disclosed in the review packet and
+   restated at retrieval rather than at detection. A PDF heading marks where a
+   provision starts and never where it ends, so a same-provision claim is
+   confined to a single paragraph -- the largest span PDF layout actually
+   proves. DOCX declares its clause starts and matches whole provisions. An
+   attempt to fix this by detecting captions better fabricated a conjunction
+   and was reverted; the reviewer's reproduction is now a regression fixture.
+   See `archive-pilot-independent-review.md`.
 
 ## Not reached
 

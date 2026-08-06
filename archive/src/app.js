@@ -305,7 +305,10 @@ function renderVaultSummary(report) {
       report.indexed_documents === 1 ? "" : "s"
     } indexed (${formatBytes(report.indexed_bytes)}). ` +
     `${report.searchable_pdf_documents.toLocaleString()} PDF, ` +
-    `${report.docx_documents.toLocaleString()} DOCX. ` +
+    // One number for every word-processor format. The distinction that
+    // matters to counsel is how much became searchable, not which container
+    // it arrived in.
+    `${report.docx_documents.toLocaleString()} Word or OpenDocument. ` +
     `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
       report.unsupported_files_skipped === 1 ? "" : "s"
     } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
@@ -316,7 +319,7 @@ function renderVaultSummary(report) {
     // does not care about.
     `${inferredBoundaryDocuments.toLocaleString()} indexed document${
       inferredBoundaryDocuments === 1 ? "" : "s"
-    } cannot answer same-clause questions because the file reports no section structure. ` +
+    } cannot answer same-clause questions because the file does not record where a clause ends. ` +
     (report.semantic_retrieval_enabled
       ? `${report.semantic_provisions_indexed.toLocaleString()} provision suggestion vector${
           report.semantic_provisions_indexed === 1 ? "" : "s"
@@ -338,6 +341,12 @@ function describeDroppedSources(report) {
     [report.malformed_text_files_skipped, "were malformed"],
     [report.oversized_files_skipped, "exceeded the size budget"],
     [report.duplicate_files_skipped, "were duplicates"],
+    // Both link counters were tallied and never shown. On de-duplicated or
+    // linked storage every file can carry a second name, so the whole archive
+    // is refused and counsel is told only that fewer documents were indexed
+    // than the folder holds -- a silent, total coverage loss.
+    [report.symlinks_skipped, "were aliases or shortcuts"],
+    [report.hard_links_skipped, "have a second name elsewhere on the disk"],
     [report.metadata_errors, "could not be read"],
     [report.directory_errors, "were in unreadable folders"],
   ].filter(([count]) => count > 0);
@@ -348,8 +357,11 @@ function describeDroppedSources(report) {
   const detail = dropped
     .map(([count, reason]) => `${count.toLocaleString()} ${reason}`)
     .join(", ");
+  // "items", not "documents": `directory_errors` counts folders, and an alias
+  // can point at one, so the aggregate spans more than files. Calling it a
+  // document count would overstate how many documents are missing.
   return (
-    `${total.toLocaleString()} document${total === 1 ? "" : "s"} ` +
+    `${total.toLocaleString()} item${total === 1 ? "" : "s"} ` +
     `${total === 1 ? "was" : "were"} not indexed and cannot be searched ` +
     `(${detail}). Review these before relying on a negative result. `
   );
@@ -365,7 +377,7 @@ async function buildTextVault() {
     elements.queryInterpretation.hidden = true;
     elements.searchStatus.textContent =
       report.indexed_documents === 0
-        ? "No searchable PDF, DOCX, TXT, or Markdown documents were found in the approved locations."
+        ? "No searchable PDF, Word, OpenDocument, RTF, TXT, or Markdown documents were found in the approved locations."
         : "Enter a legal retrieval question. Results are exact source excerpts, not generated answers.";
     showView("search");
     if (report.indexed_documents > 0) {
@@ -550,7 +562,7 @@ function renderSearchResponse(response) {
     (response.inferred_boundary_evidence_withdrawn ?? 0) > 0
       ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} searchable document${
           response.inferred_boundary_evidence_withdrawn === 1 ? "" : "s"
-        } report no section structure, so they were excluded from same-clause questions.`
+        } do not record where a clause ends, so they were excluded from same-clause questions.`
       : "";
   elements.searchStatus.textContent =
     `${verifiedCount.toLocaleString()} current ${resultKind}${

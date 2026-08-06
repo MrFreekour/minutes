@@ -62,7 +62,7 @@
               <span class="step-number">4</span>
               <div>
                 <strong>Search exact evidence</strong>
-                <span>Searchable PDF, DOCX, and text.</span>
+                <span>Searchable PDF, Word, OpenDocument, RTF, and text.</span>
               </div>
             </li>
           </ol>
@@ -215,8 +215,9 @@
                 <strong>Build a temporary document search index</strong>
                 <p>
                   This explicitly opens searchable <code>.pdf</code>,
-                  <code>.docx</code>, <code>.txt</code>, <code>.text</code>,
-                  and <code>.md</code> files. PDF and DOCX bytes go to a
+                  <code>.docx</code>, <code>.doc</code>, <code>.odt</code>,
+                  <code>.rtf</code>, <code>.txt</code>, <code>.text</code>,
+                  and <code>.md</code> files. Every converted byte goes to a
                   bounded, network-denied converter. Exact search plus the
                   revision-pinned macOS semantic model run in separate
                   network-denied workers; source text, FTS rows, and
@@ -251,7 +252,7 @@
             <h2>Building the private document index…</h2>
             <p>
               Reading bounded supported files from the approved locations.
-              PDF and DOCX conversion runs in the network-denied worker. The
+              All document conversion runs in the network-denied worker. The
               index stays in memory, links remain excluded, and the built-in
               macOS sentence model creates suggestion vectors in its own
               network-denied worker. Minutes Archive requests no model download; macOS

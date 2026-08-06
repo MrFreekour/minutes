@@ -81,7 +81,8 @@ const vaultReport = {
   searchable_pdf_documents: 1,
   docx_documents: 1,
   duplicate_files_skipped: 0,
-  symlinks_skipped: 0,
+  symlinks_skipped: 2,
+  hard_links_skipped: 3,
   metadata_errors: 0,
   directory_errors: 0,
   source_content_persisted: false,
@@ -308,6 +309,14 @@ try {
           !body.includes("Closing the window ends the session and discards the index")
         ) {
           throw new Error("Evidence provenance or session-disposal notice did not render");
+        }
+        const vaultSummary = document.querySelector("#vault-summary").textContent;
+        if (
+          !vaultSummary.includes("2 were aliases or shortcuts") ||
+          !vaultSummary.includes("3 have a second name elsewhere on the disk") ||
+          !vaultSummary.includes("5 items were not indexed")
+        ) {
+          throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }
         if (body.includes("/Users/") || body.includes("SYNTHETIC_CONTENT_CANARY")) {
           throw new Error("A path or source canary crossed the UI boundary");

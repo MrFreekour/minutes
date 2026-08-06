@@ -84,31 +84,53 @@ are listed so the reviewer tests them deliberately rather than discovering them
 as surprises, and so the boundary between "known and bounded" and "stop-ship"
 is drawn by the reviewer rather than assumed.
 
-**A same-provision conjunction can span two adjacent clauses in a PDF that
-reports no structure.** The segmenter closes a provision at a heading. Where a
-PDF has one uniform font size and section captions that no lexical rule
-recognises -- title case, no numbering -- neither the file nor the text offers
-a boundary, and a provision can run past the end of one clause into the next.
-A conjunction is then asserted across text the document never joined.
+**No PDF or RTF answers a same-provision query.** A caption marks where a
+clause starts and never where it ends, and nothing in a PDF marks the end.
 
-Scope and mitigation, all verified:
+Two narrower rules were tried and an independent reviewer defeated both. The
+first trusted a document because it contained a heading, so one administrative
+line vouched for two unrelated clauses. The second confined the claim to a
+paragraph, which assumed paragraph breaks are reliably visible; a ReportLab PDF
+of two separately labelled clauses at ordinary line spacing reported starts of
+`true, true, false` and put both in one span. Both reproductions are checked in
+as `unheaded-clauses-under-one-notice.pdf` and
+`labelled-clauses-at-uniform-spacing.pdf`.
 
-- DOCX is unaffected: `w:pStyle` reports the structure directly.
-- PDFs with numbered captions ("7. CONFIDENTIALITY") or real heading styles
-  are unaffected.
-- The excerpt is always displayed, so the reader can see both clauses. This is
-  a visible overstatement, not a hidden one.
-- Cards making a conjunction claim on a provision with no caption now say so:
-  "This provision carries no section caption, so its extent was inferred from
-  the page layout; check the excerpt that the terms are in one clause."
+RTF is withheld on the same basis, and the accurate statement is that its
+structure signals are not trusted as complete clause boundaries rather than
+that it records none: `\outlinelevel` IS recognised by this parser. The first
+attempt keyed on whether the parsed file contained a heading -- the same
+document-level reasoning -- so a single outline level switched a whole file to
+whole-provision matching. `an_rtf_carrying_an_outline_level_is_still_withheld`
+pins that closed.
 
-A reproduction is checked in at `tests/fixtures/archive-real-pdf/list-tail-merge.pdf`
-with an `#[ignore]`d test in `crates/archive-core/tests/real_pdf_segmentation.rs`.
-A geometric converter that fixed this was built, reviewed, and reverted: it
-silently deleted section captions from documents with no running header, which
-is worse. The reviewer should judge whether the disclosure is sufficient for
-the pilot or whether this is stop-ship under "make a materially broader claim
-than the tested format and location coverage".
+The prohibition is enforced on `SourceFormat`, not on a converter warning. It
+previously read a warning string, which let a reviewer pass a markerless PDF
+`ConvertedDocument` through the public normalizer and obtain declared
+boundaries and a same-clause answer; ingestion was safe only because the
+shipped converters always set it.
+`a_markerless_pdf_or_rtf_document_still_cannot_declare_its_boundaries` covers
+that, and the paragraph-unit machinery that made the bypass reachable is
+deleted rather than left in place looking like policy.
+
+What remains for PDFs: exact phrase, whole-document search, excerpts, and page
+or section anchors. Caption recovery from uniformly formatted PDFs is retained
+because it titles and cites provisions accurately; it simply no longer licenses
+a same-clause claim.
+
+**Word, OpenDocument and DOCX do answer, on their declared structure, and the
+reviewer's objection applies to them.** A `w:pStyle` heading proves a section
+starts there, not that every paragraph beneath it is one legal clause. An
+agreement with numbered sub-clauses set as body text under a single styled
+heading will be treated as one clause. This is the contract DOCX has had since
+the candidate that two rounds found fit, and `.doc` and `.odt` now inherit it
+rather than introducing it -- verified by converting the reviewer's own
+reproduction to `.docx` and observing identical behaviour. It is disclosed to
+the attorney in those terms, alongside the instruction to read the excerpt.
+
+The reviewer should judge whether that residual is acceptable, and should note
+that meaning-similarity suggestions embed and return the whole provision; they
+carry a "not a determination" label and are not the same-clause path.
 
 **PDF page-boundary segmentation is layout-derived.** Provision extents in PDFs
 come from page and paragraph layout, not from a structure the file declares.

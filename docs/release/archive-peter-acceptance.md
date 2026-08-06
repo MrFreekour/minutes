@@ -56,11 +56,17 @@ cloud item, or protected location was unavailable.
 
 ## Expected pilot limitations
 
-The initial searchable formats are searchable PDF, DOCX, TXT, TEXT, and
-Markdown. Scanned PDFs are reported as requiring OCR. Legacy Word, WordPerfect,
-Pages packages, PST/OLM/MSG mail containers, spreadsheets, presentations,
-encrypted documents, and other unsupported formats remain coverage signals,
-not searchable claims.
+The searchable formats are searchable PDF, Word (`.docx` and legacy `.doc`),
+OpenDocument Text (`.odt`), Rich Text Format (`.rtf`), TXT, TEXT, and Markdown.
+Scanned PDFs are reported as requiring OCR.
+
+WordPerfect, Pages packages, PST/OLM/MSG mail containers, spreadsheets,
+presentations, macro-enabled documents (`.docm`), encrypted documents, and
+other unsupported formats remain coverage signals, not searchable claims.
+Spreadsheets and presentations are excluded deliberately rather than for want
+of a parser: this tool segments prose into clauses and quotes them as evidence,
+and a worksheet has no clauses to find, so putting one through would produce
+confident-looking results assembled from cell text.
 
 Search results are research assistance. They are exact retrieved excerpts, not
 legal conclusions, and Peter reviews the source before use. Meaning-similar
@@ -73,8 +79,8 @@ These are accepted, disclosed limitations of the pilot, not defects to be
 discovered. The operator states both in plain language when handing over the
 app. Neither should be softened.
 
-**1. If the app is force-quit or crashes, the name of the folder you chose may
-remain on your Mac until you next open the app.**
+**1. If the app is force-quit or crashes, the location of the folder you chose
+may remain on your Mac until you next open the app.**
 
 When you click "choose folder", macOS itself remembers the last folder you
 picked. That is a standard macOS behaviour, not something Minutes Archive asks
@@ -82,24 +88,42 @@ for, and it cannot be switched off. The app erases that record when it closes
 normally, and again the next time it opens. Neither erase can run if the app is
 force-quit or crashes.
 
-What could remain is the folder's NAME -- not any document, not any text from a
-document, and nothing is ever sent anywhere. It sits in the app's own settings
-file on your Mac. In a law practice a folder name is often a client name, which
-is why this is stated rather than left unsaid. Opening Minutes Archive again
-clears it.
+What could remain is the folder's FULL PATH -- its name, the names of every
+folder above it, and the name and identifier of the disk it is on. It is not any
+document, not any text from a document, and nothing is ever sent anywhere. It
+sits in the app's own settings file on your Mac. In a law practice those folder
+names are often client names, which is why this is stated rather than left
+unsaid. Opening Minutes Archive again clears it.
 
-**2. Some PDFs can be searched but cannot answer "in the same clause"
-questions.**
+**2. PDFs and RTFs never answer "in the same clause".**
 
-Word documents record where each section begins. Many PDFs do not: if every
-line is the same size and headings are not numbered, there is genuinely no way
-to tell where one clause ends and the next starts.
+Word and OpenDocument files record where each section begins. PDF and RTF do
+not. A PDF records only where ink sits on the page; RTF can carry an outline
+marker, but so few programs write one that the app does not treat it as a
+reliable statement of where clauses divide.
 
-For those documents the app will not claim two terms appear in the same clause,
-because it cannot know that. They remain fully searchable -- by exact phrase,
-and by "which documents mention X and Y" -- and the app reports how many
-documents this applies to. This is deliberate: a wrong "same clause" answer to a
-lawyer is worse than no answer.
+The app reads clause captions out of a PDF's layout, and often recovers them
+well enough to title and cite a result by clause -- though not always, and it
+does not promise to. What it can never do is tell where a clause *ends*: a
+caption shows where one starts, and nothing in the page marks the finish. Two
+attempts were made to work around that and an independent reviewer defeated
+both, each time with a document that produced a confident and wrong answer. So
+the app no longer makes that claim about a PDF or an RTF at all.
+
+Everything else about them still works: exact phrase, "which documents mention
+X and Y", excerpts, and page or section citations. What you will not get is
+"these two things are in the same clause".
+
+**Word and OpenDocument answer it, with one thing to know.** Those files state
+where their sections begin, so the app trusts them. What a Word heading proves
+is that a *section* starts there -- not that everything beneath it is a single
+legal clause. If an agreement puts several numbered sub-clauses under one Word
+heading without styling them as headings themselves, the app treats that whole
+section as one clause and may report two of those sub-clauses as sharing it.
+Read the excerpt, which is always shown, before relying on such an answer.
+
+This is deliberate throughout: a wrong "same clause" answer to a lawyer is
+worse than no answer.
 
 ## Stop and contact the pilot operator
 
