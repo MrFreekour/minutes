@@ -9,6 +9,8 @@ const elements = {
   emptyLocations: document.querySelector("#empty-locations"),
   locationList: document.querySelector("#location-list"),
   addLocations: document.querySelector("#add-locations"),
+  skipFolders: document.querySelector("#skip-folders"),
+  clearSkipped: document.querySelector("#clear-skipped"),
   runCensus: document.querySelector("#run-census"),
   cancelCensus: document.querySelector("#cancel-census"),
   cancelIndexing: document.querySelector("#cancel-indexing"),
@@ -90,6 +92,9 @@ function showView(name) {
 
 function setLocationControlsDisabled(disabled) {
   elements.addLocations.disabled = disabled;
+  // Nothing to skip until there is a location to skip inside of.
+  elements.skipFolders.disabled = disabled || locations.length === 0;
+  elements.clearSkipped.disabled = disabled;
   elements.runCensus.disabled = disabled || locations.length === 0;
   for (const button of elements.locationList.querySelectorAll("button")) {
     button.disabled = disabled;
@@ -130,6 +135,7 @@ function renderLocations(nextLocations) {
   }
 
   elements.runCensus.disabled = locations.length === 0;
+  elements.skipFolders.disabled = locations.length === 0;
   elements.setupStatus.textContent =
     locations.length === 0
       ? "Choose at least one location to continue."
@@ -154,6 +160,72 @@ async function chooseLocations() {
         choice.folded === 1 ? "it is" : "they are"
       } covered by that one.`;
     }
+    lastReport = null;
+    vaultReport = null;
+  } catch (error) {
+    showError(error);
+  } finally {
+    setLocationControlsDisabled(false);
+  }
+}
+
+/// Folders chosen here are never read during a build.
+///
+/// The panel is the same native one used for locations, so the interface still
+/// receives no path -- only counts. Every outcome is reported, including the
+/// ones that did nothing: an operator who believes a folder is being skipped
+/// and is wrong ends up with an index they cannot account for.
+async function chooseSkippedFolders() {
+  hideError();
+  setLocationControlsDisabled(true);
+  try {
+    const choice = await invoke("choose_archive_exclusions");
+    // Skipping is reversible, and the way back has to be visible: a folder
+    // skipped by mistake is a folder silently missing from every search.
+    elements.clearSkipped.hidden = choice.total === 0;
+    const notes = [];
+    if (choice.skipped > 0) {
+      notes.push(
+        `${choice.total.toLocaleString()} folder${
+          choice.total === 1 ? "" : "s"
+        } will be skipped when the index is built.`,
+      );
+    }
+    if (choice.outside > 0) {
+      notes.push(
+        `${choice.outside.toLocaleString()} ${
+          choice.outside === 1 ? "folder is" : "folders are"
+        } not inside an approved location, so ${
+          choice.outside === 1 ? "it was" : "they were"
+        } not added.`,
+      );
+    }
+    if (choice.refusedWholeLocation > 0) {
+      notes.push(
+        "A whole approved location cannot be skipped — remove the location instead.",
+      );
+    }
+    if (notes.length > 0) {
+      elements.setupStatus.textContent = notes.join(" ");
+    }
+    lastReport = null;
+    vaultReport = null;
+  } catch (error) {
+    showError(error);
+  } finally {
+    setLocationControlsDisabled(false);
+  }
+}
+
+async function clearSkippedFolders() {
+  hideError();
+  setLocationControlsDisabled(true);
+  try {
+    const cleared = await invoke("clear_archive_exclusions");
+    elements.clearSkipped.hidden = true;
+    elements.setupStatus.textContent = `${cleared.toLocaleString()} skipped folder${
+      cleared === 1 ? "" : "s"
+    } restored. Every approved location will be read whole.`;
     lastReport = null;
     vaultReport = null;
   } catch (error) {
@@ -848,6 +920,8 @@ async function bootstrap() {
 }
 
 elements.addLocations.addEventListener("click", chooseLocations);
+elements.skipFolders.addEventListener("click", chooseSkippedFolders);
+elements.clearSkipped.addEventListener("click", clearSkippedFolders);
 elements.runCensus.addEventListener("click", runCensus);
 elements.cancelCensus.addEventListener("click", () => cancelOperation(elements.cancelCensus));
 elements.cancelIndexing.addEventListener("click", () => cancelOperation(elements.cancelIndexing));

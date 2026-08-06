@@ -8,7 +8,7 @@ use minutes_archive_core::retrieval::{LegalSearchResponse, VaultId};
 use minutes_archive_core::vault::BuildProgress;
 use minutes_archive_core::vault::{
     build_authorized_document_vault, AuthorizedDocumentVault, DocumentVaultBuildReport,
-    DocumentVaultLimits,
+    DocumentVaultLimits, ExcludedFolder,
 };
 use minutes_archive_core::{
     authorize_roots, reduce_approved_roots, scan_approved_roots, validate_approved_roots,
@@ -57,6 +57,12 @@ struct ScanControl {
 #[derive(Debug, Default)]
 struct SessionState {
     locations: Vec<ApprovedLocation>,
+    /// Folders inside approved locations that the build must not enter.
+    ///
+    /// Chosen through the same native panel as the locations themselves, so a
+    /// folder path still never crosses into the webview in either direction --
+    /// the interface asks for the panel and is told a count.
+    exclusions: Vec<SessionExclusion>,
     last_report: Option<CensusReport>,
     text_vault: Option<AuthorizedDocumentVault>,
     scan: ScanControl,
@@ -297,12 +303,202 @@ async fn choose_archive_locations(
         }
     }
     session.locations = locations;
+    // A location folded into one that covers it takes its skipped folders with
+    // it. They were named relative to a root that is no longer in the list, and
+    // silently reattaching them to the containing root would skip folders the
+    // owner never pointed at.
+    let surviving_ids = session
+        .locations
+        .iter()
+        .map(|location| location.id)
+        .collect::<Vec<_>>();
+    session
+        .exclusions
+        .retain(|exclusion| surviving_ids.contains(&exclusion.location_id));
     session.last_report = None;
     session.text_vault = None;
     Ok(LocationChoice {
         folded,
         locations: location_summaries(&session.locations),
     })
+}
+
+/// A skipped folder, held against the location's stable id rather than its
+/// position in the list.
+///
+/// `ExcludedFolder` names its root by index, which is correct for one build and
+/// wrong to store: removing a location, or folding one into a folder that
+/// covers it, renumbers everything after it, and an exclusion would quietly
+/// start skipping a folder in some other location. The index is derived at
+/// build time from the list as it stands then, and an exclusion whose location
+/// is gone simply does not appear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionExclusion {
+    location_id: u64,
+    relative_path: std::path::PathBuf,
+}
+
+/// Resolves stored exclusions against the locations as they stand right now.
+fn exclusions_for_build(session: &SessionState) -> Vec<ExcludedFolder> {
+    session
+        .exclusions
+        .iter()
+        .filter_map(|exclusion| {
+            let root_index = session
+                .locations
+                .iter()
+                .position(|location| location.id == exclusion.location_id)?;
+            Some(ExcludedFolder {
+                root_index,
+                relative_path: exclusion.relative_path.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What a round of the "skip folders" panel did.
+///
+/// Counts only. `outside` is the number of chosen folders that are not inside
+/// any approved location -- they are not silently dropped, because an operator
+/// who believes a folder is being skipped and is wrong ends up with an index
+/// they cannot account for.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExclusionChoice {
+    skipped: usize,
+    outside: usize,
+    refused_whole_location: usize,
+    /// Every folder currently being skipped, counted here rather than tallied
+    /// by the interface. A running total kept on the other side of the boundary
+    /// drifts the moment a location is removed, and a confidently wrong count
+    /// of what is being skipped is worse than none.
+    total: usize,
+}
+
+/// Choose folders inside approved locations that the build must not read.
+///
+/// A thirty-year archive is not uniformly relevant: the folder that prompted
+/// this held 2,873 screenshots and screen recordings, which cost OCR time and
+/// index nothing an attorney would search for. The alternative was to approve
+/// the parent whole or not at all.
+#[tauri::command]
+async fn choose_archive_exclusions(
+    app: tauri::AppHandle,
+    state: State<'_, ArchiveState>,
+) -> Result<ExclusionChoice, String> {
+    {
+        let session = state.session.lock().map_err(|_| lock_error())?;
+        ensure_scan_idle(&session)?;
+        if session.locations.is_empty() {
+            return Err("Approve at least one location before choosing what to skip.".to_string());
+        }
+    }
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Choose folders to skip")
+        .blocking_pick_folders();
+    native_panel_state::forget();
+    let Some(selected) = selected else {
+        let session = state.session.lock().map_err(|_| lock_error())?;
+        return Ok(ExclusionChoice {
+            skipped: 0,
+            outside: 0,
+            refused_whole_location: 0,
+            total: session.exclusions.len(),
+        });
+    };
+
+    let mut session = state.session.lock().map_err(|_| lock_error())?;
+    ensure_scan_idle(&session)?;
+    let mut choice = ExclusionChoice {
+        skipped: 0,
+        outside: 0,
+        refused_whole_location: 0,
+        total: 0,
+    };
+
+    for path in selected {
+        let Ok(path) = path.into_path() else {
+            choice.outside += 1;
+            continue;
+        };
+        let Ok(canonical) = fs::canonicalize(&path) else {
+            choice.outside += 1;
+            continue;
+        };
+        let Some((root_index, location_id, relative)) = session
+            .locations
+            .iter()
+            .enumerate()
+            .find_map(|(index, location)| {
+                canonical
+                    .strip_prefix(location.root.canonical_path())
+                    .ok()
+                    .map(|relative| (index, location.id, relative.to_path_buf()))
+            })
+        else {
+            choice.outside += 1;
+            continue;
+        };
+        // An empty relative path is the approved location itself. Excluding it
+        // would silently index nothing from that location while it still sat
+        // in the list looking approved; removing the location says the same
+        // thing honestly.
+        if relative.as_os_str().is_empty() {
+            choice.refused_whole_location += 1;
+            continue;
+        }
+        // The prefix match above is on strings. Confirm it by identity before
+        // trusting it, the same way roots are compared: the folder reached by
+        // rejoining the relative path to the root must be the folder that was
+        // actually picked.
+        let rejoined = session.locations[root_index]
+            .root
+            .canonical_path()
+            .join(&relative);
+        let same_folder = fs::metadata(&rejoined)
+            .ok()
+            .zip(fs::metadata(&canonical).ok())
+            .is_some_and(|(left, right)| {
+                use std::os::unix::fs::MetadataExt;
+                left.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
+            });
+        if !same_folder {
+            choice.outside += 1;
+            continue;
+        }
+
+        let exclusion = SessionExclusion {
+            location_id,
+            relative_path: relative,
+        };
+        if !session.exclusions.contains(&exclusion) {
+            session.exclusions.push(exclusion);
+        }
+        choice.skipped += 1;
+    }
+
+    if choice.skipped > 0 {
+        session.last_report = None;
+        session.text_vault = None;
+    }
+    choice.total = session.exclusions.len();
+    Ok(choice)
+}
+
+/// Forget every skipped folder, so the next build reads the locations whole.
+#[tauri::command]
+fn clear_archive_exclusions(state: State<'_, ArchiveState>) -> Result<usize, String> {
+    let mut session = state.session.lock().map_err(|_| lock_error())?;
+    ensure_scan_idle(&session)?;
+    let cleared = session.exclusions.len();
+    session.exclusions.clear();
+    if cleared > 0 {
+        session.last_report = None;
+        session.text_vault = None;
+    }
+    Ok(cleared)
 }
 
 #[tauri::command]
@@ -319,6 +515,12 @@ fn remove_archive_location(
     if session.locations.len() == before {
         return Err("That approved location is no longer available.".to_string());
     }
+    // Skipped folders belong to the location that contained them. Leaving them
+    // behind means a later location could inherit them by id reuse, and it
+    // makes the count of what is being skipped a lie.
+    session
+        .exclusions
+        .retain(|exclusion| exclusion.location_id != location_id);
     session.last_report = None;
     session.text_vault = None;
     Ok(location_summaries(&session.locations))
@@ -479,7 +681,7 @@ async fn build_archive_text_vault(
     state: State<'_, ArchiveState>,
 ) -> Result<DocumentVaultBuildReport, String> {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let roots = {
+    let (roots, exclusions) = {
         let mut session = state.session.lock().map_err(|_| lock_error())?;
         if session.locations.is_empty() {
             return Err("Choose at least one archive location first.".to_string());
@@ -495,11 +697,15 @@ async fn build_archive_text_vault(
         session.scan.running = true;
         session.scan.cancelled = Some(Arc::clone(&cancelled));
         session.text_vault = None;
-        session
+        // Resolved here, against the location list as it stands, so a stored
+        // exclusion can never point at a location that has since moved.
+        let exclusions = exclusions_for_build(&session);
+        let roots = session
             .locations
             .iter()
             .map(|location| location.root.clone())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (roots, exclusions)
     };
 
     let worker_executable = std::env::current_exe()
@@ -534,7 +740,10 @@ async fn build_archive_text_vault(
         build_authorized_document_vault(
             vault_id,
             &roots,
-            DocumentVaultLimits::default(),
+            DocumentVaultLimits {
+                excluded_paths: exclusions,
+                ..DocumentVaultLimits::default()
+            },
             &cancelled,
             &converter,
             transcriber.as_ref(),
@@ -978,6 +1187,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             archive_bootstrap,
             choose_archive_locations,
+            choose_archive_exclusions,
+            clear_archive_exclusions,
             remove_archive_location,
             run_archive_census,
             cancel_archive_census,
@@ -1279,6 +1490,60 @@ mod tests {
         );
         assert!(!serialized.contains("client-alpha"));
         assert!(!serialized.contains("client-beta"));
+    }
+
+    /// A skipped folder must follow its location, not its position.
+    ///
+    /// Exclusions are stored against the location's stable id and resolved to a
+    /// root index only at build time. Storing the index instead would mean that
+    /// removing the first location silently moved every exclusion onto whatever
+    /// location took its place -- folders the owner never pointed at would stop
+    /// being read, with only a count to show for it, which is the one failure
+    /// this build cannot have.
+    #[test]
+    fn a_skipped_folder_follows_its_location_when_the_list_changes() {
+        let temp = TempDir::new().expect("temp");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).expect("first");
+        fs::create_dir(&second).expect("second");
+        let mut roots = approve_roots(&[first, second]).expect("approve synthetic roots");
+        let mut session = SessionState {
+            locations: vec![
+                ApprovedLocation {
+                    id: 7,
+                    root: roots.remove(0),
+                },
+                ApprovedLocation {
+                    id: 8,
+                    root: roots.remove(0),
+                },
+            ],
+            exclusions: vec![SessionExclusion {
+                location_id: 8,
+                relative_path: std::path::PathBuf::from("attachments"),
+            }],
+            ..SessionState::default()
+        };
+
+        let resolved = exclusions_for_build(&session);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].root_index, 1, "second location is at index 1");
+
+        // Drop the first location. The exclusion still belongs to location 8,
+        // which has moved to index 0.
+        session.locations.retain(|location| location.id != 7);
+        let resolved = exclusions_for_build(&session);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].root_index, 0,
+            "the exclusion followed its location instead of staying at index 1"
+        );
+
+        // Drop the location it belongs to. The exclusion resolves to nothing
+        // rather than attaching itself to a location that never had it.
+        session.locations.clear();
+        assert!(exclusions_for_build(&session).is_empty());
     }
 
     #[test]

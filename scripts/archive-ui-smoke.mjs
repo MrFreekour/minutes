@@ -218,6 +218,13 @@ const mockScript = `
             // batch and clear the list.
             folded: 1,
           },
+          choose_archive_exclusions: {
+            skipped: 1,
+            outside: 1,
+            refusedWholeLocation: 0,
+            total: 3,
+          },
+          clear_archive_exclusions: 0,
           remove_archive_location: [],
           run_archive_census: census,
           cancel_archive_census: true,
@@ -334,6 +341,31 @@ try {
         if (!document.querySelector("#setup-status").textContent.includes("already inside a folder you approved")) {
           throw new Error("The folded location was not accounted for");
         }
+        // Skipping folders is reachable only once a location exists, and it
+        // must report both what it skipped and what it could not.
+        if (document.querySelector("#skip-folders").disabled) {
+          throw new Error("Skip folders stayed disabled with a location approved");
+        }
+        document.querySelector("#skip-folders").click();
+        await waitFor(
+          () => document.querySelector("#setup-status").textContent.includes("will be skipped"),
+          "skipped folders",
+        );
+        if (!document.querySelector("#setup-status").textContent.includes("3 folders")) {
+          throw new Error("The skipped count came from the interface, not the native side");
+        }
+        if (!document.querySelector("#setup-status").textContent.includes("not inside an approved location")) {
+          throw new Error("A folder outside every approved location was dropped silently");
+        }
+        // The way back must be visible once something is skipped.
+        if (document.querySelector("#clear-skipped").hidden) {
+          throw new Error("Skipped folders cannot be undone from the interface");
+        }
+        document.querySelector("#clear-skipped").click();
+        await waitFor(
+          () => document.querySelector("#setup-status").textContent.includes("read whole"),
+          "cleared skipped folders",
+        );
         document.querySelector("#run-census").click();
         await waitFor(() => !document.querySelector("#results-view").hidden, "census result");
         if (!document.querySelector("#result-summary").textContent.includes("without reading")) {

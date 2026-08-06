@@ -34,11 +34,27 @@ use thiserror::Error;
 
 pub const DOCUMENT_VAULT_SCHEMA: &str = "minutes.archive-document-vault.v1";
 
+/// One folder the build must not enter, named within the root that contains it.
+///
+/// Bound to a single approved root on purpose. An exclusion used to be just a
+/// relative path, which the walk compared against whichever root it happened to
+/// be walking -- so skipping "attachments" in a notes vault also skipped an
+/// unrelated `attachments` folder sitting at the top of a *different* approved
+/// root, and the only trace was a count. Silently dropping documents an
+/// attorney believes are indexed is the one failure this build cannot have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedFolder {
+    /// Position of the approved root this exclusion belongs to.
+    pub root_index: usize,
+    /// Path of the folder relative to that root.
+    pub relative_path: PathBuf,
+}
+
 // No longer `Copy`: the exclusion list owns its paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextVaultLimits {
-    /// Folders, relative to an approved root, that the build must not enter.
-    pub excluded_paths: Vec<PathBuf>,
+    /// Folders the build must not enter, each within one approved root.
+    pub excluded_paths: Vec<ExcludedFolder>,
     pub max_documents: usize,
     pub max_total_bytes: u64,
     pub max_directories: u64,
@@ -781,16 +797,16 @@ fn build_authorized_vault(
                 //
                 // The only unit of choice used to be a whole approved folder,
                 // so a notes vault with 2,873 screenshots and recordings under
-                // one subfolder had to be indexed whole or not at all. Matched
-                // on the relative path from the approved root, so excluding
-                // "attachments" excludes that folder and everything under it
-                // without touching a folder of the same name elsewhere.
+                // one subfolder had to be indexed whole or not at all. An
+                // exclusion names one folder inside one root: it covers that
+                // folder and everything beneath it, and a folder of the same
+                // name in another approved root is untouched.
                 let relative = current.relative_path.join(&name);
-                if limits
-                    .excluded_paths
-                    .iter()
-                    .any(|excluded| relative == *excluded || relative.starts_with(excluded))
-                {
+                if limits.excluded_paths.iter().any(|excluded| {
+                    excluded.root_index == current.root_index
+                        && (relative == excluded.relative_path
+                            || relative.starts_with(&excluded.relative_path))
+                }) {
                     counters.excluded_directories = counters.excluded_directories.saturating_add(1);
                     continue;
                 }
@@ -1792,18 +1808,26 @@ mod tests {
     /// reading. An index of what fits, labelled as partial, is worth having.
     /// Cancellation still discards, because there the operator asked to stop
     /// and half an index they did not ask for is not a favour.
-    /// An excluded folder is not entered, and a folder of the same name
-    /// elsewhere is untouched.
+    /// An excluded folder is not entered, and every namesake is kept.
     ///
     /// The only unit of choice was a whole approved root, so a notes vault
     /// with thousands of screenshots under one subfolder had to be taken whole
     /// or not at all.
+    ///
+    /// Two namesakes are checked, because they failed differently. A nested
+    /// `matters/attachments` was always safe: the comparison is against the
+    /// path from the root, not the folder name. `attachments` at the top of a
+    /// *second* approved root was not -- the exclusion carried no root, so the
+    /// walk compared it against whichever root it was in, and the second
+    /// folder disappeared with nothing but a count to say so.
     #[test]
-    fn an_excluded_folder_is_not_entered_and_its_namesake_is_kept() {
+    fn an_excluded_folder_is_not_entered_and_its_namesakes_are_kept() {
         let temp = TempDir::new().expect("temp");
         let root = temp.path().join("approved");
+        let other = temp.path().join("other-approved");
         fs::create_dir_all(root.join("attachments")).expect("attachments");
         fs::create_dir_all(root.join("matters/attachments")).expect("nested namesake");
+        fs::create_dir_all(other.join("attachments")).expect("second-root namesake");
         fs::write(root.join("keep.txt"), "ASSIGNMENT\nNo assignment.").expect("keep");
         fs::write(
             root.join("attachments/skip.txt"),
@@ -1815,13 +1839,21 @@ mod tests {
             "ASSIGNMENT\nNo assignment.",
         )
         .expect("namesake");
+        fs::write(
+            other.join("attachments/keep-as-well.txt"),
+            "ASSIGNMENT\nNo assignment.",
+        )
+        .expect("second-root namesake file");
 
-        let approved = approve_roots(&[root]).expect("approve");
+        let approved = approve_roots(&[root, other]).expect("approve");
         let vault = build_authorized_text_vault(
             VaultId::parse("excluding").expect("vault"),
             &approved,
             TextVaultLimits {
-                excluded_paths: vec![PathBuf::from("attachments")],
+                excluded_paths: vec![ExcludedFolder {
+                    root_index: 0,
+                    relative_path: PathBuf::from("attachments"),
+                }],
                 ..TextVaultLimits::default()
             },
             &AtomicBool::new(false),
@@ -1829,10 +1861,13 @@ mod tests {
         .expect("build");
 
         let report = vault.build_report();
-        assert_eq!(report.excluded_directories, 1);
         assert_eq!(
-            report.indexed_documents, 2,
-            "the excluded folder was entered, or its namesake was wrongly skipped"
+            report.excluded_directories, 1,
+            "exactly one folder should have been excluded"
+        );
+        assert_eq!(
+            report.indexed_documents, 3,
+            "the excluded folder was entered, or a namesake was wrongly skipped"
         );
     }
 

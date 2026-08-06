@@ -360,6 +360,15 @@ a:focus-visible {
   gap: 20px;
 }
 
+/* Approving and skipping are the same kind of choice, so they sit together
+   and wrap rather than crowding the heading on a narrow window. */
+.location-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .panel-heading {
   align-items: flex-start;
 }
