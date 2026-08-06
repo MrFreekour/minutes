@@ -8,9 +8,9 @@
 
 use crate::retrieval::{
     interpret_legal_query, normalize_converted_document, normalize_text_document,
-    CurrentRevisionSet, DocumentId, LegalIndex, LegalQuery, LegalSearchResponse,
-    ProvisionBoundaries, RetrievalError, SourceRevision, VaultId, MAX_NORMALIZED_DOCUMENT_BYTES,
-    MAX_QUERY_CHARS, MAX_SEMANTIC_PROVISIONS,
+    normalize_transcribed_document, CurrentRevisionSet, DocumentId, LegalIndex, LegalQuery,
+    LegalSearchResponse, ProvisionBoundaries, RetrievalError, SourceRevision, VaultId,
+    MAX_NORMALIZED_DOCUMENT_BYTES, MAX_QUERY_CHARS, MAX_SEMANTIC_PROVISIONS,
 };
 use crate::{
     cap_identity_matches, cap_metadata_identity_portable, cap_metadata_is_link_or_reparse,
@@ -19,6 +19,7 @@ use crate::{
 };
 use cap_std::fs::{Dir, File};
 use minutes_archive_convert::{BoundedConverter, SourceFormat, WorkerError};
+use minutes_archive_ocr::BoundedTranscriber;
 use minutes_archive_semantic::{
     BoundedSemanticEngine, SemanticError, SemanticModelMetadata, MAX_SEMANTIC_INPUT_CHARS,
 };
@@ -138,6 +139,8 @@ pub struct TextVaultBuildReport {
     pub duplicate_files_skipped: u64,
     pub symlinks_skipped: u64,
     pub hard_links_skipped: u64,
+    /// Scans that were read. Searchable, but only ever as transcriptions.
+    pub transcribed_documents: u64,
     pub metadata_errors: u64,
     pub directory_errors: u64,
     pub source_content_persisted: bool,
@@ -436,6 +439,7 @@ struct PendingDirectory {
 #[derive(Debug, Default)]
 struct BuildCounters {
     indexed_documents: u64,
+    transcribed_documents: u64,
     indexed_bytes: u64,
     unsupported_files_skipped: u64,
     oversized_files_skipped: u64,
@@ -462,7 +466,15 @@ pub fn build_authorized_text_vault(
     limits: TextVaultLimits,
     cancelled: &AtomicBool,
 ) -> Result<AuthorizedTextVault, VaultError> {
-    build_authorized_vault(vault_id, approved_roots, limits, cancelled, None, None)
+    build_authorized_vault(
+        vault_id,
+        approved_roots,
+        limits,
+        cancelled,
+        None,
+        None,
+        None,
+    )
 }
 
 pub fn build_authorized_document_vault(
@@ -471,6 +483,9 @@ pub fn build_authorized_document_vault(
     limits: TextVaultLimits,
     cancelled: &AtomicBool,
     converter: &BoundedConverter,
+    // Optional: a Mac without the recogniser still indexes everything else,
+    // and scans stay counted rather than blocking the build.
+    transcriber: Option<&BoundedTranscriber>,
     // Optional by design. The inner builder already accepted None; only this
     // wrapper insisted on an engine, which is what made a Mac without Apple's
     // linguistic asset unable to build any index at all.
@@ -482,6 +497,7 @@ pub fn build_authorized_document_vault(
         limits,
         cancelled,
         Some(converter),
+        transcriber,
         semantic_engine,
     )
 }
@@ -492,6 +508,7 @@ fn build_authorized_vault(
     limits: TextVaultLimits,
     cancelled: &AtomicBool,
     converter: Option<&BoundedConverter>,
+    transcriber: Option<&BoundedTranscriber>,
     semantic_engine: Option<BoundedSemanticEngine>,
 ) -> Result<AuthorizedTextVault, VaultError> {
     let limits = limits.validate()?;
@@ -632,7 +649,8 @@ fn build_authorized_vault(
                     counters.unsupported_files_skipped.saturating_add(1);
                 continue;
             }
-            let Some(source_kind) = source_kind(&name, converter.is_some()) else {
+            let Some(source_kind) = source_kind(&name, converter.is_some(), transcriber.is_some())
+            else {
                 counters.unsupported_files_skipped =
                     counters.unsupported_files_skipped.saturating_add(1);
                 continue;
@@ -731,6 +749,44 @@ fn build_authorized_vault(
                     }
                     normalize_converted_document(document_id.clone(), title, &bytes, &converted)
                 }
+                SourceKind::Scanned => {
+                    let Some(transcriber) = transcriber else {
+                        // Unreachable: a scan is only classified as one when a
+                        // recogniser exists. Counted rather than failing the
+                        // build, so a bad classification cannot lose a folder.
+                        counters.ocr_required_files = counters.ocr_required_files.saturating_add(1);
+                        continue;
+                    };
+                    let page = match transcriber.transcribe(&bytes) {
+                        Ok(page) => page,
+                        Err(_) => {
+                            // A scan that cannot be read is still a coverage
+                            // gap the reader should see, and it is the same
+                            // gap as a PDF with no text layer.
+                            counters.ocr_required_files =
+                                counters.ocr_required_files.saturating_add(1);
+                            continue;
+                        }
+                    };
+                    let text = page
+                        .lines
+                        .iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if text.trim().is_empty() {
+                        // A photograph, a blank scan, a separator sheet.
+                        counters.ocr_required_files = counters.ocr_required_files.saturating_add(1);
+                        continue;
+                    }
+                    normalize_transcribed_document(
+                        document_id.clone(),
+                        title,
+                        &bytes,
+                        minutes_archive_ocr::TRANSCRIBER,
+                        &[(1, text, page.lowest_confidence())],
+                    )
+                }
             };
             let normalized = match normalized {
                 Ok(document) => document,
@@ -743,6 +799,10 @@ fn build_authorized_vault(
                         SourceKind::Converted(_) => {
                             counters.conversion_failures =
                                 counters.conversion_failures.saturating_add(1);
+                        }
+                        SourceKind::Scanned => {
+                            counters.ocr_required_files =
+                                counters.ocr_required_files.saturating_add(1);
                         }
                     }
                     continue;
@@ -837,6 +897,14 @@ fn build_authorized_vault(
                 | SourceKind::Converted(SourceFormat::Rtf) => {
                     counters.docx_documents = counters.docx_documents.saturating_add(1);
                 }
+                // Counted separately from the word-processor formats: a scan
+                // that was read is searchable, but only as a transcription,
+                // and lumping it in with documents that carry their own text
+                // would overstate what the archive can actually quote.
+                SourceKind::Scanned => {
+                    counters.transcribed_documents =
+                        counters.transcribed_documents.saturating_add(1);
+                }
                 SourceKind::Text => {}
             }
             counters.indexed_bytes = counters
@@ -862,6 +930,7 @@ fn build_authorized_vault(
         duplicate_files_skipped: counters.duplicate_files_skipped,
         symlinks_skipped: counters.symlinks_skipped,
         hard_links_skipped: counters.hard_links_skipped,
+        transcribed_documents: counters.transcribed_documents,
         metadata_errors: counters.metadata_errors,
         directory_errors: counters.directory_errors,
         source_content_persisted: false,
@@ -878,7 +947,8 @@ fn build_authorized_vault(
         semantic_model_download_requested: false,
         supported_formats: if converter.is_some() {
             vec![
-                ".doc", ".docx", ".md", ".odt", ".pdf", ".rtf", ".text", ".txt",
+                ".bmp", ".doc", ".docx", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".md", ".odt",
+                ".pdf", ".png", ".rtf", ".text", ".tif", ".tiff", ".txt",
             ]
         } else {
             vec![".md", ".text", ".txt"]
@@ -898,9 +968,15 @@ fn build_authorized_vault(
 enum SourceKind {
     Text,
     Converted(SourceFormat),
+    /// A page image, read by the recogniser rather than parsed.
+    Scanned,
 }
 
-fn source_kind(name: &OsStr, converter_available: bool) -> Option<SourceKind> {
+fn source_kind(
+    name: &OsStr,
+    converter_available: bool,
+    transcriber_available: bool,
+) -> Option<SourceKind> {
     match extension_for_name(name).as_str() {
         ".md" | ".text" | ".txt" => Some(SourceKind::Text),
         ".pdf" if converter_available => Some(SourceKind::Converted(SourceFormat::Pdf)),
@@ -913,6 +989,14 @@ fn source_kind(name: &OsStr, converter_available: bool) -> Option<SourceKind> {
         ".doc" if converter_available => Some(SourceKind::Converted(SourceFormat::Doc)),
         ".odt" if converter_available => Some(SourceKind::Converted(SourceFormat::Odt)),
         ".rtf" if converter_available => Some(SourceKind::Converted(SourceFormat::Rtf)),
+        // Page images. Their text is a reading, never a quotation, which the
+        // retrieval side enforces by type; here they are simply a different
+        // road into the index.
+        ".bmp" | ".gif" | ".heic" | ".heif" | ".jpeg" | ".jpg" | ".png" | ".tif" | ".tiff"
+            if transcriber_available =>
+        {
+            Some(SourceKind::Scanned)
+        }
         _ => None,
     }
 }

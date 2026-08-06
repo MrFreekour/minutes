@@ -10,6 +10,7 @@ description = "Minutes Archive — private local legal evidence retrieval"
 [dependencies]
 minutes-archive-convert = { path = "../../crates/archive-convert" }
 minutes-archive-core = { path = "../../crates/archive-core" }
+minutes-archive-ocr = { path = "../../crates/archive-ocr" }
 minutes-archive-semantic = { path = "../../crates/archive-semantic" }
 serde = { workspace = true }
 serde_json = { workspace = true }

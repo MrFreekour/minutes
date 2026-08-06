@@ -310,6 +310,14 @@ function renderVaultSummary(report) {
     // matters to counsel is how much became searchable, not which container
     // it arrived in.
     `${report.docx_documents.toLocaleString()} Word or OpenDocument. ` +
+    // Its own number. A scan that was read is searchable, but only as a
+    // transcription, and folding it into the indexed total would say the
+    // archive can quote more of itself than it can.
+    ((report.transcribed_documents ?? 0) > 0
+      ? `${report.transcribed_documents.toLocaleString()} scanned page${
+          report.transcribed_documents === 1 ? "" : "s"
+        } read by text recognition -- searchable as transcriptions, never quoted as source text. `
+      : "") +
     `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
       report.unsupported_files_skipped === 1 ? "" : "s"
     } skipped; ${report.ocr_required_files.toLocaleString()} PDF${

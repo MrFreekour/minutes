@@ -81,6 +81,7 @@ const vaultReport = {
   searchable_pdf_documents: 1,
   docx_documents: 1,
   duplicate_files_skipped: 0,
+  transcribed_documents: 4,
   symlinks_skipped: 2,
   hard_links_skipped: 3,
   metadata_errors: 0,
@@ -358,7 +359,8 @@ try {
         if (
           !vaultSummary.includes("2 were aliases or shortcuts") ||
           !vaultSummary.includes("3 have a second name elsewhere on the disk") ||
-          !vaultSummary.includes("5 items were not indexed")
+          !vaultSummary.includes("5 items were not indexed") ||
+          !vaultSummary.includes("4 scanned pages read by text recognition")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }

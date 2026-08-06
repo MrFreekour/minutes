@@ -62,7 +62,7 @@
               <span class="step-number">4</span>
               <div>
                 <strong>Search exact evidence</strong>
-                <span>Searchable PDF, Word, OpenDocument, RTF, and text.</span>
+                <span>Searchable PDF, Word, OpenDocument, RTF, text, and scans read on-device.</span>
               </div>
             </li>
           </ol>
@@ -217,7 +217,11 @@
                   This explicitly opens searchable <code>.pdf</code>,
                   <code>.docx</code>, <code>.doc</code>, <code>.odt</code>,
                   <code>.rtf</code>, <code>.txt</code>, <code>.text</code>,
-                  and <code>.md</code> files. Every converted byte goes to a
+                  and <code>.md</code> files, and reads scanned images
+                  (<code>.png</code>, <code>.jpg</code>, <code>.tiff</code>,
+                  <code>.heic</code>) with the on-device text recognizer. A
+                  scan's text is a machine's reading and is never quoted as
+                  source language. Every converted byte goes to a
                   bounded, network-denied converter. Exact search plus the
                   revision-pinned macOS semantic model run in separate
                   network-denied workers; source text, FTS rows, and

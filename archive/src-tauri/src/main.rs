@@ -13,6 +13,7 @@ use minutes_archive_core::{
     approve_roots, scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits,
     CensusReport, CensusStatus,
 };
+use minutes_archive_ocr::BoundedTranscriber;
 use minutes_archive_semantic::{
     run_worker_process as run_semantic_worker, BoundedSemanticEngine,
     WORKER_MARKER as SEMANTIC_WORKER_MARKER,
@@ -404,6 +405,10 @@ async fn build_archive_text_vault(
         // optional aid the interface already labels review-not-verified. A Mac
         // without Apple's linguistic asset previously got NO search at all.
         let semantic_engine = BoundedSemanticEngine::bind(&worker_executable).ok();
+        // Same reasoning for the recogniser: a Mac where Vision cannot start
+        // must still index everything that is not a scan. Scans then stay
+        // counted as needing OCR, which is what they were before this existed.
+        let transcriber = BoundedTranscriber::bind(&worker_executable).ok();
         // Neither worker copies itself any more -- both execute in place from
         // the bundle -- so there is no snapshot directory left to reclaim. The
         // registry stays because it is what `purge_session` drains, and a
@@ -414,6 +419,7 @@ async fn build_archive_text_vault(
             DocumentVaultLimits::default(),
             &cancelled,
             &converter,
+            transcriber.as_ref(),
             semantic_engine,
         )
         .map_err(|error| error.to_string())
