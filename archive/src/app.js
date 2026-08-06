@@ -12,6 +12,7 @@ const elements = {
   runCensus: document.querySelector("#run-census"),
   cancelCensus: document.querySelector("#cancel-census"),
   cancelIndexing: document.querySelector("#cancel-indexing"),
+  indexingProgress: document.querySelector("#indexing-progress"),
   startOver: document.querySelector("#start-over"),
   exportReport: document.querySelector("#export-report"),
   buildTextVault: document.querySelector("#build-text-vault"),
@@ -335,6 +336,16 @@ function renderVaultSummary(report) {
         } built with the pinned macOS model inside its network-denied worker. `
       : "Semantic suggestions are unavailable on this Mac. ") +
     describeDroppedSources(report) +
+    // A partial index must say so on its face. It is a real index and worth
+    // having, but a reader who thinks it covers the whole folder will draw a
+    // false conclusion from a negative result.
+    (report.budget_reached
+      ? `This index is PARTIAL: a size or count limit was reached and ${(
+          report.documents_left_unread ?? 0
+        ).toLocaleString()} further document${
+          report.documents_left_unread === 1 ? " was" : "s were"
+        } not read. Narrow the approved folders and rebuild before relying on a negative result. `
+      : "") +
     "All indexes exist only in memory.";
 }
 
@@ -376,9 +387,57 @@ function describeDroppedSources(report) {
   );
 }
 
+let indexingPoll = null;
+
+// Polled, not pushed. Two integers on a timer need no event channel, and a
+// channel opened for progress is a channel that could later carry something
+// else.
+function startIndexingProgress() {
+  const started = Date.now();
+  stopIndexingProgress();
+  const tick = async () => {
+    try {
+      const progress = await invoke("archive_index_progress");
+      const seconds = Math.max(1, Math.round((Date.now() - started) / 1000));
+      const rate = progress.examined / seconds;
+      // No percentage. The total is not known until the walk finishes, and a
+      // made-up denominator would be a number the reader could act on and
+      // should not.
+      const parts = [
+        `${progress.indexed.toLocaleString()} indexed`,
+        `${progress.examined.toLocaleString()} examined`,
+        `${formatElapsed(Date.now() - started)} elapsed`,
+      ];
+      if (rate >= 0.2) {
+        parts.push(`~${Math.round(rate)}/s`);
+      }
+      elements.indexingProgress.textContent = parts.join(" · ");
+    } catch {
+      // A failed poll is not worth surfacing; the build reports its own errors.
+    }
+  };
+  tick();
+  indexingPoll = setInterval(tick, 700);
+}
+
+function stopIndexingProgress() {
+  if (indexingPoll !== null) {
+    clearInterval(indexingPoll);
+    indexingPoll = null;
+  }
+}
+
+function formatElapsed(milliseconds) {
+  const total = Math.round(milliseconds / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
 async function buildTextVault() {
   hideError();
   showView("indexing");
+  startIndexingProgress();
   try {
     const report = await invoke("build_archive_text_vault");
     renderVaultSummary(report);
@@ -396,6 +455,10 @@ async function buildTextVault() {
     if (lastReport) renderReport(lastReport);
     else showView("setup");
     showError(error);
+  } finally {
+    // `finally`, so a build that errors does not leave a timer polling a
+    // command whose state has moved on.
+    stopIndexingProgress();
   }
 }
 

@@ -82,6 +82,8 @@ const vaultReport = {
   docx_documents: 1,
   duplicate_files_skipped: 0,
   transcribed_documents: 4,
+  budget_reached: true,
+  documents_left_unread: 5000,
   symlinks_skipped: 2,
   hard_links_skipped: 3,
   metadata_errors: 0,
@@ -360,7 +362,9 @@ try {
           !vaultSummary.includes("2 were aliases or shortcuts") ||
           !vaultSummary.includes("3 have a second name elsewhere on the disk") ||
           !vaultSummary.includes("5 items were not indexed") ||
-          !vaultSummary.includes("4 scanned pages read by text recognition")
+          !vaultSummary.includes("4 scanned pages read by text recognition") ||
+          !vaultSummary.includes("This index is PARTIAL") ||
+          !vaultSummary.includes("5,000 further documents were not read")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }

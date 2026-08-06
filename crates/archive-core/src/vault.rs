@@ -18,7 +18,7 @@ use crate::{
     validate_approved_roots, ApprovedRoot, CensusError, FileIdentity,
 };
 use cap_std::fs::{Dir, File};
-use minutes_archive_convert::{BoundedConverter, SourceFormat, WorkerError};
+use minutes_archive_convert::{BoundedConverter, SourceFormat};
 use minutes_archive_ocr::BoundedTranscriber;
 use minutes_archive_semantic::{
     BoundedSemanticEngine, SemanticError, SemanticModelMetadata, MAX_SEMANTIC_INPUT_CHARS,
@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use thiserror::Error;
 
 pub const DOCUMENT_VAULT_SCHEMA: &str = "minutes.archive-document-vault.v1";
@@ -139,6 +139,10 @@ pub struct TextVaultBuildReport {
     pub duplicate_files_skipped: u64,
     pub symlinks_skipped: u64,
     pub hard_links_skipped: u64,
+    /// True when a size or count limit stopped the build before the end of
+    /// the approved folders. The index is real but partial.
+    pub budget_reached: bool,
+    pub documents_left_unread: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
     pub transcribed_documents: u64,
     pub metadata_errors: u64,
@@ -439,6 +443,9 @@ struct PendingDirectory {
 #[derive(Debug, Default)]
 struct BuildCounters {
     indexed_documents: u64,
+    /// Set when a limit stopped the build short of the whole folder.
+    budget_reached: bool,
+    documents_left_unread: u64,
     transcribed_documents: u64,
     indexed_bytes: u64,
     unsupported_files_skipped: u64,
@@ -460,6 +467,37 @@ struct BuildCounters {
     semantic_unavailable: bool,
 }
 
+/// Live counts for a build in flight.
+///
+/// Lock-free because the build loop touches it once per file and must not pay
+/// for the reporting. Read by the interface while the build runs, which is the
+/// whole point: a build over tens of thousands of documents with no visible
+/// progress is indistinguishable from a hung one, and someone waiting on it
+/// cannot tell whether to keep waiting or give up.
+#[derive(Debug, Default)]
+pub struct BuildProgress {
+    examined: AtomicU64,
+    indexed: AtomicU64,
+}
+
+impl BuildProgress {
+    pub fn examined(&self) -> u64 {
+        self.examined.load(Ordering::Relaxed)
+    }
+
+    pub fn indexed(&self) -> u64 {
+        self.indexed.load(Ordering::Relaxed)
+    }
+
+    fn note_examined(&self) {
+        self.examined.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_indexed(&self) {
+        self.indexed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn build_authorized_text_vault(
     vault_id: VaultId,
     approved_roots: &[ApprovedRoot],
@@ -474,9 +512,14 @@ pub fn build_authorized_text_vault(
         None,
         None,
         None,
+        None,
     )
 }
 
+// Eight arguments, each a distinct capability the caller decides on:
+// identity, roots, limits, cancellation, conversion, transcription, progress
+// and semantics. Bundling them into a struct would hide which are optional.
+#[allow(clippy::too_many_arguments)]
 pub fn build_authorized_document_vault(
     vault_id: VaultId,
     approved_roots: &[ApprovedRoot],
@@ -486,6 +529,7 @@ pub fn build_authorized_document_vault(
     // Optional: a Mac without the recogniser still indexes everything else,
     // and scans stay counted rather than blocking the build.
     transcriber: Option<&BoundedTranscriber>,
+    progress: Option<&BuildProgress>,
     // Optional by design. The inner builder already accepted None; only this
     // wrapper insisted on an engine, which is what made a Mac without Apple's
     // linguistic asset unable to build any index at all.
@@ -498,10 +542,12 @@ pub fn build_authorized_document_vault(
         cancelled,
         Some(converter),
         transcriber,
+        progress,
         semantic_engine,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_authorized_vault(
     vault_id: VaultId,
     approved_roots: &[ApprovedRoot],
@@ -509,6 +555,7 @@ fn build_authorized_vault(
     cancelled: &AtomicBool,
     converter: Option<&BoundedConverter>,
     transcriber: Option<&BoundedTranscriber>,
+    progress: Option<&BuildProgress>,
     semantic_engine: Option<BoundedSemanticEngine>,
 ) -> Result<AuthorizedTextVault, VaultError> {
     let limits = limits.validate()?;
@@ -649,6 +696,9 @@ fn build_authorized_vault(
                     counters.unsupported_files_skipped.saturating_add(1);
                 continue;
             }
+            if let Some(progress) = progress {
+                progress.note_examined();
+            }
             let Some(source_kind) = source_kind(&name, converter.is_some(), transcriber.is_some())
             else {
                 counters.unsupported_files_skipped =
@@ -660,10 +710,20 @@ fn build_authorized_vault(
                     counters.oversized_files_skipped.saturating_add(1);
                 continue;
             }
+            // Reaching a budget stops the build; it does not throw it away.
+            //
+            // This used to return an error, so a folder one document over the
+            // limit produced nothing at all after however long it had already
+            // spent reading. An index of the first 50,000 documents, clearly
+            // labelled as partial, is worth having; an error after an hour is
+            // worth nothing. The counters below are what the summary uses to
+            // say so.
             if counters.indexed_documents as usize >= limits.max_documents
                 || counters.indexed_bytes.saturating_add(metadata.len()) > limits.max_total_bytes
             {
-                return Err(VaultError::BuildBudgetExceeded);
+                counters.budget_reached = true;
+                counters.documents_left_unread = counters.documents_left_unread.saturating_add(1);
+                continue;
             }
             let Some(identity) = cap_metadata_identity_portable(&metadata) else {
                 counters.metadata_errors = counters.metadata_errors.saturating_add(1);
@@ -731,12 +791,25 @@ fn build_authorized_vault(
                     };
                     let converted = match converter.convert(format, &bytes) {
                         Ok(converted) => converted,
-                        Err(WorkerError::SourceRefused | WorkerError::WorkerBudgetExceeded) => {
+                        // Every conversion failure is a coverage gap, never a
+                        // reason to lose the build.
+                        //
+                        // This used to abort on any error that was not a
+                        // refusal or a timeout, so one document the worker
+                        // could not handle discarded everything indexed before
+                        // it. A folder of 32,605 artifacts spent six minutes
+                        // reading and returned "the bounded document converter
+                        // is unavailable" and nothing else. That is the
+                        // opposite of how the rest of this build behaves:
+                        // unreadable, malformed, oversized and duplicate files
+                        // are all counted and reported so the gap is visible.
+                        // A worker that fell over on one file is the same kind
+                        // of fact.
+                        Err(_) => {
                             counters.conversion_failures =
                                 counters.conversion_failures.saturating_add(1);
                             continue;
                         }
-                        Err(_) => return Err(VaultError::ConverterUnavailable),
                     };
                     if converted.blocks.is_empty()
                         && converted
@@ -875,6 +948,9 @@ fn build_authorized_vault(
                 },
             );
             counters.indexed_documents = document_number;
+            if let Some(progress) = progress {
+                progress.note_indexed();
+            }
             if normalized.provision_boundaries == ProvisionBoundaries::Inferred {
                 counters.inferred_boundary_documents =
                     counters.inferred_boundary_documents.saturating_add(1);
@@ -930,6 +1006,8 @@ fn build_authorized_vault(
         duplicate_files_skipped: counters.duplicate_files_skipped,
         symlinks_skipped: counters.symlinks_skipped,
         hard_links_skipped: counters.hard_links_skipped,
+        budget_reached: counters.budget_reached,
+        documents_left_unread: counters.documents_left_unread,
         transcribed_documents: counters.transcribed_documents,
         metadata_errors: counters.metadata_errors,
         directory_errors: counters.directory_errors,
@@ -1352,26 +1430,45 @@ mod tests {
         assert_eq!(vault.build_report().symlinks_skipped, 1);
     }
 
+    /// A budget stops the build; cancellation discards it. Those are different
+    /// answers to different questions.
+    ///
+    /// Hitting a limit used to return an error, so a folder one document over
+    /// produced nothing at all -- after however long it had already spent
+    /// reading. An index of what fits, labelled as partial, is worth having.
+    /// Cancellation still discards, because there the operator asked to stop
+    /// and half an index they did not ask for is not a favour.
     #[test]
-    fn build_budget_and_cancellation_discard_partial_vaults() {
+    fn a_budget_yields_a_partial_index_while_cancellation_discards() {
         let temp = TempDir::new().expect("temp");
         let root = temp.path().join("approved");
         fs::create_dir(&root).expect("root");
         fs::write(root.join("one.txt"), "ASSIGNMENT\nNo assignment.").expect("one");
         fs::write(root.join("two.txt"), "ASSIGNMENT\nNo assignment.").expect("two");
         let approved = approve_roots(&[root]).expect("approve");
-        assert!(matches!(
-            build_authorized_text_vault(
-                VaultId::parse("bounded").expect("vault"),
-                &approved,
-                TextVaultLimits {
-                    max_documents: 1,
-                    ..TextVaultLimits::default()
-                },
-                &AtomicBool::new(false),
-            ),
-            Err(VaultError::BuildBudgetExceeded)
-        ));
+        let bounded = build_authorized_text_vault(
+            VaultId::parse("bounded").expect("vault"),
+            &approved,
+            TextVaultLimits {
+                max_documents: 1,
+                ..TextVaultLimits::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("a budget must not throw away what was already read");
+        let report = bounded.build_report();
+        assert_eq!(report.indexed_documents, 1);
+        assert!(
+            report.budget_reached,
+            "a partial index must say that it is partial"
+        );
+        assert_eq!(report.documents_left_unread, 1);
+        // And it is a working index, not a husk.
+        assert!(!bounded
+            .interpret_and_search("Find documents containing assignment.")
+            .expect("search")
+            .documents
+            .is_empty());
         assert!(matches!(
             build_authorized_text_vault(
                 VaultId::parse("cancelled").expect("vault"),

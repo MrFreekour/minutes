@@ -5,6 +5,7 @@ use minutes_archive_convert::{
     WORKER_MARKER as CONVERT_WORKER_MARKER,
 };
 use minutes_archive_core::retrieval::{LegalSearchResponse, VaultId};
+use minutes_archive_core::vault::BuildProgress;
 use minutes_archive_core::vault::{
     build_authorized_document_vault, AuthorizedDocumentVault, DocumentVaultBuildReport,
     DocumentVaultLimits,
@@ -72,6 +73,13 @@ struct ArchiveState {
     /// `exit(0)` leaves both 40 MB snapshots behind. Registering the paths at
     /// creation lets the purge reclaim them whichever way the app exits.
     live_snapshots: Arc<Mutex<Vec<std::path::PathBuf>>>,
+    /// Live counts for the build in flight, polled by the interface.
+    ///
+    /// A build over tens of thousands of documents with no visible progress is
+    /// indistinguishable from a hung one. Counts only -- no filename, no path,
+    /// nothing derived from a document -- so this cannot become a channel for
+    /// anything but the two numbers.
+    build_progress: Mutex<Arc<BuildProgress>>,
 }
 
 impl Default for ArchiveState {
@@ -80,6 +88,7 @@ impl Default for ArchiveState {
             session: Mutex::new(SessionState::default()),
             next_location_id: AtomicU64::new(1),
             live_snapshots: Arc::new(Mutex::new(Vec::new())),
+            build_progress: Mutex::new(Arc::new(BuildProgress::default())),
         }
     }
 }
@@ -124,6 +133,30 @@ fn ensure_scan_idle(session: &SessionState) -> Result<(), String> {
         return Err("Wait for the current census to finish or cancel it first.".to_string());
     }
     Ok(())
+}
+
+/// Counts for the build in flight.
+///
+/// Polled rather than pushed: two integers on a timer needs no event channel,
+/// and a channel that exists only to carry progress is a channel that could
+/// later carry something else. Nothing derived from a document crosses here.
+#[derive(serde::Serialize)]
+struct UiBuildProgress {
+    examined: u64,
+    indexed: u64,
+}
+
+#[tauri::command]
+fn archive_index_progress(state: tauri::State<'_, ArchiveState>) -> UiBuildProgress {
+    let progress = state
+        .build_progress
+        .lock()
+        .map(|slot| Arc::clone(&slot))
+        .unwrap_or_default();
+    UiBuildProgress {
+        examined: progress.examined(),
+        indexed: progress.indexed(),
+    }
 }
 
 #[tauri::command]
@@ -395,6 +428,12 @@ async fn build_archive_text_vault(
     // Kept live: `purge_session` drains it, and a worker that needs scratch
     // space again should register here. Nothing populates it today.
     let _snapshot_registry = Arc::clone(&state.live_snapshots);
+    // Reset before the build, so a second build does not continue the first
+    // one's numbers.
+    let progress = Arc::new(BuildProgress::default());
+    if let Ok(mut slot) = state.build_progress.lock() {
+        *slot = Arc::clone(&progress);
+    }
     let build_result = tauri::async_runtime::spawn_blocking(move || {
         let vault_id = VaultId::parse("local-private-vault")
             .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
@@ -420,6 +459,7 @@ async fn build_archive_text_vault(
             &cancelled,
             &converter,
             transcriber.as_ref(),
+            Some(progress.as_ref()),
             semantic_engine,
         )
         .map_err(|error| error.to_string())
@@ -746,6 +786,7 @@ fn main() {
             cancel_archive_census,
             export_archive_census,
             build_archive_text_vault,
+            archive_index_progress,
             search_archive_text_vault,
         ])
         .build(tauri::generate_context!())

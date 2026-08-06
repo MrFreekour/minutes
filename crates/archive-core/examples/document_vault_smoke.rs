@@ -100,6 +100,7 @@ fn main() {
         &AtomicBool::new(false),
         &converter,
         None,
+        None,
         Some(semantic_engine),
     )
     .expect("build document vault");
