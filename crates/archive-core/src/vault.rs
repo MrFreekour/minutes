@@ -32,6 +32,51 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use thiserror::Error;
 
+/// Raise this process's open-file ceiling before anything opens a document.
+///
+/// The vault holds one descriptor per indexed document, for the fence that
+/// checks a source is still the file it was indexed from. macOS gives a GUI
+/// application a soft `RLIMIT_NOFILE` of 256, so a build stopped at 237
+/// documents and reported the rest as unreadable -- on an archive of 16,621.
+///
+/// It lives here rather than in the application's `main` because that is the
+/// one place no test can reach. A terminal inherits a far higher soft limit
+/// than launchd gives an app bundle, which is exactly why every local run
+/// passed while the real thing failed; a harness has to be able to lower the
+/// ceiling, call this, and check the build still completes.
+#[cfg(unix)]
+pub fn raise_open_file_ceiling() {
+    // Enough for a very large archive plus the process's own descriptors,
+    // without asking for an unbounded number.
+    const WANTED: libc::rlim_t = 200_000;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    if limit.rlim_cur >= WANTED {
+        return;
+    }
+    let target = if limit.rlim_max == libc::RLIM_INFINITY {
+        WANTED
+    } else {
+        WANTED.min(limit.rlim_max)
+    };
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    // Best effort. A lower ceiling is reported honestly at the point it bites.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_NOFILE, &raised);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn raise_open_file_ceiling() {}
+
 pub const DOCUMENT_VAULT_SCHEMA: &str = "minutes.archive-document-vault.v1";
 
 /// One folder the build must not enter, named within the root that contains it.

@@ -153,6 +153,8 @@ jobs:
           app="target/release/bundle/macos/Minutes Archive.app"
           cargo run -p minutes-archive-core --example document_vault_smoke -- \
             "$app/Contents/MacOS/$ARCHIVE_EXECUTABLE"
+          cargo run -p minutes-archive-core --example archive_pilot_soak -- \
+            "$app/Contents/MacOS/$ARCHIVE_EXECUTABLE"
           scripts/archive-native-lifecycle-smoke.sh "$app"
 
       - name: Re-gate bundle after candidate code executed
