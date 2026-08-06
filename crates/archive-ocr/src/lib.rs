@@ -47,6 +47,9 @@
 //! controlled, so the hostile corpus is part of the crate rather than an
 //! afterthought.
 
+mod bounded;
+pub use bounded::{BoundedTranscriber, WORKER_MARKER};
+
 use std::ffi::{c_char, CStr};
 use std::ptr;
 

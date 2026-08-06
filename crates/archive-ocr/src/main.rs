@@ -5,8 +5,17 @@
 //! document: it exits when the page is read.
 
 fn main() {
-    let operation = std::env::args().nth(1).unwrap_or_default();
-    if std::env::args().nth(2).is_some() {
+    // Accepts the marker form the application uses (`<marker> <operation>`)
+    // and the bare form the tests use, so the same binary is exercised either
+    // way rather than the tests proving something about a different path.
+    let mut arguments = std::env::args().skip(1);
+    let first = arguments.next().unwrap_or_default();
+    let operation = if first == minutes_archive_ocr::WORKER_MARKER {
+        arguments.next().unwrap_or_default()
+    } else {
+        first
+    };
+    if arguments.next().is_some() {
         std::process::exit(64);
     }
     if minutes_archive_ocr::install_worker_security_boundary().is_err() {

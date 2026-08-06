@@ -175,3 +175,43 @@ fn the_worker_reads_a_page_from_inside_its_security_boundary() {
         "sandboxed recognition lost the operative term: {text}"
     );
 }
+
+/// The bounded transcriber is what the application actually uses.
+#[test]
+fn the_bounded_transcriber_reads_a_page_and_refuses_a_swapped_worker() {
+    use minutes_archive_ocr::BoundedTranscriber;
+    use std::path::Path;
+
+    let worker = env!("CARGO_BIN_EXE_minutes-archive-ocr-worker");
+    let transcriber = BoundedTranscriber::bind(Path::new(worker)).expect("bind");
+    let page = transcriber.transcribe(SCANNED_NDA).expect("transcribe");
+    let text = page
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("Confidential Information"),
+        "the bounded transcriber lost the operative term: {text}"
+    );
+
+    assert_eq!(
+        transcriber.transcribe(b""),
+        Err(minutes_archive_ocr::OcrError::ImageRefused)
+    );
+
+    // The same identity guarantee the converter carries: a worker replaced at
+    // the path after binding lands on a different inode and is refused.
+    let directory = tempfile::tempdir().expect("temp");
+    let staged = directory.path().join("worker");
+    std::fs::copy(worker, &staged).expect("stage");
+    let staged_transcriber = BoundedTranscriber::bind(&staged).expect("bind staged");
+    std::fs::remove_file(&staged).expect("remove");
+    std::fs::copy(worker, &staged).expect("replace");
+    assert_eq!(
+        staged_transcriber.transcribe(SCANNED_NDA),
+        Err(minutes_archive_ocr::OcrError::RecognizerUnavailable),
+        "a replaced worker must be refused"
+    );
+}

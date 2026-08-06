@@ -153,16 +153,26 @@ pub enum ProvisionBoundaries {
     Inferred,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// `Eq` is gone because a confidence is a float. Nothing compares provisions
+// for equality outside tests, where `PartialEq` is what is used anyway.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NormalizedProvision {
     pub ordinal: u32,
     pub anchor: String,
     pub heading: Option<String>,
     pub text: String,
     pub sentence_count: u32,
+    /// The recogniser's weakest line on the page this came from, for a
+    /// transcription. `None` for text the file carried itself.
+    ///
+    /// Per provision rather than per document because a scan's quality varies
+    /// page to page: a clean cover sheet says nothing about the faxed exhibit
+    /// behind it.
+    #[serde(default)]
+    pub transcription_confidence: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NormalizedDocument {
     pub document_id: DocumentId,
     pub title: String,
@@ -203,6 +213,59 @@ pub fn normalize_text_document(
         converter: "utf8-text-v1".to_string(),
         provision_boundaries: ProvisionBoundaries::Declared,
         text_provenance: TextProvenance::Extracted,
+        provisions,
+    })
+}
+
+/// Turn a page reading into an indexable document.
+///
+/// The only entry point that produces `TextProvenance::Transcribed`, and the
+/// reason `normalize_converted_document` can state `Extracted` unconditionally:
+/// the two roads never cross.
+///
+/// One provision per page, anchored to the page. A transcription has no
+/// section structure to cite -- the recogniser reports lines and confidences,
+/// not clauses -- so inventing a section anchor would be a citation to
+/// something that was never established.
+pub fn normalize_transcribed_document(
+    document_id: DocumentId,
+    title: impl Into<String>,
+    source_bytes: &[u8],
+    transcriber: impl Into<String>,
+    pages: &[(u32, String, f32)],
+) -> Result<NormalizedDocument, RetrievalError> {
+    let provisions = pages
+        .iter()
+        .filter(|(_, text, _)| !text.trim().is_empty())
+        .enumerate()
+        .map(|(index, (page_number, text, confidence))| {
+            let ordinal = (index + 1) as u32;
+            NormalizedProvision {
+                ordinal,
+                anchor: format!("page:{page_number:04}"),
+                heading: None,
+                sentence_count: sentence_count(text),
+                transcription_confidence: Some(confidence.clamp(0.0, 1.0)),
+                text: text.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if provisions.is_empty() {
+        return Err(RetrievalError::InvalidDocumentText);
+    }
+    if provisions.len() > MAX_PROVISIONS_PER_DOCUMENT {
+        return Err(RetrievalError::TooManyProvisions);
+    }
+    Ok(NormalizedDocument {
+        document_id,
+        title: title.into(),
+        revision: SourceRevision::from_bytes(source_bytes),
+        converter: transcriber.into(),
+        // A reading of a page establishes no clause boundary at all, so this
+        // is not a judgement about the scan's quality -- there is simply
+        // nothing there to declare.
+        provision_boundaries: ProvisionBoundaries::Inferred,
+        text_provenance: TextProvenance::Transcribed,
         provisions,
     })
 }
@@ -647,6 +710,8 @@ fn segment_anchored_blocks(
                 anchor: format!("{source_anchor}/section:{ordinal:04}"),
                 heading,
                 sentence_count: sentence_count(&text),
+                // Segmenters here only ever see text the file carried.
+                transcription_confidence: None,
                 text,
             }
         })
@@ -722,6 +787,8 @@ fn segment_legal_provisions(text: &str) -> Result<Vec<NormalizedProvision>, Retr
                 anchor: format!("section:{ordinal:04}"),
                 heading,
                 sentence_count: sentence_count(&text),
+                // Segmenters here only ever see text the file carried.
+                transcription_confidence: None,
                 text,
             }
         })
@@ -1253,6 +1320,7 @@ struct CandidateRow {
     /// Carried on every candidate so no retrieval path can reach a passage
     /// without knowing whether it was read from an image.
     text_provenance: TextProvenance,
+    transcription_confidence: Option<f32>,
     lexical_rank: f64,
 }
 
@@ -1281,6 +1349,42 @@ impl CandidateRow {
 
 /// A candidate whose text is the author's, not a machine's reading of a page.
 struct ExtractedText<'a>(&'a CandidateRow);
+
+impl CandidateRow {
+    /// The only way a transcription reaches a reader.
+    ///
+    /// Kept beside `as_extracted` so the two roads out of a candidate are
+    /// visible together: one produces quotations, this one produces a reading
+    /// that says what it is.
+    fn transcribed_card(
+        &self,
+        vault_id: &VaultId,
+        matched: Vec<LegalConcept>,
+        lowest_line_confidence: f32,
+    ) -> TranscribedCard {
+        let (text, truncated) = bounded_excerpt(&self.body);
+        let mut why = String::from(
+            "Read from a scanned image. These characters are a machine's reading of the page, \
+             not the document's own text; check them against the source before relying on them.",
+        );
+        if truncated {
+            why.push_str(" The reading shown here was shortened.");
+        }
+        TranscribedCard {
+            vault_id: vault_id.clone(),
+            document_id: self.document_id.clone(),
+            document_title: self.document_title.clone(),
+            page_anchor: self.source_anchor.clone(),
+            transcribed_text: text,
+            lowest_line_confidence,
+            source_revision: self.source_revision.clone(),
+            transcriber: self.source_converter.clone(),
+            matched_concepts: matched,
+            why_transcribed: why,
+            index_fresh: true,
+        }
+    }
+}
 
 impl ExtractedText<'_> {
     fn evidence_card(
@@ -1434,6 +1538,7 @@ impl LegalIndex {
                     anchor UNINDEXED,
                     heading,
                     body,
+                    transcription_confidence UNINDEXED,
                     tokenize = 'unicode61 remove_diacritics 2'
                 );
                 ",
@@ -1686,7 +1791,8 @@ impl LegalIndex {
                     d.revision_bytes,
                     d.converter,
                     d.provision_boundaries,
-                    d.text_provenance
+                    d.text_provenance,
+                    p.transcription_confidence
                 FROM provisions p
                 JOIN documents d ON d.document_id = p.document_id
                 WHERE p.document_id = ?1 AND p.ordinal = ?2
@@ -1714,6 +1820,9 @@ impl LegalIndex {
                         provision_boundaries: provision_boundaries_from_db(row.get(9)?)?,
                         text_provenance: text_provenance_from_db(row.get(10)?)
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        transcription_confidence: row
+                            .get::<_, Option<f64>>(11)?
+                            .map(|value| value as f32),
                         lexical_rank: 0.0,
                     })
                 },
@@ -1740,7 +1849,8 @@ impl LegalIndex {
                 d.revision_bytes,
                 d.converter,
                 d.provision_boundaries,
-                d.text_provenance
+                d.text_provenance,
+                p.transcription_confidence
             FROM provisions p
             JOIN documents d ON d.document_id = p.document_id
             WHERE provisions MATCH ?1
@@ -1786,6 +1896,10 @@ impl LegalIndex {
                 text_provenance: text_provenance_from_db(
                     row.get(11).map_err(|_| RetrievalError::IndexUnavailable)?,
                 )?,
+                transcription_confidence: row
+                    .get::<_, Option<f64>>(12)
+                    .map_err(|_| RetrievalError::IndexUnavailable)?
+                    .map(|value| value as f32),
                 lexical_rank: row.get(5).map_err(|_| RetrievalError::IndexUnavailable)?,
             });
         }
@@ -1803,6 +1917,7 @@ impl LegalIndex {
         lexical_candidates_considered: usize,
     ) -> Result<LegalSearchResponse, RetrievalError> {
         let mut evidence = Vec::new();
+        let mut transcriptions = Vec::new();
         let mut stale_documents = BTreeSet::new();
         let mut inferred_boundary_documents = BTreeSet::new();
         for candidate in candidates {
@@ -1840,10 +1955,16 @@ impl LegalIndex {
                 continue;
             }
 
-            // Unreachable for a transcription: those are refused above,
-            // before any matching. The witness is what makes that a compile
-            // error rather than a rule someone has to remember.
+            // A transcription that matches is still worth showing -- it just
+            // is not evidence. It leaves by the other road, saying what it is.
             let Some(extracted) = candidate.as_extracted() else {
+                if transcriptions.len() < query.limit {
+                    transcriptions.push(candidate.transcribed_card(
+                        &self.vault_id,
+                        matched,
+                        candidate.transcription_confidence.unwrap_or(0.0),
+                    ));
+                }
                 continue;
             };
             evidence.push(extracted.evidence_card(&self.vault_id, matched, query.max_sentences));
@@ -1857,7 +1978,7 @@ impl LegalIndex {
             evidence,
             documents: Vec::new(),
             semantic_suggestions: Vec::new(),
-            transcriptions: Vec::new(),
+            transcriptions,
             lexical_candidates_considered,
             semantic_candidates_considered: 0,
             semantic_query_applied: false,
@@ -1876,6 +1997,7 @@ impl LegalIndex {
         lexical_candidates_considered: usize,
     ) -> Result<LegalSearchResponse, RetrievalError> {
         let mut documents = BTreeMap::<DocumentId, DocumentAccumulator>::new();
+        let mut transcriptions = Vec::new();
         let mut stale_documents = BTreeSet::new();
 
         for candidate in candidates {
@@ -1913,9 +2035,17 @@ impl LegalIndex {
             entry.excluded_concept_matched |= excluded_concept_matched;
             if positive_evidence {
                 // A document-scope card also carries excerpts, so it is built
-                // through the witness like the others.
+                // through the witness like the others. A transcription that
+                // matched leaves as its own card instead.
                 let extracted = candidate.as_extracted();
                 if extracted.is_none() {
+                    if transcriptions.len() < query.limit {
+                        transcriptions.push(candidate.transcribed_card(
+                            &self.vault_id,
+                            matched.clone(),
+                            candidate.transcription_confidence.unwrap_or(0.0),
+                        ));
+                    }
                     continue;
                 }
                 if entry.criterion_evidence.len() < MAX_DOCUMENT_EVIDENCE_PROVISIONS {
@@ -1986,7 +2116,7 @@ impl LegalIndex {
             evidence: Vec::new(),
             documents: document_evidence,
             semantic_suggestions: Vec::new(),
-            transcriptions: Vec::new(),
+            transcriptions,
             lexical_candidates_considered,
             semantic_candidates_considered: 0,
             semantic_query_applied: false,
@@ -2063,8 +2193,8 @@ fn replace_document_transaction(
         transaction
             .execute(
                 "
-                INSERT INTO provisions (document_id, ordinal, anchor, heading, body)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                INSERT INTO provisions (document_id, ordinal, anchor, heading, body, transcription_confidence)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ",
                 params![
                     document.document_id.as_str(),
@@ -2072,6 +2202,7 @@ fn replace_document_transaction(
                     provision.anchor,
                     provision.heading,
                     provision.text,
+                    provision.transcription_confidence.map(f64::from),
                 ],
             )
             .map_err(|_| RetrievalError::IndexUnavailable)?;
@@ -2539,6 +2670,47 @@ mod tests {
     /// function, and got declared boundaries and a same-clause answer. File
     /// ingestion was safe only because the shipped converters set the warning
     /// every time -- an invariant a refactor could drop is not an invariant.
+    /// A transcription's pages become page-anchored provisions, and the
+    /// document it produces is transcribed by construction.
+    #[test]
+    fn a_transcribed_document_is_page_anchored_and_never_declares_boundaries() {
+        let document = normalize_transcribed_document(
+            DocumentId::parse("scan").expect("id"),
+            "Scan",
+            b"image-bytes",
+            "apple-vision-text-r3",
+            &[
+                (
+                    1,
+                    "CONFIDENTIALITY. The Recipient shall protect it.".into(),
+                    0.94,
+                ),
+                (2, "   ".into(), 0.10),
+                (3, "Neither party may assign this Agreement.".into(), 0.41),
+            ],
+        )
+        .expect("normalize");
+
+        assert_eq!(document.text_provenance, TextProvenance::Transcribed);
+        assert_eq!(
+            document.provision_boundaries,
+            ProvisionBoundaries::Inferred,
+            "a reading of a page establishes no clause boundary"
+        );
+        // The blank page is dropped rather than indexed as an empty clause.
+        assert_eq!(document.provisions.len(), 2);
+        assert_eq!(document.provisions[0].anchor, "page:0001");
+        assert_eq!(document.provisions[1].anchor, "page:0003");
+        assert!(
+            document
+                .provisions
+                .iter()
+                .all(|provision| provision.heading.is_none()),
+            "a transcription has no section caption to cite"
+        );
+        assert_eq!(document.provisions[1].transcription_confidence, Some(0.41));
+    }
+
     /// A transcription is never quoted, on any retrieval path.
     ///
     /// Built before OCR exists, and that is the point. The failure to avoid is
@@ -2591,6 +2763,37 @@ mod tests {
                 "{scope:?} carried transcribed excerpts on a document card"
             );
         }
+
+        // The match is not discarded: it comes back as a transcription, saying
+        // what it is. Withholding it entirely would be a different kind of
+        // dishonesty -- the text IS in the archive.
+        let transcribed = index
+            .search(
+                index.vault_id(),
+                LegalQuery {
+                    raw: "confidentiality".to_string(),
+                    scope: MatchScope::AnywhereInDocument,
+                    required_concepts: vec![LegalConcept::Confidentiality],
+                    excluded_concepts: Vec::new(),
+                    exact_phrase: None,
+                    max_sentences: None,
+                    limit: 10,
+                },
+                &revisions,
+            )
+            .expect("search");
+        assert_eq!(
+            transcribed.transcriptions.len(),
+            1,
+            "a matching transcription was dropped instead of being shown as one"
+        );
+        let card = &transcribed.transcriptions[0];
+        assert!(card.transcribed_text.contains("Confidential Information"));
+        assert!(
+            card.why_transcribed.contains("machine's reading"),
+            "a transcription card did not say what it is: {}",
+            card.why_transcribed
+        );
 
         // And the same document, extracted, does answer -- so the assertions
         // above cannot pass merely because nothing matched.
@@ -2971,6 +3174,7 @@ mod tests {
             source_converter: "pdf-extract-0.12.0-v1".to_string(),
             provision_boundaries: ProvisionBoundaries::Declared,
             text_provenance: TextProvenance::Extracted,
+            transcription_confidence: None,
             lexical_rank: 0.0,
         };
         let card = candidate
