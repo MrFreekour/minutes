@@ -16,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -14,7 +14,7 @@ use minutes_archive_core::{
     approve_roots, scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits,
     CensusReport, CensusStatus,
 };
-use minutes_archive_ocr::BoundedTranscriber;
+use minutes_archive_ocr::{BoundedTranscriber, WORKER_MARKER as OCR_WORKER_MARKER};
 use minutes_archive_semantic::{
     run_worker_process as run_semantic_worker, BoundedSemanticEngine,
     WORKER_MARKER as SEMANTIC_WORKER_MARKER,
@@ -650,6 +650,41 @@ fn search_archive_text_vault(
 /// Deliberately end to end through the real `BoundedConverter`: the failure
 /// this exists to catch was in binding, not in parsing, and it only appears
 /// when the running executable carries a bundle-bound signature.
+/// The recognizer worker, reached through the same binary as the others.
+///
+/// Its absence is what made `BoundedTranscriber::bind` fail: the marker fell
+/// through to the GUI branch, so binding launched a second copy of the
+/// application instead of a worker, the self-test never passed, and every scan
+/// was silently skipped as an unsupported format. Nothing reported it, because
+/// the engine is optional by design and `.ok()` swallowed the failure.
+fn run_ocr_worker(operation: &str) -> i32 {
+    if minutes_archive_ocr::install_worker_security_boundary().is_err() {
+        return 70;
+    }
+    if operation == "sandbox-self-test" {
+        return minutes_archive_ocr::sandbox_self_test();
+    }
+    if operation != "recognize" {
+        return 64;
+    }
+    use std::io::{Read, Write};
+    let mut image = Vec::new();
+    if std::io::stdin().lock().read_to_end(&mut image).is_err() {
+        return 65;
+    }
+    let outcome = std::panic::catch_unwind(|| minutes_archive_ocr::recognize_page(&image));
+    let Ok(Ok(page)) = outcome else {
+        return 66;
+    };
+    let Ok(encoded) = serde_json::to_vec(&page) else {
+        return 67;
+    };
+    if std::io::stdout().lock().write_all(&encoded).is_err() {
+        return 68;
+    }
+    0
+}
+
 fn run_signed_worker_selftest() -> i32 {
     let executable = match std::env::current_exe() {
         Ok(path) => path,
@@ -681,13 +716,22 @@ fn run_signed_worker_selftest() -> i32 {
             return 72;
         }
     }
+    // The recognizer is bound against THIS binary, not the standalone worker.
+    // Exercising the standalone one is what let a missing marker ship: that
+    // executable of course understood its own marker, while the application it
+    // actually runs inside did not, and binding it launched a second copy of
+    // the app instead of a worker.
+    if let Err(error) = minutes_archive_ocr::BoundedTranscriber::bind(&executable) {
+        eprintln!("signed-worker-selftest: recognizer bind failed: {error}");
+        return 73;
+    }
     match minutes_archive_semantic::BoundedSemanticEngine::bind(&executable) {
-        Ok(_) => println!("signed_worker_selftest=passed converter=bound semantic=bound"),
+        Ok(_) => println!("signed_worker_selftest=passed converter=bound ocr=bound semantic=bound"),
         // Absent on a runner without Apple's linguistic asset, which is not a
         // signing failure and must not fail the check.
-        Err(error) => {
-            println!("signed_worker_selftest=passed converter=bound semantic=unavailable ({error})")
-        }
+        Err(error) => println!(
+            "signed_worker_selftest=passed converter=bound ocr=bound semantic=unavailable ({error})"
+        ),
     }
     0
 }
@@ -698,7 +742,7 @@ fn main() {
     let marker = arguments.next();
     if matches!(
         marker.as_deref(),
-        Some(CONVERT_WORKER_MARKER | SEMANTIC_WORKER_MARKER)
+        Some(CONVERT_WORKER_MARKER | SEMANTIC_WORKER_MARKER | OCR_WORKER_MARKER)
     ) {
         let operation = arguments.next().unwrap_or_default();
         if arguments.next().is_some() {
@@ -707,6 +751,7 @@ fn main() {
         let status = match marker.as_deref() {
             Some(CONVERT_WORKER_MARKER) => run_convert_worker(&operation),
             Some(SEMANTIC_WORKER_MARKER) => run_semantic_worker(&operation),
+            Some(OCR_WORKER_MARKER) => run_ocr_worker(&operation),
             _ => unreachable!("worker marker was already validated"),
         };
         std::process::exit(status);
@@ -716,6 +761,22 @@ fn main() {
             std::process::exit(64);
         }
         std::process::exit(run_signed_worker_selftest());
+    }
+    // An unrecognised flag must never reach the GUI branch.
+    //
+    // This is how a missing worker marker became a second copy of the
+    // application on the owner's screen: `BoundedTranscriber::bind` launched
+    // this binary with the OCR marker, nothing matched, and execution fell
+    // through to `tauri::Builder`. The bind then failed, every scan was skipped
+    // as unsupported, and the visible symptom was a window nobody asked for
+    // stealing focus mid-build. Refusing anything flag-shaped that is not
+    // understood turns that whole class of mistake into an immediate exit.
+    if marker
+        .as_deref()
+        .is_some_and(|value| value.starts_with("--") && value != NATIVE_LIFECYCLE_SELFTEST_MARKER)
+    {
+        eprintln!("Minutes Archive: unrecognised option");
+        std::process::exit(64);
     }
     let native_lifecycle_selftest = marker.as_deref() == Some(NATIVE_LIFECYCLE_SELFTEST_MARKER);
     if native_lifecycle_selftest && arguments.next().is_some() {
