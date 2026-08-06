@@ -33,9 +33,15 @@ jobs:
               - 'crates/cli/**'
               - 'crates/reader/**'
               - 'crates/whisper-guard/**'
+              - 'archive/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              # Sets rustflags and build env per target, so it changes how every
+              # Rust target compiles. Omitting it meant a change that statically
+              # linked the Windows CRT skipped every Rust job and reported green
+              # (#657 follow-up).
+              - '.cargo/**'
               - '.github/workflows/ci.yml'
 
   test:
