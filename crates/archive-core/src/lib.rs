@@ -852,7 +852,13 @@ fn category_for_extension(extension: &str) -> &'static str {
         ".doc" | ".docm" | ".docx" | ".dot" | ".dotm" | ".dotx" | ".odt" | ".rtf" | ".rtfd"
         | ".wpd" | ".wps" => "word_processing",
         ".eml" | ".mbox" | ".msg" | ".olm" | ".ost" | ".pst" => "email",
-        ".htm" | ".html" | ".md" | ".text" | ".txt" | ".xml" => "plain_text",
+        // Split from markup deliberately. These are the plain-text formats the
+        // index actually opens; ".htm", ".html" and ".xml" are not, and one row
+        // holding both reported a coverage number that read as searchable when
+        // most of it was not. In a large folder that is the difference between
+        // "13,046 documents you can search" and a few hundred.
+        ".md" | ".text" | ".txt" => "plain_text",
+        ".htm" | ".html" | ".xml" => "markup",
         ".bmp" | ".gif" | ".heic" | ".jpeg" | ".jpg" | ".png" | ".tif" | ".tiff" => "image_or_scan",
         ".csv" | ".numbers" | ".ods" | ".xls" | ".xlsb" | ".xlsm" | ".xlsx" => "spreadsheet",
         ".key" | ".odp" | ".ppt" | ".pptm" | ".pptx" => "presentation",

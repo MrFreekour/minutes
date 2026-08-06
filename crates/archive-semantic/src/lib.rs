@@ -92,34 +92,50 @@ struct WorkerResponse {
     error: Option<String>,
 }
 
-/// Binds semantic execution to a private, read-only snapshot of the app
-/// executable. Each build session installs the macOS sandbox before it creates
+/// Binds semantic execution to one pinned copy of the app executable, running
+/// in place. Each build session installs the macOS sandbox before it creates
 /// the Natural Language model or reads any confidential text.
 pub struct BoundedSemanticEngine {
-    _snapshot_directory: tempfile::TempDir,
     executable_path: PathBuf,
+    /// Held open with `O_NOFOLLOW` for the object's lifetime, pinning one
+    /// inode so the digest is always re-read from the same file.
     executable: fs::File,
+    executable_identity: FileIdentity,
     executable_bytes: u64,
     executable_digest: [u8; 32],
 }
 
+/// Device and inode of the pinned worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
 impl std::fmt::Debug for BoundedSemanticEngine {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BoundedSemanticEngine([private read-only worker snapshot])")
+        formatter.write_str("BoundedSemanticEngine([pinned worker executable])")
     }
 }
 
 impl BoundedSemanticEngine {
-    /// Path of the private worker snapshot directory.
-    ///
-    /// Exposed so the app can reclaim it explicitly. `exit(0)` does not
-    /// unwind, and during a vault build this object lives inside a blocking
-    /// task rather than in shared session state, so nothing the close handler
-    /// can reach owns it and no destructor will run.
-    pub fn snapshot_directory(&self) -> &Path {
-        self._snapshot_directory.path()
-    }
-
     pub fn bind(worker_executable: &Path) -> Result<Self, SemanticError> {
         let canonical = fs::canonicalize(worker_executable)
             .map_err(|_| SemanticError::ExecutableUnavailable)?;
@@ -135,7 +151,7 @@ impl BoundedSemanticEngine {
             use std::os::unix::fs::OpenOptionsExt;
             source_options.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut source = source_options
+        let source = source_options
             .open(&canonical)
             .map_err(|_| SemanticError::ExecutableUnavailable)?;
         let source_metadata = source
@@ -145,51 +161,21 @@ impl BoundedSemanticEngine {
             return Err(SemanticError::ExecutableUnavailable);
         }
 
-        let snapshot_directory = tempfile::Builder::new()
-            .prefix("minutes-archive-semantic-")
-            .tempdir()
-            .map_err(|_| SemanticError::ExecutableUnavailable)?;
-        #[cfg(unix)]
-        fs::set_permissions(
-            snapshot_directory.path(),
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-        )
-        .map_err(|_| SemanticError::ExecutableUnavailable)?;
-        let executable_path = snapshot_directory.path().join("worker");
-        let mut snapshot_options = fs::OpenOptions::new();
-        snapshot_options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            snapshot_options.mode(0o500);
-        }
-        let mut snapshot = snapshot_options
-            .open(&executable_path)
-            .map_err(|_| SemanticError::ExecutableUnavailable)?;
-        std::io::copy(&mut source, &mut snapshot)
-            .map_err(|_| SemanticError::ExecutableUnavailable)?;
-        snapshot
-            .sync_all()
-            .map_err(|_| SemanticError::ExecutableUnavailable)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            snapshot
-                .set_permissions(fs::Permissions::from_mode(0o500))
-                .map_err(|_| SemanticError::ExecutableUnavailable)?;
-        }
-        drop(snapshot);
-        let executable =
-            fs::File::open(&executable_path).map_err(|_| SemanticError::ExecutableUnavailable)?;
+        // Runs in place, like the converter and for the same reason: a
+        // Developer ID signature with the hardened runtime is bound to its
+        // bundle, so a copy of the executable fails validation and is SIGKILLed
+        // on exec. The descriptor opened above pins the inode instead, and
+        // `verify_executable` re-reads the digest through it before every use.
+        let executable_identity = file_identity(&source_metadata);
         let (executable_bytes, executable_digest) =
-            digest_file(&executable).map_err(|_| SemanticError::ExecutableUnavailable)?;
+            digest_file(&source).map_err(|_| SemanticError::ExecutableUnavailable)?;
         if executable_bytes != source_metadata.len() {
             return Err(SemanticError::ExecutableUnavailable);
         }
         let engine = Self {
-            _snapshot_directory: snapshot_directory,
-            executable_path,
-            executable,
+            executable_path: canonical,
+            executable: source,
+            executable_identity,
             executable_bytes,
             executable_digest,
         };
@@ -236,12 +222,18 @@ impl BoundedSemanticEngine {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(SemanticError::ExecutableUnavailable);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o222 != 0 {
-                return Err(SemanticError::ExecutableUnavailable);
-            }
+        // Identity, not permissions. The worker used to be a private 0500
+        // copy; an installed bundle's executable is 0755 like any other, so a
+        // no-write-bits rule would refuse every real installation.
+        if file_identity(&metadata) != self.executable_identity {
+            return Err(SemanticError::ExecutableUnavailable);
+        }
+        let pinned = self
+            .executable
+            .metadata()
+            .map_err(|_| SemanticError::ExecutableUnavailable)?;
+        if file_identity(&pinned) != self.executable_identity {
+            return Err(SemanticError::ExecutableUnavailable);
         }
         let (bytes, digest) =
             digest_file(&self.executable).map_err(|_| SemanticError::ExecutableUnavailable)?;

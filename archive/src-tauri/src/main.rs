@@ -27,6 +27,18 @@ use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 const NATIVE_LIFECYCLE_SELFTEST_MARKER: &str = "--archive-native-lifecycle-selftest";
+/// Proves the SIGNED application can actually run its own workers.
+///
+/// Everything else was verified on a build that could not do this. A
+/// Developer ID signature with the hardened runtime is bound to its bundle, so
+/// when the workers were copied to a temp directory and run from there, the
+/// copy failed validation and the kernel killed it -- every notarized build
+/// was unable to index a single document. Signature, staple, Gatekeeper and
+/// launch all passed, the window opened, and the first click on "Build
+/// document pilot" failed. The gap was that local testing used an
+/// ad-hoc-signed app, whose copy runs fine, and CI exercised the unsigned
+/// build. This mode closes it: run it against the notarized artifact.
+const SIGNED_WORKER_SELFTEST_MARKER: &str = "--archive-signed-worker-selftest";
 
 #[derive(Debug)]
 struct ApprovedLocation {
@@ -379,7 +391,9 @@ async fn build_archive_text_vault(
 
     let worker_executable = std::env::current_exe()
         .map_err(|_| "Minutes Archive could not bind its document converter.".to_string())?;
-    let snapshot_registry = Arc::clone(&state.live_snapshots);
+    // Kept live: `purge_session` drains it, and a worker that needs scratch
+    // space again should register here. Nothing populates it today.
+    let _snapshot_registry = Arc::clone(&state.live_snapshots);
     let build_result = tauri::async_runtime::spawn_blocking(move || {
         let vault_id = VaultId::parse("local-private-vault")
             .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
@@ -390,15 +404,10 @@ async fn build_archive_text_vault(
         // optional aid the interface already labels review-not-verified. A Mac
         // without Apple's linguistic asset previously got NO search at all.
         let semantic_engine = BoundedSemanticEngine::bind(&worker_executable).ok();
-        // Register both snapshots before the long build starts. Until the
-        // vault exists these objects live only in this blocking task, so a
-        // close during the build would otherwise leave both directories.
-        if let Ok(mut registry) = snapshot_registry.lock() {
-            registry.push(converter.snapshot_directory().to_path_buf());
-            if let Some(engine) = semantic_engine.as_ref() {
-                registry.push(engine.snapshot_directory().to_path_buf());
-            }
-        }
+        // Neither worker copies itself any more -- both execute in place from
+        // the bundle -- so there is no snapshot directory left to reclaim. The
+        // registry stays because it is what `purge_session` drains, and a
+        // future worker that does need scratch space should register it here.
         build_authorized_document_vault(
             vault_id,
             &roots,
@@ -556,6 +565,53 @@ fn search_archive_text_vault(
         .map_err(|error| error.to_string())
 }
 
+/// Bind the converter to this executable and convert one synthetic document.
+///
+/// Deliberately end to end through the real `BoundedConverter`: the failure
+/// this exists to catch was in binding, not in parsing, and it only appears
+/// when the running executable carries a bundle-bound signature.
+fn run_signed_worker_selftest() -> i32 {
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("signed-worker-selftest: current_exe failed: {error}");
+            return 70;
+        }
+    };
+    let converter = match minutes_archive_convert::BoundedConverter::bind(&executable) {
+        Ok(converter) => converter,
+        Err(error) => {
+            eprintln!("signed-worker-selftest: converter bind failed: {error}");
+            return 71;
+        }
+    };
+    // A minimal synthetic document, inline so the check needs no fixture on
+    // the runner and never touches a real file.
+    const SOURCE: &[u8] =
+        b"7. CONFIDENTIALITY\nConfidential Information includes affiliate data.\n";
+    match converter.convert(minutes_archive_convert::SourceFormat::Docx, SOURCE) {
+        Ok(_) => {}
+        Err(minutes_archive_convert::WorkerError::SourceRefused) => {
+            // Expected: those bytes are not a real DOCX container. What
+            // matters is that the worker ran and answered, which it cannot do
+            // if the signature check killed it.
+        }
+        Err(error) => {
+            eprintln!("signed-worker-selftest: worker did not run: {error}");
+            return 72;
+        }
+    }
+    match minutes_archive_semantic::BoundedSemanticEngine::bind(&executable) {
+        Ok(_) => println!("signed_worker_selftest=passed converter=bound semantic=bound"),
+        // Absent on a runner without Apple's linguistic asset, which is not a
+        // signing failure and must not fail the check.
+        Err(error) => {
+            println!("signed_worker_selftest=passed converter=bound semantic=unavailable ({error})")
+        }
+    }
+    0
+}
+
 fn main() {
     let mut arguments = std::env::args();
     let _program = arguments.next();
@@ -574,6 +630,12 @@ fn main() {
             _ => unreachable!("worker marker was already validated"),
         };
         std::process::exit(status);
+    }
+    if marker.as_deref() == Some(SIGNED_WORKER_SELFTEST_MARKER) {
+        if arguments.next().is_some() {
+            std::process::exit(64);
+        }
+        std::process::exit(run_signed_worker_selftest());
     }
     let native_lifecycle_selftest = marker.as_deref() == Some(NATIVE_LIFECYCLE_SELFTEST_MARKER);
     if native_lifecycle_selftest && arguments.next().is_some() {

@@ -315,6 +315,19 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app"
 
           executable="$app/Contents/MacOS/minutes-archive-app"
+
+          # Prove the SIGNED app can run its own workers, before anything is
+          # published. Every other check here is about provenance: is it the
+          # right bytes, signed by the right identity, notarized and stapled.
+          # All of that passed on a build that could not index a single
+          # document, because the workers were copied to a temp directory and a
+          # copy of a bundle-signed binary is killed on exec. Local testing used
+          # an ad-hoc-signed app whose copy runs fine, and the smokes above run
+          # on the unsigned build, so nothing saw it until a human clicked the
+          # button. This is the only step that exercises the artifact as
+          # shipped.
+          "$executable" --archive-signed-worker-selftest
+
           executable_sha="$(shasum -a 256 "$executable" | awk '{print $1}')"
           printf 'candidate=%s\nteam_id=%s\nidentifier=%s\nexecutable_sha256=%s\nnotarized=true\nstapled=true\n' \
             "$CANDIDATE_SHA" "$team_id" "$identifier" "$executable_sha" \
