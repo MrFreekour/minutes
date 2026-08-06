@@ -93,6 +93,8 @@ const vaultReport = {
   hard_links_skipped: 3,
   metadata_errors: 0,
   permission_denied: 9000,
+  unopenable: 4,
+  scans_unreadable: 12,
   entries_unstattable: 0,
   identity_unavailable: 0,
   changed_while_reading: 2,
@@ -388,12 +390,13 @@ try {
         if (
           !vaultSummary.includes("2 were aliases or shortcuts") ||
           !vaultSummary.includes("3 have a second name elsewhere on the disk") ||
-          !vaultSummary.includes("9,007 items were not indexed") ||
+          !vaultSummary.includes("9,023 items were not indexed") ||
           !vaultSummary.includes("4 scanned pages read by text recognition") ||
           !vaultSummary.includes("This index is PARTIAL") ||
           !vaultSummary.includes("5,000 documents were not read") ||
           !vaultSummary.includes("3 folders were too deep to enter") ||
-          !vaultSummary.includes("9,000 could not be opened (permission denied)") ||
+          !vaultSummary.includes("9,000 were blocked by macOS permissions") ||
+          !vaultSummary.includes("12 were scans the text recognizer could not read") ||
           !vaultSummary.includes("2 changed while being read")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);

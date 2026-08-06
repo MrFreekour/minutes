@@ -155,6 +155,10 @@ pub struct TextVaultBuildReport {
     /// number was unanswerable: five different failures shared one counter, and
     /// permission denied reads very differently from a file changing mid-read.
     pub permission_denied: u64,
+    /// Could not be opened for some reason that is NOT permissions.
+    pub unopenable: u64,
+    /// Page images the recognizer could not read, or that held no text.
+    pub scans_unreadable: u64,
     /// The entry could not be stat'd at all.
     pub entries_unstattable: u64,
     /// No stable device/inode identity, so the file could not be pinned.
@@ -535,6 +539,8 @@ struct BuildCounters {
     budget_reached: bool,
     documents_left_unread: u64,
     permission_denied: u64,
+    unopenable: u64,
+    scans_unreadable: u64,
     entries_unstattable: u64,
     identity_unavailable: u64,
     changed_while_reading: u64,
@@ -876,11 +882,17 @@ fn build_authorized_vault(
 
             let mut file = match current.directory.open(&name) {
                 Ok(file) => file,
-                Err(_) => {
-                    // Overwhelmingly the permission case in practice, and the
-                    // one worth telling a reader about: the file is there and
-                    // the app is not allowed to open it.
-                    counters.permission_denied = counters.permission_denied.saturating_add(1);
+                Err(error) => {
+                    // Ask the error what happened rather than assuming. The
+                    // first version of this counter was labelled "permission
+                    // denied" on the strength of a guess, and a real archive
+                    // then reported 10,418 of them -- a number stated as a
+                    // cause without ever measuring one.
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        counters.permission_denied = counters.permission_denied.saturating_add(1);
+                    } else {
+                        counters.unopenable = counters.unopenable.saturating_add(1);
+                    }
                     continue;
                 }
             };
@@ -995,6 +1007,8 @@ fn build_authorized_vault(
         budget_reached: counters.budget_reached,
         documents_left_unread: counters.documents_left_unread,
         permission_denied: counters.permission_denied,
+        unopenable: counters.unopenable,
+        scans_unreadable: counters.scans_unreadable,
         entries_unstattable: counters.entries_unstattable,
         identity_unavailable: counters.identity_unavailable,
         changed_while_reading: counters.changed_while_reading,
@@ -1041,7 +1055,14 @@ fn build_authorized_vault(
 enum ExtractionOutcome {
     MalformedText,
     ConversionFailed,
+    /// A PDF that carries no text layer: a picture of a page.
     OcrRequired,
+    /// A page image the recognizer could not read, or that held no text.
+    ///
+    /// Split from `OcrRequired` because sharing it told a reader "2,565 PDFs
+    /// require OCR" for an archive holding 447 PDFs -- the number was almost
+    /// entirely scans that failed, reported as something they are not.
+    ScanUnreadable,
     /// Not a coverage gap and not counted: `source_kind` only classifies a
     /// convertible format when a converter exists, so reaching this means the
     /// build was misconfigured. Carried back rather than counted because that
@@ -1102,14 +1123,14 @@ fn extract_document(
                 // Unreachable: a scan is only classified as one when a
                 // recogniser exists. Counted rather than failing the build, so
                 // a bad classification cannot lose a folder.
-                return Err(ExtractionOutcome::OcrRequired);
+                return Err(ExtractionOutcome::ScanUnreadable);
             };
             let page = match transcriber.transcribe(bytes) {
                 Ok(page) => page,
                 // A scan that cannot be read is still a coverage gap the
                 // reader should see, and it is the same gap as a PDF with no
                 // text layer.
-                Err(_) => return Err(ExtractionOutcome::OcrRequired),
+                Err(_) => return Err(ExtractionOutcome::ScanUnreadable),
             };
             let text = page
                 .lines
@@ -1119,7 +1140,7 @@ fn extract_document(
                 .join(" ");
             if text.trim().is_empty() {
                 // A photograph, a blank scan, a separator sheet.
-                return Err(ExtractionOutcome::OcrRequired);
+                return Err(ExtractionOutcome::ScanUnreadable);
             }
             normalize_transcribed_document(
                 document_id.clone(),
@@ -1133,7 +1154,7 @@ fn extract_document(
     normalized.map_err(|_| match source_kind {
         SourceKind::Text => ExtractionOutcome::MalformedText,
         SourceKind::Converted(_) => ExtractionOutcome::ConversionFailed,
-        SourceKind::Scanned => ExtractionOutcome::OcrRequired,
+        SourceKind::Scanned => ExtractionOutcome::ScanUnreadable,
     })
 }
 
@@ -1203,6 +1224,10 @@ fn index_extracted_batch(
             }
             Err(ExtractionOutcome::ConversionFailed) => {
                 counters.conversion_failures = counters.conversion_failures.saturating_add(1);
+                continue;
+            }
+            Err(ExtractionOutcome::ScanUnreadable) => {
+                counters.scans_unreadable = counters.scans_unreadable.saturating_add(1);
                 continue;
             }
             Err(ExtractionOutcome::OcrRequired) => {

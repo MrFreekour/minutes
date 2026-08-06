@@ -359,7 +359,7 @@ function renderVaultSummary(report) {
       report.unsupported_files_skipped === 1 ? "" : "s"
     } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
       report.ocr_required_files === 1 ? "" : "s"
-    } require OCR. ` +
+    } are images of pages and carry no text to read. ` +
     // Defaulted, not asserted: a missing count must never blank the search
     // view. Throwing here would hide every result behind a field the reader
     // does not care about.
@@ -413,7 +413,9 @@ function describeDroppedSources(report) {
     // documents "could not be read" and the number could not be acted on.
     // Permission denied is a thing a reader can fix; a file changing mid-read
     // is not the same problem at all.
-    [report.permission_denied, "could not be opened (permission denied)"],
+    [report.permission_denied, "were blocked by macOS permissions"],
+    [report.unopenable, "could not be opened for another reason"],
+    [report.scans_unreadable, "were scans the text recognizer could not read"],
     [report.entries_unstattable, "could not be examined at all"],
     [report.identity_unavailable, "had no stable identity to pin"],
     [report.changed_while_reading, "changed while being read"],
