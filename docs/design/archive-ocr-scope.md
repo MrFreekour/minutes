@@ -1,6 +1,13 @@
 # Scanned documents: scope for OCR in Minutes Archive
 
-Status: **proposal, not implemented.** Written 2026-08-06 after a working spike.
+Status: **implemented.** Written 2026-08-06 as a proposal; the plan below was
+followed and the work landed the same day. Kept because the reasoning -- and
+the measurement behind the sandbox decision -- is the part worth preserving.
+
+What shipped, in the order the document called for: the transcription evidence
+class first (`TranscribedCard`, enforced by an `ExtractedText` witness so that
+quoting a transcription is a compile error), then `minutes-archive-ocr`, then
+the routing that feeds scans into the index. Handwriting remains out of scope.
 
 ## Why
 
@@ -106,7 +113,17 @@ a card that reads as authoritative and is not.
 
 Item 3 first, then 1. Building the plumbing for a distinct evidence class
 before there is any OCR to put in it is what stops the transcription being
-quietly returned as a quote when the deadline is close.
+quietly returned as a quote when the deadline is close. This was followed:
+there is no commit in which OCR exists and the distinction does not.
+
+## Still open
+
+Text-layer-less PDFs -- a PDF that is really a picture of a page -- are still
+counted as requiring OCR rather than rasterised and read. Item 2 of the scope
+covered them and only the image-file half is done.
+
+Performance is unmeasured against a real archive. 2,777 images at a second each
+is 45 minutes of indexing, and the index is rebuilt per session.
 
 ## Not in scope
 
