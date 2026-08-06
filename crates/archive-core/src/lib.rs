@@ -92,6 +92,18 @@ pub struct ApprovedRoot {
     identity: FileIdentity,
 }
 
+impl ApprovedRoot {
+    /// The real path of this root.
+    ///
+    /// Deliberately not public to the interface -- it is used only to hand a
+    /// path to Finder, inside the Rust side, and never crosses the IPC
+    /// boundary. The webview names a document by opaque id and gets no path
+    /// back.
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
 impl std::fmt::Debug for ApprovedRoot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ApprovedRoot([redacted])")
@@ -786,6 +798,25 @@ pub(crate) fn open_approved_root(root: &ApprovedRoot) -> Result<Dir, CensusError
         return Err(CensusError::RootChanged);
     }
     Ok(directory)
+}
+
+/// Device and inode of a std metadata, matching `cap_metadata_identity`.
+///
+/// The reveal path is resolved with `std::fs` rather than a capability handle,
+/// because Finder needs a real path; the identity check is the same one the
+/// evidence fence uses, so a file swapped since indexing is refused.
+#[cfg(unix)]
+pub(crate) fn portable_identity_for(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        first: metadata.dev(),
+        second: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn portable_identity_for(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
 }
 
 #[cfg(unix)]

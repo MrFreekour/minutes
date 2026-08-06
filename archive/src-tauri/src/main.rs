@@ -146,6 +146,41 @@ struct UiBuildProgress {
     indexed: u64,
 }
 
+/// Show a document in Finder, named by opaque id.
+///
+/// The interface has never received a path and still does not: it sends back
+/// the id it was given on the card, and the path is resolved here, used to ask
+/// Finder to select the file, and dropped. Nothing about the location crosses
+/// into the webview, so the property the census screen states -- "the interface
+/// receives opaque location numbers, not folder paths" -- is unchanged.
+#[tauri::command]
+fn reveal_archive_document(
+    document_id: String,
+    state: tauri::State<'_, ArchiveState>,
+) -> Result<(), String> {
+    let document_id = minutes_archive_core::retrieval::DocumentId::parse(document_id)
+        .map_err(|_| "That document could not be identified.".to_string())?;
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "Minutes Archive could not read its session.".to_string())?;
+    let vault = session
+        .text_vault
+        .as_ref()
+        .ok_or_else(|| "There is no open index.".to_string())?;
+    // Refuses if the file moved, changed identity, or is no longer a regular
+    // file inside its approved root -- the same check a quotation gets.
+    let path = vault
+        .source_path_for_reveal(&document_id)
+        .ok_or_else(|| "That source is no longer where it was indexed.".to_string())?;
+    std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(&path)
+        .status()
+        .map_err(|_| "Finder could not be asked to show the document.".to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn archive_index_progress(state: tauri::State<'_, ArchiveState>) -> UiBuildProgress {
     let progress = state
@@ -497,6 +532,12 @@ async fn build_archive_text_vault(
 /// silently reach the webview.
 #[derive(serde::Serialize)]
 struct UiEvidenceCard {
+    /// The opaque id, so a card can ask for itself to be shown in Finder.
+    ///
+    /// An id, never a path: it means nothing outside this session and resolves
+    /// only against sources the vault already holds. The interface still
+    /// receives no filename and no location.
+    document_id: String,
     document_title: String,
     provision_heading: Option<String>,
     source_anchor: String,
@@ -510,6 +551,7 @@ struct UiEvidenceCard {
 impl From<&minutes_archive_core::retrieval::EvidenceCard> for UiEvidenceCard {
     fn from(card: &minutes_archive_core::retrieval::EvidenceCard) -> Self {
         Self {
+            document_id: card.document_id.as_str().to_string(),
             document_title: card.document_title.clone(),
             provision_heading: card.provision_heading.clone(),
             source_anchor: card.source_anchor.clone(),
@@ -524,6 +566,7 @@ impl From<&minutes_archive_core::retrieval::EvidenceCard> for UiEvidenceCard {
 
 #[derive(serde::Serialize)]
 struct UiSemanticCard {
+    document_id: String,
     document_title: String,
     provision_heading: Option<String>,
     source_anchor: String,
@@ -539,6 +582,7 @@ struct UiSemanticCard {
 /// interface cannot render one as the other by reaching for `exact_excerpt`.
 #[derive(serde::Serialize)]
 struct UiTranscribedCard {
+    document_id: String,
     document_title: String,
     page_anchor: String,
     transcribed_text: String,
@@ -551,6 +595,7 @@ struct UiTranscribedCard {
 impl From<&minutes_archive_core::retrieval::TranscribedCard> for UiTranscribedCard {
     fn from(card: &minutes_archive_core::retrieval::TranscribedCard) -> Self {
         Self {
+            document_id: card.document_id.as_str().to_string(),
             document_title: card.document_title.clone(),
             page_anchor: card.page_anchor.clone(),
             transcribed_text: card.transcribed_text.clone(),
@@ -605,6 +650,7 @@ impl From<LegalSearchResponse> for UiSearchResponse {
                 .semantic_suggestions
                 .iter()
                 .map(|card| UiSemanticCard {
+                    document_id: card.document_id.as_str().to_string(),
                     document_title: card.document_title.clone(),
                     provision_heading: card.provision_heading.clone(),
                     source_anchor: card.source_anchor.clone(),
@@ -848,6 +894,7 @@ fn main() {
             export_archive_census,
             build_archive_text_vault,
             archive_index_progress,
+            reveal_archive_document,
             search_archive_text_vault,
         ])
         .build(tauri::generate_context!())
@@ -1060,13 +1107,17 @@ mod tests {
             serde_json::to_string(&UiSearchResponse::from(response)).expect("serialize projection");
 
         // The full record really does carry these; the projection must not.
-        for field in [
-            "sha256",
-            "byte_len",
-            "vault_id",
-            "document_id",
-            "lexical_rank",
-        ] {
+        //
+        // `document_id` was on this list and has been deliberately removed from
+        // it, so that a card can ask for its own source to be shown in Finder.
+        // What that reveals is nothing: the id is a synthetic counter,
+        // `document-{n:016x}`, generated during the build and meaningless
+        // outside the session. It is not derived from the filename, the path or
+        // the contents, and `valid_opaque_id` restricts it to lowercase
+        // alphanumerics and hyphens, so a path could not be smuggled through it
+        // even by accident. The path itself is resolved behind the boundary and
+        // never returned. The assertion below pins that.
+        for field in ["sha256", "byte_len", "vault_id", "lexical_rank"] {
             assert!(
                 full.contains(field),
                 "fixture no longer exercises {field}; this test would pass vacuously"
@@ -1080,6 +1131,17 @@ mod tests {
         assert!(projected.contains("exact_excerpt"));
         assert!(projected.contains("why_matched"));
         assert!(projected.contains("source_anchor"));
+
+        // The id crosses, and it is opaque. Nothing about where the document
+        // lives goes with it.
+        assert!(
+            projected.contains("document_id"),
+            "cards cannot ask for their source without an id"
+        );
+        assert!(
+            !projected.contains("probe-doc.txt") && !projected.contains('/'),
+            "the projection carried a filename or a path: {projected}"
+        );
     }
 
     use super::*;

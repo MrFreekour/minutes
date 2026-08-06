@@ -147,6 +147,19 @@ pub struct TextVaultBuildReport {
     /// the approved folders. The index is real but partial.
     pub budget_reached: bool,
     pub documents_left_unread: u64,
+    /// The file exists and could not be opened. Almost always permissions.
+    ///
+    /// Split out of a single `metadata_errors` bucket after a real archive
+    /// reported 10,429 of roughly 16,600 documents "could not be read" and the
+    /// number was unanswerable: five different failures shared one counter, and
+    /// permission denied reads very differently from a file changing mid-read.
+    pub permission_denied: u64,
+    /// The entry could not be stat'd at all.
+    pub entries_unstattable: u64,
+    /// No stable device/inode identity, so the file could not be pinned.
+    pub identity_unavailable: u64,
+    /// The file changed between being seen and being read, so it was refused.
+    pub changed_while_reading: u64,
     /// Folders not descended into, because the tree was deeper than the limit.
     pub directories_left_unread: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
@@ -225,6 +238,33 @@ impl std::fmt::Debug for AuthorizedTextVault {
 impl AuthorizedTextVault {
     pub fn vault_id(&self) -> &VaultId {
         &self.vault_id
+    }
+
+    /// The real path of an indexed document, for revealing it in Finder.
+    ///
+    /// The interface never receives paths -- cards carry an opaque document id
+    /// and the IPC layer strips filenames and paths from everything it sends.
+    /// That invariant is kept here: the caller passes an id back, this resolves
+    /// it against the roots the vault already holds, and only the Rust side
+    /// ever sees the path. Nothing about it reaches the webview.
+    ///
+    /// Refuses unless the file is still the one that was indexed, checked the
+    /// same way a quotation is: same device and inode, still a regular file,
+    /// still inside its approved root. Revealing a path that now names
+    /// something else would point counsel at the wrong document.
+    pub fn source_path_for_reveal(&self, document_id: &DocumentId) -> Option<PathBuf> {
+        let source = self.sources.get(document_id)?;
+        let root = self.roots.get(source.root_index)?;
+        let path = root.approval.canonical_path().join(&source.relative_path);
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return None;
+        }
+        let current = crate::portable_identity_for(&metadata)?;
+        if current != source.identity {
+            return None;
+        }
+        Some(path)
     }
 
     pub fn build_report(&self) -> &TextVaultBuildReport {
@@ -452,6 +492,10 @@ struct BuildCounters {
     /// Set when a limit stopped the build short of the whole folder.
     budget_reached: bool,
     documents_left_unread: u64,
+    permission_denied: u64,
+    entries_unstattable: u64,
+    identity_unavailable: u64,
+    changed_while_reading: u64,
     directories_left_unread: u64,
     transcribed_documents: u64,
     indexed_bytes: u64,
@@ -645,7 +689,7 @@ fn build_authorized_vault(
             let metadata = match current.directory.symlink_metadata(&name) {
                 Ok(metadata) => metadata,
                 Err(_) => {
-                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    counters.entries_unstattable = counters.entries_unstattable.saturating_add(1);
                     continue;
                 }
             };
@@ -686,7 +730,8 @@ fn build_authorized_vault(
                 let opened_metadata = match child.dir_metadata() {
                     Ok(metadata) => metadata,
                     Err(_) => {
-                        counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                        counters.entries_unstattable =
+                            counters.entries_unstattable.saturating_add(1);
                         continue;
                     }
                 };
@@ -741,7 +786,7 @@ fn build_authorized_vault(
                 continue;
             }
             let Some(identity) = cap_metadata_identity_portable(&metadata) else {
-                counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                counters.identity_unavailable = counters.identity_unavailable.saturating_add(1);
                 continue;
             };
             if !identities.insert(identity) {
@@ -753,19 +798,22 @@ fn build_authorized_vault(
             let mut file = match current.directory.open(&name) {
                 Ok(file) => file,
                 Err(_) => {
-                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    // Overwhelmingly the permission case in practice, and the
+                    // one worth telling a reader about: the file is there and
+                    // the app is not allowed to open it.
+                    counters.permission_denied = counters.permission_denied.saturating_add(1);
                     continue;
                 }
             };
             let opened_metadata = match file.metadata() {
                 Ok(metadata) => metadata,
                 Err(_) => {
-                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    counters.entries_unstattable = counters.entries_unstattable.saturating_add(1);
                     continue;
                 }
             };
             if !cap_identity_matches(&opened_metadata, identity) {
-                counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                counters.changed_while_reading = counters.changed_while_reading.saturating_add(1);
                 continue;
             }
             let bytes = match read_bounded(&mut file, MAX_NORMALIZED_DOCUMENT_BYTES) {
@@ -779,14 +827,14 @@ fn build_authorized_vault(
             let post_read_metadata = match file.metadata() {
                 Ok(metadata) => metadata,
                 Err(_) => {
-                    counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                    counters.entries_unstattable = counters.entries_unstattable.saturating_add(1);
                     continue;
                 }
             };
             if !cap_identity_matches(&post_read_metadata, identity)
                 || post_read_metadata.len() != opened_metadata.len()
             {
-                counters.metadata_errors = counters.metadata_errors.saturating_add(1);
+                counters.changed_while_reading = counters.changed_while_reading.saturating_add(1);
                 continue;
             }
 
@@ -1023,6 +1071,10 @@ fn build_authorized_vault(
         hard_links_skipped: counters.hard_links_skipped,
         budget_reached: counters.budget_reached,
         documents_left_unread: counters.documents_left_unread,
+        permission_denied: counters.permission_denied,
+        entries_unstattable: counters.entries_unstattable,
+        identity_unavailable: counters.identity_unavailable,
+        changed_while_reading: counters.changed_while_reading,
         directories_left_unread: counters.directories_left_unread,
         transcribed_documents: counters.transcribed_documents,
         metadata_errors: counters.metadata_errors,

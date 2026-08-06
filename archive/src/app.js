@@ -409,6 +409,14 @@ function describeDroppedSources(report) {
     // than the folder holds -- a silent, total coverage loss.
     [report.symlinks_skipped, "were aliases or shortcuts"],
     [report.hard_links_skipped, "have a second name elsewhere on the disk"],
+    // Split five ways after a real archive reported 10,429 of ~16,600
+    // documents "could not be read" and the number could not be acted on.
+    // Permission denied is a thing a reader can fix; a file changing mid-read
+    // is not the same problem at all.
+    [report.permission_denied, "could not be opened (permission denied)"],
+    [report.entries_unstattable, "could not be examined at all"],
+    [report.identity_unavailable, "had no stable identity to pin"],
+    [report.changed_while_reading, "changed while being read"],
     [report.metadata_errors, "could not be read"],
     [report.directory_errors, "were in unreadable folders"],
   ].filter(([count]) => count > 0);
@@ -600,9 +608,34 @@ function evidenceCard(card, compact = false, semantic = false) {
   const why = document.createElement("p");
   why.className = "evidence-why";
   why.textContent = semantic ? card.why_suggested : card.why_matched;
-  article.append(header, excerpt, meta, why);
+  article.append(header, excerpt, meta, why, revealButton(card));
   if (semantic) article.classList.add("semantic-card");
   return article;
+}
+
+// Ask for the document by id and let the Rust side find it.
+//
+// The interface has no path to hand over and never gains one: it sends back
+// the opaque id it was given, and the resolution, the identity check and
+// Finder all happen behind the boundary. If the file has moved or changed
+// since it was indexed the request is refused rather than pointing at
+// whatever is there now.
+function revealButton(card) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "reveal-source";
+  button.textContent = "Show in Finder";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await invoke("reveal_archive_document", { documentId: card.document_id });
+    } catch (error) {
+      showError(error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
 }
 
 function documentCard(card) {
@@ -670,6 +703,7 @@ function transcribedCard(card) {
   why.className = "transcription-why";
   why.textContent = card.why_transcribed;
   article.append(why);
+  article.append(revealButton(card));
 
   return article;
 }

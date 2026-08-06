@@ -72,6 +72,7 @@ const census = {
 const vaultReport = {
   schema: "minutes.archive-document-vault.v1",
   vault_id: "local-private-vault",
+  document_id: "document-0000000000000001",
   approved_locations: 1,
   indexed_documents: 3,
   inferred_boundary_documents: 0,
@@ -91,6 +92,10 @@ const vaultReport = {
   symlinks_skipped: 2,
   hard_links_skipped: 3,
   metadata_errors: 0,
+  permission_denied: 9000,
+  entries_unstattable: 0,
+  identity_unavailable: 0,
+  changed_while_reading: 2,
   directory_errors: 0,
   source_content_persisted: false,
   retrieval_index_persisted: false,
@@ -125,6 +130,7 @@ const evidence = {
     {
       vault_id: "local-private-vault",
       document_id: "document-0000000000000001",
+      document_id: "document-0000000000000001",
       document_title: "Synthetic Agreement",
       provision_heading: "7. CONFIDENTIALITY",
       source_anchor: "section:0001",
@@ -144,6 +150,7 @@ const evidence = {
   semantic_suggestions: [
     {
       vault_id: "local-private-vault",
+      document_id: "document-0000000000000001",
       document_id: "document-0000000000000002",
       document_title: "Meaning Similar Agreement",
       provision_heading: "8. NONDISCLOSURE",
@@ -162,6 +169,7 @@ const evidence = {
   transcriptions: [
     {
       vault_id: "local-private-vault",
+      document_id: "document-0000000000000001",
       document_id: "document-0000000000000003",
       document_title: "Scanned Exhibit C",
       page_anchor: "page:0004",
@@ -336,6 +344,12 @@ try {
         }
         // A transcription must render as its own thing: never inside an
         // exact-excerpt element, and always carrying its confidence.
+        // Every card must offer a way back to the source.
+        const revealButtons = document.querySelectorAll(".reveal-source");
+        if (revealButtons.length < 2) {
+          throw new Error("cards did not offer a way to show the source in Finder");
+        }
+
         const transcriptionCards = document.querySelectorAll(".transcription-card");
         if (transcriptionCards.length !== 1) {
           throw new Error("the transcription did not render as its own card");
@@ -374,11 +388,13 @@ try {
         if (
           !vaultSummary.includes("2 were aliases or shortcuts") ||
           !vaultSummary.includes("3 have a second name elsewhere on the disk") ||
-          !vaultSummary.includes("5 items were not indexed") ||
+          !vaultSummary.includes("9,007 items were not indexed") ||
           !vaultSummary.includes("4 scanned pages read by text recognition") ||
           !vaultSummary.includes("This index is PARTIAL") ||
           !vaultSummary.includes("5,000 documents were not read") ||
-          !vaultSummary.includes("3 folders were too deep to enter")
+          !vaultSummary.includes("3 folders were too deep to enter") ||
+          !vaultSummary.includes("9,000 could not be opened (permission denied)") ||
+          !vaultSummary.includes("2 changed while being read")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }
