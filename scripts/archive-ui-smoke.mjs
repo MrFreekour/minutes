@@ -221,6 +221,8 @@ const mockScript = `
             // The interface must show the location it kept, not refuse the
             // batch and clear the list.
             folded: 1,
+            // The owner chose a folder they had previously skipped.
+            unskipped: 1,
             // The folded location had a skipped folder inside it.
             forgottenSkips: 1,
           },
@@ -353,7 +355,10 @@ try {
         }
         // Folding silently un-skipped a folder: the index then reads what the
         // owner deliberately excluded, and the first sign is the wait.
-        if (!document.querySelector("#setup-status").textContent.includes("no longer skipped")) {
+        if (!document.querySelector("#setup-status").textContent.includes("because you just chose")) {
+          throw new Error("A skip cancelled by the owner's own choice was not announced");
+        }
+        if (!document.querySelector("#setup-status").textContent.includes("was folded in")) {
           throw new Error("A skipped folder was forgotten without saying so");
         }
         // Skipping folders is reachable only once a location exists, and it

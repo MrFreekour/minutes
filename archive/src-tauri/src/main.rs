@@ -11,8 +11,8 @@ use minutes_archive_core::vault::{
     DocumentVaultLimits, ExcludedFolder,
 };
 use minutes_archive_core::{
-    authorize_roots, reduce_approved_roots, scan_approved_roots, validate_approved_roots,
-    ApprovedRoot, CensusLimits, CensusReport, CensusStatus,
+    authorize_roots, reduce_approved_roots, relative_path_within, scan_approved_roots,
+    validate_approved_roots, ApprovedRoot, CensusLimits, CensusReport, CensusStatus,
 };
 use minutes_archive_ocr::{BoundedTranscriber, WORKER_MARKER as OCR_WORKER_MARKER};
 use minutes_archive_semantic::{
@@ -117,6 +117,13 @@ struct LocationSummary {
 struct LocationChoice {
     locations: Vec<LocationSummary>,
     folded: usize,
+    /// Skipped folders cancelled because the owner explicitly chose them.
+    ///
+    /// Choosing a folder in the picker is the owner's latest word on it, and it
+    /// beats an older skip. The count is reported because the skip was also
+    /// deliberate once, and its silent disappearance would be the same lie in
+    /// the other direction.
+    unskipped: usize,
     /// Skipped folders forgotten because the location holding them was folded.
     ///
     /// Silently dropping these reads *more* than the owner asked for, not less,
@@ -294,6 +301,7 @@ async fn choose_archive_locations(
         return Ok(LocationChoice {
             folded: 0,
             forgotten_skips: 0,
+            unskipped: 0,
             locations: location_summaries(&session.locations),
         });
     };
@@ -348,6 +356,20 @@ async fn choose_archive_locations(
         }
     }
     session.locations = locations;
+    // Choosing a folder is the owner's latest word on it, and it must beat an
+    // older "skip". Without this, approving a previously skipped folder folds
+    // it into the location that covers it, the interface says "covered by that
+    // one" -- and the exclusion goes on suppressing it, so the owner is told
+    // the folder is in while the build deliberately never reads it. An
+    // exclusion equal to the chosen folder, or an ancestor of it, is the one
+    // doing the suppressing and is dropped; an exclusion strictly inside it
+    // does not contradict the choice and stays.
+    let session = &mut *session;
+    let unskipped = cancel_contradicted_skips(
+        &session.locations,
+        &mut session.exclusions,
+        &combined[existing..],
+    );
     // A location folded into one that covers it takes its skipped folders with
     // it. They were named relative to a root that is no longer in the list, and
     // silently reattaching them to the containing root would skip folders the
@@ -367,6 +389,7 @@ async fn choose_archive_locations(
     Ok(LocationChoice {
         folded,
         forgotten_skips,
+        unskipped,
         locations: location_summaries(&session.locations),
     })
 }
@@ -384,6 +407,45 @@ async fn choose_archive_locations(
 struct SessionExclusion {
     location_id: u64,
     relative_path: std::path::PathBuf,
+}
+
+/// Cancels every skip the owner's newest folder choices contradict, and says
+/// how many.
+///
+/// Choosing a folder in the picker is the owner's latest word on it, and it
+/// must beat an older "skip". Without this, approving a previously skipped
+/// folder folds it into the location that covers it, the interface says
+/// "covered by that one" -- and the exclusion goes on suppressing it, so the
+/// owner is told the folder is in while the build deliberately never reads it.
+///
+/// An exclusion equal to the chosen folder, or an ancestor of it, is the one
+/// doing the suppressing and is dropped. An exclusion strictly *inside* the
+/// chosen folder does not contradict the choice and stays. A chosen folder
+/// that became its own location resolves to itself with an empty relative
+/// path, which no stored exclusion can equal or be an ancestor of, so nothing
+/// is dropped for it.
+fn cancel_contradicted_skips(
+    locations: &[ApprovedLocation],
+    exclusions: &mut Vec<SessionExclusion>,
+    chosen: &[ApprovedRoot],
+) -> usize {
+    let mut unskipped = 0usize;
+    for root in chosen {
+        let Some((keeper_id, relative)) = locations.iter().find_map(|location| {
+            relative_path_within(&location.root, root).map(|relative| (location.id, relative))
+        }) else {
+            continue;
+        };
+        let before = exclusions.len();
+        exclusions.retain(|exclusion| {
+            exclusion.location_id != keeper_id
+                || exclusion.relative_path.as_os_str().is_empty()
+                || !(relative == exclusion.relative_path
+                    || relative.starts_with(&exclusion.relative_path))
+        });
+        unskipped += before - exclusions.len();
+    }
+    unskipped
 }
 
 /// Resolves stored exclusions against the locations as they stand right now.
@@ -1499,6 +1561,85 @@ mod tests {
         );
         assert!(!serialized.contains("client-alpha"));
         assert!(!serialized.contains("client-beta"));
+    }
+
+    /// Choosing a folder must cancel the skip that was suppressing it.
+    ///
+    /// The contradiction this pins: approve a location, skip a folder inside
+    /// it, then choose that folder in the picker because you changed your
+    /// mind. The fold reports it as "covered" by the containing location --
+    /// and without cancellation the exclusion keeps suppressing it, so the
+    /// owner is told the folder is in while the build never reads it. The
+    /// index the owner believes in and the index that exists diverge, which is
+    /// the one failure this application must never have.
+    #[test]
+    fn choosing_a_skipped_folder_cancels_the_skip_and_nothing_else() {
+        let temp = TempDir::new().expect("temp");
+        let parent = temp.path().join("life");
+        let attachments = parent.join("attachments");
+        let deeper = attachments.join("movs");
+        let other = parent.join("matters");
+        fs::create_dir_all(&deeper).expect("folders");
+        fs::create_dir_all(&other).expect("other");
+
+        let mut roots = approve_roots(std::slice::from_ref(&parent)).expect("approve parent");
+        let locations = vec![ApprovedLocation {
+            id: 7,
+            root: roots.remove(0),
+        }];
+        let mut exclusions = vec![
+            SessionExclusion {
+                location_id: 7,
+                relative_path: std::path::PathBuf::from("attachments"),
+            },
+            // Inside the chosen folder: does not contradict the choice.
+            SessionExclusion {
+                location_id: 7,
+                relative_path: std::path::PathBuf::from("attachments/movs"),
+            },
+            // Unrelated: must survive untouched.
+            SessionExclusion {
+                location_id: 7,
+                relative_path: std::path::PathBuf::from("matters"),
+            },
+        ];
+
+        // The owner picks the skipped folder itself.
+        let chosen = approve_roots(&[attachments]).expect("approve attachments");
+        let unskipped = cancel_contradicted_skips(&locations, &mut exclusions, &chosen);
+
+        assert_eq!(unskipped, 1, "exactly the suppressing skip is cancelled");
+        assert!(
+            !exclusions
+                .iter()
+                .any(|exclusion| exclusion.relative_path.as_os_str() == "attachments"),
+            "the skip that suppressed the chosen folder survived"
+        );
+        assert!(
+            exclusions
+                .iter()
+                .any(|exclusion| exclusion.relative_path.as_os_str() == "attachments/movs"),
+            "a skip inside the chosen folder was wrongly cancelled"
+        );
+        assert!(
+            exclusions
+                .iter()
+                .any(|exclusion| exclusion.relative_path.as_os_str() == "matters"),
+            "an unrelated skip was wrongly cancelled"
+        );
+
+        // Choosing deeper than the skip: the ancestor skip is the suppressor
+        // and must be cancelled too.
+        let mut exclusions = vec![SessionExclusion {
+            location_id: 7,
+            relative_path: std::path::PathBuf::from("attachments"),
+        }];
+        let chosen = approve_roots(&[deeper]).expect("approve deeper");
+        assert_eq!(
+            cancel_contradicted_skips(&locations, &mut exclusions, &chosen),
+            1,
+            "an ancestor skip suppresses the chosen folder and must be cancelled"
+        );
     }
 
     /// A skipped folder must follow its location, not its position.

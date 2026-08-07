@@ -294,6 +294,38 @@ fn root_contains(ancestor: &ApprovedRoot, descendant: &ApprovedRoot) -> bool {
     ancestor_identities(&descendant.canonical_path).contains(&ancestor.identity)
 }
 
+/// The path of `descendant` inside `ancestor`, or `None` if `ancestor` does
+/// not actually contain it.
+///
+/// Decided the way `root_contains` decides -- by walking real parent
+/// identities -- and the components are collected on the same walk. A
+/// `strip_prefix` on the canonical path strings would disagree with the
+/// containment check whenever the two roots were approved through different
+/// firmlink spellings of the same directory, and a caller that folds one root
+/// into another needs the relative path to mean exactly what the fold meant.
+pub fn relative_path_within(ancestor: &ApprovedRoot, descendant: &ApprovedRoot) -> Option<PathBuf> {
+    let mut components = Vec::new();
+    let mut current = descendant.canonical_path.clone();
+    loop {
+        let metadata = fs::metadata(&current).ok()?;
+        if std_metadata_identity(&metadata, &current) == ancestor.identity {
+            components.reverse();
+            let mut relative = PathBuf::new();
+            for component in components {
+                relative.push(component);
+            }
+            return Some(relative);
+        }
+        let name = current.file_name()?.to_os_string();
+        let parent = current.parent()?.to_path_buf();
+        if parent == current {
+            return None;
+        }
+        components.push(name);
+        current = parent;
+    }
+}
+
 /// Compatibility helper for trusted native diagnostics.
 ///
 /// New long-lived application code should retain `ApprovedRoot` values from

@@ -161,6 +161,18 @@ async function chooseLocations() {
         choice.folded === 1 ? "it is" : "they are"
       } covered by that one.`;
     }
+    // A chosen folder beats an older skip, and the cancelled skip is said out
+    // loud: the skip was deliberate once too, and its silent disappearance
+    // would be the same lie in the other direction.
+    if (choice.unskipped > 0) {
+      elements.setupStatus.textContent = `${elements.setupStatus.textContent} ${
+        choice.unskipped === 1
+          ? "One folder you had skipped is"
+          : `${choice.unskipped} folders you had skipped are`
+      } no longer skipped, because you just chose ${
+        choice.unskipped === 1 ? "it" : "them"
+      }.`;
+    }
     // Folding a location forgets the folders skipped inside it. That reads
     // more than was asked for, never less, so nothing goes missing from the
     // index -- but those folders were excluded deliberately, and finding out
