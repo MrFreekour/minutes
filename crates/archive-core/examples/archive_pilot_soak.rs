@@ -137,25 +137,42 @@ fn synthetic_pdf() -> Vec<u8> {
 /// A document with real provisions, so the semantic path does work per file
 /// rather than being skipped for want of text.
 fn synthetic_matter(index: usize) -> String {
-    // Boilerplate that most documents share, which is what a real practice
-    // looks like, plus a rare provision on a small fraction of them. Without
-    // something rare there is no query that returns a workable number of
-    // candidates, and a corpus of 16,000 identical documents tests uniformity
-    // rather than scale.
-    let escrow = if index.is_multiple_of(200) {
-        "\n12. ESCROW\nThe escrow agent shall release the retained funds upon written notice.\n"
-    } else {
-        ""
-    };
-    format!(
-        "MATTER {index:05}\n\n\
-         7. CONFIDENTIALITY\n\
-         Confidential Information includes affiliate data disclosed under this Agreement.\n\n\
-         8. ASSIGNMENT\n\
-         Neither party may assign this Agreement without prior written consent.\n\n\
-         9. GOVERNING LAW\n\
-         This Agreement is governed by the laws of the State of New York.\n{escrow}"
-    )
+    // A real practice does not put every clause in every document. Uniform
+    // filler makes an intersection query look exactly like a single-term one,
+    // which is the difference this corpus exists to show, so the clauses are
+    // spread instead: roughly 55% carry confidentiality, 50% assignment, 30%
+    // governing law, and one in two hundred an escrow clause that almost
+    // nothing else mentions.
+    let mut document = format!("MATTER {index:05}\n");
+    if index % 20 < 11 {
+        document.push_str(
+            "\n7. CONFIDENTIALITY\n\
+             Confidential Information includes affiliate data disclosed under this Agreement.\n",
+        );
+    }
+    if index.is_multiple_of(2) {
+        document.push_str(
+            "\n8. ASSIGNMENT\n\
+             Neither party may assign this Agreement without prior written consent.\n",
+        );
+    }
+    if index % 10 < 3 {
+        document.push_str(
+            "\n9. GOVERNING LAW\n\
+             This Agreement is governed by the laws of the State of New York.\n",
+        );
+    }
+    if index.is_multiple_of(200) {
+        document.push_str(
+            "\n12. ESCROW\n\
+             The escrow agent shall release the retained funds upon written notice.\n",
+        );
+    }
+    // Never empty: a document with no provision is a different test.
+    if document.lines().count() < 2 {
+        document.push_str("\n5. NOTICES\nNotices shall be delivered to the address of record.\n");
+    }
+    document
 }
 
 /// The format mix measured on the real archive this pilot is for: 16,621
@@ -357,9 +374,17 @@ fn main() {
     // query is a product decision, not something this harness should settle.
     let broad = vault
         .interpret_and_search(
-            "Find confidentiality provisions within three sentences covering affiliate.",
+            // One common concept, which is the query an attorney is most
+            // likely to type and the one a conjunction cannot narrow.
+            "Find confidentiality provisions covering affiliate.",
         )
-        .map(|response| format!("{} cards", response.evidence.len()))
+        .map(|response| {
+            format!(
+                "{}cards/{}considered",
+                response.evidence.len(),
+                response.lexical_candidates_considered
+            )
+        })
         .unwrap_or_else(|error| format!("refused ({error})"));
 
     println!(
