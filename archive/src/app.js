@@ -489,6 +489,18 @@ function renderVaultSummary(report) {
       } are images of pages and carry no text to read.`,
     });
   }
+  // Folders the owner told the build not to enter. Deliberate, so not a
+  // warning -- but it is a coverage gap, and the reader weeks later (or a
+  // different reader entirely) was not in the room when the skip was chosen.
+  if ((report.excluded_directories ?? 0) > 0) {
+    notes.push({
+      text: `${report.excluded_directories.toLocaleString()} folder${
+        report.excluded_directories === 1 ? " was" : "s were"
+      } skipped at your request; nothing inside ${
+        report.excluded_directories === 1 ? "it" : "them"
+      } is in this index.`,
+    });
+  }
   // Defaulted, not asserted: a missing count must never blank the search view.
   const inferredBoundaryDocuments = report.inferred_boundary_documents ?? 0;
   if (inferredBoundaryDocuments > 0) {

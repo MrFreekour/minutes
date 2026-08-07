@@ -103,6 +103,7 @@ const vaultReport = {
   retrieval_index_persisted: false,
   converter_sandbox_verified: true,
   semantic_worker_sandbox_verified: true,
+  excluded_directories: 2,
   semantic_retrieval_enabled: true,
   // The worker died partway through this build. Partial suggestion coverage
   // must be stated, not inferred from a smaller vector count.
@@ -462,7 +463,8 @@ try {
           !vaultSummary.includes("9,000 were blocked by macOS permissions") ||
           !vaultSummary.includes("12 were scans the text recognizer could not read") ||
           !vaultSummary.includes("2 changed while being read") ||
-          !vaultSummary.includes("suggestion model stopped partway")
+          !vaultSummary.includes("suggestion model stopped partway") ||
+          !vaultSummary.includes("2 folders were skipped at your request")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }
