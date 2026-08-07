@@ -161,6 +161,22 @@ async function chooseLocations() {
         choice.folded === 1 ? "it is" : "they are"
       } covered by that one.`;
     }
+    // Folding a location forgets the folders skipped inside it. That reads
+    // more than was asked for, never less, so nothing goes missing from the
+    // index -- but those folders were excluded deliberately, and finding out
+    // by watching an extra seventeen minutes of text recognition go by is not
+    // finding out.
+    if (choice.forgottenSkips > 0) {
+      elements.setupStatus.textContent = `${elements.setupStatus.textContent} ${
+        choice.forgottenSkips === 1
+          ? "One folder you had skipped is"
+          : `${choice.forgottenSkips} folders you had skipped are`
+      } no longer skipped, because the location holding ${
+        choice.forgottenSkips === 1 ? "it" : "them"
+      } was folded in. Choose them again under "Skip folders" if you still want ${
+        choice.forgottenSkips === 1 ? "it" : "them"
+      } left out.`;
+    }
     lastReport = null;
     vaultReport = null;
   } catch (error) {

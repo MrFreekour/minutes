@@ -117,6 +117,14 @@ struct LocationSummary {
 struct LocationChoice {
     locations: Vec<LocationSummary>,
     folded: usize,
+    /// Skipped folders forgotten because the location holding them was folded.
+    ///
+    /// Silently dropping these reads *more* than the owner asked for, not less,
+    /// so nothing is lost from the index -- but the folder they pointed at was
+    /// excluded on purpose. On the archive this pilot is for that is 2,873
+    /// screenshots and roughly seventeen minutes of text recognition arriving
+    /// unannounced, in an index they believed excluded them.
+    forgotten_skips: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +293,7 @@ async fn choose_archive_locations(
         let session = state.session.lock().map_err(|_| lock_error())?;
         return Ok(LocationChoice {
             folded: 0,
+            forgotten_skips: 0,
             locations: location_summaries(&session.locations),
         });
     };
@@ -348,13 +357,16 @@ async fn choose_archive_locations(
         .iter()
         .map(|location| location.id)
         .collect::<Vec<_>>();
+    let skips_before = session.exclusions.len();
     session
         .exclusions
         .retain(|exclusion| surviving_ids.contains(&exclusion.location_id));
+    let forgotten_skips = skips_before.saturating_sub(session.exclusions.len());
     session.last_report = None;
     session.text_vault = None;
     Ok(LocationChoice {
         folded,
+        forgotten_skips,
         locations: location_summaries(&session.locations),
     })
 }
