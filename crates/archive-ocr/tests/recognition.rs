@@ -215,3 +215,57 @@ fn the_bounded_transcriber_reads_a_page_and_refuses_a_swapped_worker() {
         "a replaced worker must be refused"
     );
 }
+
+/// The worker must stop reading an oversized image, not merely reject it after
+/// swallowing the whole thing.
+///
+/// `recognize_page` already refuses anything over the budget, but it refuses
+/// after the bytes are in memory. With an unbounded `read_to_end` the worker
+/// consumed everything the pipe offered and only then said no, so the peak
+/// allocation was set by whatever was written rather than by the budget --
+/// bounded in practice only by `RLIMIT_AS` aborting the process gigabytes
+/// later. The parent bounds what it sends; this asserts the worker does not
+/// need it to.
+///
+/// Asserted on bytes *accepted*, because the exit code cannot tell the two
+/// apart: both refuse. A worker that stops at the budget breaks the pipe, so
+/// the write fails well short of what is offered.
+#[test]
+fn the_worker_stops_reading_an_oversized_image_at_its_budget() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let worker = env!("CARGO_BIN_EXE_minutes-archive-ocr-worker");
+    let mut child = Command::new(worker)
+        .arg("recognize")
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn worker");
+
+    let offered = MAX_IMAGE_BYTES + (32 * 1024 * 1024);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let chunk = vec![0x41u8; 4 * 1024 * 1024];
+    let mut accepted = 0usize;
+    while accepted < offered {
+        if stdin.write_all(&chunk).is_err() {
+            break;
+        }
+        accepted += chunk.len();
+    }
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait");
+    assert!(
+        !output.status.success(),
+        "an oversized image was accepted rather than refused"
+    );
+    assert!(
+        accepted < offered,
+        "the worker read every byte offered ({accepted} of {offered}) instead of \
+         stopping at its budget"
+    );
+}

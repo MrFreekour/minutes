@@ -29,8 +29,21 @@ fn main() {
     }
 
     use std::io::{Read, Write};
+    // Bounded on the way in, not only on the way out.
+    //
+    // `recognize_page` refuses anything over MAX_IMAGE_BYTES, but it does so
+    // after the bytes are already in memory: an unbounded `read_to_end` would
+    // allocate until RLIMIT_AS aborted the process, three gigabytes later, for
+    // an input the next line was always going to reject at sixty-four
+    // megabytes. The parent bounds what it sends, and this worker is written
+    // not to depend on that -- the output side already takes the same care.
     let mut image = Vec::new();
-    if std::io::stdin().lock().read_to_end(&mut image).is_err() {
+    if std::io::stdin()
+        .lock()
+        .take(minutes_archive_ocr::MAX_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut image)
+        .is_err()
+    {
         std::process::exit(65);
     }
     // Any panic inside Apple's decoder is contained here rather than becoming
