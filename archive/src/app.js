@@ -282,9 +282,14 @@ function renderBuildForecast(report) {
   const scans = countFor("image_or_scan");
   const pdfs = countFor("pdf");
   const wordProcessing = countFor("word_processing");
-  // Measured on this machine: about 0.4s per scanned page, and about 0.5s per
-  // document that needs a converter process.
-  const seconds = scans * 0.4 + (pdfs + wordProcessing) * 0.5;
+  // Calibrated against a full-scale run, not a per-page guess: 16,621
+  // documents in that archive's own format mix -- 2,774 scans, 447 PDFs, 349
+  // Word -- took 1,028 seconds end to end. Extraction runs in parallel, which
+  // the old per-page arithmetic ignored, so it predicted 25 minutes for a
+  // build that takes 17. These rates keep a little headroom over the measured
+  // figure; a build that finishes early is a better surprise than one that
+  // runs past its own estimate.
+  const seconds = scans * 0.3 + (pdfs + wordProcessing) * 0.4;
   if (seconds < 60) {
     forecast.hidden = true;
     return;

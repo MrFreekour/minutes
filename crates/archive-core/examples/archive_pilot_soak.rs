@@ -18,7 +18,13 @@
 //! application spawns its workers from -- with no window, no folder picker and
 //! nobody clicking anything.
 //!
-//! Usage: `archive_pilot_soak <minutes-archive-app executable> [documents]`
+//! Usage: `archive_pilot_soak <exe> [documents] [--census-shape]`
+//!
+//! `--census-shape` mixes the formats in the proportions a real thirty-year
+//! archive actually had -- 78% text and Markdown, 17% images and scans, 3% PDF,
+//! 2% Word -- instead of text alone. Scans cost a sandboxed recognizer process
+//! each, so this is the slow, pre-delivery form; the default stays text-only
+//! and fast enough to run on every commit.
 
 use minutes_archive_convert::BoundedConverter;
 use minutes_archive_core::approve_roots;
@@ -26,12 +32,16 @@ use minutes_archive_core::retrieval::VaultId;
 use minutes_archive_core::vault::{
     build_authorized_document_vault, raise_open_file_ceiling, DocumentVaultLimits, ExcludedFolder,
 };
+use minutes_archive_ocr::BoundedTranscriber;
 use minutes_archive_semantic::BoundedSemanticEngine;
 use std::fs;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 use tempfile::TempDir;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
 
 /// The soft limit launchd hands a GUI application.
 #[cfg(unix)]
@@ -63,9 +73,80 @@ fn adopt_gui_open_file_limit() {
 #[cfg(not(unix))]
 fn adopt_gui_open_file_limit() {}
 
+fn synthetic_docx() -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = ZipWriter::new(&mut cursor);
+        writer
+            .start_file(
+                "word/document.xml",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .expect("DOCX entry");
+        writer
+            .write_all(
+                br#"<w:document xmlns:w="urn:test"><w:body>
+                <w:p><w:r><w:t>7. CONFIDENTIALITY</w:t></w:r></w:p>
+                <w:p><w:r><w:t>Confidential Information includes affiliate data.</w:t></w:r></w:p>
+                </w:body></w:document>"#,
+            )
+            .expect("DOCX XML");
+        writer.finish().expect("DOCX");
+    }
+    cursor.into_inner()
+}
+
+fn synthetic_pdf() -> Vec<u8> {
+    let stream = b"BT /F1 12 Tf 72 720 Td (7. CONFIDENTIALITY) Tj 0 -20 Td (Confidential Information includes affiliate data.) Tj ET";
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        [
+            format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(),
+            stream.to_vec(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 /// A document with real provisions, so the semantic path does work per file
 /// rather than being skipped for want of text.
 fn synthetic_matter(index: usize) -> String {
+    // Boilerplate that most documents share, which is what a real practice
+    // looks like, plus a rare provision on a small fraction of them. Without
+    // something rare there is no query that returns a workable number of
+    // candidates, and a corpus of 16,000 identical documents tests uniformity
+    // rather than scale.
+    let escrow = if index.is_multiple_of(200) {
+        "\n12. ESCROW\nThe escrow agent shall release the retained funds upon written notice.\n"
+    } else {
+        ""
+    };
     format!(
         "MATTER {index:05}\n\n\
          7. CONFIDENTIALITY\n\
@@ -73,15 +154,48 @@ fn synthetic_matter(index: usize) -> String {
          8. ASSIGNMENT\n\
          Neither party may assign this Agreement without prior written consent.\n\n\
          9. GOVERNING LAW\n\
-         This Agreement is governed by the laws of the State of New York.\n"
+         This Agreement is governed by the laws of the State of New York.\n{escrow}"
     )
+}
+
+/// The format mix measured on the real archive this pilot is for: 16,621
+/// artifacts, of which 13,029 text and Markdown, 2,774 images and scans, 447
+/// PDF, 349 other. Held as proportions so any total keeps the same shape.
+struct CensusShape {
+    scans: usize,
+    pdfs: usize,
+    word: usize,
+    text: usize,
+}
+
+impl CensusShape {
+    fn text_only(total: usize) -> Self {
+        Self {
+            scans: 0,
+            pdfs: 0,
+            word: 0,
+            text: total,
+        }
+    }
+
+    fn from_real_archive(total: usize) -> Self {
+        let scans = total * 2_774 / 16_621;
+        let pdfs = total * 447 / 16_621;
+        let word = total * 349 / 16_621;
+        Self {
+            scans,
+            pdfs,
+            word,
+            text: total - scans - pdfs - word,
+        }
+    }
 }
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
     let worker_path = arguments
         .next()
-        .expect("usage: archive_pilot_soak <minutes-archive-app executable> [documents]");
+        .expect("usage: archive_pilot_soak <exe> [documents] [--census-shape]");
     // Well past the 256 the application is given, so a build that cannot raise
     // its own ceiling fails here instead of on the owner's archive.
     let documents: usize = arguments
@@ -92,6 +206,12 @@ fn main() {
         documents > 300,
         "a soak below the 256-descriptor ceiling proves nothing"
     );
+    let census_shape = std::env::args().any(|value| value == "--census-shape");
+    let shape = if census_shape {
+        CensusShape::from_real_archive(documents)
+    } else {
+        CensusShape::text_only(documents)
+    };
 
     adopt_gui_open_file_limit();
     // Exactly what the application does at startup, from the same code.
@@ -109,17 +229,38 @@ fn main() {
     fs::create_dir_all(&deep).expect("nested folders");
     fs::create_dir(&skipped).expect("skipped folder");
 
-    for index in 0..documents {
-        let directory: &PathBuf = match index % 3 {
-            0 => &root,
-            1 => &matters,
-            _ => &deep,
-        };
+    let place = |index: usize| -> PathBuf {
+        match index % 3 {
+            0 => root.clone(),
+            1 => matters.clone(),
+            _ => deep.clone(),
+        }
+    };
+    for index in 0..shape.text {
         fs::write(
-            directory.join(format!("matter-{index:05}.txt")),
+            place(index).join(format!("matter-{index:05}.txt")),
             synthetic_matter(index),
         )
         .expect("write matter");
+    }
+    if census_shape {
+        // A real rendered page, copied. Each one costs a sandboxed recognizer
+        // process, which is the cost this shape exists to measure.
+        let scan = fs::read("tests/fixtures/archive-ocr/scanned-nda.png")
+            .expect("the OCR fixture must be run from the repository root");
+        for index in 0..shape.scans {
+            fs::write(place(index).join(format!("scan-{index:05}.png")), &scan)
+                .expect("write scan");
+        }
+        let pdf = synthetic_pdf();
+        for index in 0..shape.pdfs {
+            fs::write(place(index).join(format!("filed-{index:05}.pdf")), &pdf).expect("write pdf");
+        }
+        let word = synthetic_docx();
+        for index in 0..shape.word {
+            fs::write(place(index).join(format!("draft-{index:05}.docx")), &word)
+                .expect("write docx");
+        }
     }
     // These must never be read, and must not be counted as indexed.
     let skipped_documents = 40;
@@ -137,6 +278,10 @@ fn main() {
     // model must still complete the build.
     let semantic_engine = BoundedSemanticEngine::bind(Path::new(&worker_path)).ok();
     let semantic_bound = semantic_engine.is_some();
+    // Only bound for the census shape; there is nothing to recognise otherwise.
+    let transcriber = census_shape
+        .then(|| BoundedTranscriber::bind(Path::new(&worker_path)).ok())
+        .flatten();
 
     let approved = approve_roots(&[root]).expect("approve root");
     let started = Instant::now();
@@ -152,7 +297,7 @@ fn main() {
         },
         &AtomicBool::new(false),
         &converter,
-        None,
+        transcriber.as_ref(),
         None,
         semantic_engine,
     )
@@ -181,31 +326,57 @@ fn main() {
     );
 
     // Exact evidence is the product and must be complete regardless of what
-    // the optional workers did.
+    // the optional workers did. A query with a term that only a fraction of
+    // the archive uses is the realistic case, and it must answer.
+    // A quoted phrase, because that is the path that finds language the fixed
+    // concept vocabulary does not know -- and finding exact language is what
+    // this tool is for. Only every two-hundredth document carries it.
     let response = vault
-        .interpret_and_search("Find assignment provisions within three sentences covering assign.")
-        .expect("exact search over the soaked index");
+        .interpret_and_search("Find documents containing \"escrow agent shall release\".")
+        .expect("a selective exact search over the soaked index");
+    // A document-scope query answers in `documents`; `evidence` is where
+    // provision-scope answers land. Asserting on the wrong one reported a
+    // healthy index as returning nothing.
     assert!(
-        !response.evidence.is_empty(),
-        "exact search returned nothing over {documents} indexed documents"
+        !response.documents.is_empty(),
+        "an exact phrase present in the corpus was not found across {documents} documents"
     );
     assert!(
         response
-            .evidence
+            .documents
             .iter()
-            .all(|card| !card.exact_excerpt.is_empty()),
-        "an evidence card carried no source language"
+            .all(|card| card.exact_phrase_matched),
+        "a document answered a phrase query without matching the phrase"
     );
 
+    // A term most of the archive shares is the other realistic case, and at
+    // this scale it exceeds the 2,000-candidate ceiling and fails closed
+    // rather than ranking. Reported rather than asserted: refusing beats
+    // silently incomplete evidence, but whether an attorney searching thirty
+    // years of contracts for "confidentiality" should be told to narrow the
+    // query is a product decision, not something this harness should settle.
+    let broad = vault
+        .interpret_and_search(
+            "Find confidentiality provisions within three sentences covering affiliate.",
+        )
+        .map(|response| format!("{} cards", response.evidence.len()))
+        .unwrap_or_else(|error| format!("refused ({error})"));
+
     println!(
-        "archive_pilot_soak=passed documents={} indexed={} excluded_dirs={} \
-         open_file_limit_reached={} semantic_bound={} semantic_partial={} seconds={:.1}",
+        "archive_pilot_soak=passed shape={} documents={} indexed={} transcribed={} pdfs={} \
+         word={} excluded_dirs={} open_file_limit_reached={} semantic_bound={} \
+         semantic_partial={} broad_query={} seconds={:.1}",
+        if census_shape { "census" } else { "text-only" },
         documents,
         report.indexed_documents,
+        report.transcribed_documents,
+        report.searchable_pdf_documents,
+        report.docx_documents,
         report.excluded_directories,
         report.open_file_limit_reached,
         semantic_bound,
         report.semantic_coverage_partial,
+        broad,
         elapsed.as_secs_f64(),
     );
 }

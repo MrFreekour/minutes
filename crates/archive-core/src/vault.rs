@@ -1435,17 +1435,46 @@ fn index_extracted_batch(
                     }
                 }
                 if counters.semantic_coverage_partial {
+                    // Stop asking a dead worker, but finish the vector first.
+                    // `replace_document_with_semantics` requires one entry per
+                    // provision and rejects a short one -- so simply breaking
+                    // here turned a graceful degradation into a *different*
+                    // fatal error, and discarded the build anyway. It survived
+                    // review because the first test's documents happened to
+                    // have an even number of provisions, so the worker always
+                    // died between documents rather than inside one.
+                    while embeddings.len() < normalized.provisions.len() {
+                        counters.semantic_provisions_skipped =
+                            counters.semantic_provisions_skipped.saturating_add(1);
+                        embeddings.push(None);
+                    }
                     break;
                 }
             }
             match semantic_model.cloned() {
                 Some(model) => {
-                    let indexed = index
-                        .replace_document_with_semantics(&normalized, model, &embeddings)
-                        .map_err(VaultError::from)?;
-                    counters.semantic_provisions_indexed = counters
-                        .semantic_provisions_indexed
-                        .saturating_add(indexed as u64);
+                    match index.replace_document_with_semantics(&normalized, model, &embeddings) {
+                        Ok(indexed) => {
+                            counters.semantic_provisions_indexed = counters
+                                .semantic_provisions_indexed
+                                .saturating_add(indexed as u64);
+                        }
+                        // The index refused the suggestion vectors -- too many
+                        // of them, or a shape it will not store. That is a
+                        // reason to index this document without suggestions,
+                        // never to throw away every document already read.
+                        Err(
+                            RetrievalError::InvalidSemanticVector
+                            | RetrievalError::SemanticBudgetExceeded,
+                        ) => {
+                            counters.semantic_coverage_partial = true;
+                            index
+                                .replace_document(&normalized)
+                                .map_err(VaultError::from)?;
+                        }
+                        // A genuinely broken index is fatal, and only this is.
+                        Err(error) => return Err(VaultError::from(error)),
+                    }
                 }
                 // No pinned model means nothing can be stored as a suggestion,
                 // which is a reason to index without them, not to refuse.
@@ -1646,16 +1675,6 @@ mod tests {
         answers_before_failing: usize,
         calls: usize,
         failure: SemanticError,
-    }
-
-    impl FailingEmbedder {
-        fn new(failure: SemanticError) -> Self {
-            Self {
-                answers_before_failing: 1,
-                calls: 0,
-                failure,
-            }
-        }
     }
 
     impl SemanticEmbedder for FailingEmbedder {
@@ -1959,28 +1978,45 @@ mod tests {
     /// between. That is what the injected embedder exists for.
     #[test]
     fn a_semantic_worker_that_dies_midway_costs_suggestions_not_the_index() {
-        for failure in [
+        // Every point at which the worker can die, not just a convenient
+        // one. The first version of this test used documents with an even
+        // number of provisions and only ever failed *between* documents, so it
+        // passed while a build that lost its worker in the middle of a
+        // three-provision document still died -- with `IndexUnavailable`,
+        // because the embeddings vector came up short. `answers` sweeps the
+        // boundary instead of assuming one.
+        for (failure, answers) in [
             SemanticError::WorkerFailed,
             SemanticError::PlatformUnavailable,
             SemanticError::ModelUnavailable,
             SemanticError::SecurityBoundaryUnavailable,
             SemanticError::WorkerBudgetExceeded,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|failure| (0..7).map(move |answers| (failure.clone(), answers)))
+        {
             let temp = TempDir::new().expect("temp");
             let root = temp.path().join("approved");
             fs::create_dir(&root).expect("root");
             for index in 0..12 {
+                // Three provisions, deliberately an odd number: the worker
+                // dies partway through a document, not neatly between two.
                 fs::write(
                     root.join(format!("matter-{index:02}.txt")),
                     "ASSIGNMENT\nNeither party may assign this Agreement.\n\
-                     CONFIDENTIALITY\nEach party shall protect Confidential Information.",
+                     CONFIDENTIALITY\nEach party shall protect Confidential Information.\n\
+                     GOVERNING LAW\nThis Agreement is governed by the laws of New York.",
                 )
                 .expect("document");
             }
             let approved = approve_roots(&[root]).expect("approve");
 
             // Answers for the first document, then never again.
-            let mut embedder = FailingEmbedder::new(failure.clone());
+            let mut embedder = FailingEmbedder {
+                answers_before_failing: answers,
+                calls: 0,
+                failure: failure.clone(),
+            };
             let vault = build_authorized_vault(
                 VaultId::parse("half-semantic").expect("vault"),
                 &approved,
@@ -1993,17 +2029,34 @@ mod tests {
                 Some(&mut embedder),
             )
             .unwrap_or_else(|error| {
-                panic!("a dying semantic worker discarded the whole index: {error:?}")
+                panic!(
+                    "a semantic worker that answered {answers} times then failed with \
+                     {failure:?} discarded the whole index: {error:?}"
+                )
             });
 
             let report = vault.build_report();
             assert_eq!(
                 report.indexed_documents, 12,
-                "{failure:?} cost documents that have nothing to do with semantics"
+                "{failure:?} after {answers} answers cost documents that have nothing to \
+                 do with semantics"
             );
+            // Whatever the worker did answer before it died must survive. The
+            // fallback that indexes a document without suggestions is the
+            // safety net, not the intended path: if the vector is left short
+            // of the provision count the index rejects the whole document's
+            // suggestions, and every embedding already paid for is discarded.
+            if answers > 0 {
+                assert!(
+                    report.semantic_provisions_indexed > 0,
+                    "{failure:?} after {answers} answers threw away embeddings the worker had \
+                     already produced"
+                );
+            }
             assert!(
                 report.semantic_coverage_partial,
-                "{failure:?} degraded silently; partial suggestion coverage must be reported"
+                "{failure:?} after {answers} answers degraded silently; partial suggestion \
+                 coverage must be reported"
             );
 
             // The product is exact evidence, and it must be untouched.
@@ -2014,7 +2067,7 @@ mod tests {
                 .expect("exact search still works without the semantic worker");
             assert!(
                 !response.evidence.is_empty(),
-                "{failure:?} left exact search unable to answer"
+                "{failure:?} after {answers} answers left exact search unable to answer"
             );
         }
     }
