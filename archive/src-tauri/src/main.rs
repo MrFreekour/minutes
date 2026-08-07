@@ -122,10 +122,45 @@ struct LocationChoice {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapState {
+    /// Which build this is, for a support conversation.
+    ///
+    /// The version alone does not identify a build: two candidates carried the
+    /// same version and one of them could not index a single document. The
+    /// short digest of the running executable is what the signed provenance
+    /// record already names a candidate by, so it is the thing to ask for when
+    /// someone reports a problem -- and it is computed from the file on disk
+    /// rather than compiled in, so it cannot claim to be a build it is not.
+    build_identity: String,
     locations: Vec<LocationSummary>,
     scan_running: bool,
     report: Option<CensusReport>,
     text_vault_report: Option<DocumentVaultBuildReport>,
+}
+
+/// Version plus a short digest of the executable that is actually running.
+///
+/// Reads nothing but its own binary and reaches no network -- the whole point
+/// of this application is that it does not, and knowing which build you have
+/// must not be the exception. Auto-update was considered and deliberately not
+/// wired: docs/investigations/auto-update-evaluation.md holds the decision, and
+/// a shipped updater endpoint sat in the configuration for a while contradicting
+/// the "networking disabled by design" line in this app's own footer.
+fn build_identity() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let digest = std::env::current_exe()
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&bytes);
+            digest
+                .iter()
+                .take(6)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| "unidentified".to_string());
+    format!("v{version} · build {digest}")
 }
 
 fn lock_error() -> String {
@@ -217,6 +252,7 @@ fn archive_index_progress(state: tauri::State<'_, ArchiveState>) -> UiBuildProgr
 fn archive_bootstrap(state: State<'_, ArchiveState>) -> Result<BootstrapState, String> {
     let session = state.session.lock().map_err(|_| lock_error())?;
     Ok(BootstrapState {
+        build_identity: build_identity(),
         locations: location_summaries(&session.locations),
         scan_running: session.scan.running,
         report: session.last_report.clone(),

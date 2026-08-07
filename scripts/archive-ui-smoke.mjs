@@ -209,6 +209,7 @@ const mockScript = `
       invoke: async (command) => {
         const responses = ${JSON.stringify({
           archive_bootstrap: {
+            buildIdentity: "v0.24.0 · build 39773037b5d5",
             locations: [],
             scanRunning: false,
             report: null,
@@ -332,6 +333,10 @@ try {
           throw new Error("Timed out waiting for " + label);
         };
         await waitFor(() => !document.querySelector("#setup-view").hidden, "setup");
+        // The build has to name itself without reaching anywhere for the answer.
+        if (!document.querySelector("#build-identity").textContent.includes("build 39773037b5d5")) {
+          throw new Error("The running build does not identify itself");
+        }
         const setupButtonBounds = document
           .querySelector("#add-locations")
           .getBoundingClientRect()
