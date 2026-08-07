@@ -238,7 +238,6 @@ pub struct TextVaultBuildReport {
     pub excluded_directories: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
     pub transcribed_documents: u64,
-    pub metadata_errors: u64,
     pub directory_errors: u64,
     pub source_content_persisted: bool,
     pub retrieval_index_persisted: bool,
@@ -638,7 +637,6 @@ struct BuildCounters {
     duplicate_files_skipped: u64,
     symlinks_skipped: u64,
     hard_links_skipped: u64,
-    metadata_errors: u64,
     directory_errors: u64,
     directories_scanned: u64,
     semantic_provisions_indexed: u64,
@@ -1151,7 +1149,6 @@ fn build_authorized_vault(
         directories_left_unread: counters.directories_left_unread,
         excluded_directories: counters.excluded_directories,
         transcribed_documents: counters.transcribed_documents,
-        metadata_errors: counters.metadata_errors,
         directory_errors: counters.directory_errors,
         source_content_persisted: false,
         retrieval_index_persisted: false,

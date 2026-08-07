@@ -91,7 +91,6 @@ const vaultReport = {
   directories_left_unread: 3,
   symlinks_skipped: 2,
   hard_links_skipped: 3,
-  metadata_errors: 0,
   permission_denied: 9000,
   unopenable: 4,
   scans_unreadable: 12,

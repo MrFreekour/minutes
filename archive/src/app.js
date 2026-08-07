@@ -599,7 +599,6 @@ function describeDroppedSources(report) {
     [report.entries_unstattable, "could not be examined at all"],
     [report.identity_unavailable, "had no stable identity to pin"],
     [report.changed_while_reading, "changed while being read"],
-    [report.metadata_errors, "could not be read"],
     [report.directory_errors, "were in unreadable folders"],
   ].filter(([count]) => count > 0);
   if (dropped.length === 0) {
