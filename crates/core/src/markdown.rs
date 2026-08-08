@@ -84,11 +84,48 @@ pub(crate) const ACTIVE_CORPUS_MAX_DIRECTORY_COUNT: usize = 512;
 pub(crate) const ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES: u64 = 80 * 1024 * 1024;
 pub(crate) const ACTIVE_CORPUS_MAX_RETAINED_PATH_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS: usize = 2;
-pub(crate) const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE: Duration = Duration::from_secs(15);
 /// One materialization can read each pre-authorized source during index
 /// construction, before the transactional write, after the write, and once
 /// more when converting a result into user-visible bytes.
 pub(crate) const ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES: usize = 4;
+
+/// Slowest storage the authorization deadline is willing to call a hang.
+///
+/// Meetings routinely live on iCloud Drive, Dropbox, or an external disk, and
+/// a first read there can be a network fetch rather than a local one. Anything
+/// at or above this rate must be able to finish the whole documented envelope
+/// without tripping the deadline.
+pub(crate) const ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+
+/// Bytes one authorization may legitimately read at the documented ceiling.
+///
+/// Each attempt makes a pre-snapshot pass, a materialization phase worth
+/// `ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES` passes, and a post-snapshot
+/// pass, and the whole thing may run `ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS`
+/// times under one shared deadline.
+pub(crate) const ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES: u64 = ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES
+    * (1 + ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES as u64 + 1)
+    * ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS as u64;
+
+/// Absolute wall-clock ceiling for one corpus authorization.
+///
+/// Derived, not chosen. A hardcoded 15s silently required 64 MB/s sustained to
+/// read the documented 80 MB ceiling through all six passes of both attempts,
+/// so a corpus that fit every published limit still failed on ordinary storage
+/// (issue #679). It surfaced as an intermittent CI failure, but the same
+/// arithmetic fails a real user whose meetings sit on a synced folder.
+///
+/// Deriving it keeps the two consistent: raise the byte ceiling or add a
+/// materialization pass and the deadline follows, instead of quietly
+/// tightening the throughput this code demands.
+///
+/// This bounds cooperative checks between filesystem operations, so it is a
+/// backstop rather than the primary control. The byte, file, and directory
+/// ceilings bound the work itself, and agent-facing SDK/MCP reads wrap this
+/// boundary in a supervised, killable worker.
+pub(crate) const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE: Duration = Duration::from_secs(
+    ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES / ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC,
+);
 
 #[derive(Debug, Default)]
 struct ActiveCorpusReadUsage {
@@ -2631,6 +2668,35 @@ mod tests {
         );
         assert!(snapshot.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn authorization_deadline_admits_the_documented_ceiling_on_slow_storage() {
+        // #679: the deadline was a hardcoded 15s while the ceilings allowed
+        // 960 MB of authorized reads, so a corpus that fit every published
+        // limit still failed unless the disk sustained 64 MB/s. It showed up
+        // as an intermittent CI failure; the same arithmetic fails a user
+        // whose meetings live on iCloud Drive or an external disk.
+        //
+        // Pin the relationship, not the number: whichever ceiling moves, the
+        // deadline has to stay reachable at the assumed floor throughput.
+        let worst_case_bytes = ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES;
+        let required = ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES
+            * (1 + ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES as u64 + 1)
+            * ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS as u64;
+        assert_eq!(
+            worst_case_bytes, required,
+            "worst-case byte derivation drifted from the pass and attempt counts"
+        );
+
+        let implied_bytes_per_sec =
+            worst_case_bytes / ACTIVE_CORPUS_AUTHORIZATION_DEADLINE.as_secs();
+        assert!(
+            implied_bytes_per_sec <= ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC,
+            "the deadline demands {implied_bytes_per_sec} B/s sustained to read the documented \
+             ceiling, above the {ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC} B/s floor this \
+             envelope promises to tolerate; raise the deadline or lower the ceiling (#679)"
+        );
     }
 
     #[test]

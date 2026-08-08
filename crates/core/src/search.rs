@@ -30,6 +30,26 @@ fn with_stable_active_corpus<T>(
     with_stable_active_corpus_with_hooks(dir, operation, || {}, || {})
 }
 
+/// Name which limit stopped a corpus pass, without describing the corpus.
+///
+/// The previous message collapsed every cause into "could not be verified
+/// safely", so a deadline overrun and a corpus genuinely over the byte ceiling
+/// were indistinguishable. Diagnosing #679 needed a controlled experiment to
+/// recover a fact the error already had. The variant names a limit, never
+/// content, a path, or a count, so this leaks nothing a caller cannot already
+/// infer from the published ceilings.
+fn corpus_authorization_error(stage: &str, error: ActiveCorpusRevisionError) -> SearchError {
+    let cause = match error {
+        ActiveCorpusRevisionError::Unavailable => "the corpus could not be opened",
+        ActiveCorpusRevisionError::Traversal => "the corpus contains an unsafe path",
+        ActiveCorpusRevisionError::Budget => "the corpus exceeds a documented size ceiling",
+        ActiveCorpusRevisionError::Deadline => "the authorization deadline elapsed",
+    };
+    SearchError::Io(std::io::Error::other(format!(
+        "meeting corpus could not be {stage} safely: {cause}"
+    )))
+}
+
 fn with_stable_active_corpus_with_hooks<T>(
     dir: &Path,
     mut operation: impl FnMut(&StableActiveCorpusRevision) -> Result<T, SearchError>,
@@ -47,11 +67,7 @@ fn with_stable_active_corpus_with_hooks<T>(
         // while all passes share one absolute operation deadline. This keeps
         // safe rereads from making an otherwise supported corpus unavailable.
         let before = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
-            .map_err(|_| {
-                SearchError::Io(std::io::Error::other(
-                    "meeting corpus could not be verified safely",
-                ))
-            })?
+            .map_err(|error| corpus_authorization_error("verified", error))?
             .with_read_budget(envelope.fresh_materialization_pass());
         after_precheck();
         envelope.check_deadline().map_err(|_| {
@@ -66,13 +82,8 @@ fn with_stable_active_corpus_with_hooks<T>(
             ))
         })?;
         before_postcheck();
-        let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass()).map_err(
-            |_| {
-                SearchError::Io(std::io::Error::other(
-                    "meeting corpus could not be reverified safely",
-                ))
-            },
-        )?;
+        let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
+            .map_err(|error| corpus_authorization_error("reverified", error))?;
         if before == after {
             return Ok(value);
         }
