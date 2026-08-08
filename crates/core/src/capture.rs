@@ -1978,7 +1978,7 @@ fn report_screen_permission_failure(output_path: &Path) {
 /// produces a JSONL transcript in real-time. Returns (sender, join_handle).
 /// When the whisper+streaming features are not available, returns (None, None).
 #[cfg(all(feature = "whisper", feature = "streaming"))]
-fn start_live_sidecar(
+pub(crate) fn start_live_sidecar(
     config: &Config,
     stop_flag: &Arc<AtomicBool>,
 ) -> (
@@ -2002,7 +2002,7 @@ fn start_live_sidecar(
 }
 
 #[cfg(not(all(feature = "whisper", feature = "streaming")))]
-fn start_live_sidecar(
+pub(crate) fn start_live_sidecar(
     _config: &Config,
     _stop_flag: &Arc<AtomicBool>,
 ) -> (
