@@ -5,6 +5,7 @@ import {
   linkSync,
   mkdtempSync,
   readFileSync,
+  existsSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -573,11 +574,21 @@ describe("stable corpus lease", () => {
     }
   }, 30_000);
 
-  it("uses one cumulative deadline across hooks and retry attempts", async () => {
+  // Not "across retry attempts": the parent's cumulative timer kills the
+  // worker while it is still awaiting a hook, so the phase-result that would
+  // let the worker advance into a retry is never sent.
+  it("charges hook time against the one cumulative deadline", async () => {
     await withCorpus(async (root) => {
       writeFileSync(join(root, "meeting.md"), "deadline canary");
       let operationCalls = 0;
       let baselineCalls = 0;
+      let manifestCalls = 0;
+      // Two hooks, each comfortably inside the budget on its own, together
+      // over it. A per-phase timeout would admit both and let the lease
+      // proceed; only a shared cumulative deadline refuses. A single
+      // over-budget hook, which is what this test used to do, cannot tell
+      // those apart, because a fresh 2s timeout would have rejected a 3s hook
+      // just the same.
       await expect(
         withStableCorpusLease(
           root,
@@ -585,42 +596,60 @@ describe("stable corpus lease", () => {
             operationCalls += 1;
           },
           {
-            // `baselineCalls` is asserted to be 1, so the budget has to
-            // survive worker startup before afterBaseline is even reached, or
-            // the lease fails first and the count is zero. Same shape as the
-            // stall test below, which did exactly that on a loaded runner.
-            // The hook still outlasts the budget, which is the property under
-            // test; the budget just no longer races startup.
             timeoutMs: 2_000,
             afterBaseline: () => {
               baselineCalls += 1;
-              return new Promise((resolve) => setTimeout(resolve, 3_000));
+              return new Promise((resolve) => setTimeout(resolve, 1_300));
+            },
+            beforeFinalManifest: () => {
+              manifestCalls += 1;
+              return new Promise((resolve) => setTimeout(resolve, 1_300));
             },
           }
         )
       ).rejects.toThrow("stable meeting corpus authorization failed");
-      expect(operationCalls).toBe(0);
+      // Both hooks ran, so neither was individually over budget, and the
+      // refusal still arrived: the time is shared.
       expect(baselineCalls).toBe(1);
+      expect(manifestCalls).toBe(1);
+      expect(operationCalls).toBe(1);
     });
   });
 
   it("aborts an asynchronous operation at the cumulative authorization deadline", async () => {
     await withCorpus(async (root) => {
       writeFileSync(join(root, "meeting.md"), "operation deadline canary");
-      const started = Date.now();
+      let operationStarted = false;
+      let abortFired = false;
+      let forceOperationDeadline!: () => void;
+      const operationDeadline = new Promise<void>((resolve) => {
+        forceOperationDeadline = resolve;
+      });
       await expect(
         withStableCorpusLease(
           root,
           (_snapshot, _attempt, signal) =>
             new Promise((_resolve, reject) => {
-              signal.addEventListener("abort", () => reject(signal.reason), {
-                once: true,
-              });
+              operationStarted = true;
+              signal.addEventListener(
+                "abort",
+                () => {
+                  abortFired = true;
+                  reject(signal.reason);
+                },
+                { once: true }
+              );
+              forceOperationDeadline();
             }),
-          { timeoutMs: 250 }
+          { timeoutMs: 10_000, operationDeadlineForTest: operationDeadline }
         )
       ).rejects.toThrow("stable meeting corpus authorization failed");
-      expect(Date.now() - started).toBeLessThan(1_000);
+      // The rejection alone proved nothing: with a 250ms budget a lease that
+      // timed out during worker startup satisfied it without ever reaching an
+      // operation, let alone cancelling one. These two say the named cause
+      // actually happened.
+      expect(operationStarted).toBe(true);
+      expect(abortFired).toBe(true);
     });
   });
 
@@ -635,10 +664,25 @@ describe("stable corpus lease", () => {
           () => {
             operationCalls += 1;
           },
-          { timeoutMs: 300, workerStallPhaseForTest: "before-baseline" }
+          { timeoutMs: 1_500, workerStallPhaseForTest: "before-baseline" }
         )
       ).rejects.toThrow("stable meeting corpus authorization failed");
-      expect(Date.now() - started).toBeLessThan(2_500);
+      // Sentinels are acquired before the watcher is registered, and the
+      // injected stall is later still, so this bounds the refusal rather than
+      // pinpointing it: the worker got at least as far as sentinel
+      // acquisition. That is what separates this from the failure mode being
+      // fixed, where a budget consumed by startup refused with no worker
+      // progress at all. Measured: a stalled worker leaves both fences behind,
+      // while the same lease starved to 1ms refuses in 35ms with no namespace.
+      // Elapsed time could not separate those, since startup also spends the
+      // budget.
+      const namespace = join(root, ".minutes-corpus-lease-v1");
+      expect(existsSync(namespace)).toBe(true);
+      expect(readdirSync(namespace).sort()).toEqual([
+        "lease-shared-0.fence",
+        "lease-shared-1.fence",
+      ]);
+      expect(Date.now() - started).toBeLessThan(6_000);
       expect(operationCalls).toBe(0);
       await expect(withStableCorpusLease(root, () => "reused")).resolves.toBe(
         "reused"
@@ -699,19 +743,37 @@ describe("stable corpus lease", () => {
     await withCorpus(async (root) => {
       writeFileSync(join(root, "meeting.md"), "protocol canary");
       const fixture = join(root, "invalid-worker.mjs");
+      const emitted = join(root, "out-of-order.marker");
       writeFileSync(
         fixture,
-        `process.stdin.once("data", () => {\n` +
+        `import { writeFileSync } from "node:fs";\n` +
+          `process.stdin.once("data", () => {\n` +
+          `  writeFileSync(${JSON.stringify(emitted)}, "sent");\n` +
           `  process.stdout.write(JSON.stringify({ type: "authorized" }) + "\\n");\n` +
           `  setTimeout(() => {}, 60_000);\n` +
           `});\n`
       );
+      const started = Date.now();
       await expect(
         withStableCorpusLease(root, () => "must not publish", {
-          timeoutMs: 500,
+          // Generous relative to startup, but not so generous that a hang
+          // regression stops failing usefully: at 10s the wait plus worker
+          // cleanup plus the recovery lease crowded vitest's 15s testTimeout,
+          // which would replace the assertion below with a bare timeout.
+          timeoutMs: 6_000,
           workerScriptForTest: fixture,
         })
       ).rejects.toThrow("stable meeting corpus authorization failed");
+      // The marker is written immediately before the hostile write, so it
+      // proves the fixture ran and reached that point. It cannot prove the
+      // bytes were emitted and classified: the child could die in between, and
+      // every refusal reads the same. Recording after the write would prove
+      // more but is unreliable, because the parent kills the child on the
+      // offending line. Together with a fast refusal against a budget far
+      // larger than startup, this rules out the failure mode being fixed,
+      // where the budget itself was the cause.
+      expect(existsSync(emitted)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(3_000);
       await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
         "recovered"
       );
@@ -759,7 +821,10 @@ describe("stable corpus lease", () => {
             return "authorized retry";
           },
           {
-            timeoutMs: 1_000,
+            // De-raced only: this one already fails loudly rather than
+            // passing falsely, because it asserts positive phase and
+            // operation counts.
+            timeoutMs: 5_000,
             workerScriptForTest: fixture,
             onWatcherReady: ({ attempt }) => {
               phaseCalls += 1;
@@ -816,19 +881,26 @@ describe("stable corpus lease", () => {
   it("rejects a worker line above the fixed protocol cap and recovers", async () => {
     await withCorpus(async (root) => {
       const fixture = join(root, "oversized-worker.mjs");
+      const emitted = join(root, "oversized.marker");
       writeFileSync(
         fixture,
-        `process.stdin.once("data", () => {\n` +
+        `import { writeFileSync } from "node:fs";\n` +
+          `process.stdin.once("data", () => {\n` +
+          `  writeFileSync(${JSON.stringify(emitted)}, "sent");\n` +
           `  process.stdout.write("X".repeat(512 * 1024 + 1));\n` +
           `  setTimeout(() => {}, 60_000);\n` +
           `});\n`
       );
+      const started = Date.now();
       await expect(
         withStableCorpusLease(root, () => "must not publish", {
-          timeoutMs: 500,
+          // See the out-of-order case for why 6s rather than more.
+          timeoutMs: 6_000,
           workerScriptForTest: fixture,
         })
       ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(existsSync(emitted)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(3_000);
       await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
         "recovered"
       );
@@ -838,20 +910,24 @@ describe("stable corpus lease", () => {
   it("rejects coalesced phase, snapshot, and authorization transitions", async () => {
     await withCorpus(async (root) => {
       const fixture = join(root, "coalesced-worker.mjs");
+      const emitted = join(root, "coalesced.marker");
       writeFileSync(
         fixture,
-        `process.stdin.once("data", () => {\n` +
+        `import { writeFileSync } from "node:fs";\n` +
+          `process.stdin.once("data", () => {\n` +
           `  const lines = [\n` +
           `    { type: "phase", name: "afterBaseline", attempt: 1 },\n` +
           `    { type: "snapshot-start", attempt: 1, canonicalRoot: "/synthetic", fileCount: 0 },\n` +
           `    { type: "authorized" },\n` +
           `  ];\n` +
+          `  writeFileSync(${JSON.stringify(emitted)}, "sent");\n` +
           `  process.stdout.write(lines.map(JSON.stringify).join("\\n") + "\\n");\n` +
           `  setTimeout(() => {}, 60_000);\n` +
           `});\n`
       );
       let phaseCalls = 0;
       let operationCalls = 0;
+      const startedCoalesced = Date.now();
       await expect(
         withStableCorpusLease(
           root,
@@ -859,7 +935,11 @@ describe("stable corpus lease", () => {
             operationCalls += 1;
           },
           {
-            timeoutMs: 500,
+            // See the out-of-order case for why 6s rather than more. Both
+            // zero-state assertions below were equally true of a worker that
+            // never started, so the marker and the fast refusal carry the
+            // weight.
+            timeoutMs: 6_000,
             workerScriptForTest: fixture,
             afterBaseline: () => {
               phaseCalls += 1;
@@ -867,6 +947,8 @@ describe("stable corpus lease", () => {
           }
         )
       ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(existsSync(emitted)).toBe(true);
+      expect(Date.now() - startedCoalesced).toBeLessThan(3_000);
       expect(phaseCalls).toBe(0);
       expect(operationCalls).toBe(0);
       await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
@@ -954,23 +1036,46 @@ describe("stable corpus lease", () => {
   it("fails closed after watcher failure on both attempts", async () => {
     await withCorpus(async (root) => {
       writeFileSync(join(root, "meeting.md"), "watcher failure canary");
+      let watcherReadyCalls = 0;
       await expect(
         withStableCorpusLease(root, () => "unreachable", {
-          onWatcherReady: ({ controls }) => controls.failWatcher("test watcher failure"),
+          onWatcherReady: ({ controls }) => {
+            watcherReadyCalls += 1;
+            controls.failWatcher("test watcher failure");
+          },
         })
       ).rejects.toThrow("stable meeting corpus authorization failed");
+      // Bounds what the refusal can be: the worker reached watcher-ready and
+      // the failure was requested. It does not prove the injected failure is
+      // what the parent then refused on, which would need the module to
+      // distinguish its refusals.
+      expect(watcherReadyCalls).toBeGreaterThanOrEqual(1);
     });
   });
 
   it("fails closed when the sentinel fence is not observed", async () => {
     await withCorpus(async (root) => {
       writeFileSync(join(root, "meeting.md"), "fence timeout canary");
+      // The old 25ms budget expired during worker startup, so the refusal came
+      // from the authorization deadline and the fence path was never reached.
+      // Timing cannot separate them here either: a suppressed fence is retried,
+      // so the lease runs on to the deadline rather than ending at the fence
+      // timeout. Count the hook instead. It fires once the worker reaches
+      // watcher-ready, so a lease whose budget died during startup cannot
+      // satisfy it. It does not prove the suppression took effect: the control
+      // only queues a command, which the parent sends after the hook returns
+      // and the worker applies later still.
+      let watcherReadyCalls = 0;
       await expect(
         withStableCorpusLease(root, () => "unreachable", {
-          timeoutMs: 25,
-          onWatcherReady: ({ controls }) => controls.suppressNextFence(),
+          timeoutMs: 3_000,
+          onWatcherReady: ({ controls }) => {
+            watcherReadyCalls += 1;
+            controls.suppressNextFence();
+          },
         })
       ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(watcherReadyCalls).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -1042,7 +1147,11 @@ describe("stable corpus lease", () => {
             operationCalls += 1;
           },
           {
-            timeoutMs: 1_000,
+            // De-raced only. The sentinel names below show the worker
+            // reached sentinel acquisition, which precedes watcher
+            // registration, so they rule out a startup-consumed budget
+            // without proving the injected pulse failure is what refused.
+            timeoutMs: 5_000,
             onWatcherReady: ({ controls }) => controls.failNextFencePulse(),
           }
         )
@@ -1067,7 +1176,9 @@ describe("stable corpus lease", () => {
       try {
         await expect(
           withStableCorpusLease(root, () => "must not authorize", {
-            timeoutMs: 1_000,
+            // De-raced only: the hook below asserts as it runs, so a budget
+            // consumed by startup fails this test rather than satisfying it.
+            timeoutMs: 5_000,
             beforeFinalFence: ({ attempt, controls }) => {
               if (attempt > 1) {
                 controls.failWatcher("replacement cleanup retry");
