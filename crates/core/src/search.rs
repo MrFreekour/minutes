@@ -35,13 +35,21 @@ fn with_stable_active_corpus<T>(
 /// The previous message collapsed every cause into "could not be verified
 /// safely", so a deadline overrun and a corpus genuinely over the byte ceiling
 /// were indistinguishable. Diagnosing #679 needed a controlled experiment to
-/// recover a fact the error already had. The variant names a limit, never
-/// content, a path, or a count, so this leaks nothing a caller cannot already
-/// infer from the published ceilings.
+/// recover a fact the error already had.
+///
+/// This is a deliberate, bounded disclosure rather than no disclosure. The
+/// text reaches CLI and desktop callers, so one who cannot read restricted
+/// meetings can now tell an unopenable corpus from an oversized one, a walk
+/// failure, or an exhausted deadline. It exposes no content, path, or count,
+/// and each state is a whole-corpus condition the caller can already provoke
+/// and observe by timing an ordinary search against the published ceilings.
+/// The diagnosability is worth that; naming a file or a count would not be.
 fn corpus_authorization_error(stage: &str, error: ActiveCorpusRevisionError) -> SearchError {
     let cause = match error {
         ActiveCorpusRevisionError::Unavailable => "the corpus could not be opened",
-        ActiveCorpusRevisionError::Traversal => "the corpus contains an unsafe path",
+        // Every walk error lands here, including permission denials and files
+        // that vanish mid-walk, so this must not claim an unsafe path.
+        ActiveCorpusRevisionError::Traversal => "the corpus could not be walked",
         ActiveCorpusRevisionError::Budget => "the corpus exceeds a documented size ceiling",
         ActiveCorpusRevisionError::Deadline => "the authorization deadline elapsed",
     };
