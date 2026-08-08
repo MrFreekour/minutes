@@ -123,9 +123,21 @@ pub(crate) const ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES: u64 = ACTIVE_CORPUS_
 /// backstop rather than the primary control. The byte, file, and directory
 /// ceilings bound the work itself, and agent-facing SDK/MCP reads wrap this
 /// boundary in a supervised, killable worker.
-pub(crate) const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE: Duration = Duration::from_secs(
-    ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES / ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC,
+const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS: u64 =
+    ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES / ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC;
+
+// Integer division, so a floor throughput at or above the worst-case total
+// would truncate to a zero-second deadline and fail every authorization
+// instantly. Reject that at compile time rather than shipping a build where
+// search never succeeds.
+const _: () = assert!(
+    ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS > 0,
+    "corpus authorization deadline truncated to zero seconds: the assumed floor throughput is \
+     at least the worst-case authorized byte total"
 );
+
+pub(crate) const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE: Duration =
+    Duration::from_secs(ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS);
 
 #[derive(Debug, Default)]
 struct ActiveCorpusReadUsage {
