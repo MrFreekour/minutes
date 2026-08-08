@@ -671,8 +671,9 @@ pub fn splice_ai_sections(
 /// A successful apply rewrites summary-derived frontmatter, which invalidates
 /// every cached view built from it. This function therefore calls
 /// [`crate::derived::refresh_derived_views`] after — and only after — a real
-/// write: the graph index, vault copy, and QMD collection refresh
-/// automatically, while knowledge-base ingestion stays opt-in via
+/// write: vault and the policy-safe QMD mirror refresh automatically, while
+/// process-private search and graph projections rebuild on read and
+/// knowledge-base ingestion stays opt-in via
 /// [`ResummarizeOptions::refresh`] (its log is append-only, so re-ingesting is
 /// not idempotent). The refresh is best-effort and reported in
 /// [`ResummarizeReport::refresh`]; it can never fail a completed write.
@@ -1470,10 +1471,21 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_edit_aborts_apply() {
+    fn concurrent_edit_aborts_apply_without_overwriting_user_bytes() {
         let dir = TempDir::new().unwrap();
         let path = write_meeting(&dir);
         let path_clone = path.clone();
+        let mut user_edit = fs::read(&path).unwrap();
+        let original_bytes = b"edited hello";
+        let replacement_bytes = b"edited again";
+        assert_eq!(original_bytes.len(), replacement_bytes.len());
+        let edit_start = user_edit
+            .windows(original_bytes.len())
+            .position(|window| window == original_bytes)
+            .expect("fixture must contain the original transcript text");
+        user_edit[edit_start..edit_start + replacement_bytes.len()]
+            .copy_from_slice(replacement_bytes);
+        let expected_user_edit = user_edit.clone();
         let err = resummarize_meeting_with(
             &path,
             &test_config(),
@@ -1483,17 +1495,14 @@ mod tests {
             },
             move |_, _, _| {
                 // The user saves their editor mid-inference.
-                let mutated = fs::read_to_string(&path_clone)
-                    .unwrap()
-                    .replace("edited hello", "edited again");
-                fs::write(&path_clone, mutated).unwrap();
+                fs::write(&path_clone, &user_edit).unwrap();
                 Some(good_summary())
             },
         )
         .unwrap_err();
         assert!(matches!(err, ResummarizeError::ConcurrentEdit));
-        // The user's mid-flight save is what survives.
-        assert!(fs::read_to_string(&path).unwrap().contains("edited again"));
+        // The user's mid-flight save is the exact byte sequence that survives.
+        assert_eq!(fs::read(&path).unwrap(), expected_user_edit);
     }
 
     #[test]
@@ -1574,6 +1583,69 @@ mod tests {
         )
         .unwrap();
         assert!(!report2.applied);
+    }
+
+    #[test]
+    fn apply_round_trips_generated_artifact_larger_than_one_megabyte() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large-meeting.md");
+        let large_transcript = format!(
+            "[SPEAKER_00 0:00] edited hello\n{}",
+            "generated transcript payload \n".repeat(42_500)
+        );
+        let fixture = MEETING.replace("[SPEAKER_00 0:00] edited hello", &large_transcript);
+        assert!(
+            fixture.len() > 1_000_000,
+            "fixture must exercise the >1MB path"
+        );
+        assert!(
+            fixture.lines().count() > 42_500,
+            "fixture must exercise many physical line boundaries"
+        );
+        let expected_backup = fixture.as_bytes().to_vec();
+        let (_, original_body) = markdown::split_frontmatter(&fixture);
+        let original_notes = markdown::find_unique_section(original_body, "Notes")
+            .unwrap()
+            .expect("fixture must contain user-owned Notes");
+        let expected_notes = markdown::section_text(original_body, original_notes).to_owned();
+        fs::write(&path, fixture).unwrap();
+
+        let expected_transcript = large_transcript.clone();
+        let report = resummarize_meeting_with(
+            &path,
+            &test_config(),
+            &ResummarizeOptions {
+                apply: true,
+                ..Default::default()
+            },
+            move |transcript, _, _| {
+                assert_eq!(transcript, expected_transcript);
+                Some(good_summary())
+            },
+        )
+        .unwrap();
+        assert!(report.applied);
+        let backup = report.backup.expect("applied run must create a backup");
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            expected_backup,
+            "backup must retain every byte of the original large artifact"
+        );
+
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(
+            rewritten.len() > 1_000_000,
+            "resummarize must not truncate a >1MB artifact"
+        );
+        let (_, body) = markdown::split_frontmatter(&rewritten);
+        let transcript = markdown::find_unique_section(body, "Transcript")
+            .unwrap()
+            .expect("rewritten artifact must retain its transcript");
+        assert_eq!(markdown::section_text(body, transcript), large_transcript);
+        let notes = markdown::find_unique_section(body, "Notes")
+            .unwrap()
+            .expect("rewritten artifact must retain user-owned Notes");
+        assert_eq!(markdown::section_text(body, notes), expected_notes);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+  sign-reviewed-artifact:
+    steps:
+      - name: Download exact unsigned candidate
+        uses: ./payload/action
+      - name: Verify artifact provenance before unlocking the identity
+        run: echo verified
+      - name: Import Developer ID identity into an ephemeral keychain
+        run: echo imported
+      - name: Sign nested executables and outer app inside-out
+        run: echo signed
+      - name: Verify exact Team identity and package sealed app
+        run: echo sealed
+      - name: Remove ephemeral signing material
+        run: echo removed
+      - name: Upload short-lived signed acceptance artifact
+        run: echo uploaded

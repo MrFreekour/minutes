@@ -12,26 +12,42 @@ the operator's own files stay fully readable.
 
 | Surface | Default | Override | Override logging |
 |---|---|---|---|
-| Core text search (`search`, `search_with_mode`) | excluded | `SearchFilters::include_restricted` | caller's responsibility (CLI does it) |
+| Core text search (`search`, `search_with_mode`) | excluded; indexed hits are re-read and strictly classified from live bytes | `SearchFilters::include_restricted` | caller's responsibility (CLI does it) |
 | Core intent search (`search_intents`) | excluded | `SearchFilters::include_restricted` | caller's responsibility (CLI does it) |
-| Core open actions (`find_open_actions`) | excluded | `include_restricted` parameter | caller's responsibility (CLI does it) |
+| Core open actions (`find_open_actions`) | excluded; malformed, unknown-policy, unreadable, and out-of-root files are dropped | `include_restricted` parameter | caller's responsibility (CLI does it) |
 | Core cross-meeting research (`cross_meeting_research`) | excluded | `SearchFilters::include_restricted` | caller's responsibility (CLI does it) |
 | Core consistency report (`consistency_report`) | excluded | none this wave | n/a |
 | Core person profile (`person_profile`) | excluded | none this wave | n/a |
-| Knowledge graph rebuild (`graph.rs`) | excluded | none this wave | n/a — graph.db wipes on rebuild, so exclusion at build time is complete |
+| Core relationship graph (`graph.rs`) | excluded from every process-private rebuild | none | n/a; every answer is re-attested before return and the projection is discarded |
 | Knowledge ingest (`knowledge.rs`, `minutes ingest`) | skipped in batch; explicit ingest of a restricted meeting is refused with a message | none this wave | n/a |
 | CLI `search` / `list` / `actions` / `research` | excluded | `--include-restricted` | `sensitivity.override` event appended before results are returned |
-| SDK reader (`crates/sdk/src/reader.ts`: list, search, actions, decisions, person profiles, voice memos) | excluded | `includeRestricted` option | stderr warning naming count + surface |
+| SDK reader (`crates/sdk/src/reader.ts`: list, search, actions, decisions, person profiles, voice memos) | excluded; explicit unknown sensitivity fails closed | `includeRestricted` option | stderr warning naming count + surface |
 | SDK reader `getMeeting` by exact path | minimal stub (title, date, `sensitivity: restricted`, note) — never the body | `includeRestricted` option | stderr warning |
-| MCP tools (`list_meetings`, `search_meetings`, `get_meeting`, `research_topic`, `get_person_profile`) | excluded / stub | `include_restricted` parameter | via the CLI's `sensitivity.override` event on CLI-backed paths; server log + `sensitivity_override` response note where the server cannot write events |
-| MCP graph-backed tools (`track_commitments`, `relationship_map`, `get_person_profile` graph path) | excluded | none this wave (restricted facts never enter the graph) | n/a |
+| Standalone MCP tools (`list_meetings`, `search_meetings`, `get_meeting`, `research_topic`, `get_person_profile`) | excluded / stub; unknown policy and uncertain files fail closed | on macOS, Linux, and Windows, trusted launch policy `MINUTES_MCP_RESTRICTED_POLICY=logged-override` **and** per-call `include_restricted: true` | Rust capability-bound, cross-process serialized durable JSONL append to `$MINUTES_HOME/audit/sensitivity-overrides.jsonl`; Windows uses a protected owner-only DACL and reparse-safe handles; audit failure denies the request |
+| MCP meeting resources (recent, open actions, exact slug, recent ideas) | excluded / unavailable | no resource-level override | n/a |
+| Native Recall chat | exact live normal-sensitivity context only; no MCP servers and no tools | none | n/a |
+| Standalone MCP person profile (`get_person_profile`) | recomputed from policy-authorized live meeting snapshots; restricted excluded by default | same trusted-launch plus per-call override as other standalone MCP meeting tools | same durable MCP override audit |
+| Standalone MCP commitments (`track_commitments`) | recomputed from normal live meeting snapshots; restricted always excluded | none | n/a |
+| Standalone MCP `relationship_map` | bounded process-private core graph; restricted excluded during every rebuild | none | n/a |
 
 Desktop app search, list, palette actions, and other in-app navigation are the
 **operator's own surface**, not an agent surface: restricted meetings stay
 visible to the human in their own app. Assistant-facing context builders in
-the desktop app (assistant workspace context, proactive context bundle, the
-automation weekly summary) follow the agent-surface default and exclude
-restricted meetings.
+the desktop app are separate trust surfaces.
+
+Native Recall uses a desktop-owned `AgentSafeContext` boundary. It
+canonicalizes each path, parses exact live frontmatter, rebuilds titles and
+snippets from those bytes, binds history to the contributing snapshots, and
+revalidates them immediately before process or network egress. A selected
+focused meeting that is restricted, malformed, unknown-policy, unreadable, or
+outside the configured root blocks locally. Ranked search candidates in any
+of those states disappear. Claude runs with an empty strict MCP configuration
+and `--tools ""`; Ollama is accepted only at a parsed loopback URL. Other agent
+CLIs are denied until they have a verified no-tools/no-global-context mode.
+
+PTY workspace context, proactive bundles, and automation summaries must
+enforce the same default at their own final read point; Native Recall's gate
+does not make those surfaces safe by implication.
 
 ## Override logging
 
@@ -50,12 +66,23 @@ results**:
 - `query` — the query or filter context supplied by the caller, omitted when
   there is none.
 
-The append is best-effort by design: a failed append warns on stderr but
-never blocks the caller (the never-block-non-interactive-callers rule from
-v1). MCP tools that route through the CLI inherit this event. The MCP server
-itself has no event-bus writer; where a tool serves an override without a CLI
-round-trip (`get_meeting`), it records the override in the server log and
-flags it in the structured response (`sensitivity_override`).
+CLI event append remains best-effort for a human-invoked command. MCP uses a
+different, stricter authority boundary: request arguments are model-controlled
+and cannot establish human consent. Only an explicit parent-process launch
+grant (`logged-override`) plus the per-call flag authorizes a standalone MCP
+read. The central registration wrappers enforce that contract before any tool
+handler runs. Every authorized request must append a durable JSONL audit
+record; failure to append denies the request. Missing, misspelled, or future
+policy values resolve to `deny`. Native Recall always launches in deny mode and
+currently registers no MCP server at all.
+
+The standalone override delegates to the Rust capability layer on every
+supported platform. That layer binds the complete owner-private audit
+namespace, serializes writers with one retained lease, rejects incomplete
+JSONL tails, appends and synchronizes through the exact leaf, then re-reads the
+new record and re-attests its visible identity before content is returned. On
+Windows the same boundary uses protected owner-only DACLs, reparse-safe opens,
+and a non-delete-sharing leaf handle rather than emulating POSIX mode fields.
 
 ## Restricted stub (get-by-path)
 
@@ -69,16 +96,37 @@ override:
 - never the transcript body, action items, decisions, or attendees
 
 The SDK stub is marked with `restricted_stub: true` so callers can tell it
-apart from a full meeting.
+apart from a full meeting. MCP verifies the exact live snapshot again after
+optional CLI overlay enrichment; a sensitivity or byte change during the read
+fails rather than returning the second snapshot.
+
+QMD and SQLite are ranking hints, not authorization or content sources. MCP
+and core search canonicalize each candidate, re-read it inside the configured
+root, strictly parse sensitivity, and derive the returned excerpt from the
+verified live body. Cached snippets are never returned. If QMD candidates are
+all rejected, MCP falls back to the safe CLI path.
 
 ## No override surfaces (this wave)
 
-The knowledge graph, knowledge ingest, consistency reports, and person
-profiles have **no override**: restricted facts simply do not enter those
-derived stores or reports. `graph.db` wipes on rebuild, so graph exclusion at
-build time is complete. An explicitly named restricted meeting passed to
-`minutes ingest` is refused with a message naming the designation; batch
-ingest (`--all`) skips restricted meetings and reports the skipped count.
+The core relationship graph, knowledge ingest, and core consistency/person-profile
+commands have **no override**. Standalone MCP `get_person_profile` and
+`track_commitments` are deliberately different because they are live
+projections, not durable graph reads. The person-profile tool uses the same
+trusted-launch plus per-call override and durable audit boundary as other MCP
+meeting tools; commitments remain normal-only and expose no restricted
+override. An explicitly named restricted meeting passed to `minutes ingest`
+is refused; batch ingest skips restricted meetings and reports the count.
+Core graph rows exist only in a bounded process-private projection, are bound to
+the current corpus and correction revisions, and are discarded after the answer.
+The signed macOS desktop bundle additionally runs that projection in a
+dedicated App-Sandboxed helper whose exact CodeDirectory hash is sealed into
+the enclosing app. On older macOS, standalone, source-built, and ad-hoc
+channels supervise an exact second instance of the already-running executable;
+the parent verifies the live child's kernel CodeDirectory hash before sending
+any source bytes, and the child installs the same hard resource ceilings.
+Derived annotation, insight, and live-event tools remain
+absent from Native Recall until their records have live sensitivity provenance
+or mandatory invalidation.
 
 ## Compatibility notes
 
@@ -86,8 +134,12 @@ ingest (`--all`) skips restricted meetings and reports the skipped count.
   everywhere, and existing corpora are unaffected.
 - Agents never write `sensitivity` (RFC #194 discipline) — the designation is
   set by the human-initiated flows from Wave 1.
-- The MCP server compiles against the published `minutes-sdk` typings, which
-  may lag the in-repo reader. Until an SDK release that includes the
-  `includeRestricted` option is published and bundled, the pure-TS fallback
-  paths pass the option through shims (older SDKs ignore it) and the
-  CLI-backed paths carry the enforcement.
+- MCP declares and locks `minutes-sdk` 0.21.x, but does not trust the installed
+  package as the final policy authority. Candidate paths from the SDK are
+  canonicalized and re-read through MCP's local strict classifier before any
+  fallback tool or resource derives output. This guards against a stale npm
+  artifact silently treating a future sensitivity value as normal.
+- Missing `sensitivity` remains legacy-normal. An explicit unsupported value,
+  malformed YAML, missing required frontmatter, unreadable file, or path escape
+  is policy-uncertain and excluded even when a restricted override is
+  authorized.

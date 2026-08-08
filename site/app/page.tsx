@@ -5,6 +5,7 @@ import { APPLE_SILICON_DOWNLOAD_PATH } from "@/lib/downloads";
 import {
   MINUTES_MCP_TOOL_COUNT,
   MINUTES_RELEASE_VERSION,
+  MINUTES_TEST_COUNT,
   WINDOWS_SETUP_EXE,
 } from "@/lib/release";
 
@@ -19,7 +20,7 @@ const featureGrid = [
     label: "For developers",
     title: "Local and inspectable",
     description:
-      "whisper.cpp or parakeet.cpp transcription, diarized markdown, YAML frontmatter, and a plain-files workflow that still works with grep and git.",
+      "sealed local whisper.cpp transcription, diarized markdown, YAML frontmatter, and a plain-files workflow that still works with grep and git.",
   },
   {
     label: "For meetings",
@@ -77,16 +78,16 @@ const capabilityColumns = [
         "Action items, decisions, and commitments become queryable markdown.",
       ],
       [
-        "Relationship memory",
-        "Track people, projects, and unresolved commitments across meetings.",
+        "Policy-bound people context",
+        "Build bounded policy-safe person profiles, topic research, relationship rankings, and commitments.",
       ],
       [
         "Cross-meeting search",
-        "Search everything or ask your assistant to pull the thread for you.",
+        "Search policy-authorized history or ask your assistant to pull the thread for you.",
       ],
       [
         "Voice memo pipeline",
-        "iPhone recordings arrive on Mac and join the same memory graph.",
+        "iPhone recordings arrive on Mac and join the same policy-safe search corpus.",
       ],
     ],
   },
@@ -119,11 +120,11 @@ const comparisons = [
   ["Open source", "No", "No", "MIT", "MIT"],
   ["Free", "Freemium", "Freemium", "Free", "Free"],
   ["Agent surface", "Hosted MCP", "Hosted integrations", "Local app", `Files + ${MINUTES_MCP_TOOL_COUNT} MCP tools`],
-  ["Cross-meeting intelligence", "Cloud chat", "Cloud chat", "No", "Local graph"],
+  ["Cross-meeting intelligence", "Cloud chat", "Cloud chat", "No", "Policy-safe search"],
   ["Consent provenance", "No", "No", "No", "In every file"],
   ["Dictation mode", "No", "No", "No", "Yes"],
   ["Voice memos", "No", "No", "No", "iPhone pipeline"],
-  ["People memory", "No", "No", "No", "Yes"],
+  ["People memory", "No", "No", "No", "Bounded profiles"],
   ["Data ownership", "Their servers", "Their servers", "Local", "Local"],
   ["Data format", "Cloud DB", "Cloud DB", "Local files", "Markdown + YAML"],
   ["Agent-agnostic", "No", "No", "Partially", "Yes"],
@@ -270,7 +271,7 @@ const cloudFlow: HomeFlowStep[] = [
 
 const minutesFlow: HomeFlowStep[] = [
   { label: "Capture from your mic", detail: "device audio, on your Mac" },
-  { label: "Transcribe", detail: "on-device — whisper.cpp / parakeet.cpp" },
+  { label: "Transcribe", detail: "on-device — sealed local whisper.cpp" },
   { label: "Store transcripts + notes", detail: "your disk — markdown in ~/meetings" },
 ];
 
@@ -430,8 +431,6 @@ export default function Home() {
 
         <p className="mt-4 text-[13px] text-[var(--text-secondary)]">
           Download, install, done. First launch downloads a speech model. Run
-          <span className="mx-1 font-mono text-[var(--text)]">minutes setup --parakeet</span>
-          for the multilingual Parakeet backend, or
           <span className="mx-1 font-mono text-[var(--text)]">minutes setup --demo</span>
           to try the pipeline on five bundled fixture meetings.
         </p>
@@ -558,8 +557,9 @@ export default function Home() {
               How we test it
             </p>
             <p className="mt-3 text-[14px] leading-7 text-[var(--text-secondary)]">
-              1,148 automated tests and a public eval harness, with the limits
-              stated plainly. Read the receipts before you trust it.
+              {MINUTES_TEST_COUNT.toLocaleString()} automated test declarations
+              and a public eval harness, with the limits stated plainly. Read
+              the receipts before you trust it.
             </p>
           </a>
           <a
@@ -583,15 +583,15 @@ export default function Home() {
           How it works
         </h2>
         <pre className="mt-6 overflow-x-auto rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-5 font-mono text-[13px] leading-7 text-[var(--text-secondary)] shadow-[var(--shadow-panel)]">
-{`Audio -> Transcribe -> Diarize -> Summarize -> Markdown -> Relationship Graph
-       (local)      (local)    (your LLM)  (decisions,   (people, commitments,
-      whisper.cpp   pyannote   Claude /     action items) topics, scores)
+{`Audio -> Transcribe -> Diarize -> Summarize -> Markdown -> Policy-safe Search
+       (local)      (local)    (your LLM)  (decisions,   (live authorized,
+      whisper.cpp   pyannote   Claude /     action items) bounded reads)
                                 Ollama`}
         </pre>
         <p className="mt-5 max-w-[660px] text-[15px] leading-7 text-[var(--text-secondary)]">
-          Transcription is local via whisper.cpp or parakeet.cpp. Parakeet is
-          multilingual by default with native VAD. Live transcription falls
-          back cleanly through Apple Speech, Parakeet, and Whisper.
+          Transcription runs locally through sealed whisper.cpp. Existing
+          Parakeet and Apple Speech preferences resolve to Whisper until their
+          secure byte transports pass their release gates.
           Summarization is optional — Claude can do it conversationally when
           you ask, using your existing subscription. No API keys are required
           to get useful output.
@@ -770,8 +770,8 @@ export default function Home() {
             </p>
             <p className="mt-3 text-[14px] leading-6 text-[var(--text-secondary)]">
               Sensitivity metadata your agents are required to respect: a
-              restricted meeting never appears in search, graph queries, or
-              anything an agent assembles.
+              restricted meeting is excluded from default agent search,
+              bounded profiles, and anything an agent assembles.
             </p>
           </div>
         </div>

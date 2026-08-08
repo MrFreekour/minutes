@@ -29,13 +29,51 @@ jobs:
           filters: |
             rust:
               - 'tauri/**'
+              # Enumerated, not 'crates/**'. crates/mcp and crates/sdk are npm
+              # packages, not workspace members: neither has a Cargo.toml and
+              # between them they hold zero .rs files, so 'crates/**' ran
+              # test x3, install x2, the Linux full build and the Windows
+              # desktop installer on every TypeScript-only PR.
+              #
+              # Negation entries ('!crates/mcp/**') cannot do this: the action
+              # compiles each pattern separately, and a lone negated pattern
+              # matches every file outside its own subtree, which would make the
+              # filter always true. scripts/check_ci_rust_filter.mjs keeps this
+              # list in step with the workspace members instead.
               - 'crates/core/**'
               - 'crates/cli/**'
               - 'crates/reader/**'
               - 'crates/whisper-guard/**'
+              - 'crates/archive-convert/**'
+              - 'crates/archive-core/**'
+              - 'crates/archive-ocr/**'
+              - 'crates/archive-semantic/**'
+              # Not a workspace member and not an npm package: fixture audio
+              # read by tests and scripts. 'crates/**' used to cover it.
+              - 'crates/assets/**'
+              - 'archive/**'
+              - 'tests/**'
+              # Declared as build inputs by tauri/src-tauri/build.rs via
+              # cargo:rerun-if-changed and copied into the shipped bundle, so a
+              # change here really is a Rust build change.
+              - '.agents/skills/**'
+              - '.opencode/skills/**'
+              - '.opencode/commands/**'
+              - 'scripts/calendar-events.swift'
+              - 'scripts/calendar-helper-Info.plist'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              # Workspace lint policy (disallowed-methods). `cargo clippy --all
+              # -- -D warnings` runs only inside the filtered test job, so
+              # without this a PR editing lint policy skipped every Rust job and
+              # reported green. crates/core/clippy.toml is covered by crates/**.
+              - 'clippy.toml'
+              # Sets rustflags and build env per target, so it changes how every
+              # Rust target compiles. Omitting it meant a change that statically
+              # linked the Windows CRT skipped every Rust job and reported green
+              # (#657 follow-up).
+              - '.cargo/**'
               - '.github/workflows/ci.yml'
 
   test:
@@ -134,8 +172,12 @@ jobs:
         run: cargo build --no-default-features
 
       - name: Unit tests (no whisper)
-        run: cargo test -p minutes-core --no-default-features --lib -- --test-threads=1
-        timeout-minutes: 3
+        # Keep libtest output visible on hosted Windows so a platform-only
+        # assertion is diagnosable even if a later test reaches the job
+        # deadline. Privacy-B also substantially expanded this suite; three
+        # minutes no longer covers its bounded two-worker/QMD regressions.
+        run: cargo test -p minutes-core --no-default-features --lib -- --test-threads=1 --nocapture
+        timeout-minutes: 15
 
       - name: Copilot attach, routing, and window-contract tests
         # On Windows this executes the real named-pipe connect/reconnect path.
@@ -384,6 +426,10 @@ jobs:
         working-directory: crates/mcp
         run: npx vitest run src/captureRelay.test.ts
 
+      - name: MCP full unit suite
+        working-directory: crates/mcp
+        run: npm run test:unit
+
       # Regression guard for issue #149: v0.13.0 shipped an MCPB bundle
       # that Claude Desktop 1.3109.0 refused to unzip because the bundle
       # contained Next.js chunks with `..` in their filenames. Pack the
@@ -411,7 +457,7 @@ jobs:
   # The lockfile is generated from a clean tree with Node 22/npm 10 so its v3
   # package graph retains every platform-specific optional dependency.
   mcp_lockfile_check:
-    name: MCP Lockfile (${{ matrix.os }})
+    name: Agent Corpus + MCP Lockfile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -425,6 +471,21 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install SDK dependencies
+        working-directory: crates/sdk
+        run: npm ci
+
+      - name: SDK corpus policy tests
+        working-directory: crates/sdk
+        run: npx vitest run src/corpus-lease.test.ts src/secure-read.test.ts
+
+      - name: Build SDK production module
+        working-directory: crates/sdk
+        run: npm run build
+
+      - name: Gate SDK production recursive watcher protocol
+        run: node scripts/check_corpus_watch_fence.mjs crates/sdk/dist/corpus-lease.js
+
       - name: Install MCP dependencies
         working-directory: crates/mcp
         run: npm ci
@@ -432,6 +493,22 @@ jobs:
       - name: TypeScript check
         working-directory: crates/mcp
         run: npx tsc --noEmit
+
+      - name: MCP corpus policy tests
+        working-directory: crates/mcp
+        run: >-
+          npx vitest run
+          src/index.test.ts
+          src/corpus-lease.test.ts
+          src/secure-read.test.ts
+          src/paths.test.ts
+
+      - name: Build MCP production module
+        working-directory: crates/mcp
+        run: npm run build
+
+      - name: Gate MCP production recursive watcher protocol
+        run: node scripts/check_corpus_watch_fence.mjs crates/mcp/dist/corpus-lease.js
 
   version_sync:
     name: Version Sync
@@ -447,17 +524,29 @@ jobs:
       - name: Verify version policy
         run: node scripts/check_version_sync.mjs
 
+      - name: Verify corpus lease mirror
+        run: node scripts/check_corpus_lease_mirror.mjs
+
+      - name: Verify CI rust filter covers every workspace member
+        run: node scripts/check_ci_rust_filter.mjs
+
       - name: Test version policy checker
         run: node --test scripts/check_version_sync.test.mjs
 
       - name: Test optional Git hook setup
         run: node --test scripts/setup_hooks.test.mjs
 
+      - name: Test CI rust filter guard
+        run: node --test scripts/check_ci_rust_filter.test.mjs
+
       - name: Test transactional version bump
         run: node --test scripts/bump_version.test.mjs
 
       - name: Test committed release flow
         run: node --test scripts/release.test.mjs
+
+      - name: Test site release constant sync modes
+        run: node --test scripts/sync_site_release_version.test.mjs
 
   design_tokens:
     name: Design Tokens
@@ -557,6 +646,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - name: Install workflow-guard dependencies
+        run: python3 -m pip install --quiet pyyaml
+
+      # Repository-scoped signing secrets are readable by any job that names
+      # them, and they cannot be migrated to environment scope: GitHub secrets
+      # are write-only and the source material is not recoverable, so deleting
+      # the repository copies would be irreversible. The approval gate is
+      # enforced here instead.
+      - name: Signing secrets stay behind an approved environment gate
+        run: python3 scripts/check_signing_secret_scope.py
+
+      - name: Signing secret scope negative controls
+        run: python3 -m unittest tests/eval/test_signing_secret_scope.py
 
       - name: Public fixture privacy gate
         run: python3 scripts/check_live_sidekick_fixture_privacy.py

@@ -24,6 +24,21 @@
 - **Loading (landing site):** Google Fonts CDN for Instrument Serif + Geist + Geist Mono
 - **Loading (Tauri app):** Bundled WOFF2 files in `tauri/src/fonts/` — offline-safe, no network dependency
 
+**Approved exception — CJK fallback (localized UI only).** Geist and Instrument
+Serif have no CJK coverage, so a localized UI would render Chinese, Japanese, or
+Korean text in whatever the OS substitutes, inconsistently across machines. A
+system CJK stack (PingFang SC, Hiragino Sans, Microsoft YaHei, Noto Sans CJK) is
+therefore permitted **only** as a fallback appended after the fonts above, and
+**only** when a CJK locale is active.
+
+The constraint that keeps this from eroding the design: English rendering must be
+byte-identical to before. The fallback never precedes the primary faces, is never
+applied globally, and is scoped by active locale rather than by content
+detection. In English the stack is untouched.
+
+Approved for the zh-CN localization (#621, proposed in discussion #420). The same
+exception extends to future locales with the same scoping.
+
 **Scale (landing site):**
 
 | Role | Font | Size | Weight |
@@ -252,6 +267,7 @@ Every state must be visible in every surface (tray, app, CLI output).
 | 2026-04-08 | Transcript output as hero visual | Real diarized output in Geist Mono replaces the existing DemoPlayer gif. The product's output is the aesthetic. |
 | 2026-04-08 | Warm near-black (#0D0D0B) not pure black | Slightly warm undertone unifies dark mode with the cream light mode surfaces. |
 | 2026-04-08 | No gradients, no glows, no illustration | Information density is the aesthetic. The only decoration is well-set type. |
+| 2026-08-03 | Minutes Archive keeps a deep-green legal palette, not the coral accent | Ratified by the owner. Archive is a separate product surface: a sealed, local-only evidence tool for an attorney's confidential file, not the Minutes meeting product. Coral reads as warm and consumer; the deep green (`--green` #174f3c on `--paper` #f6f4ee) reads as archival and legal, which is the register the interface has to hold when it is quoting privileged text back to counsel. This is a scoped divergence, not a change to the system: the landing site and the Minutes desktop app keep the coral/green accents above. Everything else in this document — Instrument Serif headings, Geist body, the radius scale, no gradients, information density — applies to Archive unchanged, and its app surfaces use the section-heading scale rather than the landing hero scale. |
 | 2026-07-10 | Sanctioned "product-honest reveal" exception to the no-entrance-animation rule | Resolves the tension between "no entrance animations" (Motion) and "show streamed partials, never spinners" (Interaction craft). The hero transcript streams in once to mirror real transcription; reduce-motion renders it static. Reveals that don't demonstrate real product behavior remain banned. |
 
 ## Interaction craft

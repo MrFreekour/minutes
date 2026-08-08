@@ -37,7 +37,6 @@ pub(crate) struct PersonIdentity {
 #[derive(Clone, Debug)]
 struct PersonCandidate {
     identity: PersonIdentity,
-    alias_score: usize,
     support_score: usize,
 }
 
@@ -64,23 +63,55 @@ impl PersonCanonicalizer {
             let exact_keys = exact_keys_for_entity(entity);
             let slug_keys = slug_keys_for_entity(entity);
 
-            let alias_score = exact_keys.len().max(slug_keys.len());
-            let idx = canonicalizer.candidates.len();
-            canonicalizer.candidates.push(PersonCandidate {
-                identity,
-                alias_score,
-                support_score: 1,
+            let existing = canonicalizer.candidates.iter().position(|candidate| {
+                candidate.identity.slug == identity.slug
+                    && candidate.identity.name.eq_ignore_ascii_case(&identity.name)
             });
+            let idx = match existing {
+                Some(idx) => {
+                    for alias in identity.aliases {
+                        if !canonicalizer.candidates[idx]
+                            .identity
+                            .aliases
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(&alias))
+                        {
+                            canonicalizer.candidates[idx].identity.aliases.push(alias);
+                        }
+                    }
+                    idx
+                }
+                None => {
+                    let idx = canonicalizer.candidates.len();
+                    canonicalizer.candidates.push(PersonCandidate {
+                        identity,
+                        support_score: 1,
+                    });
+                    idx
+                }
+            };
 
             for key in exact_keys {
                 canonicalizer
                     .exact_matches
                     .entry(key)
-                    .or_default()
-                    .push(idx);
+                    .and_modify(|indices| {
+                        if !indices.contains(&idx) {
+                            indices.push(idx);
+                        }
+                    })
+                    .or_insert_with(|| vec![idx]);
             }
             for key in slug_keys {
-                canonicalizer.slug_matches.entry(key).or_default().push(idx);
+                canonicalizer
+                    .slug_matches
+                    .entry(key)
+                    .and_modify(|indices| {
+                        if !indices.contains(&idx) {
+                            indices.push(idx);
+                        }
+                    })
+                    .or_insert_with(|| vec![idx]);
             }
         }
 
@@ -109,7 +140,7 @@ impl PersonCanonicalizer {
         canonicalizer
     }
 
-    pub(crate) fn resolve(&self, raw: &str) -> Option<PersonIdentity> {
+    fn resolve_candidate(&self, raw: &str) -> Option<PersonIdentity> {
         let (_, trimmed) = normalize_raw_name(raw)?;
 
         if let Some(idx) = self.pick_best_index(self.lookup_exact(trimmed)) {
@@ -125,6 +156,19 @@ impl PersonCanonicalizer {
             return Some(self.candidates[idx].identity.clone());
         }
 
+        None
+    }
+
+    pub(crate) fn resolve(&self, raw: &str) -> Option<PersonIdentity> {
+        if let Some(identity) = self.resolve_candidate(raw) {
+            return Some(identity);
+        }
+        let (_, trimmed) = normalize_raw_name(raw)?;
+        let slug = slugify(trimmed);
+        if slug.is_empty() {
+            return None;
+        }
+
         Some(PersonIdentity {
             slug,
             name: trimmed.to_string(),
@@ -133,13 +177,27 @@ impl PersonCanonicalizer {
     }
 
     pub(crate) fn resolve_entity(&self, entity: &EntityRef) -> Option<PersonIdentity> {
-        if let Some(identity) = self.resolve(&entity.label) {
+        let explicit = normalize_entity_identity(entity)?;
+        let label_slug = slugify(&entity.label);
+        // A richer explicit slug is identity evidence, not another ambiguous
+        // alias. Preserve it before consulting the shared label, otherwise
+        // unrelated contextual mentions can cause a stronger alias candidate
+        // to rewrite a distinct file-local entity.
+        if explicit.slug != label_slug {
+            if let Some(identity) = self.resolve_candidate(&explicit.slug) {
+                if identity.slug == explicit.slug {
+                    return Some(identity);
+                }
+            }
+            return Some(explicit);
+        }
+        if let Some(identity) = self.resolve_candidate(&entity.label) {
             return Some(identity);
         }
-        if let Some(identity) = self.resolve(&entity.slug) {
+        if let Some(identity) = self.resolve_candidate(&entity.slug) {
             return Some(identity);
         }
-        normalize_entity_identity(entity)
+        Some(explicit)
     }
 
     fn lookup_exact<'a>(&'a self, raw: &str) -> &'a [usize] {
@@ -159,34 +217,30 @@ impl PersonCanonicalizer {
     fn pick_best_index(&self, indices: &[usize]) -> Option<usize> {
         let mut best_idx: Option<usize> = None;
         let mut best_support = 0usize;
-        let mut best_alias = 0usize;
         let mut ambiguous = false;
 
         for &idx in indices {
             let candidate = &self.candidates[idx];
             let support = candidate.support_score;
-            let alias = candidate.alias_score;
 
             match best_idx {
                 None => {
                     best_idx = Some(idx);
                     best_support = support;
-                    best_alias = alias;
                 }
                 Some(_) if ambiguous => {
-                    if support > best_support && alias > best_alias {
+                    if support > best_support {
                         best_idx = Some(idx);
                         best_support = support;
-                        best_alias = alias;
                         ambiguous = false;
                     }
                 }
                 Some(_) => {
-                    if support > best_support || (support == best_support && alias > best_alias) {
+                    if support > best_support {
                         best_idx = Some(idx);
                         best_support = support;
-                        best_alias = alias;
-                    } else if support == best_support && alias == best_alias {
+                        ambiguous = false;
+                    } else if support == best_support && best_idx != Some(idx) {
                         ambiguous = true;
                     }
                 }
@@ -566,10 +620,25 @@ fn normalize_entity_identity(entity: &EntityRef) -> Option<PersonIdentity> {
     if !is_plausible_person_name(&name) {
         return None;
     }
-    let slug = slugify(&name);
-    if slug.is_empty() {
+    let name_slug = slugify(&name);
+    if name_slug.is_empty() {
         return None;
     }
+    // Preserve a richer explicit identity only when its contamination-stripped
+    // form extends the visible label. This keeps two extracted "Alex" records
+    // with explicit alex-north/alex-south identities separate, while existing
+    // role-tainted slugs such as junlei-tech-lead still collapse to junlei.
+    let explicit_name = entity.slug.replace('-', " ");
+    let explicit_slug = slugify(strip_contamination(&explicit_name));
+    let slug = if explicit_slug == name_slug
+        || explicit_slug
+            .strip_prefix(&name_slug)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+    {
+        explicit_slug
+    } else {
+        name_slug
+    };
 
     Some(PersonIdentity {
         slug,
@@ -725,14 +794,63 @@ mod tests {
         assert_eq!(identity.name, "Dan");
     }
 
-    fn candidate(alias_score: usize, support_score: usize) -> PersonCandidate {
-        PersonCandidate {
-            identity: PersonIdentity {
-                slug: format!("candidate-{alias_score}-{support_score}"),
-                name: format!("Candidate {alias_score}/{support_score}"),
+    #[test]
+    fn ambiguous_equal_labels_preserve_each_explicit_entity_identity() {
+        let entities = vec![
+            EntityRef {
+                slug: "alex-north".into(),
+                label: "Alex".into(),
+                aliases: vec!["A".into()],
+            },
+            EntityRef {
+                slug: "alex-south".into(),
+                label: "Alex".into(),
+                aliases: vec!["A".into()],
+            },
+        ];
+        let resolver = PersonCanonicalizer::new(&entities, std::iter::empty::<&str>());
+        assert_eq!(resolver.resolve("Alex").unwrap().slug, "alex");
+        assert_eq!(
+            resolver.resolve_entity(&entities[0]).unwrap().slug,
+            "alex-north"
+        );
+        assert_eq!(
+            resolver.resolve_entity(&entities[1]).unwrap().slug,
+            "alex-south"
+        );
+    }
+
+    #[test]
+    fn stronger_context_never_overwrites_a_distinct_explicit_entity_slug() {
+        let entities = vec![
+            EntityRef {
+                slug: "alex-rivera".into(),
+                label: "Alex".into(),
                 aliases: vec![],
             },
-            alias_score,
+            EntityRef {
+                slug: "alice-jones".into(),
+                label: "Alice Jones".into(),
+                aliases: vec!["Alex".into()],
+            },
+        ];
+        let resolver = PersonCanonicalizer::new(
+            &entities,
+            ["Alice Jones", "Alice Jones", "Alice Jones", "Alex"],
+        );
+        assert_eq!(
+            resolver.resolve_entity(&entities[0]).unwrap().slug,
+            "alex-rivera"
+        );
+    }
+
+    fn candidate(label: usize, support_score: usize) -> PersonCandidate {
+        PersonCandidate {
+            identity: PersonIdentity {
+                slug: format!("candidate-{label}-{support_score}"),
+                name: format!("Candidate {label}/{support_score}"),
+                aliases: vec![],
+            },
             support_score,
         }
     }

@@ -1,64 +1,247 @@
 use crate::config::Config;
 use crate::error::SearchError;
-use crate::markdown::{extract_field, split_frontmatter, Frontmatter, IntentKind, Sensitivity};
+#[cfg(test)]
+use crate::markdown::stable_active_corpus_revision;
+use crate::markdown::{
+    extract_field, is_inactive_corpus_dir_name, read_stable_active_markdown, split_frontmatter,
+    stable_active_corpus_revision_with_budget, stable_markdown_file_identity,
+    ActiveCorpusReadBudget, ActiveCorpusRevisionError, Frontmatter, IntentKind, Sensitivity,
+    StableActiveCorpusRevision, StableMarkdownFileIdentity, StableMarkdownSnapshot,
+    ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS,
+};
 use crate::overlays;
 use chrono::Local;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use walkdir::WalkDir;
 
-/// Directories within `output_dir` that should be excluded from search results.
-/// These contain archived, processed, or failed files that are not active meetings.
-const EXCLUDED_DIRS: &[&str] = &["archive", "processed", "failed", "failed-captures"];
+/// Safe search-facade sync policy. The underlying index module is private so
+/// downstream callers cannot return cached content without live policy
+/// authorization.
+pub use crate::search_index::SyncMode;
 
-/// Walk `dir` for `.md` files, skipping excluded subdirectories.
-fn walk_meeting_files(dir: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
-    WalkDir::new(dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.file_type().is_dir() {
-                let name = e.file_name().to_string_lossy();
-                !EXCLUDED_DIRS.contains(&name.as_ref())
-            } else {
-                true
-            }
-        })
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+fn with_stable_active_corpus<T>(
+    dir: &Path,
+    operation: impl FnMut(&StableActiveCorpusRevision) -> Result<T, SearchError>,
+) -> Result<T, SearchError> {
+    with_stable_active_corpus_with_hooks(dir, operation, || {}, || {})
 }
 
-/// True when the file at `path` carries `sensitivity: restricted` frontmatter.
+/// Name which limit stopped a corpus pass, without describing the corpus.
 ///
-/// Reads only the frontmatter via the line-based `extract_field` helper, so
-/// the check stays cheap enough to post-filter index results. Unreadable
-/// files are treated as not restricted — every consumer skips them anyway.
-fn is_restricted_path(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
+/// The previous message collapsed every cause into "could not be verified
+/// safely", so a deadline overrun and a corpus genuinely over the byte ceiling
+/// were indistinguishable. Diagnosing #679 needed a controlled experiment to
+/// recover a fact the error already had.
+///
+/// This is a deliberate, bounded disclosure rather than no disclosure. The
+/// text reaches CLI and desktop callers, so one who cannot read restricted
+/// meetings can now tell an unopenable corpus from an oversized one, a walk
+/// failure, or an exhausted deadline. It exposes no content, path, or count,
+/// and each state is a whole-corpus condition the caller can already provoke
+/// and observe by timing an ordinary search against the published ceilings.
+/// The diagnosability is worth that; naming a file or a count would not be.
+fn corpus_authorization_error(stage: &str, error: ActiveCorpusRevisionError) -> SearchError {
+    let cause = match error {
+        ActiveCorpusRevisionError::Unavailable => "the corpus could not be opened",
+        // Every walk error lands here, including permission denials and files
+        // that vanish mid-walk, so this must not claim an unsafe path.
+        ActiveCorpusRevisionError::Traversal => "the corpus could not be walked",
+        ActiveCorpusRevisionError::Budget => "the corpus exceeds a documented size ceiling",
+        ActiveCorpusRevisionError::Deadline => "the authorization deadline elapsed",
     };
-    let (frontmatter, _) = split_frontmatter(&content);
-    extract_field(frontmatter, "sensitivity").as_deref() == Some("restricted")
+    SearchError::Io(std::io::Error::other(format!(
+        "meeting corpus could not be {stage} safely: {cause}"
+    )))
 }
 
-/// Drop results whose source meeting is `sensitivity: restricted` unless the
-/// caller opted in via `filters.include_restricted` (consent layer Wave 2).
-fn exclude_restricted_results(results: &mut Vec<SearchResult>, filters: &SearchFilters) {
-    if filters.include_restricted {
-        return;
+fn with_stable_active_corpus_with_hooks<T>(
+    dir: &Path,
+    mut operation: impl FnMut(&StableActiveCorpusRevision) -> Result<T, SearchError>,
+    mut after_precheck: impl FnMut(),
+    mut before_postcheck: impl FnMut(),
+) -> Result<T, SearchError> {
+    let envelope = ActiveCorpusReadBudget::new();
+    for _ in 0..ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS {
+        envelope.check_deadline().map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "meeting corpus could not be verified safely",
+            ))
+        })?;
+        // Every mandatory corpus pass keeps the documented per-pass envelope,
+        // while all passes share one absolute operation deadline. This keeps
+        // safe rereads from making an otherwise supported corpus unavailable.
+        let before = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
+            .map_err(|error| corpus_authorization_error("verified", error))?
+            .with_read_budget(envelope.fresh_materialization_pass());
+        after_precheck();
+        envelope.check_deadline().map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "meeting corpus authorization deadline elapsed",
+            ))
+        })?;
+        let value = operation(&before)?;
+        envelope.check_deadline().map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "meeting corpus authorization deadline elapsed",
+            ))
+        })?;
+        before_postcheck();
+        let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
+            .map_err(|error| corpus_authorization_error("reverified", error))?;
+        if before == after {
+            return Ok(value);
+        }
     }
-    results.retain(|result| !is_restricted_path(&result.path));
+    Err(SearchError::Io(std::io::Error::other(
+        "meeting corpus changed while materializing the result",
+    )))
+}
+
+/// Re-authorize and refresh every index result from one live file snapshot.
+///
+/// FTS/QMD are ranking hints, not authorization or content sources. Stale
+/// titles/snippets are replaced from live bytes; unreadable, malformed,
+/// unknown-sensitivity, symlink-escaped, and restricted-without-override
+/// results disappear. Even an explicit restricted override cannot authorize
+/// a policy-uncertain file.
+fn revision_snapshot(
+    revision: &StableActiveCorpusRevision,
+    path: &Path,
+) -> Result<StableMarkdownSnapshot, SearchError> {
+    revision.read_snapshot(path).ok_or_else(|| {
+        SearchError::Io(std::io::Error::other(
+            "an allowlisted meeting changed while materializing the result",
+        ))
+    })
+}
+
+fn retain_policy_verified_results(
+    results: &mut Vec<SearchResult>,
+    filters: &SearchFilters,
+    query: &str,
+    revision: &StableActiveCorpusRevision,
+) -> Result<(), SearchError> {
+    let candidates = std::mem::take(results);
+    for mut result in candidates {
+        // Stale index rows absent from the pre-operation allowlist are
+        // ineligible even if the path becomes readable during this query.
+        if !revision.contains_path(&result.path) {
+            continue;
+        }
+        let snapshot = revision_snapshot(revision, &result.path)?;
+        let (frontmatter_str, body) = split_frontmatter(&snapshot.content);
+        if frontmatter_str.is_empty() {
+            continue;
+        }
+        let Ok(frontmatter) = serde_yaml::from_str::<Frontmatter>(frontmatter_str) else {
+            continue;
+        };
+        if !filters.include_restricted
+            && matches!(frontmatter.sensitivity, Some(Sensitivity::Restricted))
+        {
+            continue;
+        }
+
+        let live_query = result.matched_via_alias.as_deref().unwrap_or(query);
+        let live_query_trimmed = live_query.trim();
+        let live_snippet = if live_query_trimmed.is_empty() {
+            // Empty query is the documented list mode. It still needs every
+            // policy/filter check below, but has no text predicate.
+            Some(String::new())
+        } else {
+            crate::search_index::live_fts_match_snippet(
+                &frontmatter.title,
+                body,
+                live_query_trimmed,
+            )
+        };
+        let Some(live_snippet) = live_snippet else {
+            continue;
+        };
+        if filters.content_type.as_ref().is_some_and(|expected| {
+            let actual = match frontmatter.r#type {
+                crate::markdown::ContentType::Meeting => "meeting",
+                crate::markdown::ContentType::Memo => "memo",
+                crate::markdown::ContentType::Dictation => "dictation",
+            };
+            actual != expected
+        }) {
+            continue;
+        }
+        let live_date = frontmatter.date.to_rfc3339();
+        if filters
+            .since
+            .as_ref()
+            .is_some_and(|since| live_date < *since)
+        {
+            continue;
+        }
+        if filters.attendee.as_ref().is_some_and(|attendee| {
+            let needle = attendee.to_lowercase();
+            !frontmatter
+                .normalized_attendees()
+                .iter()
+                .chain(frontmatter.people.iter())
+                .any(|candidate| candidate.to_lowercase().contains(&needle))
+        }) {
+            continue;
+        }
+        if filters.recorded_by.as_ref().is_some_and(|recorded_by| {
+            !frontmatter.recorded_by.as_ref().is_some_and(|candidate| {
+                candidate
+                    .to_lowercase()
+                    .contains(&recorded_by.to_lowercase())
+            })
+        }) {
+            continue;
+        }
+        if filters.intent_kind.as_ref().is_some_and(|intent_kind| {
+            !frontmatter
+                .intents
+                .iter()
+                .any(|intent| &intent.kind == intent_kind)
+        }) {
+            continue;
+        }
+        if filters.owner.as_ref().is_some_and(|owner| {
+            let needle = owner.to_lowercase();
+            !frontmatter
+                .action_items
+                .iter()
+                .any(|item| item.assignee.to_lowercase().contains(&needle))
+                && !frontmatter.intents.iter().any(|intent| {
+                    intent
+                        .who
+                        .as_ref()
+                        .is_some_and(|who| who.to_lowercase().contains(&needle))
+                })
+        }) {
+            continue;
+        }
+
+        result.path = snapshot.path;
+        result.title = frontmatter.title;
+        result.date = live_date;
+        result.content_type = match frontmatter.r#type {
+            crate::markdown::ContentType::Meeting => "meeting".into(),
+            crate::markdown::ContentType::Memo => "memo".into(),
+            crate::markdown::ContentType::Dictation => "dictation".into(),
+        };
+        result.snippet = live_snippet;
+        results.push(result);
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────
-// Built-in search: walk dir + case-insensitive text match.
-// Zero dependencies beyond walkdir. Fast enough for <1000 files.
-//
-// Config can swap to QMD engine for semantic search:
-//   [search]
-//   engine = "qmd"
-//   qmd_collection = "meetings"
+// Search always uses the process-private live projection. Legacy
+// `[search].engine = "qmd"` configuration is deliberately ignored: a global
+// persistent QMD index cannot guarantee prompt revocation after an external
+// policy change.
 // ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +253,888 @@ pub struct SearchResult {
     pub snippet: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_via_alias: Option<String>,
+}
+
+/// One descriptor-verified meeting snapshot authorized for a read surface.
+///
+/// Path resolution for human mutations is intentionally separate: being
+/// inside the corpus is not, by itself, authorization to return meeting
+/// bytes to an agent-facing caller.
+#[derive(Debug, Clone)]
+pub struct AuthorizedMeetingSnapshot {
+    pub path: PathBuf,
+    pub content: String,
+    pub frontmatter: Frontmatter,
+}
+
+impl AuthorizedMeetingSnapshot {
+    /// Re-read the source through the same descriptor-stable policy boundary
+    /// and require that the canonical path and every source byte still match.
+    ///
+    /// Long-running agent/provider operations use this immediately before
+    /// egress or a derived write so an in-place sensitivity flip cannot reuse
+    /// an authorization granted to older bytes at the same pathname.
+    pub fn reauthorize_exact(
+        &self,
+        config: &Config,
+        include_restricted: bool,
+    ) -> Result<(), SearchError> {
+        let current = read_authorized_meeting(&self.path, config, include_restricted)?;
+        if current.path != self.path || current.content != self.content {
+            return Err(SearchError::Io(std::io::Error::other(
+                "meeting changed after authorization",
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Derive one search excerpt only from a descriptor-authorized live snapshot.
+/// Ranked candidate metadata is never reused after this second policy read.
+pub fn authorized_snapshot_search_snippet(
+    snapshot: &AuthorizedMeetingSnapshot,
+    query: &str,
+) -> Option<String> {
+    let (_, body) = split_frontmatter(&snapshot.content);
+    crate::search_index::live_fts_match_snippet(&snapshot.frontmatter.title, body, query)
+}
+
+/// Capability-bound handle for one human-requested meeting mutation.
+///
+/// The corpus root and source parent directory stay open from authorization
+/// through unlink/rename, so replacing an ambient parent path with a
+/// symlink/reparse directory cannot redirect the destructive operation.
+pub struct MeetingMutation {
+    path: PathBuf,
+    canonical_root: PathBuf,
+    root_dir: cap_std::fs::Dir,
+    source_parent: cap_std::fs::Dir,
+    source_name: std::ffi::OsString,
+    source_identity: StableMarkdownFileIdentity,
+    source_file: std::fs::File,
+    source_sha256: String,
+    sibling_authorizations: Mutex<BTreeMap<std::ffi::OsString, BoundSiblingAuthorization>>,
+}
+
+struct BoundMutationArtifact {
+    name: std::ffi::OsString,
+    identity: StableMarkdownFileIdentity,
+    file: std::fs::File,
+    expected_sha256: Option<String>,
+}
+
+struct BoundSiblingAuthorization {
+    identity: StableMarkdownFileIdentity,
+    file: std::fs::File,
+}
+
+pub struct StagedMeetingDeletion {
+    staging_dir: cap_std::fs::Dir,
+    staging_path: PathBuf,
+    moved_artifacts: Vec<BoundMutationArtifact>,
+}
+
+impl StagedMeetingDeletion {
+    /// Permanently sanitize the already-hidden group. Windows deletes the exact
+    /// retained handles. POSIX cannot unlink by handle, so it truncates and
+    /// synchronizes each exact retained object. Every platform deliberately
+    /// keeps the inactive staging directory: removing it by name would permit
+    /// an interposed unrelated empty directory to be deleted.
+    pub fn finalize(self) -> std::io::Result<()> {
+        self.finalize_with_hook(|_| {})
+    }
+
+    fn finalize_with_hook(
+        mut self,
+        mut before_exact_delete: impl FnMut(usize),
+    ) -> std::io::Result<()> {
+        // Preflight the complete group before physical cleanup so a staged
+        // replacement cannot hide a group member before sanitization starts.
+        for artifact in &self.moved_artifacts {
+            if !MeetingMutation::artifact_is_current_at(&self.staging_dir, artifact) {
+                return Err(std::io::Error::other(format!(
+                    "staged meeting artifact changed before final deletion; recovery retained in {}",
+                    self.staging_path.display()
+                )));
+            }
+        }
+
+        for (index, artifact) in self.moved_artifacts.drain(..).enumerate() {
+            if !MeetingMutation::artifact_is_current_at(&self.staging_dir, &artifact) {
+                return Err(std::io::Error::other(format!(
+                    "staged meeting artifact changed during final deletion; recovery retained in {}",
+                    self.staging_path.display()
+                )));
+            }
+            // Exact adversarial boundary: no pathname lookup after this hook is
+            // permitted to decide which object is destroyed.
+            before_exact_delete(index);
+            #[cfg(windows)]
+            crate::policy_fs::delete_file_by_handle(&artifact.file).map_err(|error| {
+                std::io::Error::other(format!(
+                    "staged meeting artifact could not be deleted exactly; recovery retained at {}: {error}",
+                    self.staging_path.join(&artifact.name).display()
+                ))
+            })?;
+            #[cfg(unix)]
+            {
+                let recovery_path = self.staging_path.join(&artifact.name);
+                artifact.file.set_len(0).map_err(|error| {
+                    std::io::Error::other(format!(
+                        "staged meeting artifact could not be sanitized; recovery retained at {}: {error}",
+                        recovery_path.display()
+                    ))
+                })?;
+                artifact.file.sync_all().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "staged meeting artifact could not be synchronized; recovery retained at {}: {error}",
+                        recovery_path.display()
+                    ))
+                })?;
+                let sanitized_len = artifact.file.metadata().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "staged meeting artifact could not be re-attested; recovery retained at {}: {error}",
+                        recovery_path.display()
+                    ))
+                })?.len();
+                if sanitized_len != 0 {
+                    return Err(std::io::Error::other(
+                        format!(
+                            "staged meeting artifact could not be sanitized exactly; recovery retained at {}",
+                            recovery_path.display()
+                        ),
+                    ));
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "safe staged deletion is unavailable on this platform",
+            ));
+
+            #[cfg(windows)]
+            {
+                let name = artifact.name.clone();
+                drop(artifact);
+                match self.staging_dir.symlink_metadata(&name) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                    Ok(_) => {
+                        return Err(std::io::Error::other(
+                            "staged meeting artifact name was recreated during final deletion",
+                        ));
+                    }
+                }
+            }
+        }
+        #[cfg(any(unix, windows))]
+        return Ok(());
+        #[cfg(not(any(unix, windows)))]
+        unreachable!()
+    }
+}
+
+impl MeetingMutation {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn sibling_name(&self, path: &Path) -> std::io::Result<std::ffi::OsString> {
+        let sibling_parent = path.parent().and_then(|parent| parent.canonicalize().ok());
+        if sibling_parent.as_deref() != self.path.parent() {
+            return Err(std::io::Error::other(
+                "meeting artifact is outside the bound source directory",
+            ));
+        }
+        path.file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .ok_or_else(|| std::io::Error::other("meeting artifact has no file name"))
+    }
+
+    fn open_bound_regular(
+        directory: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        expected_identity: Option<StableMarkdownFileIdentity>,
+        expected_sha256: Option<&str>,
+    ) -> std::io::Result<BoundMutationArtifact> {
+        Self::open_bound_regular_with_access(
+            directory,
+            name,
+            expected_identity,
+            expected_sha256,
+            false,
+        )
+    }
+
+    fn open_bound_regular_with_access(
+        directory: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        expected_identity: Option<StableMarkdownFileIdentity>,
+        expected_sha256: Option<&str>,
+        writable: bool,
+    ) -> std::io::Result<BoundMutationArtifact> {
+        use cap_std::fs::OpenOptionsExt;
+
+        let lexical = directory.symlink_metadata(name)?;
+        if !crate::policy_fs::cap_lexical_regular_file_is_safe(&lexical) {
+            return Err(std::io::Error::other(
+                "meeting artifact is not a safe single-link regular file",
+            ));
+        }
+
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            if writable {
+                options.write(true);
+            }
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::GENERIC_READ;
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            };
+            options
+                .access_mode(GENERIC_READ | DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = directory.open_with(name, &options)?.into_std();
+        if !crate::policy_fs::opened_regular_file_is_safe(&file) {
+            return Err(std::io::Error::other(
+                "meeting artifact is not a safe single-link regular file",
+            ));
+        }
+        let identity = stable_markdown_file_identity(&file).ok_or_else(|| {
+            std::io::Error::other("meeting artifact identity could not be retained")
+        })?;
+        if expected_identity.is_some_and(|expected| expected != identity) {
+            return Err(std::io::Error::other(
+                "meeting artifact changed after authorization",
+            ));
+        }
+        if let Some(expected_sha256) = expected_sha256 {
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES {
+                return Err(std::io::Error::other(
+                    "meeting exceeded the safe mutation byte ceiling",
+                ));
+            }
+            file.seek(SeekFrom::Start(0))?;
+            if crate::policy_fs::content_sha256_hex(&bytes) != expected_sha256 {
+                return Err(std::io::Error::other("meeting changed after authorization"));
+            }
+        }
+        Ok(BoundMutationArtifact {
+            name: name.to_os_string(),
+            identity,
+            file,
+            expected_sha256: expected_sha256.map(str::to_owned),
+        })
+    }
+
+    fn bind_source(&self, writable: bool) -> std::io::Result<BoundMutationArtifact> {
+        let current = Self::open_bound_regular_with_access(
+            &self.source_parent,
+            &self.source_name,
+            Some(self.source_identity),
+            Some(&self.source_sha256),
+            writable,
+        )?;
+        Ok(BoundMutationArtifact {
+            name: current.name,
+            identity: current.identity,
+            file: if writable {
+                current.file
+            } else {
+                self.source_file.try_clone()?
+            },
+            expected_sha256: current.expected_sha256,
+        })
+    }
+
+    fn source_identity_is_current(&self) -> bool {
+        self.bind_source(false).is_ok()
+    }
+
+    fn retain_sibling_authorization(
+        &self,
+        artifact: &BoundMutationArtifact,
+    ) -> std::io::Result<()> {
+        let mut authorizations = self
+            .sibling_authorizations
+            .lock()
+            .map_err(|_| std::io::Error::other("meeting artifact authorization was poisoned"))?;
+        match authorizations.get(&artifact.name) {
+            Some(expected) if expected.identity != artifact.identity => Err(std::io::Error::other(
+                "meeting artifact changed after authorization",
+            )),
+            Some(_) => Ok(()),
+            None => {
+                authorizations.insert(
+                    artifact.name.clone(),
+                    BoundSiblingAuthorization {
+                        identity: artifact.identity,
+                        file: artifact.file.try_clone()?,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn expected_sibling_identity(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<Option<StableMarkdownFileIdentity>> {
+        self.sibling_authorizations
+            .lock()
+            .map(|authorizations| authorizations.get(name).map(|bound| bound.identity))
+            .map_err(|_| std::io::Error::other("meeting artifact authorization was poisoned"))
+    }
+
+    fn retained_sibling(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<Option<(StableMarkdownFileIdentity, std::fs::File)>> {
+        self.sibling_authorizations
+            .lock()
+            .map_err(|_| std::io::Error::other("meeting artifact authorization was poisoned"))?
+            .get(name)
+            .map(|bound| bound.file.try_clone().map(|file| (bound.identity, file)))
+            .transpose()
+    }
+
+    fn archive_dir_with_hook(
+        &self,
+        before_open: impl FnOnce(),
+    ) -> std::io::Result<cap_std::fs::Dir> {
+        match self.root_dir.create_dir("archive") {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        crate::policy_fs::open_directory_at_no_follow_with_hook(
+            &self.root_dir,
+            std::ffi::OsStr::new("archive"),
+            before_open,
+        )
+    }
+
+    /// Confirm that a candidate sibling is a regular file beneath the parent
+    /// capability retained when this mutation was authorized.
+    ///
+    /// Callers use this to select optional artifacts without an ambient
+    /// `Path::exists` check. The first successful check retains the artifact's
+    /// stable identity; later checks and the eventual atomic transfer must
+    /// identify that same file.
+    pub fn sibling_exists(&self, path: &Path) -> bool {
+        let Ok(name) = self.sibling_name(path) else {
+            return false;
+        };
+        let Ok(bound) = Self::open_bound_regular(
+            &self.source_parent,
+            &name,
+            self.expected_sibling_identity(&name).ok().flatten(),
+            None,
+        ) else {
+            return false;
+        };
+        self.retain_sibling_authorization(&bound).is_ok()
+    }
+
+    fn bind_group(
+        &self,
+        siblings: &[PathBuf],
+        writable: bool,
+    ) -> std::io::Result<Vec<BoundMutationArtifact>> {
+        let mut artifacts = vec![self.bind_source(writable)?];
+        for sibling in siblings {
+            let name = self.sibling_name(sibling)?;
+            if artifacts.iter().any(|artifact| artifact.name == name) {
+                continue;
+            }
+            let expected = self.expected_sibling_identity(&name)?;
+            let current = Self::open_bound_regular_with_access(
+                &self.source_parent,
+                &name,
+                expected,
+                None,
+                writable,
+            )?;
+            self.retain_sibling_authorization(&current)?;
+            let (identity, file) = self
+                .retained_sibling(&name)?
+                .ok_or_else(|| std::io::Error::other("meeting artifact was not retained"))?;
+            if identity != current.identity {
+                return Err(std::io::Error::other(
+                    "meeting artifact changed after authorization",
+                ));
+            }
+            artifacts.push(BoundMutationArtifact {
+                name,
+                identity,
+                file: if writable { current.file } else { file },
+                expected_sha256: None,
+            });
+        }
+        Ok(artifacts)
+    }
+
+    fn artifact_is_current_at(
+        directory: &cap_std::fs::Dir,
+        artifact: &BoundMutationArtifact,
+    ) -> bool {
+        Self::open_bound_regular(
+            directory,
+            &artifact.name,
+            Some(artifact.identity),
+            artifact.expected_sha256.as_deref(),
+        )
+        .is_ok()
+    }
+
+    #[cfg(unix)]
+    fn unpredictable_claim_name() -> std::io::Result<std::ffi::OsString> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(std::ffi::OsString::from(format!(
+            ".minutes-mutation-claim-{suffix}"
+        )))
+    }
+
+    /// Perform one descriptor-relative atomic no-replace transfer and attest
+    /// that the destination still names the retained artifact. Linux/macOS
+    /// rename by name, so an identity mismatch is rolled back with the same
+    /// non-clobbering primitive. Windows renames the exact opened handle.
+    fn move_file_no_replace(
+        source: &cap_std::fs::Dir,
+        source_path: &Path,
+        artifact: &BoundMutationArtifact,
+        destination: &cap_std::fs::Dir,
+        destination_path: &Path,
+    ) -> std::io::Result<()> {
+        Self::move_file_no_replace_with_hooks(
+            source,
+            source_path,
+            artifact,
+            destination,
+            destination_path,
+            || {},
+            || {},
+            || {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Each closure marks one exact adversarial boundary.
+    fn move_file_no_replace_with_hooks(
+        source: &cap_std::fs::Dir,
+        source_path: &Path,
+        artifact: &BoundMutationArtifact,
+        destination: &cap_std::fs::Dir,
+        destination_path: &Path,
+        before_atomic_claim: impl FnOnce(),
+        after_atomic_claim: impl FnOnce(),
+        after_atomic_promotion: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            // POSIX cannot rename an opened file handle. First atomically claim
+            // the current source name into an unpredictable inactive name, then
+            // attest the claimed object. A replacement that wins the final
+            // source-name race is quarantined and never promoted, deleted, or
+            // restored over a newer source.
+            let claim_name = Self::unpredictable_claim_name()?;
+            before_atomic_claim();
+            crate::policy_fs::move_entry_at_no_replace(
+                source,
+                &artifact.name,
+                &artifact.file,
+                destination,
+                &claim_name,
+            )?;
+            after_atomic_claim();
+            let claimed = BoundMutationArtifact {
+                name: claim_name,
+                identity: artifact.identity,
+                file: artifact.file.try_clone()?,
+                expected_sha256: artifact.expected_sha256.clone(),
+            };
+            if !Self::artifact_is_current_at(destination, &claimed) {
+                return match crate::policy_fs::move_entry_at_no_replace(
+                    destination,
+                    &claimed.name,
+                    &claimed.file,
+                    source,
+                    &artifact.name,
+                ) {
+                    Ok(()) => Err(std::io::Error::other(format!(
+                        "meeting artifact replacement was restored to {}",
+                        source_path.join(&artifact.name).display()
+                    ))),
+                    Err(_) => Err(std::io::Error::other(format!(
+                        "meeting artifact replacement was preserved in inactive quarantine at {}",
+                        destination_path.join(&claimed.name).display()
+                    ))),
+                };
+            }
+
+            if let Err(promotion_error) = crate::policy_fs::move_entry_at_no_replace(
+                destination,
+                &claimed.name,
+                &claimed.file,
+                destination,
+                &artifact.name,
+            ) {
+                return match crate::policy_fs::move_entry_at_no_replace(
+                    destination,
+                    &claimed.name,
+                    &claimed.file,
+                    source,
+                    &artifact.name,
+                ) {
+                    Ok(()) => Err(promotion_error),
+                    Err(_) => Err(std::io::Error::other(format!(
+                        "meeting artifact claim could not be promoted and was preserved at {}",
+                        destination_path.join(&claimed.name).display()
+                    ))),
+                };
+            }
+            after_atomic_promotion();
+            if Self::artifact_is_current_at(destination, artifact) {
+                return Ok(());
+            }
+            match crate::policy_fs::move_entry_at_no_replace(
+                destination,
+                &artifact.name,
+                &artifact.file,
+                source,
+                &artifact.name,
+            ) {
+                Ok(()) => Err(std::io::Error::other(format!(
+                    "promoted meeting artifact replacement was restored to {}",
+                    source_path.join(&artifact.name).display()
+                ))),
+                Err(_) => {
+                    let quarantine_name = Self::unpredictable_claim_name()?;
+                    match crate::policy_fs::move_entry_at_no_replace(
+                        destination,
+                        &artifact.name,
+                        &artifact.file,
+                        destination,
+                        &quarantine_name,
+                    ) {
+                        Ok(()) => Err(std::io::Error::other(format!(
+                            "promoted meeting artifact replacement was preserved in inactive quarantine at {}",
+                            destination_path.join(quarantine_name).display()
+                        ))),
+                        Err(_) => Err(std::io::Error::other(format!(
+                            "promoted meeting artifact replacement remains recoverable at {}",
+                            destination_path.join(&artifact.name).display()
+                        ))),
+                    }
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            before_atomic_claim();
+            after_atomic_claim();
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            before_atomic_claim();
+            after_atomic_claim();
+        }
+
+        #[cfg(not(unix))]
+        crate::policy_fs::move_entry_at_no_replace(
+            source,
+            &artifact.name,
+            &artifact.file,
+            destination,
+            &artifact.name,
+        )?;
+        #[cfg(not(unix))]
+        after_atomic_promotion();
+        #[cfg(not(unix))]
+        if Self::artifact_is_current_at(destination, artifact) {
+            return Ok(());
+        }
+
+        #[cfg(not(unix))]
+        let identity_error =
+            std::io::Error::other("meeting artifact changed at the atomic transfer boundary");
+        #[cfg(not(unix))]
+        match crate::policy_fs::move_entry_at_no_replace(
+            destination,
+            &artifact.name,
+            &artifact.file,
+            source,
+            &artifact.name,
+        ) {
+            Ok(()) => Err(identity_error),
+            Err(rollback_error) => Err(rollback_error),
+        }
+    }
+
+    fn move_group_with_hooks(
+        &self,
+        siblings: &[PathBuf],
+        destination: &cap_std::fs::Dir,
+        destination_path: &Path,
+        writable: bool,
+        before_move: impl FnMut(usize),
+        after_move: impl FnMut(usize),
+    ) -> std::io::Result<Vec<BoundMutationArtifact>> {
+        self.move_group_with_claim_hooks(
+            siblings,
+            destination,
+            destination_path,
+            writable,
+            before_move,
+            |_| {},
+            |_| {},
+            after_move,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Test seams mirror the transfer's ordered boundaries.
+    fn move_group_with_claim_hooks(
+        &self,
+        siblings: &[PathBuf],
+        destination: &cap_std::fs::Dir,
+        destination_path: &Path,
+        writable: bool,
+        mut before_move: impl FnMut(usize),
+        mut after_claim: impl FnMut(usize),
+        mut after_promotion: impl FnMut(usize),
+        mut after_move: impl FnMut(usize),
+    ) -> std::io::Result<Vec<BoundMutationArtifact>> {
+        let artifacts = self.bind_group(siblings, writable)?;
+        let source_parent_path = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("meeting source has no parent"))?;
+        for artifact in &artifacts {
+            if destination.symlink_metadata(&artifact.name).is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "mutation destination already exists",
+                ));
+            }
+        }
+
+        for (index, artifact) in artifacts.iter().enumerate() {
+            let result = if !Self::artifact_is_current_at(&self.source_parent, artifact) {
+                Err(std::io::Error::other(
+                    "meeting artifact changed during the requested mutation",
+                ))
+            } else {
+                Self::move_file_no_replace_with_hooks(
+                    &self.source_parent,
+                    source_parent_path,
+                    artifact,
+                    destination,
+                    destination_path,
+                    || before_move(index),
+                    || after_claim(index),
+                    || after_promotion(index),
+                )
+            };
+            if let Err(error) = result {
+                let mut rollback_error = None;
+                for moved_artifact in artifacts[..index].iter().rev() {
+                    if let Err(rollback) = Self::move_file_no_replace(
+                        destination,
+                        destination_path,
+                        moved_artifact,
+                        &self.source_parent,
+                        source_parent_path,
+                    ) {
+                        rollback_error.get_or_insert(rollback);
+                    }
+                }
+                return Err(rollback_error.unwrap_or(error));
+            }
+            after_move(index);
+        }
+        Ok(artifacts)
+    }
+
+    #[cfg(test)]
+    fn delete_source_with_hook(&self, hook: impl FnOnce()) -> std::io::Result<()> {
+        if !self.source_identity_is_current() {
+            return Err(std::io::Error::other(
+                "meeting changed before the requested deletion",
+            ));
+        }
+        hook();
+        if !self.source_identity_is_current() {
+            return Err(std::io::Error::other(
+                "meeting changed during the requested deletion",
+            ));
+        }
+        self.source_parent.remove_file(&self.source_name)
+    }
+
+    pub fn archive_group(&self, siblings: &[PathBuf]) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
+        self.archive_group_with_hook(siblings, |_| {})
+    }
+
+    fn archive_group_with_hook(
+        &self,
+        siblings: &[PathBuf],
+        after_move: impl FnMut(usize),
+    ) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
+        self.archive_group_with_hooks(siblings, |_| {}, after_move)
+    }
+
+    fn archive_group_with_hooks(
+        &self,
+        siblings: &[PathBuf],
+        before_move: impl FnMut(usize),
+        after_move: impl FnMut(usize),
+    ) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
+        self.archive_group_with_all_hooks(siblings, before_move, after_move, || {})
+    }
+
+    fn archive_group_with_all_hooks(
+        &self,
+        siblings: &[PathBuf],
+        before_move: impl FnMut(usize),
+        after_move: impl FnMut(usize),
+        before_open_archive: impl FnOnce(),
+    ) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
+        if !self.source_identity_is_current() {
+            return Err(std::io::Error::other(
+                "meeting changed before the requested archive",
+            ));
+        }
+        let archive = self.archive_dir_with_hook(before_open_archive)?;
+        let archive_path = self.canonical_root.join("archive");
+        let moved = self.move_group_with_hooks(
+            siblings,
+            &archive,
+            &archive_path,
+            false,
+            before_move,
+            after_move,
+        )?;
+        let destinations = moved
+            .iter()
+            .map(|artifact| self.canonical_root.join("archive").join(&artifact.name))
+            .collect::<Vec<_>>();
+        Ok((destinations[0].clone(), destinations[1..].to_vec()))
+    }
+
+    pub fn stage_delete_group(
+        self,
+        siblings: &[PathBuf],
+    ) -> std::io::Result<StagedMeetingDeletion> {
+        let staged = self.stage_delete_group_with_hooks(siblings, |_| {}, |_| {})?;
+        // On Windows the mutation retains companion handles that deliberately
+        // bind the source and optional siblings through the ordered move.
+        // Retire those authorization handles before the caller asks the
+        // staged transaction to apply exact POSIX-style disposition.
+        drop(self);
+        Ok(staged)
+    }
+
+    fn stage_delete_group_with_hooks(
+        &self,
+        siblings: &[PathBuf],
+        before_move: impl FnMut(usize),
+        after_move: impl FnMut(usize),
+    ) -> std::io::Result<StagedMeetingDeletion> {
+        self.stage_delete_group_with_all_hooks(siblings, before_move, after_move, || {})
+    }
+
+    fn stage_delete_group_with_all_hooks(
+        &self,
+        siblings: &[PathBuf],
+        before_move: impl FnMut(usize),
+        after_move: impl FnMut(usize),
+        before_open_staging: impl FnOnce(),
+    ) -> std::io::Result<StagedMeetingDeletion> {
+        let mut before_open_staging = Some(before_open_staging);
+        let mut created = None;
+        for _ in 0..8 {
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let name = std::ffi::OsString::from(format!(".delete-staging-{suffix}"));
+            match self.root_dir.create_dir(&name) {
+                Ok(()) => {
+                    let dir = match before_open_staging.take() {
+                        Some(hook) => crate::policy_fs::open_directory_at_no_follow_with_hook(
+                            &self.root_dir,
+                            &name,
+                            hook,
+                        )?,
+                        None => {
+                            crate::policy_fs::open_directory_at_no_follow(&self.root_dir, &name)?
+                        }
+                    };
+                    created = Some((name, dir));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let (staging_name, staging_dir) = created
+            .ok_or_else(|| std::io::Error::other("could not create safe deletion staging"))?;
+
+        let staging_path = self.canonical_root.join(&staging_name);
+        let moved = self.move_group_with_hooks(
+            siblings,
+            &staging_dir,
+            &staging_path,
+            true,
+            before_move,
+            after_move,
+        )?;
+        Ok(StagedMeetingDeletion {
+            staging_dir,
+            staging_path,
+            moved_artifacts: moved,
+        })
+    }
+
+    #[cfg(test)]
+    fn archive_group_with_collision_after_first_move(
+        &self,
+        siblings: &[PathBuf],
+    ) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
+        let collision = siblings
+            .first()
+            .and_then(|path| path.file_name())
+            .map(|name| self.canonical_root.join("archive").join(name));
+        self.archive_group_with_hook(siblings, |index| {
+            if index == 0 {
+                if let Some(path) = &collision {
+                    std::fs::write(path, b"collision canary").unwrap();
+                }
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,10 +1201,14 @@ struct SpeakerOwner {
 
 fn speaker_overlay_map(
     frontmatter: &Frontmatter,
-    overlay_db_path: &Path,
-    meeting_path: &Path,
+    _overlay_db_path: &Path,
+    _meeting_path: &Path,
 ) -> HashMap<String, SpeakerOwner> {
-    let mut speakers = frontmatter
+    // Agent-facing aggregates are derived only from the policy-authorized
+    // source snapshot. The mutable overlay database has an independent
+    // lifecycle and cannot be included without binding its revision into the
+    // same aggregate authorization transaction.
+    frontmatter
         .speaker_map
         .iter()
         .filter(|attr| attr.confidence == crate::diarize::Confidence::High)
@@ -152,30 +1221,7 @@ fn speaker_overlay_map(
                 },
             )
         })
-        .collect::<HashMap<_, _>>();
-
-    match overlays::load_speaker_confirmations_for_meeting_at(overlay_db_path, meeting_path) {
-        Ok(confirmations) => {
-            for confirmation in confirmations {
-                speakers.insert(
-                    confirmation.speaker_label,
-                    SpeakerOwner {
-                        name: confirmation.name,
-                        provenance: "speaker overlay".to_string(),
-                    },
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                path = %meeting_path.display(),
-                error = %error,
-                "failed to load speaker overlays for reporting"
-            );
-        }
-    }
-
-    speakers
+        .collect::<HashMap<_, _>>()
 }
 
 fn resolve_owner_with_speaker_overlays(
@@ -345,33 +1391,254 @@ pub struct SearchFilters {
 /// Resolve a meeting file by slug prefix (date-title pattern).
 /// Returns the first match found in the output directory.
 pub fn resolve_slug(slug: &str, config: &Config) -> Option<PathBuf> {
+    resolve_slug_with_budget(slug, config, ActiveCorpusReadBudget::new())
+        .ok()
+        .flatten()
+}
+
+fn resolve_slug_with_budget(
+    slug: &str,
+    config: &Config,
+    budget: ActiveCorpusReadBudget,
+) -> Result<Option<PathBuf>, ActiveCorpusRevisionError> {
     if slug.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let dir = &config.output_dir;
     if !dir.exists() {
-        return None;
+        return Ok(None);
+    }
+    let canonical_root = dir
+        .canonicalize()
+        .map_err(|_| ActiveCorpusRevisionError::Unavailable)?;
+    budget.consume_path(&canonical_root)?;
+
+    // Paths are scope-resolved without opening any unrelated meeting. The
+    // later authorized read remains the exact-byte and sensitivity boundary.
+    let candidate = Path::new(slug);
+    if candidate.is_absolute()
+        || candidate.components().count() > 1
+        || candidate
+            .extension()
+            .is_some_and(|extension| extension == "md")
+    {
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|_| ActiveCorpusRevisionError::Unavailable)?;
+        budget.consume_path(&canonical)?;
+        return Ok((canonical.starts_with(&canonical_root)
+            && canonical
+                .extension()
+                .is_some_and(|extension| extension == "md"))
+        .then_some(canonical));
     }
 
-    for entry in walk_meeting_files(dir) {
+    let slug = slug.to_lowercase();
+    let entries = WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !is_inactive_corpus_dir_name(entry.file_name())
+        });
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                budget.consume(1, 0, 0)?;
+                return Err(ActiveCorpusRevisionError::Traversal);
+            }
+        };
+        if entry.file_type().is_dir() {
+            budget.consume(0, 1, 0)?;
+        } else {
+            budget.consume(1, 0, 0)?;
+        }
+        budget.consume_path(entry.path())?;
+        if !entry.file_type().is_file()
+            || entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "md")
+        {
+            continue;
+        }
         let filename = entry
             .path()
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy();
-        if filename.to_lowercase().contains(&slug.to_lowercase()) {
-            return Some(entry.path().to_path_buf());
+        if filename.to_lowercase().contains(&slug) {
+            let canonical = entry
+                .path()
+                .canonicalize()
+                .map_err(|_| ActiveCorpusRevisionError::Unavailable)?;
+            budget.consume_path(&canonical)?;
+            if canonical.starts_with(&canonical_root) {
+                return Ok(Some(canonical));
+            }
+            return Ok(None);
         }
     }
 
-    None
+    Ok(None)
+}
+
+/// Bind one exact active meeting to retained root/parent capabilities for a
+/// human mutation. Sensitivity policy does not block deletion or archival.
+pub fn open_meeting_mutation(path: &Path, config: &Config) -> Option<MeetingMutation> {
+    let canonical_root = config.output_dir.canonicalize().ok()?;
+    let snapshot = read_stable_active_markdown(path, &canonical_root)?;
+    meeting_mutation_from_snapshot(canonical_root, snapshot)
+}
+
+fn meeting_mutation_from_snapshot(
+    canonical_root: PathBuf,
+    snapshot: StableMarkdownSnapshot,
+) -> Option<MeetingMutation> {
+    meeting_mutation_from_snapshot_with_parent_open_hook(canonical_root, snapshot, |_| {})
+}
+
+fn meeting_mutation_from_snapshot_with_parent_open_hook(
+    canonical_root: PathBuf,
+    snapshot: StableMarkdownSnapshot,
+    mut before_open_parent: impl FnMut(&std::ffi::OsStr),
+) -> Option<MeetingMutation> {
+    let relative = snapshot.path.strip_prefix(&canonical_root).ok()?;
+    let source_name = relative.file_name()?.to_os_string();
+    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+
+    let root_dir = crate::policy_fs::open_directory_no_follow(&canonical_root).ok()?;
+    let mut source_parent = root_dir.try_clone().ok()?;
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        source_parent =
+            crate::policy_fs::open_directory_at_no_follow_with_hook(&source_parent, name, || {
+                before_open_parent(name)
+            })
+            .ok()?;
+    }
+
+    let source_sha256 = crate::policy_fs::content_sha256_hex(snapshot.content.as_bytes());
+    let source_file = MeetingMutation::open_bound_regular(
+        &source_parent,
+        &source_name,
+        Some(snapshot.file_identity),
+        Some(&source_sha256),
+    )
+    .ok()?
+    .file;
+    let mutation = MeetingMutation {
+        path: snapshot.path,
+        canonical_root,
+        root_dir,
+        source_parent,
+        source_name,
+        source_identity: snapshot.file_identity,
+        source_file,
+        source_sha256,
+        sibling_authorizations: Mutex::new(BTreeMap::new()),
+    };
+    mutation.source_identity_is_current().then_some(mutation)
+}
+
+fn authorize_meeting_snapshot(
+    snapshot: &StableMarkdownSnapshot,
+    include_restricted: bool,
+) -> Result<Frontmatter, SearchError> {
+    let (frontmatter_yaml, _) = split_frontmatter(&snapshot.content);
+    if frontmatter_yaml.is_empty() {
+        return Err(SearchError::Io(std::io::Error::other(
+            "meeting policy metadata is missing",
+        )));
+    }
+    let frontmatter = serde_yaml::from_str::<Frontmatter>(frontmatter_yaml).map_err(|_| {
+        SearchError::Io(std::io::Error::other("meeting policy metadata is invalid"))
+    })?;
+    if !include_restricted && matches!(frontmatter.sensitivity, Some(Sensitivity::Restricted)) {
+        return Err(SearchError::Io(std::io::Error::other(
+            "meeting is restricted; an explicit audited override is required",
+        )));
+    }
+    Ok(frontmatter)
+}
+
+/// Read one active meeting through the same authorization policy whether the
+/// caller supplied a slug-resolved path or an exact path.
+pub fn read_authorized_meeting(
+    path: &Path,
+    config: &Config,
+    include_restricted: bool,
+) -> Result<AuthorizedMeetingSnapshot, SearchError> {
+    let canonical_root = config.output_dir.canonicalize().map_err(|_| {
+        SearchError::Io(std::io::Error::other(
+            "meeting corpus could not be verified safely",
+        ))
+    })?;
+    let snapshot = read_stable_active_markdown(path, &canonical_root).ok_or_else(|| {
+        SearchError::Io(std::io::Error::other(
+            "meeting could not be read as a stable policy snapshot",
+        ))
+    })?;
+    let frontmatter = authorize_meeting_snapshot(&snapshot, include_restricted)?;
+
+    Ok(AuthorizedMeetingSnapshot {
+        path: snapshot.path,
+        content: snapshot.content,
+        frontmatter,
+    })
+}
+
+/// Bind one exact policy-authorized meeting to the same retained capabilities
+/// used by destructive corpus mutations. Classification and the mutation's
+/// identity/hash originate from one descriptor-stable snapshot, so an in-place
+/// sensitivity flip cannot race between authorization and archive/delete.
+pub fn open_authorized_meeting_mutation(
+    path: &Path,
+    config: &Config,
+    include_restricted: bool,
+) -> Result<MeetingMutation, SearchError> {
+    let canonical_root = config.output_dir.canonicalize().map_err(|_| {
+        SearchError::Io(std::io::Error::other(
+            "meeting corpus could not be verified safely",
+        ))
+    })?;
+    let snapshot = read_stable_active_markdown(path, &canonical_root).ok_or_else(|| {
+        SearchError::Io(std::io::Error::other(
+            "meeting could not be read as a stable policy snapshot",
+        ))
+    })?;
+    authorize_meeting_snapshot(&snapshot, include_restricted)?;
+    meeting_mutation_from_snapshot(canonical_root, snapshot).ok_or_else(|| {
+        SearchError::Io(std::io::Error::other(
+            "meeting changed before the requested mutation",
+        ))
+    })
 }
 
 pub fn cross_meeting_research(
     query: &str,
     config: &Config,
     filters: &SearchFilters,
+) -> Result<CrossMeetingResearch, SearchError> {
+    let dir = &config.output_dir;
+    if !dir.exists() {
+        return Err(SearchError::DirNotFound(dir.display().to_string()));
+    }
+    with_stable_active_corpus(dir, |revision| {
+        cross_meeting_research_once(query, config, filters, revision)
+    })
+}
+
+fn cross_meeting_research_once(
+    query: &str,
+    config: &Config,
+    filters: &SearchFilters,
+    revision: &StableActiveCorpusRevision,
 ) -> Result<CrossMeetingResearch, SearchError> {
     let dir = &config.output_dir;
     if !dir.exists() {
@@ -385,26 +1652,19 @@ pub fn cross_meeting_research(
     let mut topic_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let overlay_db_path = overlays::default_db_path();
+    for path in revision.paths() {
+        let snapshot = revision_snapshot(revision, path)?;
+        let path = snapshot.path.as_path();
 
-    for entry in walk_meeting_files(dir) {
-        let path = entry.path();
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping file in cross-meeting research");
-                continue;
-            }
-        };
-
-        let (frontmatter_str, _) = split_frontmatter(&content);
+        let (frontmatter_str, _) = split_frontmatter(&snapshot.content);
         if frontmatter_str.is_empty() {
             continue;
         }
 
         let frontmatter: Frontmatter = match serde_yaml::from_str(frontmatter_str) {
             Ok(frontmatter) => frontmatter,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping malformed frontmatter in cross-meeting research");
+            Err(_) => {
+                tracing::warn!("skipping policy-uncertain meeting in cross-meeting research");
                 continue;
             }
         };
@@ -563,7 +1823,7 @@ pub fn search(
     config: &Config,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>, SearchError> {
-    search_with_mode(query, config, filters, crate::search_index::SyncMode::Auto)
+    search_with_mode(query, config, filters, SyncMode::Auto)
 }
 
 /// Search with explicit sync mode. Lets the CLI expose `--sync` / `--no-sync`
@@ -571,14 +1831,14 @@ pub fn search(
 /// about freshness.
 ///
 /// Logs sync stats (indexed/updated/removed/duration_ms) at INFO level when
-/// any work was done. Empty/no-op syncs stay silent. The duration_ms field is
-/// the canary for the watcher coalescer decision: if p95 starts approaching
-/// the 80ms UI debounce we know the corpus has outgrown the per-file scan.
+/// any work was done. Empty/no-op syncs stay silent. Public search deliberately
+/// rebuilds a private projection from stable live-source snapshots on every
+/// call so revoked plaintext cannot persist in a durable cache.
 pub fn search_with_mode(
     query: &str,
     config: &Config,
     filters: &SearchFilters,
-    mode: crate::search_index::SyncMode,
+    mode: SyncMode,
 ) -> Result<Vec<SearchResult>, SearchError> {
     search_with_mode_and_vocabulary(query, config, filters, mode, None)
 }
@@ -587,15 +1847,39 @@ fn search_with_mode_and_vocabulary(
     query: &str,
     config: &Config,
     filters: &SearchFilters,
-    mode: crate::search_index::SyncMode,
+    mode: SyncMode,
     vocabulary_override: Option<&crate::vocabulary::VocabularyStore>,
 ) -> Result<Vec<SearchResult>, SearchError> {
     let dir = &config.output_dir;
     if !dir.exists() {
         return Err(SearchError::DirNotFound(dir.display().to_string()));
     }
+    with_stable_active_corpus(dir, |revision| {
+        search_with_mode_and_vocabulary_once(
+            query,
+            config,
+            filters,
+            mode,
+            vocabulary_override,
+            revision,
+        )
+    })
+}
+
+fn search_with_mode_and_vocabulary_once(
+    query: &str,
+    config: &Config,
+    filters: &SearchFilters,
+    mode: SyncMode,
+    vocabulary_override: Option<&crate::vocabulary::VocabularyStore>,
+    revision: &StableActiveCorpusRevision,
+) -> Result<Vec<SearchResult>, SearchError> {
+    let dir = &config.output_dir;
+    if !dir.exists() {
+        return Err(SearchError::DirNotFound(dir.display().to_string()));
+    }
     let index = crate::search_index::SearchIndex::open(config)?;
-    let stats = index.sync(config, mode)?;
+    let stats = index.sync_for_active_corpus(config, mode, revision)?;
     if stats.indexed + stats.updated + stats.removed + stats.errored > 0 {
         tracing::info!(
             indexed = stats.indexed,
@@ -610,15 +1894,47 @@ fn search_with_mode_and_vocabulary(
     let expansions = vocabulary_search_expansions(query, vocabulary_override);
     if expansions.len() <= 1 {
         let mut results = index.search(query, filters, None)?;
-        exclude_restricted_results(&mut results, filters);
+        if filters.include_restricted {
+            results
+                .extend(index.search_restricted_live_for_active_corpus(query, filters, revision)?);
+        }
+        // Normal and explicit-override restricted candidates pass through one
+        // identical live-snapshot, filter, and exact-FTS authorization gate.
+        retain_policy_verified_results(&mut results, filters, query, revision)?;
         return Ok(results);
     }
 
     let original_key = search_expansion_key(query);
     let mut merged = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
+    let mut restricted = Vec::new();
+    if filters.include_restricted {
+        // Restricted files are intentionally absent from the ephemeral FTS
+        // index, so collect their policy-filtered candidates once. Determine
+        // the first matching vocabulary expansion from the already-bound
+        // revision rather than rewalking the entire corpus for every alias.
+        for mut result in
+            index.search_restricted_live_for_active_corpus(query, filters, revision)?
+        {
+            let snapshot = revision_snapshot(revision, &result.path)?;
+            let (frontmatter_text, body) = split_frontmatter(&snapshot.content);
+            let Ok(frontmatter) = serde_yaml::from_str::<Frontmatter>(frontmatter_text) else {
+                continue;
+            };
+            let Some(expansion) = expansions.iter().find(|expansion| {
+                crate::search_index::live_fts_match_snippet(&frontmatter.title, body, expansion)
+                    .is_some()
+            }) else {
+                continue;
+            };
+            if search_expansion_key(expansion) != original_key {
+                result.matched_via_alias = Some(expansion.clone());
+            }
+            restricted.push(result);
+        }
+    }
 
-    for expansion in expansions {
+    for (expansion_index, expansion) in expansions.into_iter().enumerate() {
         let expansion_key = search_expansion_key(&expansion);
         for mut result in index.search(&expansion, filters, None)? {
             if !seen_paths.insert(result.path.clone()) {
@@ -629,9 +1945,17 @@ fn search_with_mode_and_vocabulary(
             }
             merged.push(result);
         }
+        if expansion_index == 0 {
+            for result in std::mem::take(&mut restricted) {
+                if !seen_paths.insert(result.path.clone()) {
+                    continue;
+                }
+                merged.push(result);
+            }
+        }
     }
 
-    exclude_restricted_results(&mut merged, filters);
+    retain_policy_verified_results(&mut merged, filters, query, revision)?;
     Ok(merged)
 }
 
@@ -710,16 +2034,31 @@ fn search_intents_at(
     if !dir.exists() {
         return Err(SearchError::DirNotFound(dir.display().to_string()));
     }
+    with_stable_active_corpus(dir, |revision| {
+        search_intents_at_once(query, config, filters, overlay_db_path, revision)
+    })
+}
+
+fn search_intents_at_once(
+    query: &str,
+    config: &Config,
+    filters: &SearchFilters,
+    overlay_db_path: &Path,
+    revision: &StableActiveCorpusRevision,
+) -> Result<Vec<IntentResult>, SearchError> {
+    let dir = &config.output_dir;
+    if !dir.exists() {
+        return Err(SearchError::DirNotFound(dir.display().to_string()));
+    }
 
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
-
-    for entry in walk_meeting_files(dir) {
-        let path = entry.path();
-        match process_intent_file(path, &query_lower, filters, overlay_db_path) {
+    for path in revision.paths() {
+        let snapshot = revision_snapshot(revision, path)?;
+        match process_intent_snapshot(snapshot, &query_lower, filters, overlay_db_path) {
             Ok(mut file_results) => results.append(&mut file_results),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping file in intent search");
+            Err(_) => {
+                tracing::warn!("skipping policy-uncertain meeting in intent search");
             }
         }
     }
@@ -751,19 +2090,29 @@ fn consistency_report_at(
     if !dir.exists() {
         return Err(SearchError::DirNotFound(dir.display().to_string()));
     }
+    with_stable_active_corpus(dir, |revision| {
+        consistency_report_at_once(config, owner, stale_after_days, overlay_db_path, revision)
+    })
+}
+
+fn consistency_report_at_once(
+    config: &Config,
+    owner: Option<&str>,
+    stale_after_days: i64,
+    overlay_db_path: &Path,
+    revision: &StableActiveCorpusRevision,
+) -> Result<ConsistencyReport, SearchError> {
+    let dir = &config.output_dir;
+    if !dir.exists() {
+        return Err(SearchError::DirNotFound(dir.display().to_string()));
+    }
 
     let mut parsed_frontmatters = Vec::new();
-    for entry in walk_meeting_files(dir) {
-        let path = entry.path();
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping file in consistency report");
-                continue;
-            }
-        };
+    for path in revision.paths() {
+        let snapshot = revision_snapshot(revision, path)?;
+        let path = snapshot.path.as_path();
 
-        let (frontmatter_str, _) = split_frontmatter(&content);
+        let (frontmatter_str, _) = split_frontmatter(&snapshot.content);
         if frontmatter_str.is_empty() {
             continue;
         }
@@ -773,11 +2122,13 @@ fn consistency_report_at(
             // meetings never feed the consistency report. No override on this
             // surface in this wave — like the graph, exclusion is complete.
             Ok(frontmatter) if matches!(frontmatter.sensitivity, Some(Sensitivity::Restricted)) => {
-                tracing::debug!(path = %path.display(), "skipping restricted meeting in consistency report (sensitivity enforcement)");
+                tracing::debug!(
+                    "skipping restricted meeting in consistency report (sensitivity enforcement)"
+                );
             }
             Ok(frontmatter) => parsed_frontmatters.push((path.to_path_buf(), frontmatter)),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping malformed frontmatter in consistency report");
+            Err(_) => {
+                tracing::warn!("skipping policy-uncertain meeting in consistency report");
             }
         }
     }
@@ -939,21 +2290,29 @@ pub fn person_profile(config: &Config, person: &str) -> Result<PersonProfile, Se
     if !dir.exists() {
         return Err(SearchError::DirNotFound(dir.display().to_string()));
     }
+    with_stable_active_corpus(dir, |revision| {
+        person_profile_once(config, person, revision)
+    })
+}
+
+fn person_profile_once(
+    config: &Config,
+    person: &str,
+    revision: &StableActiveCorpusRevision,
+) -> Result<PersonProfile, SearchError> {
+    let dir = &config.output_dir;
+    if !dir.exists() {
+        return Err(SearchError::DirNotFound(dir.display().to_string()));
+    }
 
     let person_lower = person.to_lowercase();
     let mut parsed_frontmatters = Vec::new();
     let overlay_db_path = overlays::default_db_path();
-    for entry in walk_meeting_files(dir) {
-        let path = entry.path();
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping file in person profile");
-                continue;
-            }
-        };
+    for path in revision.paths() {
+        let snapshot = revision_snapshot(revision, path)?;
+        let path = snapshot.path.as_path();
 
-        let (frontmatter_str, _) = split_frontmatter(&content);
+        let (frontmatter_str, _) = split_frontmatter(&snapshot.content);
         if frontmatter_str.is_empty() {
             continue;
         }
@@ -963,11 +2322,13 @@ pub fn person_profile(config: &Config, person: &str) -> Result<PersonProfile, Se
             // meetings never feed person profiles. No override on this
             // surface in this wave — like the graph, exclusion is complete.
             Ok(frontmatter) if matches!(frontmatter.sensitivity, Some(Sensitivity::Restricted)) => {
-                tracing::debug!(path = %path.display(), "skipping restricted meeting in person profile (sensitivity enforcement)");
+                tracing::debug!(
+                    "skipping restricted meeting in person profile (sensitivity enforcement)"
+                );
             }
             Ok(frontmatter) => parsed_frontmatters.push((path.to_path_buf(), frontmatter)),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping malformed frontmatter in person profile");
+            Err(_) => {
+                tracing::warn!("skipping policy-uncertain meeting in person profile");
             }
         }
     }
@@ -1161,14 +2522,30 @@ fn process_file(
     }
 }
 
+#[cfg(test)]
 fn process_intent_file(
     path: &Path,
+    canonical_root: &Path,
     query: &str,
     filters: &SearchFilters,
     overlay_db_path: &Path,
 ) -> Result<Vec<IntentResult>, SearchError> {
-    let content = std::fs::read_to_string(path)?;
-    let (frontmatter_str, _) = split_frontmatter(&content);
+    let snapshot = read_stable_active_markdown(path, canonical_root).ok_or_else(|| {
+        SearchError::Io(std::io::Error::other(
+            "meeting could not be read as a stable policy snapshot",
+        ))
+    })?;
+    process_intent_snapshot(snapshot, query, filters, overlay_db_path)
+}
+
+fn process_intent_snapshot(
+    snapshot: StableMarkdownSnapshot,
+    query: &str,
+    filters: &SearchFilters,
+    overlay_db_path: &Path,
+) -> Result<Vec<IntentResult>, SearchError> {
+    let path = snapshot.path.as_path();
+    let (frontmatter_str, _) = split_frontmatter(&snapshot.content);
     if frontmatter_str.is_empty() {
         return Ok(vec![]);
     }
@@ -1288,78 +2665,60 @@ pub fn find_open_actions(
     if !dir.exists() {
         return Ok(vec![]);
     }
+    with_stable_active_corpus(dir, |revision| {
+        find_open_actions_once(config, assignee, include_restricted, revision)
+    })
+}
+
+fn find_open_actions_once(
+    config: &Config,
+    assignee: Option<&str>,
+    include_restricted: bool,
+    revision: &StableActiveCorpusRevision,
+) -> Result<Vec<ActionResult>, SearchError> {
+    let dir = &config.output_dir;
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
 
     let mut results = Vec::new();
 
-    for entry in walk_meeting_files(dir) {
-        let path = entry.path();
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
+    for path in revision.paths() {
+        let snapshot = revision_snapshot(revision, path)?;
+        let path = snapshot.path;
+
+        let (fm_str, _) = split_frontmatter(&snapshot.content);
+        if fm_str.is_empty() {
+            continue;
+        }
+        let frontmatter = match serde_yaml::from_str::<Frontmatter>(fm_str) {
+            Ok(frontmatter) => frontmatter,
             Err(_) => continue,
         };
-
-        let (fm_str, _) = split_frontmatter(&content);
-
-        // Sensitivity enforcement (consent layer Wave 2): restricted meetings
-        // contribute no action items unless explicitly overridden.
-        if !include_restricted
-            && extract_field(fm_str, "sensitivity").as_deref() == Some("restricted")
-        {
+        if !include_restricted && matches!(frontmatter.sensitivity, Some(Sensitivity::Restricted)) {
             continue;
         }
 
-        let title = extract_field(fm_str, "title").unwrap_or_default();
-        let date = extract_field(fm_str, "date").unwrap_or_default();
-
-        // Parse action_items from frontmatter (YAML list)
-        // Look for lines like "  - assignee: mat" within the action_items block
-        if !content.contains("action_items:") {
-            continue;
-        }
-
-        // Simple parse: find action_items section in frontmatter YAML
-        // Note: fm_str is already stripped of --- markers by split_frontmatter,
-        // so pass it directly — wrapping with --- would create a multi-document
-        // YAML that serde_yaml rejects.
-        let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(fm_str);
-        if let Ok(yaml) = parsed {
-            if let Some(items) = yaml.get("action_items").and_then(|v| v.as_sequence()) {
-                for item in items {
-                    let item_assignee = item
-                        .get("assignee")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unassigned");
-                    let item_status = item
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("open");
-                    let item_task = item.get("task").and_then(|v| v.as_str()).unwrap_or("");
-                    let item_due = item
-                        .get("due")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    if item_status != "open" {
-                        continue;
-                    }
-                    if let Some(filter) = assignee {
-                        let a = item_assignee.to_lowercase();
-                        let f = filter.to_lowercase();
-                        if a != f && !a.contains(&f) {
-                            continue;
-                        }
-                    }
-
-                    results.push(ActionResult {
-                        meeting_path: path.to_path_buf(),
-                        meeting_title: title.clone(),
-                        meeting_date: date.clone(),
-                        assignee: item_assignee.to_string(),
-                        task: item_task.to_string(),
-                        due: item_due,
-                    });
+        for item in frontmatter.action_items {
+            if item.status != "open" {
+                continue;
+            }
+            if let Some(filter) = assignee {
+                let candidate = item.assignee.to_lowercase();
+                let filter = filter.to_lowercase();
+                if candidate != filter && !candidate.contains(&filter) {
+                    continue;
                 }
             }
+
+            results.push(ActionResult {
+                meeting_path: path.clone(),
+                meeting_title: frontmatter.title.clone(),
+                meeting_date: frontmatter.date.to_rfc3339(),
+                assignee: item.assignee,
+                task: item.task,
+                due: item.due,
+            });
         }
     }
 
@@ -1451,6 +2810,40 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
+    fn delete_staging_entries(root: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().starts_with(".delete-staging-"))
+            .collect()
+    }
+
+    fn assert_single_retained_empty_staging(root: &Path) {
+        let entries = delete_staging_entries(root);
+        assert_eq!(entries.len(), 1, "one inactive staging quarantine");
+        assert!(
+            std::fs::read_dir(root.join(&entries[0]))
+                .unwrap()
+                .next()
+                .is_none(),
+            "rolled-back staging quarantine should be empty"
+        );
+    }
+
+    fn mutation_claim_entries(directory: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".minutes-mutation-claim-")
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
     #[test]
     fn search_finds_matching_content() {
         // Search hits the HOME-derived sqlite index; serialize with the
@@ -1518,7 +2911,7 @@ mod tests {
         create_test_file(
             dir.path(),
             "test.md",
-            "---\ntitle: Test\ndate: 2026-03-17\n---\n\nPRICING discussion",
+            "---\ntitle: Test\ntype: meeting\ndate: 2026-03-17\n---\n\nPRICING discussion",
         );
 
         let config = Config {
@@ -1537,6 +2930,28 @@ mod tests {
 
         let results = search("pricing", &config, &filters).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn configured_persistent_qmd_engine_is_ignored_for_private_search() {
+        let _guard = crate::test_home_env_lock();
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "test.md",
+            "---\ntitle: Private Projection\ntype: meeting\ndate: 2026-07-15\n---\n\nEphemeral search canary",
+        );
+        let mut config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.search.engine = "qmd".into();
+        config.search.qmd_collection = Some("persistent-target-must-not-run".into());
+
+        let results = search("ephemeral", &config, &SearchFilters::default()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Private Projection");
     }
 
     #[test]
@@ -1560,6 +2975,52 @@ mod tests {
             ..Config::default()
         };
         let filters = SearchFilters::default();
+        let vocabulary = crate::vocabulary::VocabularyStore {
+            entries: vec![crate::vocabulary::VocabularyEntry {
+                kind: crate::vocabulary::VocabularyKind::Organization,
+                canonical: "Automattic".into(),
+                aliases: vec!["Automatic".into()],
+                ..crate::vocabulary::VocabularyEntry::default()
+            }],
+        }
+        .normalized()
+        .unwrap();
+
+        let results = search_with_mode_and_vocabulary(
+            "Automattic",
+            &config,
+            &filters,
+            crate::search_index::SyncMode::Force,
+            Some(&vocabulary),
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].matched_via_alias.as_deref(), Some("Automatic"));
+    }
+
+    #[test]
+    fn restricted_override_scans_once_and_preserves_alias_provenance() {
+        let _guard = crate::test_home_env_lock();
+        let home = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+        }
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "restricted.md",
+            "---\ntitle: Private Writing Tools\ndate: 2026-05-01\ntype: meeting\nsensitivity: restricted\n---\n\nWe discussed Automatic.",
+        );
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let filters = SearchFilters {
+            include_restricted: true,
+            ..Default::default()
+        };
         let vocabulary = crate::vocabulary::VocabularyStore {
             entries: vec![crate::vocabulary::VocabularyEntry {
                 kind: crate::vocabulary::VocabularyKind::Organization,
@@ -1689,8 +3150,10 @@ mod tests {
         };
 
         let overlay_db = dir.path().join("overlays.db");
+        let canonical_root = dir.path().canonicalize().unwrap();
         let results = process_intent_file(
             &dir.path().join("2026-03-17-test.md"),
+            &canonical_root,
             "pricing",
             &filters,
             &overlay_db,
@@ -1727,8 +3190,10 @@ mod tests {
         };
 
         let overlay_db = dir.path().join("overlays.db");
+        let canonical_root = dir.path().canonicalize().unwrap();
         let results = process_intent_file(
             &dir.path().join("2026-03-17-test.md"),
+            &canonical_root,
             "",
             &filters,
             &overlay_db,
@@ -1740,26 +3205,16 @@ mod tests {
     }
 
     #[test]
-    fn search_intents_filters_owner_through_speaker_overlay() {
+    fn search_intents_resolves_owner_only_from_authorized_source_speaker_map() {
         let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
-        let meeting = dir.path().join("2026-03-17-test.md");
         create_test_file(
             dir.path(),
             "2026-03-17-test.md",
-            "---\ntitle: Pricing Review\ntype: meeting\ndate: 2026-03-17T12:00:00-07:00\nduration: 42m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions: []\nspeaker_map:\n  - speaker_label: SPEAKER_0\n    name: Unknown Speaker\n    confidence: medium\n    source: llm\nintents:\n  - kind: action-item\n    what: Send pricing doc\n    who: SPEAKER_0\n    status: open\n    by_date: Friday\n---\n\n## Transcript\n\n[SPEAKER_0 0:00] I'll send pricing.\n",
+            "---\ntitle: Pricing Review\ntype: meeting\ndate: 2026-03-17T12:00:00-07:00\nduration: 42m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions: []\nspeaker_map:\n  - speaker_label: SPEAKER_0\n    name: Alex Kim\n    confidence: high\n    source: manual\nintents:\n  - kind: action-item\n    what: Send pricing doc\n    who: SPEAKER_0\n    status: open\n    by_date: Friday\n---\n\n## Transcript\n\n[SPEAKER_0 0:00] I'll send pricing.\n",
         );
 
         let overlay_db = dir.path().join("overlays.db");
-        crate::overlays::write_speaker_confirmation_at(
-            &overlay_db,
-            &meeting,
-            "SPEAKER_0",
-            "Alex Kim",
-            Some("Unknown Speaker"),
-            Some("test owner resolution"),
-        )
-        .unwrap();
 
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -1779,10 +3234,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].who.as_deref(), Some("Alex Kim"));
         assert_eq!(results[0].who_original.as_deref(), Some("SPEAKER_0"));
-        assert_eq!(
-            results[0].who_provenance.as_deref(),
-            Some("speaker overlay")
-        );
+        assert_eq!(results[0].who_provenance.as_deref(), Some("speaker_map"));
     }
 
     #[test]
@@ -1814,8 +3266,10 @@ mod tests {
             include_restricted: false,
         };
 
+        let canonical_root = dir.path().canonicalize().unwrap();
         let matching_results = process_intent_file(
             &dir.path().join("2026-03-17-test.md"),
+            &canonical_root,
             "",
             &matching_filters,
             &dir.path().join("overlays.db"),
@@ -1823,6 +3277,7 @@ mod tests {
         .unwrap();
         let non_matching_results = process_intent_file(
             &dir.path().join("2026-03-17-test.md"),
+            &canonical_root,
             "",
             &non_matching_filters,
             &dir.path().join("overlays.db"),
@@ -1895,26 +3350,16 @@ mod tests {
     }
 
     #[test]
-    fn consistency_report_resolves_stale_owner_through_speaker_overlay() {
+    fn consistency_report_resolves_stale_owner_from_authorized_source_speaker_map() {
         let _guard = crate::test_support::home_env_lock();
         let dir = TempDir::new().unwrap();
-        let meeting = dir.path().join("2020-03-01-a.md");
         create_test_file(
             dir.path(),
             "2020-03-01-a.md",
-            "---\ntitle: Follow-up Owner\ntype: meeting\ndate: 2020-03-01T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions: []\nspeaker_map:\n  - speaker_label: SPEAKER_0\n    name: Unknown Speaker\n    confidence: medium\n    source: llm\nintents:\n  - kind: commitment\n    what: Send the rollout memo\n    who: SPEAKER_0\n    status: open\n    by_date: March 8\n---\n\n## Transcript\n\n[SPEAKER_0 0:00] I'll send it.\n",
+            "---\ntitle: Follow-up Owner\ntype: meeting\ndate: 2020-03-01T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions: []\nspeaker_map:\n  - speaker_label: SPEAKER_0\n    name: Alex Kim\n    confidence: high\n    source: manual\nintents:\n  - kind: commitment\n    what: Send the rollout memo\n    who: SPEAKER_0\n    status: open\n    by_date: March 8\n---\n\n## Transcript\n\n[SPEAKER_0 0:00] I'll send it.\n",
         );
 
         let overlay_db = dir.path().join("overlays.db");
-        crate::overlays::write_speaker_confirmation_at(
-            &overlay_db,
-            &meeting,
-            "SPEAKER_0",
-            "Alex Kim",
-            Some("Unknown Speaker"),
-            Some("test consistency owner resolution"),
-        )
-        .unwrap();
 
         let config = Config {
             output_dir: dir.path().to_path_buf(),
@@ -1926,7 +3371,7 @@ mod tests {
         let entry = &report.stale_commitments[0].entry;
         assert_eq!(entry.who.as_deref(), Some("Alex Kim"));
         assert_eq!(entry.who_original.as_deref(), Some("SPEAKER_0"));
-        assert_eq!(entry.who_provenance.as_deref(), Some("speaker overlay"));
+        assert_eq!(entry.who_provenance.as_deref(), Some("speaker_map"));
     }
 
     #[test]
@@ -2189,6 +3634,51 @@ mod tests {
 
     const NORMAL_MEETING: &str = "---\ntitle: Pricing Sync\ntype: meeting\ndate: 2026-06-10T12:00:00-07:00\nduration: 30m\nstatus: complete\nattendees: [Sam Lee]\npeople: [Sam Lee]\naction_items:\n  - assignee: Sam Lee\n    task: Share pricing deck\n    status: open\ndecisions:\n  - text: Ship monthly pricing page\n    topic: pricing\nintents:\n  - kind: commitment\n    what: Share pricing deck\n    who: Sam Lee\n    status: open\n---\n\n## Transcript\n\nWe discussed pricing.\n";
 
+    #[test]
+    fn aggregate_surfaces_keep_stable_peer_when_neighbors_are_invalid_or_oversized() {
+        let _guard = crate::test_home_env_lock();
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "stable.md", NORMAL_MEETING);
+        std::fs::write(dir.path().join("invalid.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        let oversized = std::fs::File::create(dir.path().join("oversized.md")).unwrap();
+        oversized
+            .set_len(crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES + 1)
+            .unwrap();
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            search("pricing", &config, &SearchFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            search_intents("pricing", &config, &SearchFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(find_open_actions(&config, None, false).unwrap().len(), 1);
+        assert_eq!(
+            person_profile(&config, "Sam Lee")
+                .unwrap()
+                .recent_meetings
+                .len(),
+            1
+        );
+        assert_eq!(
+            cross_meeting_research("pricing", &config, &SearchFilters::default())
+                .unwrap()
+                .recent_meetings
+                .len(),
+            1
+        );
+        consistency_report(&config, None, 30).unwrap();
+    }
+
     fn restricted_test_dir() -> TempDir {
         let dir = TempDir::new().unwrap();
         create_test_file(dir.path(), "2026-06-10-pricing-sync.md", NORMAL_MEETING);
@@ -2222,6 +3712,1523 @@ mod tests {
         assert!(overridden
             .iter()
             .any(|result| result.title == "Board Pricing Strategy"));
+    }
+
+    #[test]
+    fn restricted_override_uses_exact_live_fts_semantics() {
+        let _guard = crate::test_home_env_lock();
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "restricted.md",
+            "---\ntitle: Private Plan\ntype: meeting\ndate: 2026-06-11T12:00:00-07:00\nsensitivity: restricted\n---\n\nThe roadmap comes first. Later we revisited prices and resumes at the cafe.\n",
+        );
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let filters = SearchFilters {
+            include_restricted: true,
+            ..Default::default()
+        };
+
+        for query in ["pricing roadm", "café résu"] {
+            let results = search(query, &config, &filters).unwrap();
+            assert_eq!(results.len(), 1, "restricted FTS parity failed for {query}");
+            assert_eq!(results[0].title, "Private Plan");
+        }
+    }
+
+    #[test]
+    fn aggregate_retry_replaces_pre_flip_result_with_exact_restricted_snapshot() {
+        use std::cell::Cell;
+
+        let _guard = crate::test_home_env_lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meeting.md");
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let filters = SearchFilters {
+            include_restricted: true,
+            ..Default::default()
+        };
+        let flipped = Cell::new(false);
+
+        let results = with_stable_active_corpus_with_hooks(
+            dir.path(),
+            |revision| {
+                search_with_mode_and_vocabulary_once(
+                    "pricing",
+                    &config,
+                    &filters,
+                    SyncMode::Skip,
+                    None,
+                    revision,
+                )
+            },
+            || {},
+            || {
+                if !flipped.replace(true) {
+                    std::fs::write(
+                        &path,
+                        RESTRICTED_MEETING
+                            .replace("Board Pricing Strategy", "POST-FLIP-RESTRICTED-TITLE"),
+                    )
+                    .unwrap();
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "POST-FLIP-RESTRICTED-TITLE");
+        assert!(results.iter().all(|result| result.title != "Pricing Sync"));
+    }
+
+    #[test]
+    fn bad_good_bad_aba_file_never_enters_pre_attested_search_result() {
+        let _guard = crate::test_home_env_lock();
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "stable.md", NORMAL_MEETING);
+        let transient = dir.path().join("transient.md");
+        std::fs::write(&transient, [0xff, 0xfe, 0xfd]).unwrap();
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let results = with_stable_active_corpus_with_hooks(
+            dir.path(),
+            |revision| {
+                search_with_mode_and_vocabulary_once(
+                    "pricing",
+                    &config,
+                    &SearchFilters::default(),
+                    SyncMode::Skip,
+                    None,
+                    revision,
+                )
+            },
+            || {
+                std::fs::write(
+                    &transient,
+                    NORMAL_MEETING.replace("Pricing Sync", "TRANSIENT ABA CANARY"),
+                )
+                .unwrap();
+            },
+            || {
+                std::fs::write(&transient, [0xff, 0xfe, 0xfd]).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Pricing Sync");
+        assert!(results
+            .iter()
+            .all(|result| result.title != "TRANSIENT ABA CANARY"));
+    }
+
+    #[test]
+    fn aggregate_churn_stops_at_the_shared_retry_budget() {
+        use std::cell::Cell;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meeting.md");
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let operation_calls = Cell::new(0usize);
+        let revision_number = Cell::new(0usize);
+
+        let result = with_stable_active_corpus_with_hooks(
+            dir.path(),
+            |_revision| {
+                operation_calls.set(operation_calls.get() + 1);
+                Ok(())
+            },
+            || {},
+            || {
+                let next = revision_number.get() + 1;
+                revision_number.set(next);
+                std::fs::write(&path, format!("continuously changing revision {next}")).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            operation_calls.get(),
+            ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn search_drops_policy_uncertain_meetings_even_with_override() {
+        let _guard = crate::test_home_env_lock();
+        let dir = restricted_test_dir();
+        create_test_file(
+            dir.path(),
+            "2026-06-12-unknown.md",
+            &NORMAL_MEETING.replace(
+                "title: Pricing Sync",
+                "title: Unknown Policy\nsensitivity: confidential",
+            ),
+        );
+        create_test_file(
+            dir.path(),
+            "2026-06-13-malformed.md",
+            "---\ntitle: Malformed Policy\ntype: meeting\ndate: [not valid\nsensitivity: restricted\n---\n\nPOLICY_UNCERTAIN_CANARY pricing\n",
+        );
+        for (suffix, title, sensitivity) in [
+            ("null", "Null Policy", "null"),
+            ("empty", "Empty Policy", ""),
+            ("list", "List Policy", "[normal]"),
+            ("map", "Map Policy", "{policy: normal}"),
+        ] {
+            create_test_file(
+                dir.path(),
+                &format!("2026-06-14-{suffix}.md"),
+                &NORMAL_MEETING.replace(
+                    "title: Pricing Sync",
+                    &format!("title: {title}\nsensitivity: {sensitivity}"),
+                ),
+            );
+        }
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let results = search(
+            "pricing",
+            &config,
+            &SearchFilters {
+                include_restricted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|result| result.title != "Unknown Policy"));
+        for title in ["Null Policy", "Empty Policy", "List Policy", "Map Policy"] {
+            assert!(
+                results.iter().all(|result| result.title != title),
+                "policy-uncertain meeting leaked with override: {title}"
+            );
+        }
+        assert!(results
+            .iter()
+            .all(|result| !result.snippet.contains("POLICY_UNCERTAIN_CANARY")));
+    }
+
+    #[test]
+    fn indexed_search_result_is_refreshed_from_live_verified_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meeting.md");
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let mut results = vec![SearchResult {
+            path,
+            title: "STALE_TITLE_CANARY".into(),
+            date: "stale".into(),
+            content_type: "meeting".into(),
+            snippet: "STALE_RESTRICTED_CANARY".into(),
+            matched_via_alias: None,
+        }];
+        let revision = stable_active_corpus_revision(dir.path()).unwrap();
+
+        retain_policy_verified_results(
+            &mut results,
+            &SearchFilters::default(),
+            "pricing",
+            &revision,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Pricing Sync");
+        assert!(!results[0].snippet.contains("STALE_RESTRICTED_CANARY"));
+        assert!(results[0].snippet.contains("pricing"));
+    }
+
+    #[test]
+    fn policy_verified_results_preserve_empty_query_list_mode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meeting.md");
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let mut results = vec![SearchResult {
+            path,
+            title: "STALE_TITLE_CANARY".into(),
+            date: "stale".into(),
+            content_type: "meeting".into(),
+            snippet: "STALE_SNIPPET_CANARY".into(),
+            matched_via_alias: None,
+        }];
+        let revision = stable_active_corpus_revision(dir.path()).unwrap();
+
+        retain_policy_verified_results(&mut results, &SearchFilters::default(), "", &revision)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Pricing Sync");
+        assert!(results[0].snippet.is_empty());
+    }
+
+    #[test]
+    fn default_budget_supports_realistic_1500_meeting_multi_pass_list() {
+        let dir = TempDir::new().unwrap();
+        let filler = ".".repeat(25_800);
+        let meeting = format!(
+            "---\ntitle: Corpus Scale Meeting\ntype: meeting\ndate: 2026-07-23T12:00:00Z\nduration: 30m\nstatus: complete\nattendees: []\npeople: []\naction_items: []\ndecisions: []\nintents: []\n---\n\n## Transcript\n\n{filler}\n"
+        );
+        let aggregate_bytes = meeting.len() * 1_500;
+        assert!(
+            (38_000_000..=40_000_000).contains(&aggregate_bytes),
+            "fixture should stay representative of the 1,399-file / 39 MB corpus"
+        );
+        for index in 0..1_500 {
+            create_test_file(
+                dir.path(),
+                &format!("2026-07-23-corpus-scale-{index:04}.md"),
+                &meeting,
+            );
+        }
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let results =
+            search_with_mode("", &config, &SearchFilters::default(), SyncMode::Skip).unwrap();
+
+        assert_eq!(results.len(), 1_500);
+        assert!(results
+            .iter()
+            .all(|result| result.title == "Corpus Scale Meeting"));
+    }
+
+    #[test]
+    fn slug_scope_and_exact_path_share_restricted_read_policy() {
+        let dir = TempDir::new().unwrap();
+        let restricted = NORMAL_MEETING.replace(
+            "title: Pricing Sync",
+            "title: Private Pricing\nsensitivity: restricted",
+        );
+        create_test_file(dir.path(), "2026-07-15-private-pricing.md", &restricted);
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let slug_path = resolve_slug("private-pricing", &config)
+            .expect("scope-only slug resolution must retain human mutation access");
+        let exact_path = dir.path().join("2026-07-15-private-pricing.md");
+        assert_eq!(slug_path, exact_path.canonicalize().unwrap());
+
+        for candidate in [&slug_path, &exact_path] {
+            assert!(read_authorized_meeting(candidate, &config, false).is_err());
+            let authorized = read_authorized_meeting(candidate, &config, true).unwrap();
+            assert_eq!(authorized.frontmatter.title, "Private Pricing");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_path_slug_resolution_never_opens_unrelated_corpus_members() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("000-unrelated.md");
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        create_test_file(dir.path(), "target.md", NORMAL_MEETING);
+        let exact = dir.path().join("target.md");
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            resolve_slug(exact.to_str().unwrap(), &config),
+            Some(exact.canonicalize().unwrap())
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn slug_resolution_charges_non_markdown_traversal_entries() {
+        let dir = TempDir::new().unwrap();
+        for index in 0..3 {
+            std::fs::write(
+                dir.path().join(format!("ignored-{index:04}.txt")),
+                b"ignored",
+            )
+            .unwrap();
+        }
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let budget =
+            ActiveCorpusReadBudget::for_test(2, 8, 1_024, std::time::Duration::from_secs(1));
+
+        assert_eq!(
+            resolve_slug_with_budget("missing", &config, budget),
+            Err(ActiveCorpusRevisionError::Budget)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_agent_read_and_mutation_scope_reject_in_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "real.md", NORMAL_MEETING);
+        let real = dir.path().join("real.md");
+        let alias = dir.path().join("alias.md");
+        symlink(&real, &alias).unwrap();
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        assert!(open_meeting_mutation(&alias, &config).is_none());
+        assert!(read_authorized_meeting(&alias, &config, true).is_err());
+        assert!(real.exists());
+        assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn exact_authorization_rejects_same_path_policy_or_byte_flip() {
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let path = dir.path().join("meeting.md");
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let authorized = read_authorized_meeting(&path, &config, false).unwrap();
+
+        std::fs::write(
+            &path,
+            NORMAL_MEETING.replacen(
+                "status: complete\n",
+                "status: complete\nsensitivity: restricted\n",
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(authorized.reauthorize_exact(&config, false).is_err());
+
+        std::fs::write(
+            &path,
+            NORMAL_MEETING.replace("Pricing Sync", "Different Normal Meeting"),
+        )
+        .unwrap();
+        assert!(authorized.reauthorize_exact(&config, false).is_err());
+    }
+
+    #[test]
+    fn authorized_search_snippet_is_derived_from_the_supplied_live_snapshot() {
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let path = dir.path().join("meeting.md");
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let first = read_authorized_meeting(&path, &config, false).unwrap();
+        assert!(authorized_snapshot_search_snippet(&first, "pricing")
+            .is_some_and(|snippet| snippet.contains("pricing")));
+
+        std::fs::write(
+            &path,
+            NORMAL_MEETING
+                .replace("Pricing Sync", "Roadmap Sync")
+                .replace(
+                    "We discussed pricing.",
+                    "We discussed the release calendar instead.",
+                ),
+        )
+        .unwrap();
+        let current = read_authorized_meeting(&path, &config, false).unwrap();
+        assert!(authorized_snapshot_search_snippet(&current, "pricing").is_none());
+        assert!(authorized_snapshot_search_snippet(&current, "calendar")
+            .is_some_and(|snippet| snippet.contains("calendar")));
+    }
+
+    #[test]
+    fn authorized_mutation_binds_policy_and_exact_source_bytes() {
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let path = dir.path().join("meeting.md");
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let mutation = open_authorized_meeting_mutation(&path, &config, false).unwrap();
+        std::fs::write(
+            &path,
+            NORMAL_MEETING.replacen(
+                "status: complete\n",
+                "status: complete\nsensitivity: restricted\n",
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(mutation.archive_group(&[]).is_err());
+        assert!(path.exists());
+        assert!(!dir.path().join("archive").exists());
+        drop(mutation);
+
+        assert!(open_authorized_meeting_mutation(&path, &config, false).is_err());
+        assert!(open_authorized_meeting_mutation(&path, &config, true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_delete_cannot_be_redirected_by_parent_directory_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        let parent = root.join("nested");
+        let retained_parent = root.join("retained-nested");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        create_test_file(&parent, "meeting.md", NORMAL_MEETING);
+        create_test_file(
+            &outside,
+            "meeting.md",
+            &NORMAL_MEETING.replace("Pricing Sync", "OUTSIDE-DELETE-CANARY"),
+        );
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&parent.join("meeting.md"), &config).unwrap();
+
+        mutation
+            .delete_source_with_hook(|| {
+                std::fs::rename(&parent, &retained_parent).unwrap();
+                symlink(&outside, &parent).unwrap();
+            })
+            .unwrap();
+
+        assert!(!retained_parent.join("meeting.md").exists());
+        assert!(outside.join("meeting.md").exists());
+        assert!(std::fs::read_to_string(outside.join("meeting.md"))
+            .unwrap()
+            .contains("OUTSIDE-DELETE-CANARY"));
+        assert!(parent.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_parent_open_rejects_real_directory_replacement() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        let nested = root.join("nested");
+        let displaced = root.join("authorized-nested");
+        let replacement = root.join("replacement-nested");
+        create_test_file(&nested, "meeting.md", NORMAL_MEETING);
+        create_test_file(&replacement, "meeting.md", NORMAL_MEETING);
+        let canonical_root = root.canonicalize().unwrap();
+        let snapshot = read_stable_active_markdown(&nested.join("meeting.md"), &canonical_root)
+            .expect("initial stable snapshot");
+
+        let mutation = meeting_mutation_from_snapshot_with_parent_open_hook(
+            canonical_root,
+            snapshot,
+            |name| {
+                if name == std::ffi::OsStr::new("nested") {
+                    std::fs::rename(&nested, &displaced).unwrap();
+                    std::fs::rename(&replacement, &nested).unwrap();
+                }
+            },
+        );
+
+        assert!(mutation.is_none());
+        assert_eq!(
+            std::fs::read_to_string(displaced.join("meeting.md")).unwrap(),
+            NORMAL_MEETING
+        );
+        assert_eq!(
+            std::fs::read_to_string(nested.join("meeting.md")).unwrap(),
+            NORMAL_MEETING
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_and_staging_open_reject_real_directory_replacements() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        std::fs::create_dir_all(root.join("archive-replacement")).unwrap();
+        std::fs::write(root.join("archive/identity"), b"AUTHORIZED_ARCHIVE").unwrap();
+        std::fs::write(
+            root.join("archive-replacement/identity"),
+            b"REPLACEMENT_ARCHIVE",
+        )
+        .unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let source = root.join("meeting.md");
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+
+        mutation
+            .archive_group_with_all_hooks(
+                &[],
+                |_| {},
+                |_| {},
+                || {
+                    std::fs::rename(root.join("archive"), root.join("archive-authorized")).unwrap();
+                    std::fs::rename(root.join("archive-replacement"), root.join("archive"))
+                        .unwrap();
+                },
+            )
+            .expect_err("archive directory identity replacement must fail closed");
+        assert!(source.exists());
+        assert_eq!(
+            std::fs::read(root.join("archive-authorized/identity")).unwrap(),
+            b"AUTHORIZED_ARCHIVE"
+        );
+        assert_eq!(
+            std::fs::read(root.join("archive/identity")).unwrap(),
+            b"REPLACEMENT_ARCHIVE"
+        );
+
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+        let staging_result = mutation.stage_delete_group_with_all_hooks(
+            &[],
+            |_| {},
+            |_| {},
+            || {
+                let staging_name = delete_staging_entries(&root)
+                    .into_iter()
+                    .next()
+                    .expect("new staging directory");
+                let staging = root.join(&staging_name);
+                let displaced = root.join(format!("{}-authorized", staging_name.to_string_lossy()));
+                std::fs::rename(&staging, &displaced).unwrap();
+                std::fs::create_dir(&staging).unwrap();
+                std::fs::write(staging.join("identity"), b"REPLACEMENT_STAGING").unwrap();
+            },
+        );
+        assert!(
+            staging_result.is_err(),
+            "staging directory identity replacement must fail closed"
+        );
+        assert!(source.exists());
+        assert!(std::fs::read_dir(&root).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".delete-staging-")
+                && entry.path().join("identity").exists()
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_mismatch_with_recreated_source_surfaces_exact_quarantine() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let source = root.join("meeting.md");
+        let displaced = root.join("authorized-meeting.md");
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+        let archive = mutation.archive_dir_with_hook(|| {}).unwrap();
+        let archive_path = root.join("archive");
+
+        let error = mutation
+            .move_group_with_claim_hooks(
+                &[],
+                &archive,
+                &archive_path,
+                false,
+                |index| {
+                    if index == 0 {
+                        std::fs::rename(&source, &displaced).unwrap();
+                        std::fs::write(&source, b"CLAIM_REPLACEMENT").unwrap();
+                    }
+                },
+                |index| {
+                    if index == 0 {
+                        std::fs::write(&source, b"SOURCE_RECREATION_BLOCKER").unwrap();
+                    }
+                },
+                |_| {},
+                |_| {},
+            )
+            .err()
+            .expect("claim mismatch must fail closed");
+
+        let claims = mutation_claim_entries(&archive_path);
+        assert_eq!(claims.len(), 1);
+        assert!(error.to_string().contains(&claims[0].display().to_string()));
+        assert_eq!(std::fs::read(&claims[0]).unwrap(), b"CLAIM_REPLACEMENT");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"SOURCE_RECREATION_BLOCKER"
+        );
+        assert_eq!(std::fs::read_to_string(displaced).unwrap(), NORMAL_MEETING);
+        assert!(!archive_path.join("meeting.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_mismatch_with_recreated_source_surfaces_exact_quarantine() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let source = root.join("meeting.md");
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+        let archive = mutation.archive_dir_with_hook(|| {}).unwrap();
+        let archive_path = root.join("archive");
+
+        let error = mutation
+            .move_group_with_claim_hooks(
+                &[],
+                &archive,
+                &archive_path,
+                false,
+                |_| {},
+                |_| {},
+                |index| {
+                    if index == 0 {
+                        std::fs::write(archive_path.join("meeting.md"), b"PROMOTION_REPLACEMENT")
+                            .unwrap();
+                        std::fs::write(&source, b"SOURCE_RECREATION_BLOCKER").unwrap();
+                    }
+                },
+                |_| {},
+            )
+            .err()
+            .expect("promotion mismatch must fail closed");
+
+        let claims = mutation_claim_entries(&archive_path);
+        assert_eq!(claims.len(), 1);
+        assert!(error.to_string().contains(&claims[0].display().to_string()));
+        assert_eq!(std::fs::read(&claims[0]).unwrap(), b"PROMOTION_REPLACEMENT");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"SOURCE_RECREATION_BLOCKER"
+        );
+        assert!(!archive_path.join("meeting.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_meeting_can_archive_but_cannot_enter_delete_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let archive_root = temp.path().join("archive-case");
+        std::fs::create_dir_all(&archive_root).unwrap();
+        create_test_file(&archive_root, "meeting.md", NORMAL_MEETING);
+        let archive_source = archive_root.join("meeting.md");
+        std::fs::set_permissions(&archive_source, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let archive_config = Config {
+            output_dir: archive_root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&archive_source, &archive_config).unwrap();
+        mutation
+            .archive_group(&[])
+            .expect("directory-authorized rename must not require inode write access");
+        assert_eq!(
+            std::fs::read_to_string(archive_root.join("archive/meeting.md")).unwrap(),
+            NORMAL_MEETING
+        );
+
+        let delete_root = temp.path().join("delete-case");
+        std::fs::create_dir_all(&delete_root).unwrap();
+        create_test_file(&delete_root, "meeting.md", NORMAL_MEETING);
+        let delete_source = delete_root.join("meeting.md");
+        std::fs::set_permissions(&delete_source, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let delete_config = Config {
+            output_dir: delete_root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&delete_source, &delete_config).unwrap();
+        assert!(
+            mutation.stage_delete_group(&[]).is_err(),
+            "deletion must bind writable exact handles before moving anything"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&delete_source).unwrap(),
+            NORMAL_MEETING
+        );
+        assert_single_retained_empty_staging(&delete_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_delete_error_never_removes_interposed_empty_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let source = root.join("meeting.md");
+        let authorized_source = root.join("authorized-meeting.md");
+        let retained_staging = root.join("authorized-staging");
+        let staging_name = std::cell::RefCell::new(None);
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+
+        let result = mutation.stage_delete_group_with_hooks(
+            &[],
+            |index| {
+                if index != 0 {
+                    return;
+                }
+                let name = delete_staging_entries(&root)
+                    .into_iter()
+                    .next()
+                    .expect("created staging directory");
+                let ambient_staging = root.join(&name);
+                std::fs::rename(&ambient_staging, &retained_staging).unwrap();
+                std::fs::create_dir(&ambient_staging).unwrap();
+                *staging_name.borrow_mut() = Some(name);
+
+                std::fs::rename(&source, &authorized_source).unwrap();
+                std::fs::write(&source, b"CLAIM_REPLACEMENT").unwrap();
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        let staging_name = staging_name.into_inner().expect("captured staging name");
+        assert!(
+            root.join(staging_name).is_dir(),
+            "an interposed empty directory must never be removed by name"
+        );
+        assert!(
+            std::fs::read_dir(&retained_staging)
+                .unwrap()
+                .next()
+                .is_none(),
+            "the exact staging directory is retained after rollback"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"CLAIM_REPLACEMENT");
+        assert_eq!(
+            std::fs::read_to_string(authorized_source).unwrap(),
+            NORMAL_MEETING
+        );
+    }
+
+    #[test]
+    fn archive_group_rolls_back_source_when_late_destination_collides() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        std::fs::write(&audio, b"audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+
+        let error = mutation
+            .archive_group_with_collision_after_first_move(std::slice::from_ref(&audio))
+            .expect_err("late collision must fail the group move");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "unexpected group-move error: {error}"
+        );
+
+        assert!(root.join("meeting.md").exists());
+        assert_eq!(std::fs::read(&audio).unwrap(), b"audio canary");
+        assert!(!root.join("archive/meeting.md").exists());
+        assert_eq!(
+            std::fs::read(root.join("archive/meeting.wav")).unwrap(),
+            b"collision canary"
+        );
+    }
+
+    #[test]
+    fn archive_group_never_clobbers_a_source_created_during_rollback() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        std::fs::write(&audio, b"audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+
+        let archive_audio = root.join("archive/meeting.wav");
+        let replacement_source = root.join("meeting.md");
+        let error = mutation
+            .archive_group_with_hook(std::slice::from_ref(&audio), |index| {
+                if index == 0 {
+                    // Force the second destination claim to fail, then make
+                    // rollback contend with a newly created source path.
+                    std::fs::write(&archive_audio, b"destination collision canary").unwrap();
+                    std::fs::write(&replacement_source, b"replacement source canary").unwrap();
+                }
+            })
+            .expect_err("rollback collision must fail without replacing either file");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+
+        assert_eq!(
+            std::fs::read(&replacement_source).unwrap(),
+            b"replacement source canary"
+        );
+        assert_eq!(std::fs::read(&audio).unwrap(), b"audio canary");
+        assert!(root.join("archive/meeting.md").exists());
+        assert_eq!(
+            std::fs::read(&archive_audio).unwrap(),
+            b"destination collision canary"
+        );
+    }
+
+    #[test]
+    fn archive_group_retains_optional_sibling_identity_from_selection() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        let displaced = root.join("authorized-meeting.wav");
+        std::fs::write(&audio, b"authorized audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+
+        assert!(mutation.sibling_exists(&audio));
+        std::fs::rename(&audio, &displaced).unwrap();
+        std::fs::write(&audio, b"replacement audio canary").unwrap();
+
+        mutation
+            .archive_group(std::slice::from_ref(&audio))
+            .expect_err("a sibling replacement after selection must fail closed");
+        assert!(root.join("meeting.md").exists());
+        assert_eq!(std::fs::read(&audio).unwrap(), b"replacement audio canary");
+        assert_eq!(
+            std::fs::read(&displaced).unwrap(),
+            b"authorized audio canary"
+        );
+        assert!(!root.join("archive/meeting.md").exists());
+        assert!(!root.join("archive/meeting.wav").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_and_staged_delete_reject_source_symlink_swap_at_atomic_claim() {
+        use std::os::unix::fs::symlink;
+
+        for staged_delete in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("meetings");
+            std::fs::create_dir_all(&root).unwrap();
+            create_test_file(&root, "meeting.md", NORMAL_MEETING);
+            let source = root.join("meeting.md");
+            let displaced = root.join("authorized-meeting.md");
+            let outside = temp.path().join("outside.md");
+            std::fs::write(&outside, b"outside markdown canary").unwrap();
+            let config = Config {
+                output_dir: root.clone(),
+                ..Config::default()
+            };
+            let mutation = open_meeting_mutation(&source, &config).unwrap();
+
+            if staged_delete {
+                let result = mutation.stage_delete_group_with_hooks(
+                    &[],
+                    |index| {
+                        if index == 0 {
+                            std::fs::rename(&source, &displaced).unwrap();
+                            symlink(&outside, &source).unwrap();
+                        }
+                    },
+                    |_| {},
+                );
+                assert!(
+                    result.is_err(),
+                    "staged deletion must reject a source symlink swap"
+                );
+            } else {
+                mutation
+                    .archive_group_with_hooks(
+                        &[],
+                        |index| {
+                            if index == 0 {
+                                std::fs::rename(&source, &displaced).unwrap();
+                                symlink(&outside, &source).unwrap();
+                            }
+                        },
+                        |_| {},
+                    )
+                    .expect_err("archive must reject a source symlink swap");
+            }
+
+            assert!(source.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"outside markdown canary");
+            assert_eq!(std::fs::read_to_string(&displaced).unwrap(), NORMAL_MEETING);
+            assert!(!root.join("archive/meeting.md").exists());
+            if staged_delete {
+                assert_single_retained_empty_staging(&root);
+            } else {
+                assert!(delete_staging_entries(&root).is_empty());
+            }
+        }
+    }
+
+    // POSIX renames by source name and must reject a name winner installed at
+    // the claim boundary. Windows renames the already-authorized exact handle,
+    // so the safe result there is to move the old object while preserving the
+    // new source-name winner; the adjacent atomic-transfer tests enforce that.
+    #[cfg(unix)]
+    #[test]
+    fn archive_and_staged_delete_reject_source_inode_swap_at_atomic_claim() {
+        for staged_delete in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("meetings");
+            std::fs::create_dir_all(&root).unwrap();
+            create_test_file(&root, "meeting.md", NORMAL_MEETING);
+            let source = root.join("meeting.md");
+            let displaced = root.join("authorized-meeting.md");
+            let config = Config {
+                output_dir: root.clone(),
+                ..Config::default()
+            };
+            let mutation = open_meeting_mutation(&source, &config).unwrap();
+
+            if staged_delete {
+                let result = mutation.stage_delete_group_with_hooks(
+                    &[],
+                    |index| {
+                        if index == 0 {
+                            std::fs::rename(&source, &displaced).unwrap();
+                            std::fs::write(&source, b"replacement markdown canary").unwrap();
+                        }
+                    },
+                    |_| {},
+                );
+                assert!(
+                    result.is_err(),
+                    "staged deletion must reject a source inode swap"
+                );
+            } else {
+                mutation
+                    .archive_group_with_hooks(
+                        &[],
+                        |index| {
+                            if index == 0 {
+                                std::fs::rename(&source, &displaced).unwrap();
+                                std::fs::write(&source, b"replacement markdown canary").unwrap();
+                            }
+                        },
+                        |_| {},
+                    )
+                    .expect_err("archive must reject a source inode swap");
+            }
+
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                b"replacement markdown canary"
+            );
+            assert_eq!(std::fs::read_to_string(&displaced).unwrap(), NORMAL_MEETING);
+            assert!(!root.join("archive/meeting.md").exists());
+            if staged_delete {
+                assert_single_retained_empty_staging(&root);
+            } else {
+                assert!(delete_staging_entries(&root).is_empty());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_group_rejects_sibling_symlink_swap_at_atomic_claim() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        let displaced = root.join("authorized-meeting.wav");
+        let outside = temp.path().join("outside.wav");
+        std::fs::write(&audio, b"authorized audio canary").unwrap();
+        std::fs::write(&outside, b"outside audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+        assert!(mutation.sibling_exists(&audio));
+
+        mutation
+            .archive_group_with_hooks(
+                std::slice::from_ref(&audio),
+                |index| {
+                    if index == 1 {
+                        std::fs::rename(&audio, &displaced).unwrap();
+                        symlink(&outside, &audio).unwrap();
+                    }
+                },
+                |_| {},
+            )
+            .expect_err("a symlink installed at the atomic claim must fail closed");
+
+        assert!(root.join("meeting.md").exists());
+        assert!(audio.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside audio canary");
+        assert_eq!(
+            std::fs::read(&displaced).unwrap(),
+            b"authorized audio canary"
+        );
+        assert!(!root.join("archive/meeting.md").exists());
+        assert!(!root.join("archive/meeting.wav").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_delete_rejects_sibling_symlink_swap_at_atomic_claim() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        let displaced = root.join("authorized-meeting.wav");
+        let outside = temp.path().join("outside.wav");
+        std::fs::write(&audio, b"authorized audio canary").unwrap();
+        std::fs::write(&outside, b"outside audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+        assert!(mutation.sibling_exists(&audio));
+
+        let result = mutation.stage_delete_group_with_hooks(
+            std::slice::from_ref(&audio),
+            |index| {
+                if index == 1 {
+                    std::fs::rename(&audio, &displaced).unwrap();
+                    symlink(&outside, &audio).unwrap();
+                }
+            },
+            |_| {},
+        );
+        assert!(
+            result.is_err(),
+            "a symlink installed at the staged claim must fail closed"
+        );
+
+        assert!(root.join("meeting.md").exists());
+        assert!(audio.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside audio canary");
+        assert_eq!(
+            std::fs::read(&displaced).unwrap(),
+            b"authorized audio canary"
+        );
+        assert_single_retained_empty_staging(&root);
+    }
+
+    // See the source-swap test above: this fixture exercises POSIX's
+    // name-based primitive. Windows binds and moves the exact sibling handle.
+    #[cfg(unix)]
+    #[test]
+    fn archive_group_rejects_sibling_inode_swap_at_atomic_claim() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        let displaced = root.join("authorized-meeting.wav");
+        std::fs::write(&audio, b"authorized audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+        assert!(mutation.sibling_exists(&audio));
+
+        mutation
+            .archive_group_with_hooks(
+                std::slice::from_ref(&audio),
+                |index| {
+                    if index == 1 {
+                        std::fs::rename(&audio, &displaced).unwrap();
+                        std::fs::write(&audio, b"replacement audio canary").unwrap();
+                    }
+                },
+                |_| {},
+            )
+            .expect_err("a different inode installed at the atomic claim must fail closed");
+
+        assert!(root.join("meeting.md").exists());
+        assert_eq!(std::fs::read(&audio).unwrap(), b"replacement audio canary");
+        assert_eq!(
+            std::fs::read(&displaced).unwrap(),
+            b"authorized audio canary"
+        );
+        assert!(!root.join("archive/meeting.md").exists());
+        assert!(!root.join("archive/meeting.wav").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_delete_rejects_sibling_inode_swap_at_atomic_claim() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        let displaced = root.join("authorized-meeting.wav");
+        std::fs::write(&audio, b"authorized audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+        assert!(mutation.sibling_exists(&audio));
+
+        let result = mutation.stage_delete_group_with_hooks(
+            std::slice::from_ref(&audio),
+            |index| {
+                if index == 1 {
+                    std::fs::rename(&audio, &displaced).unwrap();
+                    std::fs::write(&audio, b"replacement audio canary").unwrap();
+                }
+            },
+            |_| {},
+        );
+        assert!(
+            result.is_err(),
+            "a different inode installed at the staged claim must fail closed"
+        );
+
+        assert!(root.join("meeting.md").exists());
+        assert_eq!(std::fs::read(&audio).unwrap(), b"replacement audio canary");
+        assert_eq!(
+            std::fs::read(&displaced).unwrap(),
+            b"authorized audio canary"
+        );
+        assert_single_retained_empty_staging(&root);
+    }
+
+    #[test]
+    fn archive_atomic_transfer_never_unlinks_a_new_source() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let source = root.join("meeting.md");
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+
+        mutation
+            .archive_group_with_hook(&[], |index| {
+                if index == 0 {
+                    std::fs::write(&source, b"new atomic-save source canary").unwrap();
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"new atomic-save source canary"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("archive/meeting.md")).unwrap(),
+            NORMAL_MEETING
+        );
+    }
+
+    #[test]
+    fn staged_delete_atomic_transfer_never_unlinks_a_new_source() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let source = root.join("meeting.md");
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+
+        let staged = mutation
+            .stage_delete_group_with_hooks(
+                &[],
+                |_| {},
+                |index| {
+                    if index == 0 {
+                        std::fs::write(&source, b"new atomic-save source canary").unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        staged.finalize().unwrap();
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"new atomic-save source canary"
+        );
+        let staging_name = delete_staging_entries(&root)
+            .into_iter()
+            .next()
+            .expect("deletion keeps one inactive recovery quarantine");
+        #[cfg(windows)]
+        assert!(
+            std::fs::read_dir(root.join(&staging_name))
+                .unwrap()
+                .next()
+                .is_none(),
+            "Windows exact-handle deletion leaves an empty quarantine"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(root.join(&staging_name).join("meeting.md"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_delete_finalize_never_unlinks_a_replaced_staged_entry() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let source = root.join("meeting.md");
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&source, &config).unwrap();
+        let staged = mutation.stage_delete_group(&[]).unwrap();
+        let staging_name = delete_staging_entries(&root)
+            .into_iter()
+            .next()
+            .expect("staged deletion directory");
+        let staged_source = root.join(&staging_name).join("meeting.md");
+        let retained_source = root.join(&staging_name).join("authorized-meeting.md");
+
+        let result = staged.finalize_with_hook(|index| {
+            if index == 0 {
+                std::fs::rename(&staged_source, &retained_source).unwrap();
+                std::fs::write(&staged_source, b"replacement staged canary").unwrap();
+            }
+        });
+
+        result.expect("the exact retained inode can be sanitized after a pathname swap");
+        assert_eq!(
+            std::fs::read(&staged_source).unwrap(),
+            b"replacement staged canary"
+        );
+        assert_eq!(std::fs::metadata(&retained_source).unwrap().len(), 0);
+        assert!(root.join(staging_name).exists());
+    }
+
+    #[test]
+    fn archive_group_rejects_nonregular_sibling_before_moving_source() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        std::fs::create_dir(&audio).unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+
+        assert!(!mutation.sibling_exists(&audio));
+        assert!(mutation
+            .archive_group(std::slice::from_ref(&audio))
+            .is_err());
+        assert!(root.join("meeting.md").exists());
+        assert!(!root.join("archive/meeting.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_group_rejects_symlink_sibling_before_moving_source() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let outside = temp.path().join("outside-audio.wav");
+        std::fs::write(&outside, b"outside canary").unwrap();
+        let audio = root.join("meeting.wav");
+        symlink(&outside, &audio).unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+
+        assert!(!mutation.sibling_exists(&audio));
+        assert!(mutation
+            .archive_group(std::slice::from_ref(&audio))
+            .is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside canary");
+        assert!(root.join("meeting.md").exists());
+        assert!(!root.join("archive/meeting.md").exists());
+    }
+
+    #[test]
+    fn staged_delete_hides_the_complete_group_before_physical_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        std::fs::create_dir_all(&root).unwrap();
+        create_test_file(&root, "meeting.md", NORMAL_MEETING);
+        let audio = root.join("meeting.wav");
+        std::fs::write(&audio, b"audio canary").unwrap();
+        let config = Config {
+            output_dir: root.clone(),
+            ..Config::default()
+        };
+        let mutation = open_meeting_mutation(&root.join("meeting.md"), &config).unwrap();
+
+        let staged = mutation
+            .stage_delete_group(std::slice::from_ref(&audio))
+            .unwrap();
+
+        assert!(!root.join("meeting.md").exists());
+        assert!(!audio.exists());
+        let staging = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .find(|name| name.to_string_lossy().starts_with(".delete-staging-"))
+            .expect("staged group must remain privately retained until finalize");
+        assert!(root.join(&staging).join("meeting.md").exists());
+        assert_eq!(
+            std::fs::read(root.join(&staging).join("meeting.wav")).unwrap(),
+            b"audio canary"
+        );
+
+        staged.finalize().unwrap();
+        let quarantine = root.join(staging);
+        assert!(quarantine.exists());
+        #[cfg(windows)]
+        assert!(
+            std::fs::read_dir(&quarantine).unwrap().next().is_none(),
+            "Windows exact-handle deletion leaves an empty quarantine"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(quarantine.join("meeting.md"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert_eq!(
+                std::fs::metadata(quarantine.join("meeting.wav"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn skip_mode_populates_fresh_private_projection() {
+        let _guard = crate::test_home_env_lock();
+        let dir = TempDir::new().unwrap();
+        create_test_file(dir.path(), "meeting.md", NORMAL_MEETING);
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let results = search_with_mode(
+            "pricing",
+            &config,
+            &SearchFilters::default(),
+            SyncMode::Skip,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Pricing Sync");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_verified_results_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        create_test_file(outside.path(), "outside.md", NORMAL_MEETING);
+        let link = root.path().join("linked.md");
+        symlink(outside.path().join("outside.md"), &link).unwrap();
+        let mut results = vec![SearchResult {
+            path: link,
+            title: "OUTSIDE_CANARY".into(),
+            date: "stale".into(),
+            content_type: "meeting".into(),
+            snippet: "OUTSIDE_CANARY".into(),
+            matched_via_alias: None,
+        }];
+        let revision = stable_active_corpus_revision(root.path()).unwrap();
+
+        retain_policy_verified_results(
+            &mut results,
+            &SearchFilters {
+                include_restricted: true,
+                ..Default::default()
+            },
+            "pricing",
+            &revision,
+        )
+        .unwrap();
+
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -2268,6 +5275,31 @@ mod tests {
         assert!(overridden
             .iter()
             .any(|action| action.task == "Draft board pricing memo"));
+    }
+
+    #[test]
+    fn find_open_actions_drops_unknown_sensitivity_even_with_override() {
+        let _guard = crate::test_home_env_lock();
+        let dir = restricted_test_dir();
+        create_test_file(
+            dir.path(),
+            "2026-06-12-unknown.md",
+            &NORMAL_MEETING.replace(
+                "title: Pricing Sync",
+                "title: Unknown Policy\nsensitivity: confidential",
+            ),
+        );
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let results = find_open_actions(&config, None, true).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|action| action.meeting_title != "Unknown Policy"));
     }
 
     #[test]

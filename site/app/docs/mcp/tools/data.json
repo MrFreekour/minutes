@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-29",
+  "generatedAt": "2026-08-07",
   "installCommand": "npx minutes-mcp",
   "documentationUrl": "https://useminutes.app/for-agents",
   "supportUrl": "https://github.com/silverstein/minutes/discussions",
@@ -34,63 +34,63 @@
     },
     {
       "name": "list_meetings",
-      "description": "List recent meetings and voice memos",
+      "description": "List recent normal meetings and voice memos; restricted items are excluded unless an explicit logged override is enabled and requested",
       "group": "Search and recall",
       "anchorId": "tool-list-meetings",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-list-meetings"
     },
     {
       "name": "search_meetings",
-      "description": "Search meeting transcripts and voice memos",
+      "description": "Search normal meeting transcripts and voice memos; restricted items are excluded unless an explicit logged override is enabled and requested",
       "group": "Search and recall",
       "anchorId": "tool-search-meetings",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-search-meetings"
     },
     {
       "name": "get_meeting",
-      "description": "Get full transcript of a specific meeting",
+      "description": "Get a normal meeting transcript; restricted meetings return a content-free stub unless an explicit logged override is enabled and requested",
       "group": "Search and recall",
       "anchorId": "tool-get-meeting",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-meeting"
     },
     {
       "name": "activity_summary",
-      "description": "Summarize meeting-adjacent desktop context for a linked artifact, context session, or time window",
+      "description": "Summarize desktop context bound to one exact normal meeting source",
       "group": "Search and recall",
       "anchorId": "tool-activity-summary",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-activity-summary"
     },
     {
       "name": "search_context",
-      "description": "Search desktop-context events across app focus and captured window titles, including opted-in browser titles",
+      "description": "Search desktop-context events bound to one exact normal meeting source",
       "group": "Search and recall",
       "anchorId": "tool-search-context",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-search-context"
     },
     {
       "name": "get_moment",
-      "description": "Show the local desktop-context rewind around a linked artifact, session, or timestamp",
+      "description": "Show the local desktop-context rewind bound to one exact normal meeting source",
       "group": "Search and recall",
       "anchorId": "tool-get-moment",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-moment"
     },
     {
       "name": "get_screen_context",
-      "description": "Retrieve bounded, verified screenshots linked to a Minutes context session",
+      "description": "Retrieve bounded, verified screenshots bound to one exact normal meeting source",
       "group": "Search and recall",
       "anchorId": "tool-get-screen-context",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-screen-context"
     },
     {
       "name": "process_audio",
-      "description": "Process an audio file through the transcription pipeline",
+      "description": "On macOS and Linux, process bounded inbox or Downloads WAV audio; compressed/private containers and Windows fail closed without reading audio; retained library recordings are unavailable",
       "group": "Notes and processing",
       "anchorId": "tool-process-audio",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-process-audio"
     },
     {
       "name": "add_note",
-      "description": "Add a timestamped note to the current recording or an existing meeting",
+      "description": "Add a timestamped note to the current active recording; existing meeting files are not mutable from this assistant tool",
       "group": "Notes and processing",
       "anchorId": "tool-add-note",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-add-note"
@@ -104,31 +104,17 @@
     },
     {
       "name": "get_person_profile",
-      "description": "Build a profile for a person across all meetings",
+      "description": "Build a profile from policy-authorized meetings within supported corpus bounds",
       "group": "People and relationships",
       "anchorId": "tool-get-person-profile",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-person-profile"
     },
     {
       "name": "research_topic",
-      "description": "Research a topic across meetings, decisions, and follow-ups",
+      "description": "Research a topic across policy-authorized meetings within supported corpus bounds",
       "group": "Search and recall",
       "anchorId": "tool-research-topic",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-research-topic"
-    },
-    {
-      "name": "qmd_collection_status",
-      "description": "Check if the Minutes output directory is registered as a QMD collection",
-      "group": "Integration",
-      "anchorId": "tool-qmd-collection-status",
-      "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-qmd-collection-status"
-    },
-    {
-      "name": "register_qmd_collection",
-      "description": "Register the Minutes output directory as a QMD collection",
-      "group": "Integration",
-      "anchorId": "tool-register-qmd-collection",
-      "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-register-qmd-collection"
     },
     {
       "name": "start_dictation",
@@ -153,7 +139,7 @@
     },
     {
       "name": "relationship_map",
-      "description": "All contacts with relationship scores and losing-touch alerts",
+      "description": "Rank relationships from the bounded process-private policy-safe graph projection",
       "group": "People and relationships",
       "anchorId": "tool-relationship-map",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-relationship-map"
@@ -167,14 +153,14 @@
     },
     {
       "name": "confirm_speaker",
-      "description": "Confirm or correct speaker attribution in a meeting transcript",
+      "description": "Compatibility name only: agent-controlled speaker mutation is unavailable; use the Minutes app or human CLI",
       "group": "Voice and speaker ID",
       "anchorId": "tool-confirm-speaker",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-confirm-speaker"
     },
     {
       "name": "get_meeting_insights",
-      "description": "Query structured meeting insights (decisions, commitments, questions) with confidence filtering",
+      "description": "Query decisions, commitments, and questions extracted from meetings; each insight records a path to its source meeting, that path is resolved to a meeting in the live corpus and the resolved meeting is re-verified against live sensitivity policy before release, and withheld records are reported as a partial view",
       "group": "Insights",
       "anchorId": "tool-get-meeting-insights",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-meeting-insights"
@@ -222,13 +208,6 @@
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-read-copilot-nudges"
     },
     {
-      "name": "open_dashboard",
-      "description": "Open the Meeting Intelligence Dashboard in the browser — visual overview of conversation memory",
-      "group": "Notes and processing",
-      "anchorId": "tool-open-dashboard",
-      "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-open-dashboard"
-    },
-    {
       "name": "ingest_meeting",
       "description": "Extract facts from a meeting and update the knowledge base (person profiles, log, index)",
       "group": "Insights",
@@ -258,7 +237,7 @@
     },
     {
       "name": "get_agent_annotations",
-      "description": "Read append-only agent.annotation events separately from human-authored meeting markdown and frontmatter",
+      "description": "Compatibility name only: unavailable because an annotation's source pointer and body are both author-supplied, so revalidating the pointer cannot bound what the body discloses",
       "group": "Agent Event Bus",
       "anchorId": "tool-get-agent-annotations",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#tool-get-agent-annotations"
@@ -300,7 +279,7 @@
     {
       "name": "recent_events",
       "uri": "minutes://events/recent",
-      "description": "Recent pipeline events (recordings, processing, notes)",
+      "description": "Recent pipeline events with meeting-derived content withheld until source policy provenance is available",
       "group": "Status",
       "anchorId": "resource-recent-events",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#resource-recent-events"
@@ -308,10 +287,26 @@
     {
       "name": "agent_annotations",
       "uri": "minutes://events/agent-annotations",
-      "description": "Recent append-only agent.annotation events, separate from human meeting markdown",
+      "description": "Agent annotations are withheld until their source policy provenance can be revalidated",
       "group": "Status",
       "anchorId": "resource-agent-annotations",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#resource-agent-annotations"
+    },
+    {
+      "name": "live_events",
+      "uri": "minutes://events/live",
+      "description": "Live events are currently withheld because raw cursors can reveal restricted activity; reads return a constant unavailable response.",
+      "group": "Live",
+      "anchorId": "resource-live-events",
+      "docsUrl": "https://useminutes.app/docs/mcp/tools#resource-live-events"
+    },
+    {
+      "name": "live_copilot",
+      "uri": "minutes://live/copilot",
+      "description": "Current copilot state and latest observed nudge. Subscribe for notifications/resources/updated or poll this URI; MCP only controls and observes the independent minutes copilot engine.",
+      "group": "Live",
+      "anchorId": "resource-live-copilot",
+      "docsUrl": "https://useminutes.app/docs/mcp/tools#resource-live-copilot"
     },
     {
       "name": "recent-ideas",
@@ -320,6 +315,14 @@
       "group": "Memory",
       "anchorId": "resource-recent-ideas",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#resource-recent-ideas"
+    },
+    {
+      "name": "live_events_since_seq",
+      "uri": "minutes://events/live{?since_seq,limit}",
+      "description": "Live event cursor reads are currently withheld because raw cursors can reveal restricted activity; reads return a constant unavailable response.",
+      "group": "Live",
+      "anchorId": "resource-live-events-since-seq",
+      "docsUrl": "https://useminutes.app/docs/mcp/tools#resource-live-events-since-seq"
     },
     {
       "name": "meeting",
@@ -367,18 +370,18 @@
       "arguments": [
         "name"
       ],
-      "text": "Build a profile for ${arguments.name} across all my meetings. What topics do we discuss? What commitments are open? What decisions have we made together?",
+      "text": "Build a profile for ${arguments.name} from policy-authorized meetings within supported corpus bounds. What topics do we discuss? What commitments are open? What decisions have we made together?",
       "group": "Prep",
       "anchorId": "prompt-person-briefing",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#prompt-person-briefing"
     },
     {
       "name": "topic_research",
-      "description": "Research a topic across all meetings",
+      "description": "Research a topic across policy-authorized meetings within supported corpus bounds",
       "arguments": [
         "topic"
       ],
-      "text": "Research ${arguments.topic} across all my meetings. Show related decisions, open follow-ups, and which meetings discussed it most.",
+      "text": "Research ${arguments.topic} across policy-authorized meetings within supported corpus bounds. Show related decisions, open follow-ups, and which meetings discussed it most.",
       "group": "Prep",
       "anchorId": "prompt-topic-research",
       "docsUrl": "https://useminutes.app/docs/mcp/tools#prompt-topic-research"

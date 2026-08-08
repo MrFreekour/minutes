@@ -96,12 +96,24 @@ echo "=== Staging CLI as Tauri sidecar ==="
 HOST_TARGET="$(rustc -Vv | awk '/host:/ {print $2}')"
 mkdir -p tauri/src-tauri/bin
 cp -f target/release/minutes "tauri/src-tauri/bin/minutes-${HOST_TARGET}"
+cp -f target/release/minutes-graph-worker \
+  "tauri/src-tauri/bin/minutes-graph-worker-${HOST_TARGET}"
+cp -f target/release/minutes-apple-speech-worker \
+  "tauri/src-tauri/bin/minutes-apple-speech-worker-${HOST_TARGET}"
 
 echo "=== Building ${DEV_PRODUCT_NAME}.app ==="
 # The calendar-events Swift helper is compiled and staged into
 # tauri/src-tauri/resources/ by tauri/src-tauri/build.rs, and Tauri bundles it
 # into the .app automatically via tauri.conf.json.
-run_with_ort_retry cargo tauri build --bundles app --config "$DEV_CONFIG" --features "$MINUTES_BUILD_FEATURES" --no-sign
+# Built from inside the app's own package directory, not the repo root. The
+# root is a virtual workspace, so cargo resolves --features against every
+# member; once the Archive crates joined the workspace, `--features
+# parakeet,metal` started failing with "the package 'minutes-archive-app' does
+# not contain these features". Running here scopes resolution to minutes-app.
+# Package-qualified syntax (minutes-app/parakeet) does not help -- cargo still
+# rejects it against the other members. Outputs are unaffected: target/ is
+# workspace-level, so $BUILD_APP below is still correct from the root.
+(cd tauri/src-tauri && run_with_ort_retry cargo tauri build --bundles app --config "$ROOT_DIR/$DEV_CONFIG" --features "$MINUTES_BUILD_FEATURES" --no-sign)
 # Inside-out signing (#311): sign every nested executable FIRST (the CLI
 # sidecar with its own entitlements), then the outer bundle WITHOUT --deep.
 # --deep re-signs nested code with the outer entitlements (clobbering the
@@ -122,6 +134,14 @@ if [[ "$SIGN_MODE" == "identity" ]]; then
         "$nested_executable"
     fi
   done < <(find "$BUILD_APP/Contents/MacOS" -maxdepth 1 -type f \( -perm -100 -o -perm -010 -o -perm -001 \))
+  ./scripts/package-graph-xpc.sh \
+    "$BUILD_APP" \
+    "$SIGNING_IDENTITY" \
+    tauri/src-tauri/minutes-graph-worker.entitlements
+  ./scripts/package-apple-speech-xpc.sh \
+    "$BUILD_APP" \
+    "$SIGNING_IDENTITY" \
+    tauri/src-tauri/minutes-apple-speech-worker.entitlements
 
   echo "=== Signing ${DEV_PRODUCT_NAME}.app (outer, no --deep) ==="
   codesign --force --options runtime --timestamp \
@@ -142,6 +162,14 @@ else
       codesign --force --sign - "$nested_executable"
     fi
   done < <(find "$BUILD_APP/Contents/MacOS" -maxdepth 1 -type f \( -perm -100 -o -perm -010 -o -perm -001 \))
+  ./scripts/package-graph-xpc.sh \
+    "$BUILD_APP" \
+    - \
+    tauri/src-tauri/minutes-graph-worker.entitlements
+  ./scripts/package-apple-speech-xpc.sh \
+    "$BUILD_APP" \
+    - \
+    tauri/src-tauri/minutes-apple-speech-worker.entitlements
   codesign --force --sign - "$BUILD_APP"
 fi
 

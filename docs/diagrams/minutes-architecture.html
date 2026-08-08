@@ -241,7 +241,7 @@
         <rect x="504" y="336" width="28" height="12" rx="2" fill="transparent" stroke="rgba(140,136,128,0.45)" stroke-width="0.8"/>
         <text x="518" y="345" fill="#8c8880" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">IDX</text>
         <text x="584" y="368" fill="#1a1916" font-size="14" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Local sidecars</text>
-        <text x="584" y="388" fill="#8c8880" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">graph.db / context.db / JSONL / WAV</text>
+        <text x="584" y="388" fill="#8c8880" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">overlays.db / context.db / JSONL / WAV</text>
 
         <rect x="752" y="164" width="168" height="88" rx="6" fill="#f8f4ed"/>
         <rect x="752" y="164" width="168" height="88" rx="6" fill="#ffffff" stroke="#1a1916" stroke-width="1"/>
@@ -285,13 +285,13 @@
       <article class="card">
         <p class="card-eyebrow">Durable contract</p>
         <h2>The markdown corpus is the product</h2>
-        <p><code>~/meetings/*.md</code> is the durable memory surface. If the sidecar databases disappear, the conversation corpus still exists as files that any agent or human tool can read directly.</p>
+        <p><code>~/meetings/*.md</code> is the durable memory surface. If the sidecar databases disappear, the conversation corpus still exists as human-owned files. Agents use the policy-aware local surfaces so restricted meetings remain excluded by default.</p>
       </article>
 
       <article class="card">
         <p class="card-eyebrow">Why sidecars exist</p>
         <h2>Recall gets faster without swallowing the source</h2>
-        <p><code>graph.db</code> and <code>context.db</code> keep relationship, artifact, and desktop-context indexes local and adjacent. They enrich recall and MCP workflows without becoming the only place the truth lives.</p>
+        <p><code>overlays.db</code> and <code>context.db</code> keep confirmed corrections and desktop-context indexes local and adjacent. Relationship graphs are rebuilt as process-private projections from authorized Markdown plus attested corrections, so no durable graph cache can outlive its source policy.</p>
       </article>
 
       <article class="card">

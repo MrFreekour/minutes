@@ -1,10 +1,10 @@
 # CLAUDE.md — Minutes
 
-> Your AI remembers every conversation you've had.
+> Your AI remembers the conversations you authorize.
 
 ## Project Overview
 
-**Minutes** — open-source, privacy-first conversation memory layer for AI assistants. Captures any audio (meetings, voice memos, brain dumps), transcribes locally with whisper.cpp or parakeet.cpp, diarizes speakers, and outputs searchable markdown with structured action items and decisions. Built with Rust + Tauri v2 + Node.js (MCP).
+**Minutes** — open-source, privacy-first conversation memory layer for AI assistants. Captures meetings, voice memos, and brain dumps, transcribes locally with whisper.cpp, diarizes speakers, and outputs searchable markdown with structured action items and decisions. Built with Rust + Tauri v2 + Node.js (MCP).
 
 **Four input modes, one pipeline:**
 - **Live recording**: `minutes record` / `minutes stop` — for meetings, calls, conversations
@@ -179,10 +179,12 @@ minutes/
 ├── CLAUDE.md                  # This file
 ├── Cargo.toml                 # Workspace root
 ├── crates/
-│   ├── core/src/              # 34 Rust modules — the engine
+│   ├── core/src/              # 82 Rust modules — the engine (the tree below is a
+│   │                          # partial map; run `ls crates/core/src/*.rs` for the
+│   │                          # full list before concluding something is missing)
 │   │   ├── capture.rs         # Audio capture (cpal), device categorization, loopback detection
 │   │   ├── resample.rs        # Shared mono-downmix + 16kHz decimation resampler (used by capture + streaming)
-│   │   ├── transcribe.rs      # Transcription: whisper.cpp (default) or parakeet.cpp (opt-in). Delegates to whisper-guard for anti-hallucination, optional nnnoiseless denoise
+│   │   ├── transcribe.rs      # Batch transcription: whisper.cpp. Retained Parakeet config resolves to Whisper until secure transport exists
 │   │   ├── diarize.rs         # Speaker diarization + attribution types (pyannote-rs, or energy-based from per-source stems)
 │   │   ├── summarize.rs       # LLM summarization + speaker mapping (ureq HTTP client)
 │   │   ├── voice.rs           # Voice profile storage and matching (voices.db, enrollment, cosine similarity)
@@ -268,14 +270,13 @@ node test/mcp_tools_test.mjs                        # 8 MCP integration tests
 
 - **Rust** for the engine — single 6.7MB binary, cross-platform, fast
 - **whisper-rs** (whisper.cpp) for transcription (default) — local, Apple Silicon optimized, params match whisper-cli defaults (best_of=5, entropy/logprob thresholds)
-- **parakeet.cpp** for transcription (opt-in) — NVIDIA FastConformer via subprocess, Metal GPU acceleration on Apple Silicon. Lower WER than Whisper at equivalent model sizes. Requires `--features parakeet` at build time. See `docs/architecture/parakeet.md` for setup
-- **ffmpeg preferred for audio decoding** — shells out to ffmpeg for m4a/mp3/ogg when available (identical to whisper-cli's pipeline). Falls back to symphonia (pure Rust) when ffmpeg isn't installed. This matters for non-English audio — symphonia's AAC decoder produces subtly different samples that trigger whisper hallucination loops (issue #21).
+- **parakeet.cpp selection is retained but unavailable** — legacy Parakeet config remains parseable, but batch selection resolves to Whisper until secure byte transport exists. See `docs/architecture/parakeet.md` for the dormant contract.
+- **ffmpeg preferred for compressed audio decoding, bounded worker as fallback** — shells out to ffmpeg for the named compressed formats (m4a/mp3/ogg/webm/mp4/mov/aac) and consumes bounded 16 kHz mono PCM. ffmpeg stays preferred because Symphonia's AAC decoder produces subtly different samples that trigger whisper hallucination loops on non-English audio (issue #21). When ffmpeg is absent, decoding falls back to Symphonia running inside the bounded audio-decode worker child (`crates/core/src/audio_decode_worker.rs`), default-on via `transcription.compressed_decode_fallback`. There is still deliberately no *in-process* Symphonia fallback: its container probing can allocate attacker-declared tables before resource limits run, so the ceiling binds before the decoder reads an attacker-controlled byte. Linux and Windows install it from the parent (`pre_exec` / a Job Object at `CREATE_SUSPENDED`); Darwin rejects an absolute `RLIMIT_AS` below its pre-`main()` shared-cache baseline, so there the child installs a measured baseline-plus-budget ceiling itself before any decode, the same way `graph_worker` does. WAV uses the bounded in-process decoder.
 - **Silero VAD** (via whisper-rs) — ML-based voice activity detection integrated directly into whisper's transcription params. Prevents hallucination loops by skipping silence segments. Auto-downloaded during `minutes setup`.
 - **whisper-guard** crate — standalone anti-hallucination toolkit extracted from minutes-core. 6-layer defense: Silero VAD gating, no_speech probability filtering (>80% = skip), consecutive segment dedup (3+ similar collapsed), interleaved A/B/A/B pattern detection, foreign-script hallucination detection, language-agnostic noise marker collapse (`[Śmiech]`, `[music]`, `[risas]`, etc.), trailing noise trimming. Publishable to crates.io independently.
 - **nnnoiseless** (optional) — pure Rust RNNoise port for noise reduction. Behind `denoise` feature flag, controlled by `config.transcription.noise_reduction`. Processes at 48kHz with first-frame priming. Batch path only (not streaming).
 - **pyannote-rs** for speaker diarization — native Rust, ONNX models (~34MB), no Python. Works in CLI, Tauri desktop app, and via MCP. Behind the `diarize` Cargo feature flag.
-- **Speaker attribution** — confidence-aware system mapping SPEAKER_X labels to real names. Four levels: L0 (deterministic 1-on-1 via calendar+identity), L1 (LLM suggestions capped at Medium confidence), L2 (voice enrollment in `voices.db`), L3 (confirmed-only learning). Wrong names are worse than anonymous — only High-confidence attributions rewrite transcript labels. `speaker_map` in YAML frontmatter is the canonical attribution data. Voice profiles stored in `~/.minutes/voices.db` (separate from `graph.db` which wipes on rebuild).
-- **symphonia** for audio format conversion — m4a/mp3/ogg → WAV, pure Rust (fallback when ffmpeg unavailable)
+- **Speaker attribution** — confidence-aware system mapping SPEAKER_X labels to real names. Four levels: L0 (deterministic 1-on-1 via calendar+identity), L1 (LLM suggestions capped at Medium confidence), L2 (voice enrollment in `voices.db`), L3 (confirmed-only learning). Wrong names are worse than anonymous — only High-confidence attributions rewrite transcript labels. `speaker_map` in YAML frontmatter is the canonical attribution data. Voice profiles are stored durably in `~/.minutes/voices.db`; relationship graphs are process-private projections rematerialized from authorized sources.
 - **Windowed-sinc resampler** (32-tap Hann) — alias-free 44100→16000 downsampling for WAV inputs
 - **ureq** for HTTP — pure Rust, no secrets in process args (replaced curl)
 - **fs2 flock** for PID files — atomic check-and-write, prevents TOCTOU races
@@ -285,9 +286,36 @@ node test/mcp_tools_test.mjs                        # 8 MCP integration tests
 - **No API keys needed** — Claude summarizes conversationally via MCP tools
 - **Live transcript** — per-utterance whisper → JSONL append with PidGuard flock for session exclusivity. Delta reads via line cursor or wall-clock duration. Optional WAV preservation for post-meeting reprocessing. Agent-agnostic: JSONL readable by any agent, MCP tools for Claude, CLAUDE.md context injection for Codex/Gemini/OpenCode.
 
+## Already Built — check here before proposing to build it
+
+The module tree above covers 34 of 82 core modules. Several substantial
+capabilities are not in it, and have been independently re-proposed as "new
+work" more than once. Grep before you design.
+
+| Capability | Where | How to check it is live |
+|---|---|---|
+| Custom vocabulary (people, orgs, acronyms) | `vocabulary.rs`, `~/.minutes/vocabulary.toml` | `minutes vocabulary list` |
+| Decode-time lexical biasing | `pipeline.rs::build_decode_hints` → `transcribe.rs::whisper_initial_prompt` → `set_initial_prompt` | vocabulary entries appear in the whisper prompt |
+| Hint evaluation with false-positive scoring | `autoresearch.rs::run_decode_hint_eval_corpus`, `scripts/run_proper_name_eval.sh` | baseline vs candidate WER, `max_wer_regression`, required/forbidden terms |
+| Dictation benchmark corpus | `scripts/run_dictation_benchmark.sh`, `tests/eval/fixtures/` | |
+| In-process SOTA engine (sherpa-onnx / parakeet-v3) | `sherpa_engine.rs`, feature `engine-sherpa` | `minutes setup --sherpa`, `engine = "sherpa"` |
+| Name correction / entity resolution | `name_correction.rs`, `person_identity.rs`, `entity_cluster.rs` | |
+| Bounded child processes, policy filesystem | `bounded_child.rs` (3k lines), `policy_fs.rs` (4.5k lines) | |
+| Search index, context store, desktop context | `search_index.rs`, `context_store.rs`, `desktop_context.rs` | |
+
+**Two traps that produced wrong conclusions in practice:**
+
+- `minutes transcribe` calls `DecodeHints::default()`, so it gets **no**
+  vocabulary biasing. Only the `process`/pipeline path does. Benchmarking name
+  accuracy through `transcribe` measures the unbiased path and tells you
+  nothing about what users of `process` get.
+- Reading one function is not reading the behavior. `effective_batch_engine`
+  looks like a silent engine swap until you read its caller, which warns. Check
+  callers before concluding.
+
 ## Key Patterns
 
-- All audio processing is local (whisper.cpp or parakeet.cpp + pyannote-rs + Silero VAD). ffmpeg recommended but optional.
+- All audio processing is local (whisper.cpp + pyannote-rs + Silero VAD). WAV decoding is in-process; importing M4A, MP3, OGG, WebM, MP4, MOV, or AAC uses local ffmpeg when installed, otherwise the bounded audio-decode worker.
 - Claude summarizes via MCP when the user asks (no API key needed)
 - Optional automated summarization fully on-device via Apple Foundation Models (macOS 26+, `engine = "apple"`; preferred by `"auto"` when available — see docs/architecture/apple-foundation-models.md), via Ollama (local), Mistral, or cloud LLMs
 - Config at `~/.config/minutes/config.toml` (optional, compiled defaults work)

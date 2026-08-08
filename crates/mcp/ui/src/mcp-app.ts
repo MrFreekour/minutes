@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/ext-apps";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import "./mcp-app.css";
+import { normalizeCommitmentDisplayRows } from "./render-contract.js";
 
 // ─── DOM Helpers ──────────────────────────────────────────────────────────────
 
@@ -574,6 +575,7 @@ function renderPerson(data: any) {
   const name: string = data.name || "Unknown";
   const topics: any[] = data.top_topics || [];
   const openIntents: any[] = data.open_intents || [];
+  const recentDecisions: any[] = data.recent_decisions || [];
   const recentMeetings: any[] = data.recent_meetings || [];
 
   // Header
@@ -607,6 +609,21 @@ function renderPerson(data: any) {
             <div class="intent-what">${escapeHtml(i.what || "")}</div>
             ${i.kind ? `<div class="intent-who">${escapeHtml(i.kind)}</div>` : ""}
             ${i.by_date ? `<div class="intent-date">by ${escapeHtml(i.by_date)}</div>` : ""}
+          </div>`,
+          )
+          .join("")}
+      </div>`);
+  }
+
+  if (recentDecisions.length > 0) {
+    sections.push(`
+      <div class="person-section"><h3>Recent Decisions</h3>
+        ${recentDecisions
+          .map(
+            (decision: any) => `
+          <div class="intent-item">
+            <div class="intent-what">${escapeHtml(decision.what || "")}</div>
+            ${decision.date ? `<div class="intent-date">${escapeHtml(decision.date)}</div>` : ""}
           </div>`,
           )
           .join("")}
@@ -723,6 +740,30 @@ function renderPeopleMap(people: any[]) {
   };
 
   showView("people-map");
+}
+
+function renderCommitments(data: any) {
+  const commitments = normalizeCommitmentDisplayRows(data);
+  const person = typeof data.person === "string" && data.person.trim() ? data.person.trim() : "";
+  setInner(
+    $("report-header"),
+    `<h1>Commitments${person ? ` for ${escapeHtml(person)}` : ""}</h1>`,
+  );
+
+  if (commitments.length === 0) {
+    setInner($("report-body"), `<div class="report-empty">No open commitments found.</div>`);
+    showView("report");
+    return;
+  }
+
+  const rows = commitments.map((item) => {
+    return `<div class="intent-item ${item.status === "stale" ? "conflict" : ""}">
+      <div class="intent-what">${escapeHtml(item.text)}</div>
+      <div class="intent-source">${escapeHtml(item.owner)} • ${escapeHtml(item.status)} • due ${escapeHtml(item.due)} • ${escapeHtml(item.source)}</div>
+    </div>`;
+  });
+  setInner($("report-body"), `<div class="report-section">${rows.join("")}</div>`);
+  showView("report");
 }
 
 // ─── View: Report ─────────────────────────────────────────────────────────────
@@ -909,8 +950,10 @@ function handleToolResult(result: CallToolResult) {
       renderPerson(data);
       break;
     case "relationship_map":
-    case "commitments":
       renderPeopleMap(data.people || []);
+      break;
+    case "commitments":
+      renderCommitments(data);
       break;
     case "report":
       renderReport(data);

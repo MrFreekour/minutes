@@ -86,11 +86,10 @@ impl TranscriptSource {
 }
 
 pub const PARAKEET_SCOPE_DOC_REF: &str = "docs/architecture/parakeet.md#scope";
-/// Shown at session start when the user configured `engine = "parakeet"` but the
-/// binary was built without the `parakeet` Cargo feature. The engine choice is
-/// silently honored as whisper for this session.
+/// Shown at session start when a retained `engine = "parakeet"` preference is
+/// not selectable. The session resolves explicitly to Whisper.
 pub const PARAKEET_LIVE_SCOPE_WARNING: &str =
-    "this build does not include parakeet; live transcription uses whisper (see docs/architecture/parakeet.md#scope)";
+    "parakeet cannot receive secure private audio in this runtime; live transcription uses whisper (see docs/architecture/parakeet.md#scope)";
 /// Shown at runtime when the parakeet engine IS compiled in but fails during a
 /// live session (warmup error, sidecar unreachable, transcribe error). The
 /// session transparently falls back to whisper for the remainder.
@@ -100,9 +99,9 @@ pub const PARAKEET_LIVE_FALLBACK_WARNING: &str =
 
 pub const APPLE_SPEECH_SCOPE_DOC_REF: &str = "docs/designs/apple-speech-benchmark-2026-04-22.md";
 pub const APPLE_SPEECH_LIVE_SCOPE_WARNING: &str =
-    "apple-speech live transcript is unavailable on this machine; falling back to parakeet or whisper for this session";
+    "the authenticated apple-speech byte-transport service is unavailable or untrusted; live transcript uses sealed local Whisper for this session";
 pub const APPLE_SPEECH_LIVE_FALLBACK_WARNING: &str =
-    "apple-speech live transcription failed; falling back to parakeet or whisper for this session";
+    "apple-speech live transcription is unavailable; using sealed local Whisper for this session";
 
 /// True iff this build can route `engine = "parakeet"` to the parakeet path.
 /// Used at session start to decide between scope-warning (compile-time gap)
@@ -118,16 +117,8 @@ fn live_engine_scope_warning(engine: &str) -> Option<&'static str> {
 }
 
 fn live_supports_parakeet(engine: &str) -> bool {
-    #[cfg(feature = "parakeet")]
-    {
-        engine.eq_ignore_ascii_case("parakeet")
-    }
-
-    #[cfg(not(feature = "parakeet"))]
-    {
-        let _ = engine;
-        false
-    }
+    engine.eq_ignore_ascii_case("parakeet")
+        && crate::pipeline::parakeet_capability(cfg!(feature = "parakeet")).selectable
 }
 
 fn recording_sidecar_live_backend(config: &Config) -> (&str, Option<String>) {
@@ -138,10 +129,11 @@ fn recording_sidecar_live_backend(config: &Config) -> (&str, Option<String>) {
         }
         return (
             "whisper",
-            Some(
-                "live_transcript.backend resolved to parakeet, but this build lacks parakeet; using whisper for recording sidecar"
-                    .into(),
-            ),
+            Some(format!(
+                "live_transcript.backend retained parakeet, but Parakeet {}; using whisper for recording sidecar",
+                crate::pipeline::parakeet_capability(cfg!(feature = "parakeet"))
+                    .unavailable_reason()
+            )),
         );
     }
     if backend.eq_ignore_ascii_case("whisper") {
@@ -150,10 +142,10 @@ fn recording_sidecar_live_backend(config: &Config) -> (&str, Option<String>) {
     if backend.eq_ignore_ascii_case("apple-speech") {
         return (
             "whisper",
-            Some(
-                "apple-speech currently applies only to standalone live transcript; using whisper for recording sidecar"
-                    .into(),
-            ),
+            Some(format!(
+                "live_transcript.backend retained apple-speech, but Apple Speech {}; using sealed local Whisper for recording sidecar",
+                crate::pipeline::apple_speech_unavailable_reason()
+            )),
         );
     }
 
@@ -196,25 +188,18 @@ fn live_ready_parakeet_fallback(_config: &Config) -> bool {
 }
 
 fn live_supports_apple_speech() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        match crate::apple_speech::probe_capabilities() {
-            Ok(report) => {
-                report.runtime_supported && report.speech_transcriber.is_available.unwrap_or(false)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "apple-speech capability probe failed during live transcript startup"
-                );
-                false
-            }
-        }
-    }
+    crate::pipeline::apple_speech_private_audio_transport_supported()
+}
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
+/// Resolve a retained standalone-live preference to the backend that will
+/// actually receive audio. Callers that describe evidence availability must
+/// use runtime truth, not the saved label.
+pub fn resolved_standalone_backend(config: &Config) -> &str {
+    let requested = config.effective_live_transcript_backend();
+    if requested.eq_ignore_ascii_case("parakeet") && !live_supports_parakeet(requested) {
+        "whisper"
+    } else {
+        crate::pipeline::resolved_apple_speech_backend(requested)
     }
 }
 
@@ -828,7 +813,9 @@ fn run_inner(
         config.transcription.language.clone(),
         config.transcription.partial_max_secs,
     );
-    let standalone_backend = config.effective_live_transcript_backend();
+    let requested_standalone_backend = config.effective_live_transcript_backend();
+    #[cfg(any(target_os = "macos", feature = "parakeet"))]
+    let standalone_backend = resolved_standalone_backend(config);
     #[cfg(target_os = "macos")]
     let mut apple_utterance_samples: Vec<f32> = Vec::new();
     #[cfg(target_os = "macos")]
@@ -861,11 +848,11 @@ fn run_inner(
 
     // One-time scope warning when the user configured parakeet but the feature
     // isn't compiled in. Same warning the recording sidecar emits.
-    if standalone_backend.eq_ignore_ascii_case("parakeet") && !parakeet_live_enabled {
-        emit_live_engine_scope_warning(standalone_backend, "standalone");
+    if requested_standalone_backend.eq_ignore_ascii_case("parakeet") && !parakeet_live_enabled {
+        emit_live_engine_scope_warning(requested_standalone_backend, "standalone");
     }
-    if standalone_backend.eq_ignore_ascii_case("apple-speech") && !apple_live_enabled {
-        emit_live_engine_scope_warning(standalone_backend, "standalone");
+    if requested_standalone_backend.eq_ignore_ascii_case("apple-speech") && !apple_live_enabled {
+        emit_live_engine_scope_warning(requested_standalone_backend, "standalone");
     }
     if apple_live_enabled {
         eprintln!("[minutes] Apple Speech live transcript enabled (experimental, standalone only)");
@@ -1909,7 +1896,7 @@ fn load_sidecar_whisper_ctx(config: &Config) -> Result<whisper_rs::WhisperContex
 /// churn and latency spikes on noisy inputs.
 #[cfg(feature = "parakeet")]
 const PARAKEET_LIVE_MIN_SAMPLES: usize = 16_000; // 1 second at 16kHz
-#[cfg(all(feature = "whisper", target_os = "macos"))]
+#[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
 const APPLE_SPEECH_LIVE_MIN_SAMPLES: usize = 16_000; // 1 second at 16kHz
 
 #[cfg(feature = "parakeet")]
@@ -1951,11 +1938,11 @@ fn transcribe_with_apple_speech_for_live_sidecar(
     transcribe_with_apple_speech_for_live_sidecar_impl(
         samples,
         config,
-        crate::apple_speech::transcribe_with_apple_speech,
+        crate::apple_speech_worker::transcribe_samples,
     )
 }
 
-#[cfg(all(feature = "whisper", target_os = "macos"))]
+#[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
 fn transcribe_with_apple_speech_for_live_sidecar_impl<F>(
     samples: &[f32],
     config: &Config,
@@ -1963,7 +1950,7 @@ fn transcribe_with_apple_speech_for_live_sidecar_impl<F>(
 ) -> Result<Option<(String, f64)>, MinutesError>
 where
     F: FnOnce(
-        &Path,
+        &[f32],
         Option<&str>,
         crate::apple_speech::AppleSpeechMode,
         bool,
@@ -1973,16 +1960,9 @@ where
         return Ok(None);
     }
 
-    let tmp_wav = tempfile::Builder::new()
-        .prefix("minutes-live-apple-speech-")
-        .suffix(".wav")
-        .tempfile()
-        .map_err(TranscribeError::Io)?;
-    crate::transcribe::write_wav_16k_mono(tmp_wav.path(), samples)?;
-
     let locale = crate::apple_speech::live_locale_hint(config.transcription.language.as_deref());
     let result = transcribe_fn(
-        tmp_wav.path(),
+        samples,
         locale.as_deref(),
         crate::apple_speech::AppleSpeechMode::Speech,
         true,
@@ -2028,7 +2008,7 @@ fn ensure_live_whisper_ctx<'a>(
         .expect("whisper context should exist after ensure_live_whisper_ctx"))
 }
 
-#[cfg(all(feature = "whisper", feature = "parakeet"))]
+#[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
 fn resolve_apple_speech_live_fallback<P, W>(
     parakeet_fallback_ready: bool,
     mut try_parakeet: P,
@@ -2073,6 +2053,9 @@ fn finalize_live_utterance(
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
     source: &'static str,
 ) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    let _ = (apple_live_enabled, parakeet_fallback_ready);
+
     #[cfg(target_os = "macos")]
     if *apple_live_enabled {
         match transcribe_with_apple_speech_for_live_sidecar(apple_utterance_samples, config) {
@@ -4083,24 +4066,62 @@ mod tests {
     }
 
     #[test]
-    fn live_scope_warning_only_applies_to_parakeet() {
-        #[cfg(feature = "parakeet")]
-        {
-            assert_eq!(live_engine_scope_warning("parakeet"), None);
-            assert_eq!(live_engine_scope_warning("PaRaKeEt"), None);
-        }
-        #[cfg(not(feature = "parakeet"))]
-        {
-            assert_eq!(
-                live_engine_scope_warning("parakeet"),
-                Some(PARAKEET_LIVE_SCOPE_WARNING)
-            );
-            assert_eq!(
-                live_engine_scope_warning("PaRaKeEt"),
-                Some(PARAKEET_LIVE_SCOPE_WARNING)
-            );
-        }
+    fn pathname_only_live_backends_resolve_to_whisper() {
+        assert_eq!(
+            live_engine_scope_warning("parakeet"),
+            Some(PARAKEET_LIVE_SCOPE_WARNING)
+        );
+        assert_eq!(
+            live_engine_scope_warning("PaRaKeEt"),
+            Some(PARAKEET_LIVE_SCOPE_WARNING)
+        );
         assert_eq!(live_engine_scope_warning("whisper"), None);
+        assert_eq!(
+            live_engine_scope_warning("apple-speech"),
+            Some(APPLE_SPEECH_LIVE_SCOPE_WARNING)
+        );
+        assert!(!live_supports_apple_speech());
+
+        let mut config = Config::default();
+        config.live_transcript.backend = "apple-speech".into();
+        assert_eq!(resolved_standalone_backend(&config), "whisper");
+        assert_eq!(
+            live_engine_scope_warning(config.effective_live_transcript_backend()),
+            Some(APPLE_SPEECH_LIVE_SCOPE_WARNING)
+        );
+        config.live_transcript.backend = "parakeet".into();
+        assert_eq!(resolved_standalone_backend(&config), "whisper");
+        assert_eq!(
+            live_engine_scope_warning(config.effective_live_transcript_backend()),
+            Some(PARAKEET_LIVE_SCOPE_WARNING)
+        );
+    }
+
+    #[test]
+    fn recording_sidecar_resolves_retained_parakeet_to_whisper() {
+        let mut config = Config::default();
+        config.live_transcript.backend = "parakeet".into();
+
+        let (backend, diagnostic) = recording_sidecar_live_backend(&config);
+
+        assert_eq!(backend, "whisper");
+        let diagnostic = diagnostic.expect("fallback reason must remain visible");
+        assert!(diagnostic.contains("retained parakeet"));
+        assert!(diagnostic.contains("secure private audio"));
+    }
+
+    #[test]
+    fn recording_sidecar_resolves_retained_apple_speech_honestly() {
+        let mut config = Config::default();
+        config.live_transcript.backend = "apple-speech".into();
+
+        let (backend, diagnostic) = recording_sidecar_live_backend(&config);
+
+        assert_eq!(backend, "whisper");
+        let diagnostic = diagnostic.expect("fallback reason must remain visible");
+        assert!(diagnostic.contains("retained apple-speech"));
+        assert!(diagnostic.contains("cannot receive secure private audio"));
+        assert!(!diagnostic.contains("applies only to standalone"));
     }
 
     #[test]
@@ -4216,7 +4237,7 @@ mod tests {
         // test in the RFC.)
     }
 
-    #[cfg(all(feature = "whisper", feature = "parakeet"))]
+    #[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
     #[test]
     fn apple_speech_fallback_prefers_ready_parakeet_before_whisper() {
         let calls = std::sync::Mutex::new(Vec::<&'static str>::new());
@@ -4237,7 +4258,7 @@ mod tests {
         assert_eq!(result, Some(("parakeet transcript".into(), 1.2)));
     }
 
-    #[cfg(all(feature = "whisper", feature = "parakeet"))]
+    #[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
     #[test]
     fn apple_speech_fallback_uses_whisper_when_parakeet_is_not_ready() {
         let calls = std::sync::Mutex::new(Vec::<&'static str>::new());
@@ -4258,7 +4279,7 @@ mod tests {
         assert_eq!(result, Some(("whisper transcript".into(), 1.2)));
     }
 
-    #[cfg(all(feature = "whisper", feature = "parakeet"))]
+    #[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
     #[test]
     fn apple_speech_fallback_tries_whisper_after_parakeet_error() {
         let calls = std::sync::Mutex::new(Vec::<&'static str>::new());
@@ -4277,32 +4298,6 @@ mod tests {
 
         assert_eq!(calls.lock().unwrap().as_slice(), &["parakeet", "whisper"]);
         assert_eq!(result, Some(("whisper transcript".into(), 0.9)));
-    }
-
-    #[cfg(all(feature = "whisper", target_os = "macos"))]
-    #[test]
-    fn apple_speech_live_helper_cleans_up_tempfile_on_error() {
-        let cfg = Config::default();
-        let samples = vec![0.0f32; APPLE_SPEECH_LIVE_MIN_SAMPLES];
-        let seen_path = std::sync::Mutex::new(None::<PathBuf>);
-
-        let result = transcribe_with_apple_speech_for_live_sidecar_impl(
-            &samples,
-            &cfg,
-            |path, _locale, _mode, _ensure_assets| {
-                *seen_path.lock().unwrap() = Some(path.to_path_buf());
-                Err(MinutesError::Io(std::io::Error::other(
-                    "simulated apple speech failure",
-                )))
-            },
-        );
-
-        assert!(result.is_err());
-        let leaked_path = seen_path.lock().unwrap().clone().unwrap();
-        assert!(
-            !leaked_path.exists(),
-            "temporary WAV should be cleaned up after helper failure"
-        );
     }
 
     #[test]

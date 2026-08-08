@@ -64,12 +64,12 @@ predicate, not a ground-up rebuild.
 - `crates/core/src/overlays.rs` — `~/.minutes/overlays.db`, additive
   human-confirmed state layered over immutable meeting markdown and re-applied
   on every graph rebuild. The existing home for confirmations that must survive
-  the `graph.db` wipe.
+  rematerialization of the process-private graph projection.
 - `crates/core/src/vocabulary.rs` — local vocabulary store + CLI
   (`minutes vocabulary add --kind person <canonical> --alias ...`); feeds both
   the decode hints and the name-correction pool.
-- Speaker attribution L0-L3 with confidence gating; voice profiles in
-  `voices.db` (survives graph rebuild; `graph.db` does not).
+- Speaker attribution L0-L3 with confidence gating; durable voice profiles in
+  `voices.db` survive graph projection rematerialization.
 
 ## The gap the junrei case exposes
 
@@ -176,8 +176,8 @@ Status (2026-07-02): part 2 (confirm-merge action + persistence) SHIPPED as
 vocabulary store (no new graph routing): the command writes a `Person`
 `VocabularyEntry{canonical, aliases}`, which `load_vocabulary_person_entities`
 feeds into the `PersonCanonicalizer` on rebuild, collapsing every variant to the
-canonical slug and re-pointing meetings/commitments. It survives the `graph.db`
-wipe because vocabulary.toml is not derived. Canonical is evidence-ranked in the
+canonical slug and re-pointing meetings/commitments. It survives projection
+rematerialization because vocabulary.toml is not derived. Canonical is evidence-ranked in the
 suggested command (highest `meeting_count` first); `validate_alias_conflicts`
 fail-closes on a variant already bound to a different canonical (named error +
 recovery command); the graph auto-rebuilds (or `--no-rebuild`), reporting
@@ -198,7 +198,7 @@ clustering (union-find) over those edges. Add a user-facing confirm-merge
 (`minutes graph merge` CLI and/or an MCP tool); default stays suggestion-only,
 auto-merge only at extreme confidence and always with provenance.
 
-Persistence: a confirmed merge must survive the `graph.db` wipe. Two existing
+Persistence: a confirmed merge must survive process-private projection rematerialization. Two existing
 homes, pick one deliberately: `overlays.rs` (`~/.minutes/overlays.db`, the
 purpose-built additive human-confirmed-state layer re-applied on rebuild), or
 the vocabulary store (already loaded into `PersonCanonicalizer` on rebuild).
@@ -241,8 +241,8 @@ engine track, not part of the canonicalization epic.
 
 - **Wrong-merge regressions** — mitigated by the asymmetric eval and
   confirm-gating; the gating number is wrong-merges = 0.
-- **Persistence** — confirmed merges must survive `graph.db` rebuild, so they
-  write to vocabulary/canonicalizer, never only to `graph.db`.
+- **Persistence** — confirmed merges must survive graph projection rematerialization, so they
+  write to vocabulary/canonicalizer, never only to the disposable projection.
 - **Scope creep** into a full diarization rewrite — kept in the Adjacent track.
 - **Symphonym transfer risk** (place names -> personal names) — bench before
   adopt; rules stay the default until beaten.

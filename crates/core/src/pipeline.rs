@@ -9,9 +9,16 @@ use crate::notes;
 use crate::person_identity::{is_plausible_person_name, strip_contamination};
 use crate::summarize;
 use chrono::{DateTime, Local};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
+#[cfg(not(any(target_os = "macos", windows)))]
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use whisper_guard::segments as wg_segments;
+use zeroize::Zeroizing;
 
 /// Stem active-ratio threshold below which a capture source is considered
 /// "sparse" (almost no audible energy).
@@ -187,6 +194,37 @@ fn detect_summarization_warnings(
         });
     }
     warnings
+}
+
+/// Records a [`ProcessingWarning`] when the configured batch transcription
+/// engine is not the one that actually produced the transcript.
+///
+/// `transcribe_dispatch` already emits a `tracing` warning for this, but that
+/// only reaches the CLI: the desktop app deliberately installs no
+/// `tracing_subscriber`, so the event is dropped and the substitution is
+/// invisible there. The engine materially changes the transcript, so the file
+/// itself carries the record and stays greppable after the fact (#633).
+fn detect_engine_fallback_warning(config: &Config) -> Option<ProcessingWarning> {
+    let requested = config.transcription.engine.trim();
+    let effective = crate::transcribe::effective_batch_engine(config);
+    if requested.eq_ignore_ascii_case(effective) {
+        return None;
+    }
+    let detail = if requested.eq_ignore_ascii_case("parakeet") {
+        parakeet_capability(cfg!(feature = "parakeet")).unavailable_reason()
+    } else if requested.eq_ignore_ascii_case("apple-speech") {
+        apple_speech_unavailable_reason()
+    } else {
+        "it is unavailable in this build"
+    };
+    Some(ProcessingWarning {
+        step: "transcribe".to_string(),
+        reason: "engine_fallback".to_string(),
+        timeout_secs: None,
+        message: Some(format!(
+            "Requested transcription engine `{requested}` did not run ({detail}); this transcript was produced by `{effective}`."
+        )),
+    })
 }
 
 const SILENT_REMOTE_WARNING_MESSAGE: &str =
@@ -577,12 +615,12 @@ fn log_rendered_label_collapse_diagnostic(
         diarization_speakers = result.num_speakers,
         rendered_speaker_labels,
         degraded_capture = result.degraded_capture.is_some(),
-        audio = %audio_path.display(),
+        audio = %private_audio_diagnostic_label(audio_path),
         "diarization found multiple speakers but transcript rendered one or fewer speaker labels"
     );
     logging::log_step(
         "diarize_rendered_label_collapse",
-        &audio_path.display().to_string(),
+        &private_audio_diagnostic_label(audio_path),
         0,
         serde_json::json!({
             "diagnostic": true,
@@ -599,36 +637,1163 @@ fn expected_voice_stem_path(audio_path: &Path) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{}.voice.wav", stem)))
 }
 
-/// RAII handle for a stem-mix temp file. Dropping the value unlinks the
-/// file from /tmp, including on early Err returns from the transcription
-/// coordinator. Belt-and-suspenders against future call-site refactors
-/// that might forget the manual cleanup (#235 review item #1).
-///
-/// The temp file contains raw meeting audio, so leaking it on error is
-/// a privacy issue, not just a cleanliness one. The Drop impl deliberately
-/// swallows the unlink error (the file may already be gone if the OS or
-/// a test harness cleaned it up); leaving a partial file behind is the
-/// only failure mode worth thinking about and `Drop` cannot recover from
-/// it any better than the existing best-effort logic did.
-struct MixedStemTempFile {
-    path: std::path::PathBuf,
+#[cfg(target_os = "linux")]
+fn ensure_private_audio_process_barrier() -> std::io::Result<()> {
+    static BARRIER: OnceLock<Result<(), String>> = OnceLock::new();
+    let result = BARRIER.get_or_init(|| {
+        // Linux exposes anonymous descriptors through /proc/<pid>/fd to any
+        // process allowed to ptrace this one. Owner-only modes, O_TMPFILE and
+        // CLOEXEC do not close that same-UID route. Make this process and its
+        // ordinary children non-dumpable before the first audio descriptor is
+        // created; the Parakeet child inherits the barrier while receiving
+        // only its explicitly leased descriptor.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err("could not install the Linux private-audio process barrier".into());
+        }
+        if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err("Linux private-audio process barrier did not remain active".into());
+        }
+        Ok(())
+    });
+    result
+        .as_ref()
+        .map_err(|message| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, message.clone())
+        })
+        .copied()
 }
 
-impl MixedStemTempFile {
-    fn as_path(&self) -> &Path {
-        &self.path
+#[cfg(target_os = "linux")]
+fn create_anonymous_audio_file(root: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    ensure_private_audio_process_barrier()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC)
+        .open(root)?;
+    verify_anonymous_audio_file(&file)?;
+    Ok(file)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn create_anonymous_audio_file(_root: &Path) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "anonymous private audio capabilities are unavailable on this Unix platform",
+    ))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn verify_anonymous_audio_file(_file: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "anonymous private audio capabilities are unavailable on this Unix platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_anonymous_audio_file(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 0 || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(
+            "private audio capability is not anonymous and owner-private",
+        ));
+    }
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+        return Err(std::io::Error::other(
+            "private audio capability is unexpectedly inheritable",
+        ));
+    }
+    Ok(())
+}
+
+/// Process-local name for an exact private-audio handle.
+///
+/// The returned path is deliberately not a filesystem pathname. It is an
+/// opaque key into this process's registry, allowing existing pipeline APIs to
+/// carry format information without exposing a plaintext filesystem path.
+struct PrivateAudioRegistration {
+    path: PathBuf,
+}
+
+enum RegisteredPrivateAudio {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    File(Arc<RegisteredFileAudio>),
+    #[cfg(any(target_os = "macos", windows))]
+    Sealed(crate::sealed_audio::WeakSealedAudio),
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+const MAX_ACTIVE_REGISTERED_PRIVATE_AUDIO_READERS: usize = 8;
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) struct RegisteredFileAudio {
+    file: File,
+    state: Mutex<RegisteredFileGenerationState>,
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+struct RegisteredFileGenerationState {
+    generation: u64,
+    sealed: bool,
+    writer_issued: bool,
+    writer_active: bool,
+    active_readers: usize,
+    retired: bool,
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) struct RegisteredFileReaderLease {
+    audio: Arc<RegisteredFileAudio>,
+    generation: u64,
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+impl Drop for RegisteredFileReaderLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.audio.state.lock() {
+            state.active_readers = state.active_readers.saturating_sub(1);
+        }
     }
 }
 
-impl Drop for MixedStemTempFile {
+#[cfg(not(any(target_os = "macos", windows)))]
+impl RegisteredFileReaderLease {
+    fn verify(&self) -> std::io::Result<()> {
+        let state = self
+            .audio
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("private audio generation lock poisoned"))?;
+        if state.retired || !state.sealed || state.generation != self.generation {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private audio reader generation was retired",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) struct RegisteredFileWriterLease {
+    audio: Arc<RegisteredFileAudio>,
+    generation: u64,
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+impl Drop for RegisteredFileWriterLease {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Ok(mut state) = self.audio.state.lock() {
+            if state.generation == self.generation {
+                state.writer_active = false;
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+impl RegisteredFileAudio {
+    fn prepare_writer(self: &Arc<Self>) -> std::io::Result<PrivateAudioWriter> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("private audio generation lock poisoned"))?;
+        if state.retired || state.writer_active || state.active_readers != 0 {
+            return Err(std::io::Error::other("private audio is still in use"));
+        }
+
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("private audio generation counter overflowed"))?;
+        state.sealed = false;
+        state.writer_issued = true;
+        state.writer_active = true;
+        let generation = state.generation;
+
+        let prepared = self.file.try_clone().and_then(|mut file| {
+            file.set_len(0)?;
+            file.rewind()?;
+            Ok(file)
+        });
+        let file = match prepared {
+            Ok(file) => file,
+            Err(error) => {
+                // Once destructive preparation starts, no prior generation may
+                // remain readable. Retire even when the failure happened before
+                // truncation; fail-closed is preferable to guessing which
+                // descriptor operation completed.
+                state.writer_active = false;
+                state.retired = true;
+                return Err(error);
+            }
+        };
+        drop(state);
+
+        Ok(PrivateAudioWriter::File {
+            file,
+            _registered_lease: Some(RegisteredFileWriterLease {
+                audio: Arc::clone(self),
+                generation,
+            }),
+        })
+    }
+
+    fn finish(&self) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("private audio generation lock poisoned"))?;
+        if state.retired || state.writer_active || !state.writer_issued {
+            return Err(std::io::Error::other(
+                "private audio generation is incomplete or retired",
+            ));
+        }
+        self.file.sync_all()?;
+        state.sealed = true;
+        Ok(())
+    }
+}
+
+fn private_audio_registry() -> &'static Mutex<HashMap<PathBuf, RegisteredPrivateAudio>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, RegisteredPrivateAudio>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn is_reserved_private_audio_path(path: &Path) -> bool {
+    path.starts_with(Path::new("/minutes-private-audio"))
+}
+
+pub(crate) fn private_audio_diagnostic_label(path: &Path) -> String {
+    if is_reserved_private_audio_path(path) {
+        "private-audio".into()
+    } else {
+        path.display().to_string()
+    }
+}
+
+fn allocate_private_audio_registration(
+    backing: RegisteredPrivateAudio,
+    format_extension: &str,
+) -> std::io::Result<PrivateAudioRegistration> {
+    let extension = format_extension.trim_start_matches('.');
+    for _ in 0..16 {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|error| {
+            std::io::Error::other(format!("private audio registry nonce failed: {error}"))
+        })?;
+        let token = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = PathBuf::from("/minutes-private-audio").join(format!("{token}.{extension}"));
+        let mut registry = private_audio_registry()
+            .lock()
+            .map_err(|_| std::io::Error::other("private audio registry lock poisoned"))?;
+        if registry.contains_key(&path) {
+            continue;
+        }
+        registry.insert(path.clone(), backing);
+        return Ok(PrivateAudioRegistration { path });
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique private audio registry capability",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn register_private_audio_file(
+    file: &File,
+    format_extension: &str,
+) -> std::io::Result<PrivateAudioRegistration> {
+    let retained = file.try_clone()?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+            return Err(std::io::Error::other(
+                "private audio registry descriptor is unexpectedly inheritable",
+            ));
+        }
+    }
+    allocate_private_audio_registration(
+        RegisteredPrivateAudio::File(Arc::new(RegisteredFileAudio {
+            file: retained,
+            state: Mutex::new(RegisteredFileGenerationState {
+                generation: 0,
+                sealed: false,
+                writer_issued: false,
+                writer_active: false,
+                active_readers: 0,
+                retired: false,
+            }),
+        })),
+        format_extension,
+    )
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn register_sealed_private_audio(
+    audio: &crate::sealed_audio::SealedAudio,
+    format_extension: &str,
+) -> std::io::Result<PrivateAudioRegistration> {
+    allocate_private_audio_registration(
+        RegisteredPrivateAudio::Sealed(audio.downgrade()),
+        format_extension,
+    )
+}
+
+fn registered_private_audio_reader(path: &Path) -> std::io::Result<Option<PrivateAudioReader>> {
+    let registry = private_audio_registry()
+        .lock()
+        .map_err(|_| std::io::Error::other("private audio registry lock poisoned"))?;
+    match registry.get(path) {
+        #[cfg(not(any(target_os = "macos", windows)))]
+        Some(RegisteredPrivateAudio::File(audio)) => Ok(Some(
+            PrivateAudioReader::from_registered_file(Arc::clone(audio))?,
+        )),
+        #[cfg(any(target_os = "macos", windows))]
+        Some(RegisteredPrivateAudio::Sealed(audio)) => {
+            let audio = audio.upgrade().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "private audio owner retired")
+            })?;
+            Ok(Some(PrivateAudioReader::Sealed(audio.reader()?)))
+        }
+        None if is_reserved_private_audio_path(path) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private audio capability is stale or forged",
+        )),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn registered_file_audio(path: &Path) -> std::io::Result<Arc<RegisteredFileAudio>> {
+    let registry = private_audio_registry()
+        .lock()
+        .map_err(|_| std::io::Error::other("private audio registry lock poisoned"))?;
+    match registry.get(path) {
+        Some(RegisteredPrivateAudio::File(audio)) => Ok(Arc::clone(audio)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private audio capability is stale or forged",
+        )),
+    }
+}
+
+fn retire_private_audio_registration(path: &Path) {
+    let removed = private_audio_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    if let Some(RegisteredPrivateAudio::File(audio)) = removed {
+        if let Ok(mut state) = audio.state.lock() {
+            state.retired = true;
+            state.sealed = false;
+        }
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = removed;
+}
+
+/// Independent cursor over an exact private-audio handle.
+///
+/// Unix `dup` descriptors share one kernel file offset. Using positional reads
+/// keeps concurrent transcription, probes, and diarization from advancing one
+/// another even though they refer to the same anonymous object.
+pub(crate) enum PrivateAudioReader {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    File {
+        file: File,
+        position: u64,
+        len: u64,
+        _registered_lease: Option<RegisteredFileReaderLease>,
+    },
+    #[cfg(any(target_os = "macos", windows))]
+    Sealed(crate::sealed_audio::SealedAudioReader),
+}
+
+impl PrivateAudioReader {
+    #[cfg(all(not(unix), not(windows)))]
+    fn from_file(file: File) -> std::io::Result<Self> {
+        let len = file.metadata()?.len();
+        Ok(Self::File {
+            file,
+            position: 0,
+            len,
+            _registered_lease: None,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn from_registered_file(audio: Arc<RegisteredFileAudio>) -> std::io::Result<Self> {
+        let generation = {
+            let mut state = audio
+                .state
+                .lock()
+                .map_err(|_| std::io::Error::other("private audio generation lock poisoned"))?;
+            if state.retired || !state.sealed || state.writer_active {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "private audio generation is not sealed for reading",
+                ));
+            }
+            if state.active_readers >= MAX_ACTIVE_REGISTERED_PRIVATE_AUDIO_READERS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "private audio reader count is exhausted",
+                ));
+            }
+            state.active_readers += 1;
+            state.generation
+        };
+        let lease = RegisteredFileReaderLease { audio, generation };
+        let file = match lease.audio.file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                drop(lease);
+                return Err(error);
+            }
+        };
+        let len = file.metadata()?.len();
+        Ok(Self::File {
+            file,
+            position: 0,
+            len,
+            _registered_lease: Some(lease),
+        })
+    }
+}
+
+impl Read for PrivateAudioReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(not(any(target_os = "macos", windows)))]
+            Self::File {
+                file,
+                position,
+                _registered_lease,
+                ..
+            } => {
+                if let Some(lease) = _registered_lease {
+                    lease.verify()?;
+                }
+                #[cfg(unix)]
+                let read = {
+                    use std::os::unix::fs::FileExt;
+                    file.read_at(buffer, *position)?
+                };
+                #[cfg(not(unix))]
+                let read = {
+                    file.seek(std::io::SeekFrom::Start(*position))?;
+                    file.read(buffer)?
+                };
+                *position = position.saturating_add(read as u64);
+                Ok(read)
+            }
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Sealed(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl Seek for PrivateAudioReader {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            #[cfg(not(any(target_os = "macos", windows)))]
+            Self::File {
+                position: current,
+                len,
+                ..
+            } => {
+                let next = match position {
+                    std::io::SeekFrom::Start(offset) => i128::from(offset),
+                    std::io::SeekFrom::End(offset) => i128::from(*len) + i128::from(offset),
+                    std::io::SeekFrom::Current(offset) => i128::from(*current) + i128::from(offset),
+                };
+                if !(0..=i128::from(u64::MAX)).contains(&next) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "private audio seek is outside the capability",
+                    ));
+                }
+                *current = next as u64;
+                Ok(*current)
+            }
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Sealed(reader) => reader.seek(position),
+        }
+    }
+}
+
+#[cfg(test)]
+fn read_registered_private_audio(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut reader = registered_private_audio_reader(path)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "capability missing"))?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn private_audio_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let registry = private_audio_registry()
+        .lock()
+        .map_err(|_| std::io::Error::other("private audio registry lock poisoned"))?;
+    match registry.get(path) {
+        #[cfg(not(any(target_os = "macos", windows)))]
+        Some(RegisteredPrivateAudio::File(audio)) => audio.file.metadata(),
+        #[cfg(any(target_os = "macos", windows))]
+        Some(RegisteredPrivateAudio::Sealed(audio)) => audio
+            .upgrade()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "private audio owner retired")
+            })?
+            .metadata(),
+        None if is_reserved_private_audio_path(path) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private audio capability is stale or forged",
+        )),
+        None => std::fs::metadata(path),
+    }
+}
+
+pub(crate) fn private_audio_len(path: &Path) -> std::io::Result<u64> {
+    let registry = private_audio_registry()
+        .lock()
+        .map_err(|_| std::io::Error::other("private audio registry lock poisoned"))?;
+    match registry.get(path) {
+        #[cfg(not(any(target_os = "macos", windows)))]
+        Some(RegisteredPrivateAudio::File(audio)) => Ok(audio.file.metadata()?.len()),
+        #[cfg(any(target_os = "macos", windows))]
+        Some(RegisteredPrivateAudio::Sealed(audio)) => audio
+            .upgrade()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "private audio owner retired")
+            })?
+            .len(),
+        None if is_reserved_private_audio_path(path) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private audio capability is stale or forged",
+        )),
+        None => Ok(std::fs::metadata(path)?.len()),
+    }
+}
+
+impl Drop for PrivateAudioRegistration {
+    fn drop(&mut self) {
+        retire_private_audio_registration(&self.path);
+    }
+}
+
+/// Retained capability for a raw-audio temporary file.
+///
+/// Linux uses an anonymous file with no cleanup pathname. macOS and Windows
+/// retain encrypted bytes behind an exact, non-inheritable parent-side handle.
+/// Other platforms may use an owner-private temporary leaf when available.
+pub(crate) enum PrivateAudioWriter {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    File {
+        file: File,
+        _registered_lease: Option<RegisteredFileWriterLease>,
+    },
+    #[cfg(any(target_os = "macos", windows))]
+    Sealed(crate::sealed_audio::SealedAudioWriter),
+}
+
+impl Write for PrivateAudioWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(not(any(target_os = "macos", windows)))]
+            Self::File {
+                file,
+                _registered_lease: Some(lease),
+            } => {
+                let state =
+                    lease.audio.state.lock().map_err(|_| {
+                        std::io::Error::other("private audio generation lock poisoned")
+                    })?;
+                if state.retired || !state.writer_active || state.generation != lease.generation {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "private audio writer generation was retired",
+                    ));
+                }
+                file.write(bytes)
+            }
+            #[cfg(not(any(target_os = "macos", windows)))]
+            Self::File {
+                file,
+                _registered_lease: None,
+            } => file.write(bytes),
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Sealed(writer) => writer.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(not(any(target_os = "macos", windows)))]
+            Self::File {
+                file,
+                _registered_lease: Some(lease),
+            } => {
+                let state =
+                    lease.audio.state.lock().map_err(|_| {
+                        std::io::Error::other("private audio generation lock poisoned")
+                    })?;
+                if state.retired || !state.writer_active || state.generation != lease.generation {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "private audio writer generation was retired",
+                    ));
+                }
+                file.flush()
+            }
+            #[cfg(not(any(target_os = "macos", windows)))]
+            Self::File {
+                file,
+                _registered_lease: None,
+            } => file.flush(),
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Sealed(writer) => writer.flush(),
+        }
+    }
+}
+
+pub(crate) struct PrivateAudioTempFile {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    file: File,
+    #[cfg(any(target_os = "macos", windows))]
+    sealed: crate::sealed_audio::SealedAudio,
+    #[cfg(any(unix, windows))]
+    processing_path: PathBuf,
+    #[cfg(any(unix, windows))]
+    _registration: PrivateAudioRegistration,
+    #[cfg(all(not(unix), not(windows)))]
+    file: tempfile::NamedTempFile,
+    #[cfg(all(not(unix), not(windows)))]
+    _directory: tempfile::TempDir,
+}
+
+/// Whether this platform has an exact private-audio capability that can be
+/// handed to an out-of-process decoder without reopening a mutable leaf.
+///
+/// Linux uses an anonymous descriptor; macOS and Windows use an authenticated
+/// ciphertext spool retained behind a non-inheritable parent-side handle.
+pub const fn private_audio_processing_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos", windows))
+}
+
+/// Whether the configured pathname-only Parakeet CLI can consume an exact
+/// anonymous private-audio capability on this platform.
+///
+/// The pathname-only CLI is deliberately disabled on every supported
+/// platform. Linux can inherit an O_TMPFILE descriptor, but an ordinary
+/// `execve` resets the child to dumpable and makes that descriptor race-openable
+/// through `/proc/<pid>/fd` by a hostile same-UID process. macOS likewise must
+/// not expose the sealed ciphertext backing or key. Parakeet remains on the
+/// in-process Whisper fallback until it accepts bytes/stdin or participates in
+/// an acknowledged post-exec descriptor-isolation protocol.
+pub const fn parakeet_private_audio_transport_supported() -> bool {
+    false
+}
+
+/// Whether this exact running app can authenticate the bundled one-purpose
+/// Apple Speech XPC service before sending private utterance bytes.
+pub fn apple_speech_private_audio_transport_supported() -> bool {
+    // The service implementation and packaging are present, but product
+    // selection remains fail-closed until the exact reviewed SHA passes the
+    // separately authorized signed-macOS hostile-holder/runtime gate.
+    false
+}
+
+/// Resolve an Apple Speech preference through the product transport gate.
+///
+/// This stays in the always-compiled pipeline layer so product callers and the
+/// signed transport acceptance route exercise the same fail-closed decision.
+pub fn resolved_apple_speech_backend(requested: &str) -> &str {
+    if requested.eq_ignore_ascii_case("apple-speech")
+        && !apple_speech_private_audio_transport_supported()
+    {
+        "whisper"
+    } else {
+        requested
+    }
+}
+
+pub const fn apple_speech_unavailable_reason() -> &'static str {
+    "the signed Apple Speech secure private audio byte-transport service is unavailable or untrusted"
+}
+
+/// One cross-surface answer to whether Parakeet can actually be selected.
+///
+/// Keeping the individual layers visible lets settings and health explain the
+/// missing prerequisite without ever confusing "compiled" with "usable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParakeetCapability {
+    pub compiled: bool,
+    pub platform_supported: bool,
+    pub transport_supported: bool,
+    pub runtime_available: bool,
+    pub selectable: bool,
+}
+
+impl ParakeetCapability {
+    /// Compose a capability from independently testable layers.
+    pub const fn from_layers(
+        compiled: bool,
+        platform_supported: bool,
+        transport_supported: bool,
+        runtime_available: bool,
+    ) -> Self {
+        Self {
+            compiled,
+            platform_supported,
+            transport_supported,
+            runtime_available,
+            selectable: compiled && platform_supported && transport_supported && runtime_available,
+        }
+    }
+
+    /// Stable human-readable reason used by every user-facing surface.
+    pub const fn unavailable_reason(self) -> &'static str {
+        // The secure transport is the load-bearing blocker: rebuilding with
+        // the feature enabled still cannot make the pathname-only helper safe.
+        // Lead with that invariant so minimal and feature builds tell users
+        // the same truth instead of implying that a rebuild is sufficient.
+        if !self.transport_supported {
+            "unavailable because the Parakeet process cannot receive secure private audio on this platform"
+        } else if !self.compiled {
+            "unavailable in this build"
+        } else if !self.platform_supported {
+            "unavailable on this platform"
+        } else if !self.runtime_available {
+            "unavailable because secure private-audio storage is not available at runtime"
+        } else {
+            "unavailable"
+        }
+    }
+}
+
+/// Resolve the actual Parakeet capability for this platform and runtime.
+///
+/// `compiled` is supplied by the caller because the CLI and desktop have
+/// separate Cargo feature surfaces even though both share this policy.
+pub fn parakeet_capability(compiled: bool) -> ParakeetCapability {
+    ParakeetCapability::from_layers(
+        compiled,
+        private_audio_processing_supported(),
+        parakeet_private_audio_transport_supported(),
+        private_audio_processing_available(),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRIVATE_AUDIO_PROCESSING_AVAILABLE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Override the runtime capability probe for one test thread. The scoped,
+/// thread-local guard keeps parallel tests from changing production dispatch
+/// decisions in neighboring tests.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_private_audio_processing_available_for_test<T>(
+    available: bool,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PRIVATE_AUDIO_PROCESSING_AVAILABLE_OVERRIDE.with(|slot| slot.set(self.0));
+        }
+    }
+
+    PRIVATE_AUDIO_PROCESSING_AVAILABLE_OVERRIDE.with(|slot| {
+        let restore = Restore(slot.replace(Some(available)));
+        let result = run();
+        drop(restore);
+        result
+    })
+}
+
+/// Probe the actual anonymous-audio primitive for the configured temp root.
+/// Platform support alone is insufficient on Linux because the selected
+/// filesystem may reject `O_TMPFILE`.
+pub fn private_audio_processing_available() -> bool {
+    #[cfg(test)]
+    if let Some(available) = PRIVATE_AUDIO_PROCESSING_AVAILABLE_OVERRIDE.with(std::cell::Cell::get)
+    {
+        return available;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        PrivateAudioTempFile::new("minutes-private-audio-probe-", ".wav").is_ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        false
+    }
+}
+
+/// A child-visible view of an exact private-audio capability.
+///
+/// Unix descriptor paths are meaningful only in a process that inherited the
+/// corresponding descriptor. The lease owns a fresh read handle that remains
+/// `FD_CLOEXEC` in the parent and must stay alive through the complete child
+/// lifecycle. Only the selected child's `pre_exec` hook clears cloexec and
+/// rewinds that handle; concurrent unrelated children cannot inherit it.
+#[cfg(any(feature = "parakeet", all(test, target_os = "linux")))]
+#[cfg_attr(not(feature = "parakeet"), allow(dead_code))]
+pub(crate) struct PrivateAudioChildLease {
+    path: PathBuf,
+    #[cfg(unix)]
+    _inherited_read: File,
+}
+
+#[cfg(any(feature = "parakeet", all(test, target_os = "linux")))]
+#[cfg_attr(not(feature = "parakeet"), allow(dead_code))]
+impl PrivateAudioChildLease {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Make only this exact command inherit the anonymous read descriptor.
+    /// The parent descriptor remains `FD_CLOEXEC`, so concurrent unrelated
+    /// spawns cannot enumerate or read raw meeting audio.
+    pub(crate) fn configure_command(
+        &self,
+        command: &mut crate::bounded_child::BoundedCommand,
+    ) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = self._inherited_read.as_raw_fd();
+            let current = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if current < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if current & libc::FD_CLOEXEC == 0 {
+                return Err(std::io::Error::other(
+                    "private audio child descriptor was unexpectedly inheritable in the parent",
+                ));
+            }
+            // SAFETY: this closure executes after fork and before exec; `fcntl`
+            // and `lseek` are async-signal-safe and the captured descriptor is
+            // a plain integer.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        || libc::lseek(fd, 0, libc::SEEK_SET) < 0
+                    {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = command;
+        Ok(())
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn ensure_private_temp_directory(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "private audio temporary root is not a directory",
+        ))
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn ensure_private_temp_file(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "private audio temporary capability is not a regular file",
+        ))
+    }
+}
+
+impl PrivateAudioTempFile {
+    pub(crate) fn new(prefix: &str, suffix: &str) -> std::io::Result<Self> {
+        Self::new_in(&std::env::temp_dir(), prefix, suffix)
+    }
+
+    fn new_in(root: &Path, prefix: &str, suffix: &str) -> std::io::Result<Self> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let _ = prefix;
+            let file = create_anonymous_audio_file(root)?;
+            let registration = register_private_audio_file(&file, suffix)?;
+            let processing_path = registration.path.clone();
+            let temp = Self {
+                file,
+                processing_path,
+                _registration: registration,
+            };
+            temp.verify_private_identity()?;
+            Ok(temp)
+        }
+
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let _ = prefix;
+            let sealed = crate::sealed_audio::SealedAudio::new_in(root)?;
+            let registration = register_sealed_private_audio(&sealed, suffix)?;
+            let processing_path = registration.path.clone();
+            let temp = Self {
+                sealed,
+                processing_path,
+                _registration: registration,
+            };
+            temp.verify_private_identity()?;
+            Ok(temp)
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let directory = tempfile::Builder::new().prefix(prefix).tempdir_in(root)?;
+            ensure_private_temp_directory(directory.path())?;
+            let file = tempfile::Builder::new()
+                .prefix("audio-")
+                .suffix(suffix)
+                .tempfile_in(directory.path())?;
+            ensure_private_temp_file(file.path())?;
+            let temp = Self {
+                file,
+                _directory: directory,
+            };
+            temp.verify_private_identity()?;
+            Ok(temp)
+        }
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        #[cfg(any(unix, windows))]
+        return &self.processing_path;
+
+        #[cfg(all(not(unix), not(windows)))]
+        return self.file.path();
+    }
+
+    /// Return the opaque process-local key for the retained handle. It is not
+    /// a filesystem pathname; readers resolve it through the exact capability
+    /// registry and decoder children receive a cloned fd or byte stream.
+    pub(crate) fn processing_path(&self) -> PathBuf {
+        #[cfg(any(unix, windows))]
+        return self.processing_path.clone();
+
+        #[cfg(all(not(unix), not(windows)))]
+        return self.file.path().to_path_buf();
+    }
+
+    pub(crate) fn prepare_for_write(&mut self) -> std::io::Result<PrivateAudioWriter> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            registered_file_audio(&self.processing_path)?.prepare_writer()
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.sealed.reset()?;
+            Ok(PrivateAudioWriter::Sealed(self.sealed.writer()?))
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let file = self.file.as_file_mut();
+            file.set_len(0)?;
+            file.rewind()?;
+            Ok(PrivateAudioWriter::File {
+                file: file.try_clone()?,
+                _registered_lease: None,
+            })
+        }
+    }
+
+    pub(crate) fn finish_write(&mut self) -> std::io::Result<()> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            registered_file_audio(&self.processing_path)?.finish()?;
+            self.verify_private_identity()
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.sealed.finish()?;
+            self.verify_private_identity()
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let file = self.file.as_file_mut();
+            file.flush()?;
+            file.sync_all()?;
+            file.rewind()?;
+            self.verify_private_identity()
+        }
+    }
+
+    pub(crate) fn try_clone_reader(&self) -> std::io::Result<PrivateAudioReader> {
+        #[cfg(any(unix, windows))]
+        {
+            registered_private_audio_reader(&self.processing_path)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "private audio capability is not registered",
+                )
+            })
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            PrivateAudioReader::from_file(self.file.as_file().try_clone()?)
+        }
+    }
+
+    /// Discard a failed child output generation. If reset itself cannot prove
+    /// the destination empty (for example because a detached pipe worker still
+    /// owns the writer lease), retire the opaque registry entry immediately so
+    /// no caller can resolve the partial generation.
+    fn discard_failed_write(&mut self) -> std::io::Result<()> {
+        match self.prepare_for_write() {
+            Ok(writer) => {
+                drop(writer);
+                Ok(())
+            }
+            Err(error) => {
+                #[cfg(any(unix, windows))]
+                retire_private_audio_registration(&self.processing_path);
+                Err(std::io::Error::new(
+                    error.kind(),
+                    format!("private audio destination reset failed; capability retired: {error}"),
+                ))
+            }
+        }
+    }
+
+    #[cfg(any(feature = "parakeet", all(test, target_os = "linux")))]
+    pub(crate) fn child_lease(&self) -> std::io::Result<PrivateAudioChildLease> {
+        #[cfg(target_os = "linux")]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pathname-only child cannot safely inherit private audio across exec on Linux",
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pathname-only child cannot receive sealed private audio on macOS",
+            ))
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pathname-only child private-audio transport is unavailable",
+            ))
+        }
+
+        #[cfg(windows)]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pathname-only child cannot receive sealed private audio on Windows",
+            ))
+        }
+    }
+
+    pub(crate) fn verify_private_identity(&self) -> std::io::Result<()> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            // The platform constructors and this verifier must share one
+            // definition of an anonymous capability. Linux uses O_TMPFILE and
+            // requires a regular 0600 zero-link inode. The opaque registry
+            // must still resolve to this exact retained object before every
+            // processing boundary.
+            use std::os::unix::fs::MetadataExt;
+
+            verify_anonymous_audio_file(&self.file)?;
+            let registry = private_audio_registry()
+                .lock()
+                .map_err(|_| std::io::Error::other("private audio registry lock poisoned"))?;
+            let registered = match registry.get(&self.processing_path) {
+                Some(RegisteredPrivateAudio::File(file)) => file,
+                _ => {
+                    return Err(std::io::Error::other(
+                        "private audio capability is not registered",
+                    ))
+                }
+            };
+            let held = self.file.metadata()?;
+            let resolved = registered.file.metadata()?;
+            if held.dev() != resolved.dev() || held.ino() != resolved.ino() {
+                return Err(std::io::Error::other(
+                    "private audio registry changed identity",
+                ));
+            }
+            Ok(())
+        }
+
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.sealed.verify()?;
+            let registry = private_audio_registry()
+                .lock()
+                .map_err(|_| std::io::Error::other("private audio registry lock poisoned"))?;
+            match registry.get(&self.processing_path) {
+                Some(RegisteredPrivateAudio::Sealed(registered))
+                    if registered
+                        .upgrade()
+                        .is_some_and(|audio| audio.same_backing(&self.sealed)) =>
+                {
+                    Ok(())
+                }
+                _ => Err(std::io::Error::other(
+                    "sealed private audio registry changed identity",
+                )),
+            }
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let held = self.file.as_file().metadata()?;
+            let live = std::fs::symlink_metadata(self.file.path())?;
+            if !held.is_file() || !live.is_file() || live.file_type().is_symlink() {
+                return Err(std::io::Error::other(
+                    "private audio temp leaf is not a regular file",
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
 enum PreparedTranscriptionInput {
     Original,
-    Mixed(MixedStemTempFile),
+    Mixed(AuthorizedProcessAudioInput),
     SingleStem {
         path: std::path::PathBuf,
         recording_health: markdown::RecordingHealth,
@@ -636,11 +1801,22 @@ enum PreparedTranscriptionInput {
 }
 
 impl PreparedTranscriptionInput {
-    fn as_path<'a>(&'a self, original: &'a Path) -> &'a Path {
+    fn processing_path(&self, original: &Path) -> PathBuf {
         match self {
-            Self::Original => original,
-            Self::Mixed(handle) => handle.as_path(),
-            Self::SingleStem { path, .. } => path,
+            Self::Original => original.to_path_buf(),
+            Self::Mixed(handle) => handle.processing_path().to_path_buf(),
+            Self::SingleStem { path, .. } => path.clone(),
+        }
+    }
+
+    fn format_extension(&self) -> Option<&'static str> {
+        matches!(self, Self::Mixed(_)).then_some("wav")
+    }
+
+    fn internal_authority(&self) -> Option<&AuthorizedProcessAudioInput> {
+        match self {
+            Self::Mixed(input) => Some(input),
+            Self::Original | Self::SingleStem { .. } => None,
         }
     }
 
@@ -661,27 +1837,50 @@ impl PreparedTranscriptionInput {
     }
 }
 
+/// Dispatch a prepared source without erasing its authority. Ambient originals
+/// and surviving named stems use the public pathname entry; an owned stem mix
+/// stays bound to the typed private capability accepted by the authorized
+/// coordinator entry. A caller-supplied proof authority takes precedence and
+/// is independently revalidated by that entry.
+fn transcribe_prepared_input_with_hints(
+    prepared: &PreparedTranscriptionInput,
+    original: &Path,
+    input_authority: Option<&AuthorizedProcessAudioInput>,
+    content_type: ContentType,
+    config: &Config,
+    decode_hints: crate::transcribe::DecodeHints,
+) -> Result<crate::transcribe::TranscribeResult, crate::error::TranscribeError> {
+    if let Some(authority) = input_authority.or_else(|| prepared.internal_authority()) {
+        crate::transcription_coordinator::transcribe_authorized_path_for_content_with_hints(
+            authority,
+            content_type,
+            config,
+            decode_hints,
+        )
+    } else {
+        crate::transcription_coordinator::transcribe_path_for_content_with_hints(
+            &prepared.processing_path(original),
+            content_type,
+            config,
+            decode_hints,
+        )
+    }
+}
+
 /// Prepare the input handed to the transcription coordinator, working around
 /// the macOS 26 SCRecordingOutput dual-track `.mov` 2x decode bug (#234).
 ///
 /// macOS SCRecordingOutput writes a `.mov` with two audio tracks (system + mic)
-/// plus pristine `.voice.wav` and `.system.wav` PCM stems beside it. Decoding
-/// the `.mov` for transcription produces audio at 2x real duration, so whisper
-/// receives garbled samples and emits gibberish. When the stems are present and
-/// recoverable, this helper repairs verified broken WAV headers and mixes both
-/// stems into a 16kHz mono PCM via `ffmpeg amix`. The probe measures payload
-/// bytes from the data offset to EOF instead of trusting placeholder RIFF/data
-/// sizes (#519).
-///
-/// The original stem payload is never rewritten. Header repair is restricted
-/// to parsed RIFF/WAVE files with a sane PCM `fmt ` chunk, holds an exclusive
-/// file lock, rolls header bytes back on write failure, and preserves 0600
-/// permissions.
-///
-/// After recovery, this helper
-/// returns a prepared input for the caller to hand to the transcriber. When
-/// both stems are usable, the mixed handle's `Drop` impl cleans up the temp
-/// file on success, Err, panic, or any future early-return. When exactly one
+/// plus `.voice.wav` and `.system.wav` PCM stems beside it. Decoding the `.mov`
+/// for transcription produces audio at 2x real duration, so whisper receives
+/// garbled samples and emits gibberish. A stopped or crashed capture can leave
+/// valid payload behind placeholder RIFF/data lengths; verified recoverable
+/// headers are repaired before the shared diarization classifier runs. When
+/// both stems are usable, this helper mixes them into a 16kHz mono PCM via
+/// `ffmpeg amix` and returns a prepared input to the transcriber. When
+/// both stems are usable, the mixed handle's `Drop` impl retires the anonymous
+/// or sealed capability on success, Err, panic, or any future early-return;
+/// no plaintext filesystem path is published. When exactly one
 /// stem is usable, the surviving PCM is returned directly with explicit
 /// degraded recording health; it is never deleted by this helper (#463).
 ///
@@ -701,29 +1900,39 @@ impl PreparedTranscriptionInput {
 ///
 /// Path handling: the `.mov` is canonicalized before stem lookup so a symlinked
 /// recording resolves to its target before sibling lookup (#237 touched the
-/// same area in the diarization path).
+/// same area in the diarization path). Stem discovery, including the empty-stem
+/// check via `stem_has_audio`, reuses [`crate::diarize::discover_stem_plan`] so
+/// a single source of truth governs which side files count as "stems present".
+#[cfg(test)]
 fn prepare_transcription_input(
     audio_path: &Path,
 ) -> Result<PreparedTranscriptionInput, MinutesError> {
-    prepare_transcription_input_with_mixer(audio_path, mix_stems_with_ffmpeg)
+    prepare_transcription_input_with_format(audio_path, None)
 }
 
-fn prepare_transcription_input_with_mixer<F>(
+fn prepare_transcription_input_with_format(
     audio_path: &Path,
-    mut mixer: F,
-) -> Result<PreparedTranscriptionInput, MinutesError>
-where
-    F: FnMut(&Path, &Path, &Path) -> Result<(), String>,
-{
+    format_extension: Option<&str>,
+) -> Result<PreparedTranscriptionInput, MinutesError> {
     // Only `.mov` containers can hit the 2x decode bug. Everything else is
     // either a clean PCM wav (Jake's manual reprocess flow), a single-stream
     // m4a/mp3/ogg (voice memos), or a format that does not exercise the
     // SCRecordingOutput dual-track path.
-    let ext = audio_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase());
+    let ext = format_extension.map(str::to_lowercase).or_else(|| {
+        audio_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+    });
     if ext.as_deref() != Some("mov") {
+        return Ok(PreparedTranscriptionInput::Original);
+    }
+
+    // An explicit format belongs to a proof/descriptor-authorized input that
+    // has already been copied into anonymous storage. Its anonymous fd path
+    // is not a namespace from which sibling stems may be discovered. Recovery
+    // jobs authorize and mix their exact stem members before reaching here.
+    if format_extension.is_some() {
         return Ok(PreparedTranscriptionInput::Original);
     }
 
@@ -736,217 +1945,390 @@ where
         .canonicalize()
         .unwrap_or_else(|_| audio_path.to_path_buf());
 
-    let Some(parent) = canonical.parent() else {
-        return Ok(PreparedTranscriptionInput::Original);
-    };
-    let Some(stem_name) = canonical.file_stem().and_then(|stem| stem.to_str()) else {
-        return Ok(PreparedTranscriptionInput::Original);
-    };
-    let voice = parent.join(format!("{stem_name}.voice.wav"));
-    let system = parent.join(format!("{stem_name}.system.wav"));
-    let voice_probe = crate::stem_probe::probe_and_repair(&voice).map_err(|reason| {
+    repair_recoverable_native_call_stem_headers(&canonical)?;
+
+    // Stem discovery reuses the diarization helper so transcription and
+    // diarization agree on what "stems present" means, including the
+    // zero-byte-stem check via `stem_has_audio` that catches partial-crash
+    // wavs (.exists() alone accepts them; `stem_has_audio` requires a valid
+    // hound-readable header with non-zero sample/channel counts).
+    let checked = crate::diarize::discover_stem_plan_checked(&canonical).map_err(|reason| {
         crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
             reason: format!(
-                "Minutes could not safely probe or repair microphone stem {}: {reason}",
-                voice.display()
+                "native call stem validation failed for {}: {reason}",
+                canonical.display()
             ),
         }
     })?;
-    let system_probe = crate::stem_probe::probe_and_repair(&system).map_err(|reason| {
-        crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
-            reason: format!(
-                "Minutes could not safely probe or repair system stem {}: {reason}",
-                system.display()
-            ),
-        }
-    })?;
+    let invalid_sibling = checked.invalid_sibling;
 
-    for (source, path, probe) in [
-        ("microphone", &voice, &voice_probe),
-        ("system", &system, &system_probe),
-    ] {
-        if probe.repaired {
-            tracing::warn!(
-                source,
-                stem = %path.display(),
-                format_repaired = probe.format_repaired,
-                "repaired recoverable native-call WAV header before retry"
-            );
-        }
-    }
-
-    let stems = match (voice_probe.is_usable(), system_probe.is_usable()) {
-        (true, true) => crate::diarize::StemPaths {
-            voice: voice.clone(),
-            system: system.clone(),
-        },
-        (false, true) => {
+    let stems = match checked.plan {
+        Some(crate::diarize::SourceAwareDiarizationPlan::FullStems(paths)) => paths,
+        Some(crate::diarize::SourceAwareDiarizationPlan::SystemStemOnly(system)) => {
             tracing::warn!(
                 audio = %canonical.display(),
                 system = %system.display(),
-                voice_state = %voice_probe.description(),
-                "microphone stem is unusable; transcribing surviving system stem"
+                "microphone stem is missing or silent; transcribing surviving system stem"
             );
+            let mut recording_health =
+                crate::health::recording_health_for_native_call_stem_recovery(
+                    crate::diarize::CaptureSource::System,
+                );
+            if let Some(invalid) = invalid_sibling.as_ref() {
+                crate::health::append_native_call_invalid_stem_warning(
+                    &mut recording_health,
+                    invalid.source,
+                    &invalid.reason,
+                );
+            }
             return Ok(PreparedTranscriptionInput::SingleStem {
                 path: system,
-                recording_health: crate::health::recording_health_for_native_call_stem_recovery(
-                    crate::diarize::CaptureSource::System,
-                ),
+                recording_health,
             });
         }
-        (true, false) => {
+        Some(crate::diarize::SourceAwareDiarizationPlan::SilentSystemStem(paths)) => {
             tracing::warn!(
                 audio = %canonical.display(),
-                voice = %voice.display(),
-                system_state = %system_probe.description(),
-                "system stem is unusable; transcribing surviving microphone stem"
+                voice = %paths.voice.display(),
+                system = %paths.system.display(),
+                "system stem is missing or silent; transcribing surviving microphone stem"
             );
-            return Ok(PreparedTranscriptionInput::SingleStem {
-                path: voice,
-                recording_health: crate::health::recording_health_for_native_call_stem_recovery(
+            let mut recording_health =
+                crate::health::recording_health_for_native_call_stem_recovery(
                     crate::diarize::CaptureSource::Voice,
-                ),
+                );
+            if let Some(invalid) = invalid_sibling.as_ref() {
+                crate::health::append_native_call_invalid_stem_warning(
+                    &mut recording_health,
+                    invalid.source,
+                    &invalid.reason,
+                );
+            }
+            return Ok(PreparedTranscriptionInput::SingleStem {
+                path: paths.voice,
+                recording_health,
             });
         }
-        (false, false) => {
-            if matches!(voice_probe.signal, crate::stem_probe::StemSignal::Missing)
-                && matches!(system_probe.signal, crate::stem_probe::StemSignal::Missing)
-            {
-                // No sibling stems at all. This may be an ordinary .mov rather
-                // than a native-call capture, so retain the existing fallback.
-                return Ok(PreparedTranscriptionInput::Original);
-            }
-            return Err(
-                crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
-                    reason: format!(
-                        "native call capture at {} has no usable PCM stem after automatic recovery: voice={} ({}), system={} ({}). The files were left in place",
-                        canonical.display(),
-                        voice.display(),
-                        voice_probe.description(),
-                        system.display(),
-                        system_probe.description()
-                    ),
+        None => {
+            // `discover_stem_plan` returns None for two semantically different
+            // cases: (a) neither stem present (ordinary non-native-call `.mov`
+            // or a native capture whose stems were cleaned up) and (b) voice
+            // stem present and audible but system stem file is entirely
+            // absent from disk (`(true, false) && !system.exists()` branch of
+            // discover_stem_plan at `diarize.rs:600-606`). Case (b) is a
+            // native capture where the system side was lost during recording,
+            // and falling through to the broken `.mov` decoder reproduces the
+            // exact 2x-duration bug this helper exists to prevent. Codex
+            // review of PR #235 v2 caught this.
+            //
+            // Distinguish by independently checking the sibling paths. A
+            // usable voice stem is recoverable even when the system file is
+            // absent. If either sibling exists but neither has signal, this
+            // is definitely a native capture and must fail clearly instead
+            // of decoding the known-broken dual-track `.mov`.
+            if let Some(parent) = canonical.parent() {
+                if let Some(stem_name) = canonical.file_stem().and_then(|s| s.to_str()) {
+                    let voice = parent.join(format!("{}.voice.wav", stem_name));
+                    let system = parent.join(format!("{}.system.wav", stem_name));
+                    match crate::diarize::classify_stem_signal(&voice) {
+                        crate::diarize::StemSignal::Signal => {
+                            return Ok(PreparedTranscriptionInput::SingleStem {
+                                path: voice,
+                                recording_health:
+                                    crate::health::recording_health_for_native_call_stem_recovery(
+                                        crate::diarize::CaptureSource::Voice,
+                                    ),
+                            });
+                        }
+                        crate::diarize::StemSignal::Invalid(reason) => {
+                            return Err(
+                                crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+                                    reason: format!(
+                                        "native call voice stem validation failed for {}: {reason}",
+                                        canonical.display()
+                                    ),
+                                }
+                                .into(),
+                            );
+                        }
+                        crate::diarize::StemSignal::Silence => {}
+                    }
+                    if voice.exists() || system.exists() {
+                        return Err(crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+                            reason: format!(
+                                "native call capture at {} has no usable PCM stem: voice={}, system={}. Both stems are missing, empty, invalid, or digitally silent.",
+                                canonical.display(),
+                                voice.display(),
+                                system.display()
+                            ),
+                        }
+                        .into());
+                    }
                 }
-                .into(),
-            );
+            }
+            // No usable stems at all. Could be a non-native-call `.mov`
+            // (screen recording, downloaded file) or a native-call capture
+            // whose stems were cleaned up; we cannot distinguish. Conservative:
+            // treat as ordinary `.mov` and let the existing decoder handle
+            // it. Hard-erroring on every stemless `.mov` would break
+            // legitimate non-native-call use cases.
+            return Ok(PreparedTranscriptionInput::Original);
         }
     };
 
-    // Tempfile name includes pid + nanosecond timestamp + stem so two
-    // concurrent invocations on the same recording cannot land on the same
-    // path (Tauri's recovery path can spawn a worker thread for a recording
-    // whose `processing` flag is mid-CAS, which would otherwise collide
-    // here). Falls back to pid+stem alone if SystemTime is unavailable.
-    let stem_name = canonical
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-    let unique_suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "minutes-stem-mix-{}-{}-{}.wav",
-        std::process::id(),
-        unique_suffix,
-        stem_name
-    ));
-    create_private_mix_target(&tmp).map_err(|reason| {
-        crate::error::TranscribeError::NativeCaptureStemMixUnavailable { reason }
+    let mut raw_pcm =
+        PrivateAudioTempFile::new("minutes-stem-mix-pcm-", ".s16le").map_err(|error| {
+            crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+                reason: format!(
+                    "owner-private temp file could not be created for stem mix of {}: {}",
+                    canonical.display(),
+                    error
+                ),
+            }
+        })?;
+
+    // ffmpeg amix defaults: `duration=longest` is the framework default
+    // (specifying it explicitly was redundant); `normalize=1` is the
+    // default and prevents combined-amplitude clipping when one stem is
+    // significantly louder than the other. System audio is usually
+    // hotter than mic, so `normalize=0` could bake clipping into the
+    // PCM before whisper sees it (jmh1313 confirmed the original PR's
+    // recordings had stems at -0.0 and -0.1 dB peak, which would have
+    // clipped on normalize=0). Default normalization is the safer
+    // choice unless we add explicit weights with measured levels.
+    let system_str = stems.system.to_str().ok_or_else(|| {
+        crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+            reason: format!(
+                "system stem path is not valid UTF-8: {}",
+                stems.system.display()
+            ),
+        }
+    })?;
+    let voice_str = stems.voice.to_str().ok_or_else(|| {
+        crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+            reason: format!(
+                "voice stem path is not valid UTF-8: {}",
+                stems.voice.display()
+            ),
+        }
+    })?;
+    let ffmpeg = crate::ffmpeg::resolve_ffmpeg().map_err(|error| {
+        crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+            reason: format!(
+                "ffmpeg could not be resolved for stem mix of {}: {}",
+                canonical.display(),
+                error
+            ),
+        }
     })?;
 
-    if let Err(reason) = mixer(&stems.system, &stems.voice, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let mut command = crate::bounded_child::BoundedCommand::new(&ffmpeg);
+    command.args([
+        "-i",
+        system_str,
+        "-i",
+        voice_str,
+        "-filter_complex",
+        "[0:a][1:a]amix=inputs=2",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]);
+    let output = output_with_authorized_audio_stdin_to_private_file_with_budget(
+        &mut command,
+        None,
+        &mut raw_pcm,
+        crate::audio_budget::AudioWorkBudget::max_pcm_s16le_bytes(),
+        crate::audio_budget::AUDIO_DECODE_DEADLINE,
+    )
+        .map_err(|e| {
+            crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+                reason: format!(
+                    "ffmpeg could not be invoked for stem mix of {} via {}: {}. Install ffmpeg (brew install ffmpeg) or set MINUTES_FFMPEG.",
+                    canonical.display(),
+                    ffmpeg.display(),
+                    e
+                ),
+            }
+        })?;
+    if !output.status.success() {
+        let stderr_tail = String::from_utf8_lossy(&output.stderr);
+        let last_line = stderr_tail
+            .lines()
+            .last()
+            .unwrap_or("(no stderr)")
+            .to_string();
         return Err(
             crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
                 reason: format!(
-                    "automatic stem mix failed for {} (voice={}, system={}): {}",
+                    "ffmpeg amix failed for {} (voice={}, system={}): {}",
                     canonical.display(),
                     stems.voice.display(),
                     stems.system.display(),
-                    reason
+                    last_line
                 ),
             }
             .into(),
         );
     }
-    set_private_file_permissions(&tmp).map_err(|reason| {
-        let _ = std::fs::remove_file(&tmp);
-        crate::error::TranscribeError::NativeCaptureStemMixUnavailable { reason }
+    let tmp = private_pcm_s16le_mono_to_wav(&raw_pcm, 16_000).map_err(|error| {
+        crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+            reason: format!(
+                "mixed PCM could not be wrapped as a bounded WAV for {}: {}",
+                canonical.display(),
+                error
+            ),
+        }
     })?;
     tracing::info!(
         audio = %canonical.display(),
-        mixed = %tmp.display(),
+        mixed = %private_audio_diagnostic_label(tmp.as_path()),
         "using mixed stems instead of .mov for transcription (workaround for dual-track 2x bug)"
     );
-    Ok(PreparedTranscriptionInput::Mixed(MixedStemTempFile {
-        path: tmp,
-    }))
+    Ok(PreparedTranscriptionInput::Mixed(
+        AuthorizedProcessAudioInput::from_internal_private_wav(tmp)?,
+    ))
 }
 
-const STEM_MIX_FILTER: &str = "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0";
+fn repair_recoverable_native_call_stem_headers(canonical_mov: &Path) -> Result<(), MinutesError> {
+    let Some(parent) = canonical_mov.parent() else {
+        return Ok(());
+    };
+    let Some(stem_name) = canonical_mov.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(());
+    };
 
-fn create_private_mix_target(path: &Path) -> Result<(), String> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path).map(drop).map_err(|error| {
-        format!(
-            "could not create private stem mix {}: {error}",
-            path.display()
-        )
-    })
-}
-
-fn set_private_file_permissions(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |error| {
-                format!(
-                    "could not preserve 0600 permissions on mixed stem {}: {error}",
+    for (source, path) in [
+        ("microphone", parent.join(format!("{stem_name}.voice.wav"))),
+        ("system", parent.join(format!("{stem_name}.system.wav"))),
+    ] {
+        let probe = crate::stem_probe::probe_and_repair(&path).map_err(|reason| {
+            crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+                reason: format!(
+                    "Minutes could not safely probe or repair {source} stem {}: {reason}",
                     path.display()
-                )
-            },
-        )?;
+                ),
+            }
+        })?;
+        if probe.repaired {
+            tracing::warn!(
+                source,
+                stem = %path.display(),
+                format_repaired = probe.format_repaired,
+                usable = probe.is_usable(),
+                stem_state = %probe.description(),
+                "repaired recoverable native-call WAV header before transcription"
+            );
+        }
     }
     Ok(())
 }
 
-fn mix_stems_with_ffmpeg(system: &Path, voice: &Path, output_path: &Path) -> Result<(), String> {
-    let ffmpeg = crate::ffmpeg::resolve_ffmpeg()
-        .map_err(|error| format!("ffmpeg could not be resolved for the internal mix: {error}"))?;
-    let output = crate::engine_process::command(&ffmpeg)
-        .arg("-y")
-        .arg("-i")
-        .arg(system)
-        .arg("-i")
-        .arg(voice)
-        .arg("-filter_complex")
-        .arg(STEM_MIX_FILTER)
-        .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
-        .arg(output_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| {
-            format!(
-                "ffmpeg could not be invoked via {}: {error}. Install ffmpeg (brew install ffmpeg) or set MINUTES_FFMPEG",
-                ffmpeg.display()
-            )
-        })?;
-    if output.status.success() {
-        return Ok(());
+/// Wrap an exact signed-16-bit mono PCM capability in a canonical WAV without
+/// ever publishing plaintext audio as a filesystem pathname.
+///
+/// FFmpeg cannot backfill a WAV header when stdout is a pipe, so its streamed
+/// WAV muxer writes `0xffff_ffff` as the data length. Hound correctly rejects
+/// that value because it is not divisible by the two-byte sample width. Keep
+/// FFmpeg on bounded headerless PCM, then construct the exact header in this
+/// trusted parent after the sealed raw length is known. The copy uses fixed,
+/// zeroizing working memory and writes a fresh private generation; no encrypted
+/// chunk is ever rewritten under the same key and nonce.
+pub(crate) fn private_pcm_s16le_mono_to_wav(
+    raw_pcm: &PrivateAudioTempFile,
+    sample_rate: u32,
+) -> std::io::Result<PrivateAudioTempFile> {
+    const WAV_HEADER_BYTES: usize = 44;
+    const CHANNELS: u16 = 1;
+    const BITS_PER_SAMPLE: u16 = 16;
+    const BLOCK_ALIGN: u16 = CHANNELS * (BITS_PER_SAMPLE / 8);
+
+    if sample_rate == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WAV sample rate must be non-zero",
+        ));
     }
-    let stderr_tail = String::from_utf8_lossy(&output.stderr);
-    let last_line = stderr_tail.lines().last().unwrap_or("(no stderr)");
-    Err(format!("ffmpeg amix failed: {last_line}"))
+    let data_len = private_audio_len(raw_pcm.as_path())?;
+    if data_len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mixed PCM output is empty",
+        ));
+    }
+    if data_len % u64::from(BLOCK_ALIGN) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mixed PCM length is not aligned to a complete sample",
+        ));
+    }
+    let data_len = u32::try_from(data_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mixed PCM is too large for a canonical WAV container",
+        )
+    })?;
+    if u64::from(data_len) > MAX_AUTHORIZED_PROCESS_AUDIO_BYTES - WAV_HEADER_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mixed PCM plus its WAV header exceeds the private-audio budget",
+        ));
+    }
+    let riff_len = data_len.checked_add(36).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mixed PCM exceeds the WAV container length limit",
+        )
+    })?;
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(BLOCK_ALIGN))
+        .ok_or_else(|| std::io::Error::other("WAV byte rate overflowed"))?;
+
+    let mut header = [0_u8; WAV_HEADER_BYTES];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16_u32.to_le_bytes());
+    header[20..22].copy_from_slice(&1_u16.to_le_bytes());
+    header[22..24].copy_from_slice(&CHANNELS.to_le_bytes());
+    header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    header[32..34].copy_from_slice(&BLOCK_ALIGN.to_le_bytes());
+    header[34..36].copy_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_len.to_le_bytes());
+
+    let mut wav = PrivateAudioTempFile::new("minutes-pcm-wav-", ".wav")?;
+    let write_result = (|| -> std::io::Result<()> {
+        let mut writer = wav.prepare_for_write()?;
+        writer.write_all(&header)?;
+
+        let mut reader = raw_pcm.try_clone_reader()?;
+        let mut buffer = Zeroizing::new(vec![0_u8; 32 * 1024]);
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..read])?;
+        }
+        writer.flush()?;
+        drop(writer);
+        wav.finish_write()
+    })();
+
+    if let Err(error) = write_result {
+        let _ = wav.discard_failed_write();
+        return Err(error);
+    }
+    Ok(wav)
 }
 
 fn log_attribution_decision(
@@ -966,12 +2348,12 @@ fn log_attribution_decision(
     });
     logging::log_step(
         "attribution",
-        &audio_path.display().to_string(),
+        &private_audio_diagnostic_label(audio_path),
         duration_ms,
         extra,
     );
     tracing::info!(
-        audio = %audio_path.display(),
+        audio = %private_audio_diagnostic_label(audio_path),
         output = %output_path.display(),
         capture_backend = %details.capture_backend,
         diarization_from_stems = details.diarization_from_stems,
@@ -1054,7 +2436,7 @@ fn log_structured_llm_step(
     }
     logging::log_step(
         step,
-        &audio_path.display().to_string(),
+        &private_audio_diagnostic_label(audio_path),
         started.elapsed().as_millis() as u64,
         serde_json::Value::Object(payload),
     );
@@ -1191,6 +2573,8 @@ fn single_stem_speaker_self_attribution(
 #[allow(clippy::too_many_arguments)]
 fn attribute_meeting_speakers(
     audio_path: &Path,
+    diagnostic_audio_path: &Path,
+    allow_path_derived_audio: bool,
     content_type: ContentType,
     source: Option<&str>,
     config: &Config,
@@ -1264,15 +2648,19 @@ fn attribute_meeting_speakers(
             .iter()
             .map(|a| a.speaker_label.clone())
             .collect();
-        let self_attribution = single_stem_speaker_self_attribution(
-            audio_path,
-            config,
-            &voice_result,
-            diarization_from_stems,
-            &transcript,
-            &transcript_labels,
-            &already_mapped_labels,
-        );
+        let self_attribution = if allow_path_derived_audio {
+            single_stem_speaker_self_attribution(
+                audio_path,
+                config,
+                &voice_result,
+                diarization_from_stems,
+                &transcript,
+                &transcript_labels,
+                &already_mapped_labels,
+            )
+        } else {
+            SelfAttributionOutcome::skipped(SelfAttributionSkippedReason::NoStems)
+        };
         if let Some(attr) = self_attribution.attribution.clone() {
             speaker_map.push(attr);
         }
@@ -1296,7 +2684,7 @@ fn attribute_meeting_speakers(
         if has_unmapped {
             // Keep L0 deterministic mapping fenced to trusted attendees; the
             // broader merged attendee list is only for the L1 name-mapping fallback.
-            let log_file = audio_path.display().to_string();
+            let log_file = diagnostic_audio_path.display().to_string();
             for attribution in
                 summarize::map_speakers(&transcript, llm_attendees, config, Some(&log_file))
             {
@@ -1359,8 +2747,8 @@ fn attribute_meeting_speakers(
 //                     config.diarization  config.summarization
 //                     .engine != "none"   .engine != "none"
 //
-// Transcription uses whisper-rs (whisper.cpp) with symphonia for
-// format conversion (m4a/mp3/ogg → 16kHz mono PCM).
+// Transcription uses whisper-rs (whisper.cpp); ambient compressed formats use
+// the bounded ffmpeg child, while private exact-byte processing admits WAV.
 // Phase 1b adds Diarize + Summarize with if-guards.
 // ──────────────────────────────────────────────────────────────
 
@@ -1394,15 +2782,83 @@ pub struct BackgroundPipelineContext {
     pub template: Option<crate::template::Template>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, PartialEq, Eq)]
+struct PrivateAudioAuthority(PathBuf);
+
+#[derive(Clone, PartialEq, Eq)]
+enum TranscriptAuthority {
+    AmbientPath,
+    AuthorizedCapability(PrivateAudioAuthority),
+}
+
+#[derive(Clone)]
 pub struct TranscriptArtifact {
     pub write_result: WriteResult,
     pub frontmatter: Frontmatter,
     pub transcript: String,
+    /// Private provenance prevents callers from downgrading an authorized
+    /// artifact into the ambient-path enrichment path. Authorized enrichment
+    /// additionally requires the live capability and re-verifies it at use.
+    authority: TranscriptAuthority,
     /// Signal-verified surviving native-call stem selected during
     /// transcription. Diarization must reuse it rather than reopening the
     /// dual-track `.mov` that recovery deliberately bypassed.
-    pub diarization_audio_path: Option<std::path::PathBuf>,
+    diarization_audio_path: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for TranscriptArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TranscriptArtifact")
+            .field("status", &self.frontmatter.status)
+            .field("transcript_bytes", &self.transcript.len())
+            .field(
+                "authority",
+                &if self.is_descriptor_authorized() {
+                    "authorized-capability"
+                } else {
+                    "ambient-path"
+                },
+            )
+            .field(
+                "has_diarization_audio",
+                &self.diarization_audio_path.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl TranscriptArtifact {
+    fn is_descriptor_authorized(&self) -> bool {
+        matches!(self.authority, TranscriptAuthority::AuthorizedCapability(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ambient_for_test(
+        write_result: WriteResult,
+        frontmatter: Frontmatter,
+        transcript: String,
+    ) -> Self {
+        Self {
+            write_result,
+            frontmatter,
+            transcript,
+            authority: TranscriptAuthority::AmbientPath,
+            diarization_audio_path: None,
+        }
+    }
+}
+
+fn resolve_screen_context_directory(
+    _context_session_id: Option<&str>,
+    audio_path: &Path,
+    descriptor_authorized: bool,
+) -> Option<PathBuf> {
+    // The sealed-screenshot lifecycle is intentionally deferred to #510.
+    // Until that complete authority lands, preserve current-main path
+    // behavior for ordinary jobs and never attach ambient screen paths to a
+    // descriptor-authorized processing request.
+    (!descriptor_authorized).then(|| crate::screen::screens_dir_for(audio_path))
 }
 
 /// Optional metadata from a sidecar JSON file (e.g., from iPhone Apple Shortcut).
@@ -1415,6 +2871,1157 @@ pub struct SidecarMetadata {
     pub captured_at: Option<chrono::DateTime<Local>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// A private, byte-exact input capability for an authorized `process` run.
+///
+/// Proof-bound callers copy the proven source revision into storage that cannot
+/// be replaced while the pipeline runs; pipeline-owned mixes bind their
+/// retained private storage directly. Linux uses an anonymous file retained by
+/// descriptor. macOS and Windows retain only authenticated ciphertext behind a
+/// non-inheritable parent handle. Processing resolves the opaque registry
+/// capability in-process; no platform creates a named plaintext staging copy.
+#[allow(dead_code)] // Constructed by the restricted process-audio boundary in slice B.
+pub struct AuthorizedProcessAudioInput {
+    #[cfg(any(unix, windows))]
+    private_audio: PrivateAudioTempFile,
+    processing_path: PathBuf,
+    format_extension: String,
+}
+
+/// Open a fresh parent-side handle when `audio_path` is an opaque registered
+/// private-audio key. External decoders receive its bytes over stdin, never the
+/// raw backing descriptor or a parent-addressable descriptor path.
+pub(crate) fn authorized_audio_stdin(
+    audio_path: &Path,
+) -> std::io::Result<Option<PrivateAudioReader>> {
+    registered_private_audio_reader(audio_path)
+}
+
+/// Run a decoder while streaming an authorized input through a one-way pipe.
+/// A decoder grandchild may retain the pipe endpoint, but it never receives a
+/// seekable raw-audio descriptor and cannot reopen the exhausted input.
+#[allow(dead_code)] // Exercised by transport regressions and used by policy slice B.
+pub(crate) fn output_with_authorized_audio_stdin(
+    command: &mut crate::bounded_child::BoundedCommand,
+    input: Option<PrivateAudioReader>,
+) -> std::io::Result<std::process::Output> {
+    #[cfg(target_os = "linux")]
+    if input.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "authorized audio cannot cross a Linux child-process boundary",
+        ));
+    }
+    let run = crate::bounded_child::run(
+        command,
+        input.map(|input| Box::new(input) as crate::bounded_child::StdinSource),
+        crate::bounded_child::StdoutTarget::Capture {
+            max_bytes: crate::bounded_child::DEFAULT_STDOUT_LIMIT,
+        },
+        crate::bounded_child::ChildBudget {
+            wall_clock: std::time::Duration::from_secs(30 * 60),
+            stderr_tail: MAX_PRIVATE_AUDIO_CHILD_STDERR_BYTES,
+        },
+    )?;
+    if run.timed_out {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "authorized audio child exceeded its wall-clock budget",
+        ));
+    }
+    Ok(run.output)
+}
+
+const MAX_PRIVATE_AUDIO_CHILD_STDERR_BYTES: usize = 256 * 1024;
+
+/// Run an exact decoder child without granting it an output pathname.
+///
+/// Stdout is drained in bounded chunks directly into the retained private-file
+/// handle while stderr is drained concurrently and retained only as a bounded
+/// tail. Optional authorized input is likewise streamed over stdin. The child
+/// never receives an output pathname. Unix has no temporary leaf at all; on a
+/// named platform fallback, replacement can only make the final identity check
+/// deny the result and cannot redirect the streamed bytes.
+pub(crate) fn output_with_authorized_audio_stdin_to_private_file_with_budget(
+    command: &mut crate::bounded_child::BoundedCommand,
+    input: Option<PrivateAudioReader>,
+    destination: &mut PrivateAudioTempFile,
+    max_output_bytes: u64,
+    wall_clock: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    #[cfg(target_os = "linux")]
+    if input.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "authorized audio cannot cross a Linux child-process boundary",
+        ));
+    }
+    let exact_output = destination.prepare_for_write()?;
+    let run = crate::bounded_child::run(
+        command,
+        input.map(|input| Box::new(input) as crate::bounded_child::StdinSource),
+        crate::bounded_child::StdoutTarget::ExactWriter {
+            writer: Box::new(exact_output),
+            max_bytes: max_output_bytes,
+        },
+        crate::bounded_child::ChildBudget {
+            wall_clock,
+            stderr_tail: MAX_PRIVATE_AUDIO_CHILD_STDERR_BYTES,
+        },
+    );
+    let run = match run {
+        Ok(run) if !run.timed_out => run,
+        Ok(_) => {
+            let timeout = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "private audio child exceeded its wall-clock budget",
+            );
+            return match destination.discard_failed_write() {
+                Ok(()) => Err(timeout),
+                Err(retirement) => Err(std::io::Error::new(
+                    timeout.kind(),
+                    format!("{timeout}; {retirement}"),
+                )),
+            };
+        }
+        Err(error) => {
+            return match destination.discard_failed_write() {
+                Ok(()) => Err(error),
+                Err(retirement) => {
+                    Err(crate::bounded_child::with_context_preserving_spawn_failure(
+                        error,
+                        retirement.to_string(),
+                    ))
+                }
+            };
+        }
+    };
+    if run.output.status.success() {
+        if let Err(error) = destination.finish_write() {
+            return match destination.discard_failed_write() {
+                Ok(()) => Err(error),
+                Err(retirement) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{error}; {retirement}"),
+                )),
+            };
+        }
+    } else {
+        destination.discard_failed_write()?;
+    }
+    Ok(run.output)
+}
+
+fn reject_authorized_input(message: impl Into<String>) -> MinutesError {
+    crate::error::TranscribeError::UnsupportedFormat(format!(
+        "authorized process input rejected: {}",
+        message.into()
+    ))
+    .into()
+}
+
+fn normalize_authorized_format(format_extension: &str) -> Result<String, MinutesError> {
+    let format = format_extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    // The exact-byte authorization boundary currently admits only the WAV
+    // parser, which is streaming and allocation-bounded. Symphonia 0.5.5
+    // demuxers allocate attacker-controlled container table counts while
+    // probing, before the decoder resource guard can run. Compressed/private
+    // inputs must fail closed until a bounded demuxer or secure byte-streaming
+    // child transport exists.
+    if format != "wav" {
+        return Err(reject_authorized_input(
+            "private processing currently supports bounded WAV input only",
+        ));
+    }
+    Ok(format)
+}
+
+#[cfg(unix)]
+fn open_authorized_source(path: &Path) -> Result<File, MinutesError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(reject_authorized_input(
+            "source must be a regular, single-link file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Result<(u32, u64), MinutesError> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let info = unsafe { info.assume_init() };
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(reject_authorized_input("reparse points are not allowed"));
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err(reject_authorized_input(
+            "source must be a regular, single-link file",
+        ));
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    ))
+}
+
+#[cfg(windows)]
+fn open_authorized_source(path: &Path) -> Result<File, MinutesError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(reject_authorized_input("source must be a regular file"));
+    }
+    windows_file_identity(&file)?;
+    Ok(file)
+}
+
+fn copy_and_verify_authorized_bytes<W: Write>(
+    source: File,
+    destination: &mut W,
+    expected_sha256: &str,
+    expected_byte_length: u64,
+) -> Result<(), MinutesError> {
+    copy_and_verify_authorized_bytes_with_budget(
+        source,
+        destination,
+        expected_sha256,
+        expected_byte_length,
+        MAX_AUTHORIZED_PROCESS_AUDIO_BYTES,
+        AUTHORIZED_PROCESS_AUDIO_COPY_TIMEOUT,
+    )
+}
+
+pub const MAX_AUTHORIZED_PROCESS_AUDIO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const AUTHORIZED_PROCESS_AUDIO_COPY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+fn copy_and_verify_authorized_bytes_with_budget<W: Write>(
+    mut source: File,
+    destination: &mut W,
+    expected_sha256: &str,
+    expected_byte_length: u64,
+    max_bytes: u64,
+    timeout: std::time::Duration,
+) -> Result<(), MinutesError> {
+    copy_and_verify_authorized_bytes_from_reader(
+        &mut source,
+        destination,
+        expected_sha256,
+        expected_byte_length,
+        max_bytes,
+        timeout,
+    )
+}
+
+fn copy_and_verify_authorized_bytes_from_reader<W: Write>(
+    source: &mut File,
+    destination: &mut W,
+    expected_sha256: &str,
+    expected_byte_length: u64,
+    max_bytes: u64,
+    timeout: std::time::Duration,
+) -> Result<(), MinutesError> {
+    copy_authorized_bytes_from_reader(
+        source,
+        destination,
+        Some(expected_sha256),
+        expected_byte_length,
+        max_bytes,
+        timeout,
+    )
+}
+
+fn copy_authorized_bytes_from_reader<W: Write>(
+    source: &mut File,
+    destination: &mut W,
+    expected_sha256: Option<&str>,
+    expected_byte_length: u64,
+    max_bytes: u64,
+    timeout: std::time::Duration,
+) -> Result<(), MinutesError> {
+    let normalized_sha = expected_sha256.map(|value| value.trim().to_ascii_lowercase());
+    if normalized_sha
+        .as_ref()
+        .is_some_and(|sha| sha.len() != 64 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(reject_authorized_input("invalid SHA-256 proof"));
+    }
+
+    if expected_byte_length > max_bytes || source.metadata()?.len() > max_bytes {
+        return Err(reject_authorized_input(
+            "audio copy resource budget exceeded",
+        ));
+    }
+
+    let started = std::time::Instant::now();
+    let mut digest = Sha256::new();
+    let mut byte_length = 0_u64;
+    let mut chunk = Zeroizing::new([0_u8; 256 * 1024]);
+    loop {
+        if started.elapsed() >= timeout {
+            return Err(reject_authorized_input(
+                "audio copy resource budget exceeded",
+            ));
+        }
+        let read = source.read(chunk.as_mut())?;
+        if read == 0 {
+            break;
+        }
+        byte_length = byte_length
+            .checked_add(read as u64)
+            .ok_or_else(|| reject_authorized_input("source length overflowed"))?;
+        if byte_length > expected_byte_length || byte_length > max_bytes {
+            return Err(reject_authorized_input("byte length did not match proof"));
+        }
+        digest.update(&chunk[..read]);
+        destination.write_all(&chunk[..read])?;
+    }
+
+    if started.elapsed() >= timeout {
+        return Err(reject_authorized_input(
+            "audio copy resource budget exceeded",
+        ));
+    }
+
+    let actual_sha = format!("{:x}", digest.finalize());
+    if byte_length != expected_byte_length
+        || normalized_sha
+            .as_ref()
+            .is_some_and(|expected| actual_sha != *expected)
+    {
+        return Err(reject_authorized_input(
+            "source bytes did not match the final authorization proof",
+        ));
+    }
+    destination.flush()?;
+    Ok(())
+}
+
+#[allow(dead_code)] // The processor entry point lands in the dependent policy slice B.
+impl AuthorizedProcessAudioInput {
+    /// Bind a completed pipeline-owned WAV to the same typed authority used by
+    /// proof-bound external inputs. This constructor is deliberately private:
+    /// callers cannot turn an opaque token string into authorized behavior.
+    fn from_internal_private_wav(
+        private_audio: PrivateAudioTempFile,
+    ) -> Result<Self, MinutesError> {
+        private_audio.verify_private_identity()?;
+        let processing_path = private_audio.processing_path();
+        if private_audio_len(&processing_path)? == 0 {
+            return Err(reject_authorized_input(
+                "retained internal audio capability is empty",
+            ));
+        }
+        Ok(Self {
+            private_audio,
+            processing_path,
+            format_extension: "wav".into(),
+        })
+    }
+
+    /// Consume the exact fd 3 capability claimed by the CLI before startup.
+    ///
+    /// The caller has opened and attested the user's exact source revision.
+    /// Ordinary imports may legitimately be group/world-readable (for example
+    /// a 0644 Downloads file); privacy begins at the immediate copy into
+    /// Minutes' sealed private-audio store. This constructor never reopens a
+    /// pathname and closes the source handle before decoder or enrichment work.
+    #[cfg(unix)]
+    pub fn from_claimed_inherited_file(
+        source: File,
+        expected_byte_length: u64,
+        original_format_extension: &str,
+    ) -> Result<Self, MinutesError> {
+        Self::from_claimed_inherited_file_with_hook(
+            source,
+            expected_byte_length,
+            original_format_extension,
+            true,
+            || Ok(()),
+        )
+    }
+
+    #[cfg(unix)]
+    fn from_claimed_inherited_file_with_hook<F>(
+        mut source: File,
+        expected_byte_length: u64,
+        original_format_extension: &str,
+        require_fd_three: bool,
+        after_copy: F,
+    ) -> Result<Self, MinutesError>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        if require_fd_three && source.as_raw_fd() != 3 {
+            return Err(reject_authorized_input(
+                "claimed inherited descriptor was not fd 3",
+            ));
+        }
+        let descriptor_flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) };
+        if descriptor_flags < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if descriptor_flags & libc::FD_CLOEXEC == 0 {
+            return Err(reject_authorized_input(
+                "claimed inherited descriptor was not close-on-exec",
+            ));
+        }
+        if expected_byte_length > MAX_AUTHORIZED_PROCESS_AUDIO_BYTES {
+            return Err(reject_authorized_input(
+                "audio copy resource budget exceeded",
+            ));
+        }
+        let format_extension = normalize_authorized_format(original_format_extension)?;
+        let before = source.metadata()?;
+        if !before.file_type().is_file()
+            || before.nlink() != 1
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.len() != expected_byte_length
+        {
+            return Err(reject_authorized_input(
+                "inherited source must be an exact caller-owned single-link file",
+            ));
+        }
+        source.rewind()?;
+        let mut private_audio = PrivateAudioTempFile::new(
+            "minutes-authorized-process-",
+            &format!(".{format_extension}"),
+        )?;
+        {
+            let mut writer = private_audio.prepare_for_write()?;
+            copy_authorized_bytes_from_reader(
+                &mut source,
+                &mut writer,
+                None,
+                expected_byte_length,
+                MAX_AUTHORIZED_PROCESS_AUDIO_BYTES,
+                AUTHORIZED_PROCESS_AUDIO_COPY_TIMEOUT,
+            )?;
+        }
+        private_audio.finish_write()?;
+        after_copy()?;
+        let after = source.metadata()?;
+        if !after.file_type().is_file()
+            || after.nlink() != 1
+            || after.uid() != before.uid()
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
+            || after.mode() != before.mode()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+        {
+            return Err(reject_authorized_input(
+                "inherited source identity changed during authorization",
+            ));
+        }
+        drop(source);
+        let processing_path = private_audio.processing_path();
+        Ok(Self {
+            private_audio,
+            processing_path,
+            format_extension,
+        })
+    }
+
+    pub(crate) fn from_proof(
+        source_path: &Path,
+        expected_sha256: &str,
+        expected_byte_length: u64,
+        original_format_extension: &str,
+    ) -> Result<Self, MinutesError> {
+        if expected_byte_length > MAX_AUTHORIZED_PROCESS_AUDIO_BYTES {
+            return Err(reject_authorized_input(
+                "audio copy resource budget exceeded",
+            ));
+        }
+        let format_extension = normalize_authorized_format(original_format_extension)?;
+        let source = open_authorized_source(source_path)?;
+        if source.metadata()?.len() > MAX_AUTHORIZED_PROCESS_AUDIO_BYTES {
+            return Err(reject_authorized_input(
+                "audio copy resource budget exceeded",
+            ));
+        }
+
+        #[cfg(any(unix, windows))]
+        {
+            let mut private_audio = PrivateAudioTempFile::new(
+                "minutes-authorized-process-",
+                &format!(".{format_extension}"),
+            )?;
+            {
+                let mut writer = private_audio.prepare_for_write()?;
+                copy_and_verify_authorized_bytes(
+                    source,
+                    &mut writer,
+                    expected_sha256,
+                    expected_byte_length,
+                )?;
+            }
+            private_audio.finish_write()?;
+            let processing_path = private_audio.processing_path();
+            Ok(Self {
+                private_audio,
+                processing_path,
+                format_extension,
+            })
+        }
+    }
+
+    pub(crate) fn verify_pipeline_binding(&self) -> Result<(), MinutesError> {
+        #[cfg(any(unix, windows))]
+        {
+            self.private_audio.verify_private_identity()?;
+            if private_audio_len(&self.processing_path)? == 0 {
+                return Err(reject_authorized_input(
+                    "retained audio capability is empty",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn processing_path(&self) -> &Path {
+        &self.processing_path
+    }
+
+    pub(crate) fn format_extension(&self) -> &str {
+        &self.format_extension
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcessOptions<'a> {
+    sidecar: Option<&'a SidecarMetadata>,
+    template: Option<&'a crate::template::Template>,
+    input_authority: Option<&'a AuthorizedProcessAudioInput>,
+}
+
+#[cfg(test)]
+mod authorized_process_input_tests {
+    use super::*;
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn descriptor_authority_never_discovers_an_ambient_screen_directory() {
+        let audio_path = Path::new("/synthetic/meeting.wav");
+        assert!(resolve_screen_context_directory(None, audio_path, true).is_none());
+        assert_eq!(
+            resolve_screen_context_directory(None, audio_path, false),
+            Some(crate::screen::screens_dir_for(audio_path))
+        );
+    }
+
+    #[test]
+    fn descriptor_authority_survives_transcript_artifact_enrichment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let unique = dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let audio_path = dir.path().join(format!("authorized-{unique}.wav"));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio_path, spec).unwrap();
+        for _ in 0..1_600 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let audio_bytes = std::fs::read(&audio_path).unwrap();
+        let input = AuthorizedProcessAudioInput::from_proof(
+            &audio_path,
+            &sha256(&audio_bytes),
+            audio_bytes.len() as u64,
+            "wav",
+        )
+        .unwrap();
+
+        // Poison the ambient pathname namespace with sibling stems.
+        // Descriptor-authorized enrichment must leave them untouched and must
+        // not derive output behavior from them.
+        let stem = audio_path.file_stem().unwrap().to_string_lossy();
+        let voice_stem = dir.path().join(format!("{stem}.voice.wav"));
+        let system_stem = dir.path().join(format!("{stem}.system.wav"));
+        std::fs::write(&voice_stem, b"ambient voice stem canary").unwrap();
+        std::fs::write(&system_stem, b"ambient system stem canary").unwrap();
+        let mut config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        config.transcription.min_words = 1;
+        config.summarization.engine = "none".into();
+        config.diarization.engine = "none".into();
+        config.screen_context.keep_after_summary = false;
+        let context = BackgroundPipelineContext::default();
+
+        // This is the transcribe/write seam. The private artifact provenance
+        // is bound to this exact retained capability token.
+        let artifact = write_transcript_artifact_with_authority(
+            input.processing_path(),
+            ContentType::Meeting,
+            Some("Authorized lifecycle"),
+            &config,
+            &context,
+            None,
+            "[0:00] We confirmed the proof-bound processing boundary.\n".into(),
+            crate::transcribe::FilterStats::default(),
+            0,
+            TranscriptAuthority::AuthorizedCapability(PrivateAudioAuthority(
+                input.processing_path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+        assert!(artifact.is_descriptor_authorized());
+        let rendered = format!("{artifact:?}");
+        assert!(!rendered.contains(input.processing_path().to_string_lossy().as_ref()));
+        assert!(!rendered.contains("proof-bound processing boundary"));
+        let ordinary_process = process(
+            input.processing_path(),
+            ContentType::Meeting,
+            Some("Bearer replay"),
+            &config,
+        )
+        .expect_err("ordinary process must reject a live private token");
+        assert!(ordinary_process
+            .to_string()
+            .contains("typed authorized entry point"));
+        let ordinary_transcribe = crate::transcribe::transcribe_with_hints(
+            input.processing_path(),
+            &config,
+            &crate::transcribe::DecodeHints::default(),
+        )
+        .expect_err("ordinary transcribe must reject a live private token");
+        assert!(ordinary_transcribe
+            .to_string()
+            .contains("typed authorized entry point"));
+        assert!(crate::diarize::audio_duration_secs(input.processing_path()).is_err());
+        assert!(crate::diarize::audio_duration_secs_authorized(&input).is_ok());
+        assert!(matches!(
+            crate::diarize::diarize_with_context(
+                input.processing_path(),
+                &config,
+                crate::diarize::DiarizationContext {
+                    purpose: crate::diarize::DiarizationPurpose::Auxiliary,
+                    transcript_windows: None,
+                },
+            ),
+            crate::diarize::DiarizationOutcome::NotConfigured
+        ));
+        assert!(resolve_screen_context_directory(
+            context.context_session_id.as_deref(),
+            &audio_path,
+            artifact.is_descriptor_authorized(),
+        )
+        .is_none());
+
+        let ordinary_error =
+            enrich_transcript_artifact(&audio_path, &artifact, &config, &context, |_| {})
+                .expect_err("authorized artifact must not enter ambient enrichment");
+        assert!(ordinary_error.to_string().contains("retained capability"));
+
+        let other_path = dir.path().join("unrelated.wav");
+        std::fs::write(&other_path, &audio_bytes).unwrap();
+        let other = AuthorizedProcessAudioInput::from_proof(
+            &other_path,
+            &sha256(&audio_bytes),
+            audio_bytes.len() as u64,
+            "wav",
+        )
+        .unwrap();
+        let substitution_error =
+            enrich_transcript_artifact_authorized(&other, &artifact, &config, &context, |_| {})
+                .expect_err("a different retained capability must not authorize enrichment");
+        assert!(substitution_error.to_string().contains("does not match"));
+
+        let result =
+            enrich_transcript_artifact_authorized(&input, &artifact, &config, &context, |_| {})
+                .unwrap();
+        let written = std::fs::read_to_string(&result.path).unwrap();
+        assert!(!written.contains(&audio_path.display().to_string()));
+        assert!(!written.contains("Retry audio"));
+        assert!(!written.contains("minutes process"));
+        assert_eq!(
+            std::fs::read(&voice_stem).unwrap(),
+            b"ambient voice stem canary"
+        );
+        assert_eq!(
+            std::fs::read(&system_stem).unwrap(),
+            b"ambient system stem canary"
+        );
+        // No-speech artifacts normally include a retry command. The authority
+        // bit must suppress it at the initial transcript write as well as on
+        // later rewrites, so neither an ambient nor opaque path is disclosed.
+        config.transcription.min_words = 100;
+        let no_speech = write_transcript_artifact_with_authority(
+            input.processing_path(),
+            ContentType::Meeting,
+            Some("Authorized no speech"),
+            &config,
+            &context,
+            None,
+            "[0:00] brief\n".into(),
+            crate::transcribe::FilterStats::default(),
+            0,
+            TranscriptAuthority::AuthorizedCapability(PrivateAudioAuthority(
+                input.processing_path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+        assert_eq!(no_speech.frontmatter.status, Some(OutputStatus::NoSpeech));
+        enrich_transcript_artifact_authorized(&input, &no_speech, &config, &context, |_| {})
+            .unwrap();
+        let written = std::fs::read_to_string(&no_speech.write_result.path).unwrap();
+        assert!(!written.contains(&audio_path.display().to_string()));
+        assert!(!written.contains("Retry audio"));
+        assert!(!written.contains("minutes process"));
+    }
+
+    #[test]
+    fn authorized_compressed_container_fails_before_private_copy_or_probe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("hostile.m4a");
+        let bytes = b"synthetic hostile container metadata";
+        std::fs::write(&source, bytes).unwrap();
+        let error = match AuthorizedProcessAudioInput::from_proof(
+            &source,
+            &sha256(bytes),
+            bytes.len() as u64,
+            "m4a",
+        ) {
+            Ok(_) => panic!("compressed private input must fail before copy and demux probing"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("bounded WAV input only"));
+
+        let disguised = AuthorizedProcessAudioInput::from_proof(
+            &source,
+            &sha256(bytes),
+            bytes.len() as u64,
+            "wav",
+        )
+        .unwrap();
+        let config = Config::default();
+        let decode_error = crate::transcribe::transcribe_authorized_with_hints(
+            &disguised,
+            ContentType::Memo,
+            &config,
+            &crate::transcribe::DecodeHints::default().with_audio_format_extension("wav"),
+        )
+        .expect_err("content disguised as WAV must stay on the bounded WAV parser");
+        assert!(!decode_error
+            .to_string()
+            .contains(disguised.processing_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn authorized_input_consumes_retained_original_after_source_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source.wav");
+        let original = b"synthetic authorized original revision";
+        std::fs::write(&source, original).unwrap();
+
+        let input = AuthorizedProcessAudioInput::from_proof(
+            &source,
+            &sha256(original),
+            original.len() as u64,
+            "wav",
+        )
+        .unwrap();
+        assert!(is_reserved_private_audio_path(&input.processing_path));
+        assert!(
+            !input.processing_path.exists(),
+            "authorized processing must expose only an opaque registry token"
+        );
+        std::fs::write(&source, b"replacement revision after proof").unwrap();
+
+        assert_eq!(
+            read_registered_private_audio(&input.processing_path).unwrap(),
+            original
+        );
+        input.verify_pipeline_binding().unwrap();
+    }
+
+    #[test]
+    fn authorized_pipeline_entry_revalidates_the_retained_capability() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source.wav");
+        let bytes = b"synthetic authorized audio";
+        std::fs::write(&source, bytes).unwrap();
+        let mut input = AuthorizedProcessAudioInput::from_proof(
+            &source,
+            &sha256(bytes),
+            bytes.len() as u64,
+            "wav",
+        )
+        .unwrap();
+        input.processing_path = dir.path().join("missing-private-audio-authority.wav");
+
+        let error = process_with_template_authorized(
+            &input,
+            ContentType::Memo,
+            None,
+            &Config::default(),
+            None,
+            |_| {},
+        )
+        .expect_err("pipeline must verify the capability before any processing");
+        assert!(
+            matches!(&error, MinutesError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "unexpected pre-processing error: {error}"
+        );
+    }
+
+    #[test]
+    fn authorized_input_rejects_replacement_and_in_place_mutation_after_proof() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source.wav");
+        let displaced = dir.path().join("source.displaced.wav");
+        let original = b"synthetic proof revision";
+        std::fs::write(&source, original).unwrap();
+        let proof = sha256(original);
+
+        std::fs::rename(&source, &displaced).unwrap();
+        std::fs::write(&source, b"synthetic replacement!!").unwrap();
+        let replacement_error =
+            AuthorizedProcessAudioInput::from_proof(&source, &proof, original.len() as u64, "wav")
+                .err()
+                .expect("replacement must not satisfy the original proof");
+        assert!(replacement_error.to_string().contains("proof"));
+
+        std::fs::write(&source, original).unwrap();
+        let mut mutated = original.to_vec();
+        mutated[0] ^= 0x01;
+        std::fs::write(&source, mutated).unwrap();
+        let mutation_error =
+            AuthorizedProcessAudioInput::from_proof(&source, &proof, original.len() as u64, "wav")
+                .err()
+                .expect("in-place mutation must not satisfy the original proof");
+        assert!(mutation_error.to_string().contains("proof"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inherited_source_accepts_an_exact_caller_owned_0644_revision() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("bridge.wav");
+        let bytes = b"synthetic inherited wav revision";
+        let mut create = std::fs::OpenOptions::new();
+        create.read(true).write(true).create_new(true).mode(0o600);
+        let mut created = create.open(&source).unwrap();
+        created.write_all(bytes).unwrap();
+        created.sync_all().unwrap();
+        drop(created);
+
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let exact = std::fs::File::open(&source).unwrap();
+        let input = AuthorizedProcessAudioInput::from_claimed_inherited_file_with_hook(
+            exact,
+            bytes.len() as u64,
+            "wav",
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_registered_private_audio(input.processing_path()).unwrap(),
+            bytes
+        );
+        assert!(!input.processing_path().exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inherited_bridge_rejects_a_source_changed_during_copy() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("bridge.wav");
+        let bytes = b"synthetic inherited wav revision";
+        let mut create = std::fs::OpenOptions::new();
+        create.read(true).write(true).create_new(true).mode(0o600);
+        let mut created = create.open(&source).unwrap();
+        created.write_all(bytes).unwrap();
+        created.sync_all().unwrap();
+        drop(created);
+
+        let exact = std::fs::File::open(&source).unwrap();
+        let changed = source.clone();
+        let error = AuthorizedProcessAudioInput::from_claimed_inherited_file_with_hook(
+            exact,
+            bytes.len() as u64,
+            "wav",
+            false,
+            move || {
+                let mut replacement = bytes.to_vec();
+                replacement[0] ^= 1;
+                std::fs::write(changed, replacement)
+            },
+        )
+        .err()
+        .expect("a changed inherited revision must fail closed");
+        assert!(error.to_string().contains("changed during authorization"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn authorized_input_is_rejected_before_either_linux_child_can_spawn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source.wav");
+        let marker = dir.path().join("child-spawned");
+        let original = b"synthetic descriptor inheritance revision";
+        std::fs::write(&source, original).unwrap();
+        let input = AuthorizedProcessAudioInput::from_proof(
+            &source,
+            &sha256(original),
+            original.len() as u64,
+            "wav",
+        )
+        .unwrap();
+
+        let mut exact_child = crate::bounded_child::BoundedCommand::new("/bin/sh");
+        exact_child.args([
+            "-c",
+            "printf spawned > \"$1\"; /bin/cat",
+            "authorized-child",
+        ]);
+        exact_child.arg(&marker);
+        let authorized_input = authorized_audio_stdin(&input.processing_path).unwrap();
+        let error = output_with_authorized_audio_stdin(&mut exact_child, authorized_input)
+            .expect_err("Linux must reject authorized input before spawn");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !marker.exists(),
+            "rejected child must never create its marker"
+        );
+
+        let mut destination = PrivateAudioTempFile::new("minutes-no-spawn-", ".wav").unwrap();
+        let mut output_child = crate::bounded_child::BoundedCommand::new("/bin/sh");
+        output_child.args([
+            "-c",
+            "printf spawned > \"$1\"; /bin/cat",
+            "authorized-output-child",
+        ]);
+        output_child.arg(&marker);
+        let authorized_input = authorized_audio_stdin(&input.processing_path).unwrap();
+        let error = output_with_authorized_audio_stdin_to_private_file_with_budget(
+            &mut output_child,
+            authorized_input,
+            &mut destination,
+            1024,
+            std::time::Duration::from_secs(5),
+        )
+        .expect_err("Linux must reject authorized input before output-child spawn");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !marker.exists(),
+            "rejected child must never create its marker"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_audio_temp_creation_has_no_named_leaf() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        let mut private = PrivateAudioTempFile::new_in(dir.path(), "ignored-", ".wav").unwrap();
+        let after = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(before, after);
+        assert_eq!(
+            private_audio_metadata(private.as_path()).unwrap().nlink(),
+            0
+        );
+        private
+            .prepare_for_write()
+            .unwrap()
+            .write_all(b"synthetic anonymous audio")
+            .unwrap();
+        private.finish_write().unwrap();
+        assert_eq!(
+            read_registered_private_audio(&private.processing_path()).unwrap(),
+            b"synthetic anonymous audio"
+        );
+        private.verify_private_identity().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn registered_private_audio_readers_are_bounded_and_release_their_lease() {
+        let mut private = PrivateAudioTempFile::new("minutes-reader-cap-", ".wav").unwrap();
+        private
+            .prepare_for_write()
+            .unwrap()
+            .write_all(b"synthetic bounded reader audio")
+            .unwrap();
+        private.finish_write().unwrap();
+        let path = private.processing_path();
+        let mut readers = (0..MAX_ACTIVE_REGISTERED_PRIVATE_AUDIO_READERS)
+            .map(|_| registered_private_audio_reader(&path).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let error = match registered_private_audio_reader(&path) {
+            Ok(_) => panic!("registered private audio readers must remain bounded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        readers.pop();
+        assert!(registered_private_audio_reader(&path).unwrap().is_some());
+
+        drop(readers);
+        let mut owner_readers = (0..MAX_ACTIVE_REGISTERED_PRIVATE_AUDIO_READERS)
+            .map(|_| private.try_clone_reader().unwrap())
+            .collect::<Vec<_>>();
+        let error = match private.try_clone_reader() {
+            Ok(_) => panic!("owner-side readers must share the registry lease cap"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        owner_readers.pop();
+        assert!(private.try_clone_reader().is_ok());
+    }
+
+    #[test]
+    fn explicit_authorized_mov_format_never_discovers_ambient_sibling_stems() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let anonymous_view = dir.path().join("authorized.mov");
+        std::fs::write(&anonymous_view, b"proof-bound primary").unwrap();
+        let voice = dir.path().join("authorized.voice.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&voice, spec).unwrap();
+        for _ in 0..1_600 {
+            writer.write_sample(4_000_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        assert!(matches!(
+            prepare_transcription_input_with_format(&anonymous_view, Some("mov")).unwrap(),
+            PreparedTranscriptionInput::Original
+        ));
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn authorized_audio_pipe_drives_a_real_ffmpeg_decoder() {
+        let Ok(ffmpeg) = crate::ffmpeg::resolve_ffmpeg() else {
+            return;
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+        for _ in 0..1_600 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let bytes = std::fs::read(&source).unwrap();
+        let input = AuthorizedProcessAudioInput::from_proof(
+            &source,
+            &sha256(&bytes),
+            bytes.len() as u64,
+            "wav",
+        )
+        .unwrap();
+
+        let mut command = crate::bounded_child::BoundedCommand::new(ffmpeg);
+        command.args(["-v", "error", "-i", "pipe:0", "-f", "null", "-"]);
+        let authorized_input = authorized_audio_stdin(&input.processing_path).unwrap();
+        let output = output_with_authorized_audio_stdin(&mut command, authorized_input).unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg rejected authorized stdin: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn authorized_copy_rejects_sparse_and_expired_resource_budgets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source_path = dir.path().join("PRIVATE_SPARSE_CANARY.wav");
+        let source = File::create(&source_path).unwrap();
+        source.set_len(1_025).unwrap();
+        drop(source);
+        let mut destination = tempfile::tempfile().unwrap();
+        let failure = copy_and_verify_authorized_bytes_with_budget(
+            File::open(&source_path).unwrap(),
+            &mut destination,
+            &"0".repeat(64),
+            1_025,
+            1_024,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(failure
+            .to_string()
+            .contains("audio copy resource budget exceeded"));
+        assert!(!failure.to_string().contains("PRIVATE_SPARSE_CANARY"));
+
+        let small_path = dir.path().join("small.wav");
+        std::fs::write(&small_path, b"small").unwrap();
+        let mut destination = tempfile::tempfile().unwrap();
+        let expired = copy_and_verify_authorized_bytes_with_budget(
+            File::open(&small_path).unwrap(),
+            &mut destination,
+            &sha256(b"small"),
+            5,
+            10,
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(expired.to_string().contains("resource budget exceeded"));
+    }
 }
 
 /// Process an audio file through the full pipeline.
@@ -1444,8 +4051,10 @@ where
         content_type,
         title,
         config,
-        sidecar,
-        None,
+        ProcessOptions {
+            sidecar,
+            ..ProcessOptions::default()
+        },
         on_progress,
     )
 }
@@ -1465,8 +4074,7 @@ where
         content_type,
         title,
         config,
-        None,
-        None,
+        ProcessOptions::default(),
         on_progress,
     )
 }
@@ -1491,8 +4099,43 @@ where
         content_type,
         title,
         config,
-        sidecar,
-        template,
+        ProcessOptions {
+            sidecar,
+            template,
+            ..ProcessOptions::default()
+        },
+        on_progress,
+    )
+}
+
+/// Process only the exact bytes retained by an authorization capability.
+///
+/// Keeping the capability itself in the call graph makes it impossible for a
+/// caller to obtain descriptor-authorized behavior by supplying a boolean or
+/// format string beside an unrelated path.
+#[allow(dead_code)] // Public bridge is enabled by the dependent policy slice B.
+pub fn process_with_template_authorized<F>(
+    input: &AuthorizedProcessAudioInput,
+    content_type: ContentType,
+    title: Option<&str>,
+    config: &Config,
+    template: Option<&crate::template::Template>,
+    on_progress: F,
+) -> Result<WriteResult, MinutesError>
+where
+    F: FnMut(PipelineStage),
+{
+    input.verify_pipeline_binding()?;
+    process_with_progress_and_sidecar(
+        input.processing_path(),
+        content_type,
+        title,
+        config,
+        ProcessOptions {
+            template,
+            input_authority: Some(input),
+            ..ProcessOptions::default()
+        },
         on_progress,
     )
 }
@@ -1505,27 +4148,83 @@ pub fn transcribe_to_artifact(
     context: &BackgroundPipelineContext,
     existing_output_path: Option<&Path>,
 ) -> Result<TranscriptArtifact, MinutesError> {
-    let metadata = std::fs::metadata(audio_path)?;
-    if metadata.len() == 0 {
+    transcribe_to_artifact_with_authority(
+        audio_path,
+        content_type,
+        title,
+        config,
+        context,
+        existing_output_path,
+        None,
+    )
+}
+
+#[allow(dead_code)] // Background bridge is enabled by the dependent policy slice B.
+pub(crate) fn transcribe_to_artifact_authorized(
+    input: &AuthorizedProcessAudioInput,
+    content_type: ContentType,
+    title: Option<&str>,
+    config: &Config,
+    context: &BackgroundPipelineContext,
+    existing_output_path: Option<&Path>,
+) -> Result<TranscriptArtifact, MinutesError> {
+    input.verify_pipeline_binding()?;
+    transcribe_to_artifact_with_authority(
+        input.processing_path(),
+        content_type,
+        title,
+        config,
+        context,
+        existing_output_path,
+        Some(input),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transcribe_to_artifact_with_authority(
+    audio_path: &Path,
+    content_type: ContentType,
+    title: Option<&str>,
+    config: &Config,
+    context: &BackgroundPipelineContext,
+    existing_output_path: Option<&Path>,
+    input_authority: Option<&AuthorizedProcessAudioInput>,
+) -> Result<TranscriptArtifact, MinutesError> {
+    if input_authority.is_none() && is_reserved_private_audio_path(audio_path) {
+        return Err(reject_authorized_input(
+            "private audio tokens require the typed authorized entry point",
+        ));
+    }
+    if let Some(input) = input_authority {
+        input.verify_pipeline_binding()?;
+    }
+    let audio_path = input_authority
+        .map(AuthorizedProcessAudioInput::processing_path)
+        .unwrap_or(audio_path);
+    let authorized_format = input_authority.map(AuthorizedProcessAudioInput::format_extension);
+    let metadata = private_audio_metadata(audio_path)?;
+    if private_audio_len(audio_path)? == 0 {
         return Err(crate::error::TranscribeError::EmptyAudio.into());
     }
     let recording_date =
         infer_recording_date(context.recorded_at, context.sidecar.as_ref(), &metadata);
 
-    if let Ok(canonical) = audio_path.canonicalize() {
-        let allowed = &config.security.allowed_audio_dirs;
-        if !allowed.is_empty() {
-            let in_allowed = allowed.iter().any(|dir| {
-                dir.canonicalize()
-                    .map(|d| canonical.starts_with(&d))
-                    .unwrap_or(false)
-            });
-            if !in_allowed {
-                return Err(crate::error::TranscribeError::UnsupportedFormat(format!(
-                    "file not in allowed directories: {}",
-                    audio_path.display()
-                ))
-                .into());
+    if authorized_format.is_none() {
+        if let Ok(canonical) = audio_path.canonicalize() {
+            let allowed = &config.security.allowed_audio_dirs;
+            if !allowed.is_empty() {
+                let in_allowed = allowed.iter().any(|dir| {
+                    dir.canonicalize()
+                        .map(|d| canonical.starts_with(&d))
+                        .unwrap_or(false)
+                });
+                if !in_allowed {
+                    return Err(crate::error::TranscribeError::UnsupportedFormat(format!(
+                        "file not in allowed directories: {}",
+                        audio_path.display()
+                    ))
+                    .into());
+                }
             }
         }
     }
@@ -1542,7 +4241,7 @@ pub fn transcribe_to_artifact(
         .as_ref()
         .map(|event| event.attendees.clone())
         .unwrap_or_default();
-    let decode_hints = build_decode_hints(
+    let mut decode_hints = build_decode_hints(
         title,
         calendar_event_title.as_deref(),
         context.pre_context.as_deref(),
@@ -1550,6 +4249,9 @@ pub fn transcribe_to_artifact(
         Some(&config.identity),
         load_vocabulary_for_decode_hints().as_ref(),
     );
+    if let Some(format) = authorized_format {
+        decode_hints = decode_hints.with_audio_format_extension(format);
+    }
 
     // Apply the same stem-mix workaround as `process_with_progress_and_sidecar`
     // so background-job and `minutes process` callers (which reach the
@@ -1557,15 +4259,19 @@ pub fn transcribe_to_artifact(
     // entry point) are not exposed to the macOS 26 dual-track `.mov` 2x
     // bug. A mixed temp handle cleans itself up; a single surviving stem is
     // borrowed in place and contributes explicit recording health (#463).
-    let prepared_input = prepare_transcription_input(audio_path)?;
+    let prepared_input = prepare_transcription_input_with_format(audio_path, authorized_format)?;
+    if let Some(format_extension) = prepared_input.format_extension() {
+        decode_hints = decode_hints.with_audio_format_extension(format_extension);
+    }
     let prepared_recording_health = prepared_input.recording_health().cloned();
     let diarization_audio_path = prepared_input
         .diarization_audio_path()
         .map(Path::to_path_buf);
-    let transcribe_input = prepared_input.as_path(audio_path);
     let step_start = std::time::Instant::now();
-    let result = crate::transcription_coordinator::transcribe_path_for_content_with_hints(
-        transcribe_input,
+    let result = transcribe_prepared_input_with_hints(
+        &prepared_input,
+        audio_path,
+        input_authority,
         content_type,
         config,
         decode_hints,
@@ -1584,7 +4290,7 @@ pub fn transcribe_to_artifact(
         prepared_recording_health,
         effective_context.recording_health,
     );
-    let artifact = write_transcript_artifact(
+    let artifact = write_transcript_artifact_with_authority(
         audio_path,
         content_type,
         title,
@@ -1594,6 +4300,13 @@ pub fn transcribe_to_artifact(
         transcript,
         filter_stats,
         step_start.elapsed().as_millis() as u64,
+        if let Some(input) = input_authority {
+            TranscriptAuthority::AuthorizedCapability(PrivateAudioAuthority(
+                input.processing_path().to_path_buf(),
+            ))
+        } else {
+            TranscriptAuthority::AmbientPath
+        },
     );
     let artifact = artifact.map(|mut artifact| {
         artifact.diarization_audio_path = diarization_audio_path;
@@ -1621,7 +4334,58 @@ pub fn write_transcript_artifact(
     filter_stats: crate::transcribe::FilterStats,
     transcribe_ms: u64,
 ) -> Result<TranscriptArtifact, MinutesError> {
-    let metadata = std::fs::metadata(audio_path)?;
+    if is_reserved_private_audio_path(audio_path) {
+        return Err(reject_authorized_input(
+            "private audio tokens require the typed authorized entry point",
+        ));
+    }
+    write_transcript_artifact_with_authority(
+        audio_path,
+        content_type,
+        title,
+        config,
+        context,
+        existing_output_path,
+        transcript,
+        filter_stats,
+        transcribe_ms,
+        TranscriptAuthority::AmbientPath,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_transcript_artifact_with_authority(
+    audio_path: &Path,
+    content_type: ContentType,
+    title: Option<&str>,
+    config: &Config,
+    context: &BackgroundPipelineContext,
+    existing_output_path: Option<&Path>,
+    transcript: String,
+    filter_stats: crate::transcribe::FilterStats,
+    transcribe_ms: u64,
+    authority: TranscriptAuthority,
+) -> Result<TranscriptArtifact, MinutesError> {
+    match &authority {
+        TranscriptAuthority::AmbientPath if is_reserved_private_audio_path(audio_path) => {
+            return Err(reject_authorized_input(
+                "private audio tokens require the typed authorized entry point",
+            ));
+        }
+        TranscriptAuthority::AuthorizedCapability(identity) if identity.0 != audio_path => {
+            return Err(reject_authorized_input(
+                "transcript authority does not match the private audio capability",
+            ));
+        }
+        TranscriptAuthority::AmbientPath | TranscriptAuthority::AuthorizedCapability(_) => {}
+    }
+    let descriptor_authorized = matches!(&authority, TranscriptAuthority::AuthorizedCapability(_));
+    let diagnostic_audio_target = if descriptor_authorized {
+        "authorized-audio".to_string()
+    } else {
+        audio_path.display().to_string()
+    };
+    let metadata = private_audio_metadata(audio_path)?;
     let recording_date =
         infer_recording_date(context.recorded_at, context.sidecar.as_ref(), &metadata);
     let matched_event = if content_type == ContentType::Meeting {
@@ -1663,7 +4427,7 @@ pub fn write_transcript_artifact(
     let word_count = transcript.split_whitespace().count();
     logging::log_step(
         "transcribe",
-        &audio_path.display().to_string(),
+        &diagnostic_audio_target,
         transcribe_ms,
         serde_json::json!({"words": word_count, "mode": "background", "diagnosis": filter_stats.diagnosis()}),
     );
@@ -1732,7 +4496,7 @@ pub fn write_transcript_artifact(
         title: auto_title,
         r#type: content_type,
         date: recording_date,
-        duration: estimate_duration(audio_path),
+        duration: format_duration_secs(filter_stats.audio_duration_secs),
         source,
         status,
         tags,
@@ -1783,13 +4547,31 @@ pub fn write_transcript_artifact(
     };
 
     let write_result = if let Some(path) = existing_output_path {
-        markdown::rewrite_with_retry_path(
-            path,
+        if descriptor_authorized {
+            markdown::rewrite_without_retry_path(
+                path,
+                &frontmatter,
+                &transcript,
+                None,
+                context.user_notes.as_deref(),
+            )?
+        } else {
+            markdown::rewrite_with_retry_path(
+                path,
+                &frontmatter,
+                &transcript,
+                None,
+                context.user_notes.as_deref(),
+                Some(audio_path),
+            )?
+        }
+    } else if descriptor_authorized {
+        markdown::write_without_retry_path(
             &frontmatter,
             &transcript,
             None,
             context.user_notes.as_deref(),
-            Some(audio_path),
+            config,
         )?
     } else {
         markdown::write_with_retry_path(
@@ -1806,6 +4588,7 @@ pub fn write_transcript_artifact(
         write_result,
         frontmatter,
         transcript,
+        authority,
         diarization_audio_path: None,
     })
 }
@@ -1815,19 +4598,104 @@ pub fn enrich_transcript_artifact<F>(
     artifact: &TranscriptArtifact,
     config: &Config,
     context: &BackgroundPipelineContext,
+    on_progress: F,
+) -> Result<WriteResult, MinutesError>
+where
+    F: FnMut(PipelineStage),
+{
+    if is_reserved_private_audio_path(audio_path) {
+        return Err(reject_authorized_input(
+            "private audio tokens require the typed authorized entry point",
+        ));
+    }
+    if artifact.is_descriptor_authorized() {
+        return Err(reject_authorized_input(
+            "authorized transcript requires the retained capability at enrichment",
+        ));
+    }
+    enrich_transcript_artifact_with_authority(
+        audio_path,
+        artifact,
+        config,
+        context,
+        TranscriptAuthority::AmbientPath,
+        None,
+        on_progress,
+    )
+}
+
+#[allow(dead_code)] // Background bridge is enabled by the dependent policy slice B.
+pub(crate) fn enrich_transcript_artifact_authorized<F>(
+    input: &AuthorizedProcessAudioInput,
+    artifact: &TranscriptArtifact,
+    config: &Config,
+    context: &BackgroundPipelineContext,
+    on_progress: F,
+) -> Result<WriteResult, MinutesError>
+where
+    F: FnMut(PipelineStage),
+{
+    input.verify_pipeline_binding()?;
+    if !artifact.is_descriptor_authorized() {
+        return Err(reject_authorized_input(
+            "ambient transcript cannot be promoted to authorized enrichment",
+        ));
+    }
+    enrich_transcript_artifact_with_authority(
+        input.processing_path(),
+        artifact,
+        config,
+        context,
+        TranscriptAuthority::AuthorizedCapability(PrivateAudioAuthority(
+            input.processing_path().to_path_buf(),
+        )),
+        Some(input),
+        on_progress,
+    )
+}
+
+fn enrich_transcript_artifact_with_authority<F>(
+    audio_path: &Path,
+    artifact: &TranscriptArtifact,
+    config: &Config,
+    context: &BackgroundPipelineContext,
+    authority: TranscriptAuthority,
+    input_authority: Option<&AuthorizedProcessAudioInput>,
     mut on_progress: F,
 ) -> Result<WriteResult, MinutesError>
 where
     F: FnMut(PipelineStage),
 {
+    if artifact.authority != authority {
+        return Err(reject_authorized_input(
+            "transcript authority does not match the enrichment entry point",
+        ));
+    }
     if artifact.frontmatter.status == Some(OutputStatus::NoSpeech) {
+        on_progress(PipelineStage::Saving);
         return Ok(artifact.write_result.clone());
     }
 
-    let diarization_audio_path = artifact
-        .diarization_audio_path
-        .as_deref()
-        .unwrap_or(audio_path);
+    let descriptor_authorized = matches!(&authority, TranscriptAuthority::AuthorizedCapability(_));
+    if descriptor_authorized != input_authority.is_some() {
+        return Err(reject_authorized_input(
+            "live capability does not match transcript provenance",
+        ));
+    }
+    let diagnostic_audio_path = if descriptor_authorized {
+        Path::new("authorized-audio")
+    } else {
+        audio_path
+    };
+    let diagnostic_audio_target = diagnostic_audio_path.display().to_string();
+    let diarization_audio_path = if descriptor_authorized {
+        audio_path
+    } else {
+        artifact
+            .diarization_audio_path
+            .as_deref()
+            .unwrap_or(audio_path)
+    };
     let mut transcript = artifact.transcript.clone();
     let mut diarization_num_speakers = 0usize;
     let mut diarization_from_stems = false;
@@ -1838,15 +4706,26 @@ where
     if config.diarization.engine != "none" && artifact.frontmatter.r#type == ContentType::Meeting {
         on_progress(PipelineStage::Diarizing);
         let diarize_start = std::time::Instant::now();
-        let transcript_windows = build_transcript_windows(
-            &transcript,
-            diarize::audio_duration_secs(diarization_audio_path).unwrap_or(f64::INFINITY),
-        );
+        let audio_duration = if let Some(input) = input_authority {
+            diarize::audio_duration_secs_authorized(input).unwrap_or(f64::INFINITY)
+        } else {
+            diarize::audio_duration_secs(diarization_audio_path).unwrap_or(f64::INFINITY)
+        };
+        let transcript_windows = build_transcript_windows(&transcript, audio_duration);
         let ctx = diarize::DiarizationContext {
             purpose: diarize::DiarizationPurpose::PrimaryMeeting,
             transcript_windows: Some(&transcript_windows),
         };
-        match diarize::diarize_with_context(diarization_audio_path, config, ctx) {
+        let outcome = if descriptor_authorized {
+            diarize::diarize_proof_bound_audio(
+                input_authority.expect("authorized enrichment checked its live capability"),
+                config,
+                ctx,
+            )
+        } else {
+            diarize::diarize_with_context(diarization_audio_path, config, ctx)
+        };
+        match outcome {
             diarize::DiarizationOutcome::Result(result) => {
                 let diarize_ms = diarize_start.elapsed().as_millis() as u64;
                 diarization_num_speakers = result.num_speakers;
@@ -1860,7 +4739,7 @@ where
                 diarization_embeddings = result.speaker_embeddings.clone();
                 logging::log_step(
                     "diarize",
-                    &audio_path.display().to_string(),
+                    &diagnostic_audio_target,
                     diarize_ms,
                     serde_json::json!({
                         "speakers": result.num_speakers,
@@ -1870,13 +4749,13 @@ where
                     }),
                 );
                 transcript = diarize::apply_speakers(&transcript, &result);
-                log_rendered_label_collapse_diagnostic(audio_path, &result, &transcript);
+                log_rendered_label_collapse_diagnostic(diagnostic_audio_path, &result, &transcript);
             }
             diarize::DiarizationOutcome::Skipped { reason } => {
                 let diarize_ms = diarize_start.elapsed().as_millis() as u64;
                 logging::log_step(
                     "diarize",
-                    &audio_path.display().to_string(),
+                    &diagnostic_audio_target,
                     diarize_ms,
                     serde_json::json!({
                         "skipped": true,
@@ -1889,7 +4768,7 @@ where
             diarize::DiarizationOutcome::NotConfigured => {
                 logging::log_step(
                     "diarize",
-                    &audio_path.display().to_string(),
+                    &diagnostic_audio_target,
                     diarize_start.elapsed().as_millis() as u64,
                     serde_json::json!({"skipped": true}),
                 );
@@ -1897,18 +4776,22 @@ where
         }
     }
 
-    let screen_dir = crate::screen::screens_dir_for(audio_path);
-    let screen_files = if screen_dir.exists() {
-        crate::screen::list_screenshots(&screen_dir)
-    } else {
-        vec![]
-    };
+    let screen_dir = resolve_screen_context_directory(
+        context.context_session_id.as_deref(),
+        audio_path,
+        descriptor_authorized,
+    );
+    let screen_files = screen_dir
+        .as_ref()
+        .filter(|dir| dir.exists())
+        .map(|dir| crate::screen::list_screenshots(dir))
+        .unwrap_or_default();
 
     let mut summary_participants: Vec<String> = Vec::new();
     let mut structured_actions: Vec<markdown::ActionItem> = Vec::new();
     let mut structured_decisions: Vec<markdown::Decision> = Vec::new();
     let mut structured_intents: Vec<markdown::Intent> = Vec::new();
-    let audio_log_target = audio_path.display().to_string();
+    let audio_log_target = diagnostic_audio_target.clone();
     let summary_model = summarize::summarization_model_hint(config, !screen_files.is_empty());
 
     let mut raw_summary: Option<summarize::Summary> = None;
@@ -1932,7 +4815,7 @@ where
             structured_actions = extract_action_items(&summary);
             log_structured_llm_step(
                 "action_items",
-                audio_path,
+                diagnostic_audio_path,
                 actions_started,
                 StructuredLlmLogFields {
                     outcome: if structured_actions.is_empty() {
@@ -1953,7 +4836,7 @@ where
             structured_intents = extract_intents(&summary);
             log_structured_llm_step(
                 "intent_extract",
-                audio_path,
+                diagnostic_audio_path,
                 intents_started,
                 StructuredLlmLogFields {
                     outcome: if structured_intents.is_empty() {
@@ -1979,7 +4862,7 @@ where
     if summary.is_none() && config.summarization.engine != "none" {
         log_structured_llm_step(
             "action_items",
-            audio_path,
+            diagnostic_audio_path,
             std::time::Instant::now(),
             StructuredLlmLogFields {
                 outcome: "fallback",
@@ -1991,7 +4874,7 @@ where
         );
         log_structured_llm_step(
             "intent_extract",
-            audio_path,
+            diagnostic_audio_path,
             std::time::Instant::now(),
             StructuredLlmLogFields {
                 outcome: "fallback",
@@ -2003,7 +4886,7 @@ where
         );
     }
 
-    if !config.screen_context.keep_after_summary {
+    if !descriptor_authorized && !config.screen_context.keep_after_summary {
         if let Some(session_id) = context.context_session_id.as_deref() {
             match crate::context_store::cleanup_screen_context(session_id) {
                 Ok(status) => {
@@ -2014,8 +4897,10 @@ where
                     tracing::warn!(session_id, error = %error, "failed to clean screen context");
                 }
             }
-        } else if screen_dir.exists() && std::fs::remove_dir_all(&screen_dir).is_ok() {
-            tracing::info!(dir = %screen_dir.display(), "screen captures cleaned up");
+        } else if let Some(screen_dir) = screen_dir.as_ref() {
+            if screen_dir.exists() && std::fs::remove_dir_all(screen_dir).is_ok() {
+                tracing::info!(dir = %screen_dir.display(), "screen captures cleaned up");
+            }
         }
     }
 
@@ -2023,7 +4908,13 @@ where
 
     let attribution_start = std::time::Instant::now();
     let attribution = attribute_meeting_speakers(
-        audio_path,
+        if descriptor_authorized {
+            diagnostic_audio_path
+        } else {
+            audio_path
+        },
+        diagnostic_audio_path,
+        !descriptor_authorized,
         artifact.frontmatter.r#type,
         artifact.frontmatter.source.as_deref(),
         config,
@@ -2105,7 +4996,7 @@ where
     );
     log_structured_llm_step(
         "entity_extract",
-        audio_path,
+        diagnostic_audio_path,
         entities_started,
         StructuredLlmLogFields {
             outcome: if entities.people.is_empty() && entities.projects.is_empty() {
@@ -2154,17 +5045,22 @@ where
     if let Some(warning) = collapse_warning {
         summarization_warnings.push(warning);
     }
-    if let Some(warning) = detect_silent_remote_stem_warning(
-        artifact.frontmatter.r#type,
-        audio_path,
-        artifact.frontmatter.source.as_deref(),
-        merge_recording_health(
-            recording_health.clone(),
-            artifact.frontmatter.recording_health.clone(),
-        )
-        .as_ref(),
-    ) {
+    if let Some(warning) = detect_engine_fallback_warning(config) {
         summarization_warnings.push(warning);
+    }
+    if !descriptor_authorized {
+        if let Some(warning) = detect_silent_remote_stem_warning(
+            artifact.frontmatter.r#type,
+            audio_path,
+            artifact.frontmatter.source.as_deref(),
+            merge_recording_health(
+                recording_health.clone(),
+                artifact.frontmatter.recording_health.clone(),
+            )
+            .as_ref(),
+        ) {
+            summarization_warnings.push(warning);
+        }
     }
     frontmatter.status = if !summarization_warnings.is_empty() {
         Some(OutputStatus::Degraded)
@@ -2185,32 +5081,48 @@ where
     frontmatter.recording_health =
         merge_recording_health(recording_health, frontmatter.recording_health);
 
-    on_progress(PipelineStage::Saving);
-    let mut result = markdown::rewrite_with_retry_path(
-        &artifact.write_result.path,
-        &frontmatter,
-        &transcript,
-        summary.as_deref(),
-        context.user_notes.as_deref(),
-        Some(audio_path),
-    )?;
+    let mut result = if descriptor_authorized {
+        markdown::rewrite_without_retry_path(
+            &artifact.write_result.path,
+            &frontmatter,
+            &transcript,
+            summary.as_deref(),
+            context.user_notes.as_deref(),
+        )?
+    } else {
+        markdown::rewrite_with_retry_path(
+            &artifact.write_result.path,
+            &frontmatter,
+            &transcript,
+            summary.as_deref(),
+            context.user_notes.as_deref(),
+            Some(audio_path),
+        )?
+    };
     apply_title_generation(
-        audio_path,
+        diagnostic_audio_path,
         &mut result,
         &mut frontmatter,
         title_generation,
         |duration_ms, extra| {
             logging::log_step(
                 "title_generation",
-                &audio_path.display().to_string(),
+                &diagnostic_audio_target,
                 duration_ms,
                 extra,
             );
         },
     );
 
+    on_progress(PipelineStage::Saving);
+
     if frontmatter.r#type == ContentType::Meeting {
-        log_attribution_decision(audio_path, &result.path, attribution_ms, &attribution.debug);
+        log_attribution_decision(
+            diagnostic_audio_path,
+            &result.path,
+            attribution_ms,
+            &attribution.debug,
+        );
     }
 
     if !diarization_embeddings.is_empty() {
@@ -2291,22 +5203,45 @@ fn process_with_progress_and_sidecar<F>(
     content_type: ContentType,
     title: Option<&str>,
     config: &Config,
-    sidecar: Option<&SidecarMetadata>,
-    template: Option<&crate::template::Template>,
+    options: ProcessOptions<'_>,
     mut on_progress: F,
 ) -> Result<WriteResult, MinutesError>
 where
     F: FnMut(PipelineStage),
 {
+    let ProcessOptions {
+        sidecar,
+        template,
+        input_authority,
+    } = options;
+    if input_authority.is_none() && is_reserved_private_audio_path(audio_path) {
+        return Err(reject_authorized_input(
+            "private audio tokens require the typed authorized entry point",
+        ));
+    }
+    if let Some(input) = input_authority {
+        input.verify_pipeline_binding()?;
+    }
+    let audio_path = input_authority
+        .map(AuthorizedProcessAudioInput::processing_path)
+        .unwrap_or(audio_path);
+    let authorized_format = input_authority.map(AuthorizedProcessAudioInput::format_extension);
+    let descriptor_bound = input_authority.is_some();
+    let diagnostic_audio_path = if descriptor_bound {
+        Path::new("authorized-audio")
+    } else {
+        audio_path
+    };
+    let diagnostic_audio_target = diagnostic_audio_path.display().to_string();
     let start = std::time::Instant::now();
     tracing::info!(
-        file = %audio_path.display(),
+        file = %diagnostic_audio_path.display(),
         content_type = ?content_type,
         "starting pipeline"
     );
 
     // Verify file exists and is not empty
-    let metadata = std::fs::metadata(audio_path)?;
+    let metadata = private_audio_metadata(audio_path)?;
     let recording_date =
         infer_recording_date(sidecar.and_then(|s| s.captured_at), sidecar, &metadata);
     if metadata.len() == 0 {
@@ -2314,20 +5249,22 @@ where
     }
 
     // Security: verify file is in an allowed directory (prevents path traversal via MCP)
-    if let Ok(canonical) = audio_path.canonicalize() {
-        let allowed = &config.security.allowed_audio_dirs;
-        if !allowed.is_empty() {
-            let in_allowed = allowed.iter().any(|dir| {
-                dir.canonicalize()
-                    .map(|d| canonical.starts_with(&d))
-                    .unwrap_or(false)
-            });
-            if !in_allowed {
-                return Err(crate::error::TranscribeError::UnsupportedFormat(format!(
-                    "file not in allowed directories: {}",
-                    audio_path.display()
-                ))
-                .into());
+    if !descriptor_bound {
+        if let Ok(canonical) = audio_path.canonicalize() {
+            let allowed = &config.security.allowed_audio_dirs;
+            if !allowed.is_empty() {
+                let in_allowed = allowed.iter().any(|dir| {
+                    dir.canonicalize()
+                        .map(|d| canonical.starts_with(&d))
+                        .unwrap_or(false)
+                });
+                if !in_allowed {
+                    return Err(crate::error::TranscribeError::UnsupportedFormat(format!(
+                        "file not in allowed directories: {}",
+                        audio_path.display()
+                    ))
+                    .into());
+                }
             }
         }
     }
@@ -2348,7 +5285,7 @@ where
         .as_ref()
         .map(|e| e.attendees.clone())
         .unwrap_or_default();
-    let decode_hints = build_decode_hints(
+    let mut decode_hints = build_decode_hints(
         title,
         calendar_event_title.as_deref(),
         pre_context.as_deref(),
@@ -2356,6 +5293,9 @@ where
         Some(&config.identity),
         load_vocabulary_for_decode_hints().as_ref(),
     );
+    if let Some(format_extension) = authorized_format {
+        decode_hints = decode_hints.with_audio_format_extension(format_extension);
+    }
 
     // Step 1: Transcribe (always)
     on_progress(PipelineStage::Transcribing);
@@ -2365,16 +5305,20 @@ where
     // automatic; a surviving original stem is borrowed and never removed.
     // If neither sibling contains signal, the typed mix error still prevents
     // unsafe fallback to the broken dual-track `.mov` decoder.
-    let prepared_input = prepare_transcription_input(audio_path)?;
+    let prepared_input = prepare_transcription_input_with_format(audio_path, authorized_format)?;
+    if let Some(format_extension) = prepared_input.format_extension() {
+        decode_hints = decode_hints.with_audio_format_extension(format_extension);
+    }
     let prepared_recording_health = prepared_input.recording_health().cloned();
     let diarization_audio_path = prepared_input
         .diarization_audio_path()
         .map(Path::to_path_buf);
-    let transcribe_input = prepared_input.as_path(audio_path);
-    tracing::info!(step = "transcribe", file = %transcribe_input.display(), "transcribing audio");
+    tracing::info!(step = "transcribe", file = %diagnostic_audio_path.display(), "transcribing audio");
     let step_start = std::time::Instant::now();
-    let result = crate::transcription_coordinator::transcribe_path_for_content_with_hints(
-        transcribe_input,
+    let result = transcribe_prepared_input_with_hints(
+        &prepared_input,
+        audio_path,
+        input_authority,
         content_type,
         config,
         decode_hints,
@@ -2402,7 +5346,7 @@ where
     );
     logging::log_step(
         "transcribe",
-        &audio_path.display().to_string(),
+        &diagnostic_audio_target,
         transcribe_ms,
         serde_json::json!({"words": word_count, "diagnosis": filter_stats.diagnosis()}),
     );
@@ -2434,15 +5378,26 @@ where
     {
         on_progress(PipelineStage::Diarizing);
         tracing::info!(step = "diarize", "running speaker diarization");
-        let transcript_windows = build_transcript_windows(
-            &transcript,
-            diarize::audio_duration_secs(diarization_audio_path).unwrap_or(f64::INFINITY),
-        );
+        let audio_duration = if let Some(input) = input_authority {
+            diarize::audio_duration_secs_authorized(input).unwrap_or(f64::INFINITY)
+        } else {
+            diarize::audio_duration_secs(diarization_audio_path).unwrap_or(f64::INFINITY)
+        };
+        let transcript_windows = build_transcript_windows(&transcript, audio_duration);
         let ctx = diarize::DiarizationContext {
             purpose: diarize::DiarizationPurpose::PrimaryMeeting,
             transcript_windows: Some(&transcript_windows),
         };
-        match diarize::diarize_with_context(diarization_audio_path, config, ctx) {
+        let outcome = if descriptor_bound {
+            diarize::diarize_proof_bound_audio(
+                input_authority.expect("descriptor-bound pipeline retained its capability"),
+                config,
+                ctx,
+            )
+        } else {
+            diarize::diarize_with_context(diarization_audio_path, config, ctx)
+        };
+        match outcome {
             diarize::DiarizationOutcome::Result(result) => {
                 diarization_num_speakers = result.num_speakers;
                 diarization_from_stems = result.source_aware;
@@ -2457,7 +5412,7 @@ where
                 }
                 diarization_embeddings = result.speaker_embeddings.clone();
                 let transcript = diarize::apply_speakers(&transcript, &result);
-                log_rendered_label_collapse_diagnostic(audio_path, &result, &transcript);
+                log_rendered_label_collapse_diagnostic(diagnostic_audio_path, &result, &transcript);
                 transcript
             }
             diarize::DiarizationOutcome::Skipped { reason } => {
@@ -2503,19 +5458,21 @@ where
     let mut structured_intents: Vec<markdown::Intent> = Vec::new();
 
     // Collect screen context screenshots (if any were captured)
-    let screen_dir = crate::screen::screens_dir_for(audio_path);
-    let screen_files = if screen_dir.exists() {
-        let files = crate::screen::list_screenshots(&screen_dir);
-        if !files.is_empty() {
-            tracing::info!(count = files.len(), "screen context screenshots found");
-        }
-        files
-    } else {
-        vec![]
-    };
+    let screen_dir = (!descriptor_bound).then(|| crate::screen::screens_dir_for(audio_path));
+    let screen_files = screen_dir
+        .as_ref()
+        .filter(|dir| dir.exists())
+        .map(|dir| crate::screen::list_screenshots(dir))
+        .unwrap_or_default();
+    if !screen_files.is_empty() {
+        tracing::info!(
+            count = screen_files.len(),
+            "screen context screenshots found"
+        );
+    }
 
     let mut summary_participants: Vec<String> = Vec::new();
-    let audio_log_target = audio_path.display().to_string();
+    let audio_log_target = diagnostic_audio_target.clone();
     let summary_model = summarize::summarization_model_hint(config, !screen_files.is_empty());
 
     let mut raw_summary: Option<summarize::Summary> = None;
@@ -2547,7 +5504,7 @@ where
             structured_actions = extract_action_items(&s);
             log_structured_llm_step(
                 "action_items",
-                audio_path,
+                diagnostic_audio_path,
                 actions_started,
                 StructuredLlmLogFields {
                     outcome: if structured_actions.is_empty() {
@@ -2568,7 +5525,7 @@ where
             structured_intents = extract_intents(&s);
             log_structured_llm_step(
                 "intent_extract",
-                audio_path,
+                diagnostic_audio_path,
                 intents_started,
                 StructuredLlmLogFields {
                     outcome: if structured_intents.is_empty() {
@@ -2600,7 +5557,7 @@ where
     if summary.is_none() && config.summarization.engine != "none" {
         log_structured_llm_step(
             "action_items",
-            audio_path,
+            diagnostic_audio_path,
             std::time::Instant::now(),
             StructuredLlmLogFields {
                 outcome: "fallback",
@@ -2612,7 +5569,7 @@ where
         );
         log_structured_llm_step(
             "intent_extract",
-            audio_path,
+            diagnostic_audio_path,
             std::time::Instant::now(),
             StructuredLlmLogFields {
                 outcome: "fallback",
@@ -2625,15 +5582,15 @@ where
     }
 
     // Clean up screen captures (runs regardless of summarization setting — fixes race)
-    if !config.screen_context.keep_after_summary
-        && screen_dir.exists()
-        && std::fs::remove_dir_all(&screen_dir).is_ok()
-    {
-        tracing::info!(dir = %screen_dir.display(), "screen captures cleaned up");
+    if !config.screen_context.keep_after_summary {
+        if let Some(screen_dir) = screen_dir.as_ref() {
+            if screen_dir.exists() && std::fs::remove_dir_all(screen_dir).is_ok() {
+                tracing::info!(dir = %screen_dir.display(), "screen captures cleaned up");
+            }
+        }
     }
 
     // Step 4: Match calendar event + merge attendees
-    on_progress(PipelineStage::Saving);
 
     if let Some(ref title) = calendar_event_title {
         tracing::info!(event = %title, attendees = calendar_attendees.len(), "matched calendar event");
@@ -2649,7 +5606,9 @@ where
     // Level 2 → Level 0 → Level 1 (voice enrollment → deterministic → LLM)
     let attribution_start = std::time::Instant::now();
     let attribution = attribute_meeting_speakers(
-        audio_path,
+        diagnostic_audio_path,
+        diagnostic_audio_path,
+        !descriptor_bound,
         content_type,
         sidecar.and_then(|metadata| metadata.source.as_deref()),
         config,
@@ -2717,7 +5676,7 @@ where
     );
 
     // Step 5: Write markdown (always)
-    let duration = estimate_duration(audio_path);
+    let duration = format_duration_secs(filter_stats.audio_duration_secs);
     let auto_title = title.map(String::from).unwrap_or_else(|| {
         if status == Some(OutputStatus::NoSpeech) {
             "Untitled Recording".into()
@@ -2743,7 +5702,7 @@ where
     );
     log_structured_llm_step(
         "entity_extract",
-        audio_path,
+        diagnostic_audio_path,
         entities_started,
         StructuredLlmLogFields {
             outcome: if entities.people.is_empty() && entities.projects.is_empty() {
@@ -2818,6 +5777,9 @@ where
     if let Some(warning) = collapse_warning {
         summarization_warnings.push(warning);
     }
+    if let Some(warning) = detect_engine_fallback_warning(config) {
+        summarization_warnings.push(warning);
+    }
     if let Some(warning) = detect_silent_remote_stem_warning(
         content_type,
         audio_path,
@@ -2885,23 +5847,34 @@ where
     tracing::info!(step = "write", "writing markdown");
     crate::process_trace::stage("pipeline.write.start");
     let step_start = std::time::Instant::now();
-    let mut result = markdown::write_with_retry_path(
-        &frontmatter,
-        &transcript,
-        summary.as_deref(),
-        user_notes.as_deref(),
-        Some(audio_path),
-        config,
-    )?;
+    let mut result = if descriptor_bound {
+        markdown::write_without_retry_path(
+            &frontmatter,
+            &transcript,
+            summary.as_deref(),
+            user_notes.as_deref(),
+            config,
+        )?
+    } else {
+        markdown::write_with_retry_path(
+            &frontmatter,
+            &transcript,
+            summary.as_deref(),
+            user_notes.as_deref(),
+            Some(audio_path),
+            config,
+        )?
+    };
+    on_progress(PipelineStage::Saving);
     apply_title_generation(
-        audio_path,
+        diagnostic_audio_path,
         &mut result,
         &mut frontmatter,
         title_generation,
         |duration_ms, extra| {
             logging::log_step(
                 "title_generation",
-                &audio_path.display().to_string(),
+                &diagnostic_audio_target,
                 duration_ms,
                 extra,
             );
@@ -2909,7 +5882,12 @@ where
     );
 
     if frontmatter.r#type == ContentType::Meeting {
-        log_attribution_decision(audio_path, &result.path, attribution_ms, &attribution.debug);
+        log_attribution_decision(
+            diagnostic_audio_path,
+            &result.path,
+            attribution_ms,
+            &attribution.debug,
+        );
     }
     // Save per-speaker embeddings as sidecar (for Level 3 confirmed learning)
     if !diarization_embeddings.is_empty() {
@@ -2932,7 +5910,7 @@ where
     let write_ms = step_start.elapsed().as_millis() as u64;
     logging::log_step(
         "write",
-        &audio_path.display().to_string(),
+        &diagnostic_audio_target,
         write_ms,
         serde_json::json!({"output": result.path.display().to_string(), "words": result.word_count}),
     );
@@ -2969,13 +5947,13 @@ where
     // Emit event for agents/watchers
     crate::events::append_event(crate::events::audio_processed_event(
         &result,
-        &audio_path.display().to_string(),
+        &diagnostic_audio_target,
     ));
 
     let elapsed = start.elapsed();
     logging::log_step(
         "pipeline_complete",
-        &audio_path.display().to_string(),
+        &diagnostic_audio_target,
         elapsed.as_millis() as u64,
         serde_json::json!({"output": result.path.display().to_string(), "words": result.word_count, "content_type": format!("{:?}", content_type)}),
     );
@@ -2991,21 +5969,6 @@ where
     );
 
     Ok(result)
-}
-
-/// Estimate audio duration from file size (rough approximation).
-/// 16kHz mono 16-bit WAV ≈ 32KB/sec.
-fn estimate_duration(audio_path: &Path) -> String {
-    if let Ok(duration_secs) = diarize::audio_duration_secs(audio_path) {
-        return format_duration_secs(duration_secs);
-    }
-
-    let bytes = std::fs::metadata(audio_path).map(|m| m.len()).unwrap_or(0);
-
-    // WAV header is 44 bytes, then raw PCM at 32000 bytes/sec (16kHz 16-bit mono)
-    let secs = if bytes > 44 { (bytes - 44) / 32_000 } else { 0 };
-
-    format_duration_secs(secs as f64)
 }
 
 fn format_duration_secs(duration_secs: f64) -> String {
@@ -4622,8 +7585,8 @@ pub(crate) fn build_entity_links(
 /// "mathieu@work.com" on one calendar and "mat@personal.com" on
 /// another, mentioned in transcript as "Mathieu". Without this fold,
 /// each surface spawns its own entity and both the markdown frontmatter
-/// and `graph.db` end up with duplicate Person rows that compound on
-/// every rerun. Non-user entities are unaffected.
+/// and each disposable graph projection end up with duplicate Person rows.
+/// Non-user entities are unaffected.
 fn fold_user_identity(
     people: &mut BTreeMap<String, (String, BTreeSet<String>)>,
     identity: &IdentityConfig,
@@ -5017,6 +7980,16 @@ pub fn run_post_record_hook(config: &Config, transcript_path: &Path) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn apple_speech_preference_resolves_through_closed_product_gate() {
+        assert_eq!(
+            resolved_apple_speech_backend("apple-speech"),
+            "whisper",
+            "Apple Speech must remain unselectable before signed runtime acceptance"
+        );
+        assert_eq!(resolved_apple_speech_backend("whisper"), "whisper");
+    }
+
     fn sparse_health(voice: f32, system: f32) -> markdown::RecordingHealth {
         markdown::RecordingHealth {
             voice_stem_active_ratio: Some(voice),
@@ -5239,6 +8212,44 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("engine `claude`"));
+    }
+
+    #[test]
+    fn engine_fallback_warning_absent_when_requested_engine_runs() {
+        let mut config = Config::default();
+        config.transcription.engine = "whisper".into();
+        assert!(detect_engine_fallback_warning(&config).is_none());
+    }
+
+    #[test]
+    fn engine_fallback_warning_records_retained_parakeet_selection() {
+        // A retained `parakeet` preference resolves to Whisper until the
+        // secure byte transport ships. The desktop app installs no tracing
+        // subscriber, so the transcript is the only place a user can learn
+        // which engine actually ran (#633).
+        let mut config = Config::default();
+        config.transcription.engine = "parakeet".into();
+        let warning = detect_engine_fallback_warning(&config)
+            .expect("retained parakeet selection must be recorded");
+        assert_eq!(warning.step, "transcribe");
+        assert_eq!(warning.reason, "engine_fallback");
+        let message = warning.message.as_ref().unwrap();
+        assert!(
+            message.contains("`parakeet`"),
+            "names the request: {message}"
+        );
+        assert!(message.contains("`whisper`"), "names the actual: {message}");
+    }
+
+    #[test]
+    fn engine_fallback_warning_records_retained_apple_speech_selection() {
+        let mut config = Config::default();
+        config.transcription.engine = "apple-speech".into();
+        let warning = detect_engine_fallback_warning(&config)
+            .expect("retained apple-speech selection must be recorded");
+        assert_eq!(warning.step, "transcribe");
+        assert_eq!(warning.reason, "engine_fallback");
+        assert!(warning.message.as_ref().unwrap().contains("`apple-speech`"));
     }
 
     fn apply_silent_remote_warning_on_batch_path(
@@ -5748,18 +8759,6 @@ mod tests {
     }
 
     #[test]
-    fn estimate_duration_formats_correctly() {
-        // 32000 bytes/sec * 90 sec + 44 header = 2_880_044 bytes
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.wav");
-        let data = vec![0u8; 2_880_044];
-        std::fs::write(&path, &data).unwrap();
-
-        let duration = estimate_duration(&path);
-        assert_eq!(duration, "1m 30s");
-    }
-
-    #[test]
     fn format_duration_secs_rounds_to_nearest_second() {
         assert_eq!(format_duration_secs(4313.6), "71m 54s");
         assert_eq!(format_duration_secs(59.6), "1m 0s");
@@ -6179,6 +9178,8 @@ mod tests {
 
         let result = attribute_meeting_speakers(
             Path::new("/fake.wav"),
+            Path::new("/fake.wav"),
+            true,
             ContentType::Meeting,
             None,
             &config,
@@ -6205,6 +9206,8 @@ mod tests {
 
         let result = attribute_meeting_speakers(
             Path::new("/fake.wav"),
+            Path::new("/fake.wav"),
+            true,
             ContentType::Meeting,
             None,
             &config,
@@ -6342,6 +9345,8 @@ mod tests {
 
         let result = attribute_meeting_speakers(
             Path::new("/Users/test/.minutes/native-captures/fake-call.mov"),
+            Path::new("/Users/test/.minutes/native-captures/fake-call.mov"),
+            true,
             ContentType::Meeting,
             Some("native-call"),
             &config,
@@ -7470,6 +10475,390 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod private_audio_temp_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn external_same_uid_process_cannot_reopen_private_audio_through_proc() {
+        use std::os::fd::AsRawFd;
+
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut audio =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-private-audio-", ".wav").unwrap();
+        audio
+            .prepare_for_write()
+            .unwrap()
+            .write_all(b"PRIVATE_AUDIO_PROC_CANARY")
+            .unwrap();
+        audio.finish_write().unwrap();
+
+        let proc_path = format!("/proc/{}/fd/{}", std::process::id(), audio.file.as_raw_fd());
+        let read = crate::engine_process::command(Path::new("/bin/sh"))
+            .args([
+                "-c",
+                "exec 3< \"$1\"; dd bs=1 count=1 <&3 >/dev/null 2>&1",
+                "sh",
+                &proc_path,
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            !read.success(),
+            "same-UID process reopened private audio for reading"
+        );
+
+        let write = crate::engine_process::command(Path::new("/bin/sh"))
+            .args(["-c", "exec 3<> \"$1\"; printf X >&3", "sh", &proc_path])
+            .status()
+            .unwrap();
+        assert!(
+            !write.success(),
+            "same-UID process reopened private audio for writing"
+        );
+        assert_eq!(
+            read_registered_private_audio(&audio.processing_path()).unwrap(),
+            b"PRIVATE_AUDIO_PROC_CANARY"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_private_audio_uses_sealed_registry_storage_and_cleans_up() {
+        assert!(private_audio_processing_supported());
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut audio =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-private-audio-", ".wav").unwrap();
+        audio
+            .prepare_for_write()
+            .unwrap()
+            .write_all(b"WINDOWS_SEALED_AUDIO_CANARY")
+            .unwrap();
+        audio.finish_write().unwrap();
+        audio.verify_private_identity().unwrap();
+
+        let processing_path = audio.processing_path();
+        assert!(is_reserved_private_audio_path(&processing_path));
+        assert_eq!(
+            read_registered_private_audio(&processing_path).unwrap(),
+            b"WINDOWS_SEALED_AUDIO_CANARY"
+        );
+        assert_eq!(
+            private_audio_len(&processing_path).unwrap(),
+            b"WINDOWS_SEALED_AUDIO_CANARY".len() as u64
+        );
+
+        drop(audio);
+        assert!(private_audio_len(&processing_path).is_err());
+        assert_eq!(std::fs::read_dir(ambient.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_audio_temps_are_unique_private_and_cleanup_exactly() {
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(target_os = "linux")]
+        use std::os::unix::fs::PermissionsExt;
+
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut first =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-private-audio-", ".wav").unwrap();
+        let mut second =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-private-audio-", ".wav").unwrap();
+        assert_ne!(first.as_path(), second.as_path());
+
+        first
+            .prepare_for_write()
+            .unwrap()
+            .write_all(b"first synthetic private audio")
+            .unwrap();
+        first.finish_write().unwrap();
+        second
+            .prepare_for_write()
+            .unwrap()
+            .write_all(b"second synthetic private audio")
+            .unwrap();
+        second.finish_write().unwrap();
+
+        let first_path = first.as_path().to_path_buf();
+        let second_path = second.as_path().to_path_buf();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            private_audio_metadata(&first_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(private_audio_metadata(&first_path).unwrap().nlink(), 0);
+        first.verify_private_identity().unwrap();
+        second.verify_private_identity().unwrap();
+        assert_eq!(std::fs::read_dir(ambient.path()).unwrap().count(), 0);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        assert!(authorized_audio_stdin(&first_path).unwrap().is_some());
+        assert!(authorized_audio_stdin(&second_path).unwrap().is_some());
+
+        drop(first);
+        let retired_error = match authorized_audio_stdin(&first_path) {
+            Ok(_) => panic!("retired private-audio capability must be denied"),
+            Err(error) => error,
+        };
+        assert_eq!(retired_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!retired_error
+            .to_string()
+            .contains(&first_path.display().to_string()));
+        assert_eq!(private_audio_diagnostic_label(&first_path), "private-audio");
+        assert!(
+            !crate::diarize::stem_has_audio(&first_path),
+            "a retired capability must not fall through to an ambient pathname probe"
+        );
+        assert!(authorized_audio_stdin(&second_path).unwrap().is_some());
+        drop(second);
+        assert_eq!(
+            authorized_audio_stdin(&second_path).err().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::read_dir(ambient.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_audio_readers_have_independent_positional_cursors() {
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-private-audio-", ".wav").unwrap();
+        temp.prepare_for_write()
+            .unwrap()
+            .write_all(b"0123456789")
+            .unwrap();
+        temp.finish_write().unwrap();
+
+        let mut first = authorized_audio_stdin(temp.as_path()).unwrap().unwrap();
+        let mut second = authorized_audio_stdin(temp.as_path()).unwrap().unwrap();
+        let mut first_prefix = [0_u8; 4];
+        let mut second_prefix = [0_u8; 4];
+        first.read_exact(&mut first_prefix).unwrap();
+        second.read_exact(&mut second_prefix).unwrap();
+        assert_eq!(&first_prefix, b"0123");
+        assert_eq!(&second_prefix, b"0123");
+
+        first.seek(std::io::SeekFrom::Start(8)).unwrap();
+        let mut tail = [0_u8; 2];
+        first.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"89");
+
+        let mut second_next = [0_u8; 2];
+        second.read_exact(&mut second_next).unwrap();
+        assert_eq!(&second_next, b"45");
+        assert_eq!(std::fs::read_dir(ambient.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn anonymous_generation_rejects_finish_reset_and_stale_reader_overlap() {
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-generation-", ".wav").unwrap();
+        let path = temp.processing_path();
+        let mut writer = temp.prepare_for_write().unwrap();
+        writer.write_all(b"sealed generation").unwrap();
+
+        assert!(
+            temp.finish_write().is_err(),
+            "an active writer must block seal"
+        );
+        drop(writer);
+        temp.finish_write().unwrap();
+
+        let mut reader = temp.try_clone_reader().unwrap();
+        assert!(
+            temp.prepare_for_write().is_err(),
+            "an active reader must block generation reset"
+        );
+        let retirement = temp
+            .discard_failed_write()
+            .expect_err("failed exclusive reset must retire the capability");
+        assert!(retirement.to_string().contains("capability retired"));
+        assert_eq!(
+            private_audio_len(&path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "a reader from the retired generation must fail closed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn anonymous_failed_reset_revokes_detached_writer_lease() {
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-writer-retire-", ".wav").unwrap();
+        let path = temp.processing_path();
+        let mut writer = temp.prepare_for_write().unwrap();
+        writer.write_all(b"partial").unwrap();
+
+        let retirement = temp
+            .discard_failed_write()
+            .expect_err("an active detached writer must force capability retirement");
+        assert!(retirement.to_string().contains("capability retired"));
+        assert_eq!(
+            writer.write_all(b"must-not-land").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let retired = match registered_private_audio_reader(&path) {
+            Ok(_) => panic!("retired writer capability must not resolve"),
+            Err(error) => error,
+        };
+        assert_eq!(retired.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn private_audio_child_lease_fails_closed_across_exec() {
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-private-audio-", ".wav").unwrap();
+        temp.prepare_for_write()
+            .unwrap()
+            .write_all(b"PRIVATE_AUDIO_CANARY")
+            .unwrap();
+        temp.finish_write().unwrap();
+        let error = match temp.child_lease() {
+            Ok(_) => panic!("raw private audio must never cross ordinary exec"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("across exec"));
+        assert_eq!(std::fs::read_dir(ambient.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_audio_output_has_no_swappable_leaf_and_ignores_legacy_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let ambient = tempfile::TempDir::new().unwrap();
+        let canary = ambient.path().join("RAW_AUDIO_CANARY");
+        std::fs::write(&canary, b"private").unwrap();
+        let legacy = ambient
+            .path()
+            .join(format!("minutes-ffmpeg-{}.wav", std::process::id()));
+        symlink(&canary, &legacy).unwrap();
+
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-ffmpeg-", ".wav").unwrap();
+        assert_ne!(temp.as_path(), legacy);
+
+        // There is no temporary leaf to replace before the simulated decoder
+        // emits bytes: only the retained descriptor capability exists.
+        assert_eq!(std::fs::read_dir(ambient.path()).unwrap().count(), 2);
+        let mut command = crate::bounded_child::BoundedCommand::new("sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 6000 ]; do printf 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef >&2; i=$((i + 1)); done; printf decoded",
+        ]);
+        let output = output_with_authorized_audio_stdin_to_private_file_with_budget(
+            &mut command,
+            None,
+            &mut temp,
+            MAX_AUTHORIZED_PROCESS_AUDIO_BYTES,
+            std::time::Duration::from_secs(30 * 60),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stderr.len(), MAX_PRIVATE_AUDIO_CHILD_STDERR_BYTES);
+        assert_eq!(std::fs::read(&canary).unwrap(), b"private");
+
+        let mut retained = temp.try_clone_reader().unwrap();
+        let mut decoded = Vec::new();
+        retained.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"decoded");
+
+        drop(temp);
+        assert!(std::fs::symlink_metadata(&legacy)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&canary).unwrap(), b"private");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_audio_output_budget_failure_zeroes_the_exact_destination() {
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-ffmpeg-", ".wav").unwrap();
+        let mut command = crate::bounded_child::BoundedCommand::new("sh");
+        command.args(["-c", "printf too-many-bytes"]);
+
+        let error = output_with_authorized_audio_stdin_to_private_file_with_budget(
+            &mut command,
+            None,
+            &mut temp,
+            4,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("resource budget"));
+        assert_eq!(private_audio_len(temp.as_path()).unwrap(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_audio_child_nonzero_exit_discards_partial_output() {
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-ffmpeg-", ".wav").unwrap();
+        let mut command = crate::bounded_child::BoundedCommand::new("sh");
+        command.args(["-c", "printf partial-output; exit 7"]);
+
+        let output = output_with_authorized_audio_stdin_to_private_file_with_budget(
+            &mut command,
+            None,
+            &mut temp,
+            MAX_AUTHORIZED_PROCESS_AUDIO_BYTES,
+            std::time::Duration::from_secs(30 * 60),
+        )
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(private_audio_len(temp.as_path()).unwrap(), 0);
+        assert!(
+            temp.prepare_for_write().is_ok(),
+            "discarded output must be reusable"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", windows))]
+    fn failed_destination_reset_retires_the_opaque_capability() {
+        let ambient = tempfile::TempDir::new().unwrap();
+        let mut temp =
+            PrivateAudioTempFile::new_in(ambient.path(), "minutes-retire-failed-", ".wav").unwrap();
+        let path = temp.processing_path();
+        let writer = temp.prepare_for_write().unwrap();
+
+        let error = temp
+            .discard_failed_write()
+            .expect_err("an active sealed writer must prevent reset");
+        assert!(error.to_string().contains("capability retired"));
+        let retired = match registered_private_audio_reader(&path) {
+            Ok(_) => panic!("retired capability must not resolve"),
+            Err(error) => error,
+        };
+        assert_eq!(retired.kind(), std::io::ErrorKind::PermissionDenied);
+        drop(writer);
+    }
+}
+
 /// Tests for `prepare_transcription_input`: the helper that decides whether
 /// the input `.mov` needs stem-mixing before transcription (#234 fix, #235 v2
 /// review items #3 stem-lookup correctness, #4 typed error, #6 shared between
@@ -7477,8 +10866,33 @@ mod tests {
 #[cfg(test)]
 mod prepare_transcription_input_tests {
     use super::*;
-    use std::cell::RefCell;
     use std::fs;
+
+    #[cfg(all(unix, not(feature = "whisper")))]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(all(unix, not(feature = "whisper")))]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(all(unix, not(feature = "whisper")))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     /// Write a 1-second audible-tone WAV at 16kHz mono s16. We need a non-
     /// silent signal because `stem_has_audio` (via `discover_stem_plan`)
@@ -7501,6 +10915,17 @@ mod prepare_transcription_input_tests {
         writer.finalize().unwrap();
     }
 
+    #[cfg(all(unix, not(feature = "whisper")))]
+    fn write_audible_pcm_s16le(path: &std::path::Path) {
+        let two_pi_over_period = 2.0 * std::f32::consts::PI * 440.0 / 16_000.0;
+        let mut bytes = Vec::with_capacity(16_000 * std::mem::size_of::<i16>());
+        for n in 0..16_000 {
+            let sample = (5000.0 * (n as f32 * two_pi_over_period).sin()) as i16;
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
     fn write_digital_silence_wav(path: &std::path::Path) {
         let spec = hound::WavSpec {
             channels: 1,
@@ -7515,35 +10940,7 @@ mod prepare_transcription_input_tests {
         writer.finalize().unwrap();
     }
 
-    /// Build the `<name>.mov` + `<name>.voice.wav` + `<name>.system.wav`
-    /// trio that a native-call capture produces. The `.mov` itself is a
-    /// 1-byte stub because `prepare_transcription_input` sniffs only the
-    /// extension and the sibling stems, never the `.mov` content.
-    fn fake_native_call_capture(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mov = dir.path().join(format!("{}.mov", name));
-        let voice = dir.path().join(format!("{}.voice.wav", name));
-        let system = dir.path().join(format!("{}.system.wav", name));
-        fs::write(&mov, b"x").unwrap();
-        write_audible_wav(&voice);
-        write_audible_wav(&system);
-        (dir, mov)
-    }
-
-    fn fake_mixer(system: &Path, voice: &Path, output: &Path) -> Result<(), String> {
-        assert!(system.exists(), "fake mixer must receive the system stem");
-        assert!(voice.exists(), "fake mixer must receive the voice stem");
-        write_audible_wav(output);
-        Ok(())
-    }
-
-    fn prepare_with_fake_mixer(
-        audio_path: &Path,
-    ) -> Result<PreparedTranscriptionInput, MinutesError> {
-        prepare_transcription_input_with_mixer(audio_path, fake_mixer)
-    }
-
-    fn write_unfinalized_f32_wav(path: &Path, audible: bool) {
+    fn write_unfinalized_f32_wav(path: &std::path::Path, audible: bool) {
         const DATA_OFFSET: usize = 0x1000;
         let mut bytes = vec![0_u8; DATA_OFFSET];
         bytes[0..4].copy_from_slice(b"RIFF");
@@ -7579,6 +10976,73 @@ mod prepare_transcription_input_tests {
         }
     }
 
+    /// Build the `<name>.mov` + `<name>.voice.wav` + `<name>.system.wav`
+    /// trio that a native-call capture produces. The `.mov` itself is a
+    /// 1-byte stub because `prepare_transcription_input` sniffs only the
+    /// extension and the sibling stems, never the `.mov` content.
+    fn fake_native_call_capture(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mov = dir.path().join(format!("{}.mov", name));
+        let voice = dir.path().join(format!("{}.voice.wav", name));
+        let system = dir.path().join(format!("{}.system.wav", name));
+        fs::write(&mov, b"x").unwrap();
+        write_audible_wav(&voice);
+        write_audible_wav(&system);
+        (dir, mov)
+    }
+
+    fn ffmpeg_available() -> bool {
+        let Ok(ffmpeg) = crate::ffmpeg::resolve_ffmpeg() else {
+            return false;
+        };
+        crate::engine_process::command(ffmpeg)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(all(unix, not(feature = "whisper")))]
+    fn with_deterministic_native_mix(run: impl FnOnce(&Path, &Config)) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_lock = crate::test_home_env_lock();
+        let (capture_dir, mov) = fake_native_call_capture("typed-dispatch");
+        let mixed_fixture = capture_dir.path().join("mixed-fixture.s16le");
+        write_audible_pcm_s16le(&mixed_fixture);
+
+        let fake_ffmpeg = capture_dir.path().join("fake-ffmpeg");
+        let fixture = mixed_fixture.to_string_lossy().replace('\'', "'\\''");
+        fs::write(
+            &fake_ffmpeg,
+            format!("#!/bin/sh\nexec /bin/cat -- '{fixture}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_ffmpeg, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let home = capture_dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _ffmpeg = EnvVarGuard::set("MINUTES_FFMPEG", &fake_ffmpeg);
+        let mut config = Config {
+            output_dir: capture_dir.path().join("meetings"),
+            ..Config::default()
+        };
+        config.summarization.engine = "none".into();
+        config.diarization.engine = "none".into();
+
+        run(&mov, &config);
+    }
+
+    #[cfg(all(unix, not(feature = "whisper")))]
+    fn assert_typed_mix_reached_transcriber(transcript: &str) {
+        assert!(transcript.contains("Transcription placeholder"));
+        assert!(transcript.contains("Audio file: private-audio"));
+        assert!(!transcript.contains("typed authorized entry point"));
+    }
+
     #[test]
     fn returns_ok_none_for_non_mov_input() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -7610,91 +11074,124 @@ mod prepare_transcription_input_tests {
 
     #[test]
     fn mixes_stems_when_both_present_and_valid() {
+        let _env_lock = crate::test_home_env_lock();
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
         let (_dir, mov) = fake_native_call_capture("call-clean");
-        let result =
-            prepare_with_fake_mixer(&mov).expect("mix must succeed when both stems are valid PCM");
+        let result = prepare_transcription_input(&mov)
+            .expect("mix must succeed when both stems are valid PCM");
         let PreparedTranscriptionInput::Mixed(handle) = result else {
             panic!("both valid stems must be mixed")
         };
-        let mixed_path = handle.as_path().to_path_buf();
-        assert!(mixed_path.exists(), "mixed PCM file must exist on disk");
-
-        // Verify the file is a valid WAV (RIFF header + WAVE format tag).
-        let header = fs::read(&mixed_path).unwrap();
+        let mixed_capability = handle.processing_path().to_path_buf();
+        assert!(is_reserved_private_audio_path(&mixed_capability));
         assert!(
-            header.len() >= 12,
-            "wav header is too short: {} bytes",
-            header.len()
+            !mixed_capability.exists(),
+            "mixed PCM must not be published as a plaintext filesystem path"
         );
-        assert_eq!(&header[0..4], b"RIFF", "wav must start with RIFF magic");
-        assert_eq!(&header[8..12], b"WAVE", "wav must declare WAVE format");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(&mixed_path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
 
-        // Drop must clean up the temp file.
+        // Parse the exact retained capability with the same WAV parser used by
+        // transcription. Checking only RIFF/WAVE magic misses FFmpeg's
+        // non-seekable `0xffff_ffff` data-length placeholder, which is the
+        // signed-Mac runtime regression this test exists to prevent.
+        let reader = authorized_audio_stdin(handle.processing_path())
+            .unwrap()
+            .expect("mixed authority must resolve its retained reader");
+        let mut wav = hound::WavReader::new(reader)
+            .expect("two-stem FFmpeg output must be a bounded, parseable WAV");
+        assert_eq!(wav.spec().channels, 1);
+        assert_eq!(wav.spec().sample_rate, 16_000);
+        assert_eq!(wav.spec().bits_per_sample, 16);
+        assert_eq!(wav.duration(), 16_000);
+        let mut samples = 0_u32;
+        for sample in wav.samples::<i16>() {
+            sample.expect("every mixed sample must decode");
+            samples += 1;
+        }
+        assert_eq!(samples, 16_000);
+        drop(wav);
+
+        // Drop must retire the opaque registry capability.
         drop(handle);
         assert!(
-            !mixed_path.exists(),
-            "MixedStemTempFile Drop impl must remove the temp file"
+            registered_private_audio_reader(&mixed_capability).is_err(),
+            "dropped mixed audio must not remain resolvable"
         );
     }
 
     #[test]
-    fn internal_mix_uses_repaired_unfinalized_stems() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mov = dir.path().join("unfinalized.mov");
-        let voice = dir.path().join("unfinalized.voice.wav");
-        let system = dir.path().join("unfinalized.system.wav");
-        fs::write(&mov, b"x").unwrap();
-        write_unfinalized_f32_wav(&voice, true);
-        write_unfinalized_f32_wav(&system, true);
-        let invocations = RefCell::new(Vec::new());
-
-        let result =
-            prepare_transcription_input_with_mixer(&mov, |system_path, voice_path, output_path| {
-                invocations
-                    .borrow_mut()
-                    .push((system_path.to_path_buf(), voice_path.to_path_buf()));
-                fake_mixer(system_path, voice_path, output_path)
-            })
-            .expect("repaired stems must be mixed internally");
-
-        assert!(matches!(result, PreparedTranscriptionInput::Mixed(_)));
-        // Canonicalize expectations: macOS tempdirs live under the /var ->
-        // /private/var symlink and the prepare path canonicalizes stem paths.
-        assert_eq!(
-            invocations.into_inner(),
-            vec![(
-                system.canonicalize().unwrap(),
-                voice.canonicalize().unwrap()
-            )],
-            "both repaired stems must flow through the internal mixer seam"
-        );
-        for path in [&voice, &system] {
-            let bytes = fs::read(path).unwrap();
-            assert_eq!(
-                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-                (bytes.len() - 8) as u32
-            );
-            assert_eq!(
-                u32::from_le_bytes(bytes[0xffc..0x1000].try_into().unwrap()),
-                (bytes.len() - 0x1000) as u32
-            );
+    fn private_pcm_wrapper_rejects_partial_s16_sample() {
+        let mut raw = PrivateAudioTempFile::new("minutes-odd-pcm-", ".s16le").unwrap();
+        {
+            let mut writer = raw.prepare_for_write().unwrap();
+            writer.write_all(&[1_u8, 2, 3]).unwrap();
         }
+        raw.finish_write().unwrap();
+
+        let error = private_pcm_s16le_mono_to_wav(&raw, 16_000)
+            .err()
+            .expect("partial samples must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("complete sample"));
     }
 
     #[test]
-    fn exact_internal_mix_filter_is_pinned() {
-        assert_eq!(
-            STEM_MIX_FILTER,
-            "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0"
+    fn private_pcm_wrapper_rejects_empty_output_and_raw_capability_retires() {
+        let mut raw = PrivateAudioTempFile::new("minutes-empty-pcm-", ".s16le").unwrap();
+        {
+            let writer = raw.prepare_for_write().unwrap();
+            drop(writer);
+        }
+        raw.finish_write().unwrap();
+        let raw_capability = raw.processing_path();
+
+        let error = private_pcm_s16le_mono_to_wav(&raw, 16_000)
+            .err()
+            .expect("empty PCM must fail closed before WAV authorization");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("empty"));
+        assert!(
+            registered_private_audio_reader(&raw_capability)
+                .unwrap()
+                .is_some(),
+            "the caller-owned raw capability remains exact until its owner drops"
         );
+
+        drop(raw);
+        assert!(
+            registered_private_audio_reader(&raw_capability).is_err(),
+            "failed raw capability must retire when its owner drops"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(feature = "whisper")))]
+    fn foreground_two_stem_mix_reaches_typed_authorized_transcription() {
+        with_deterministic_native_mix(|mov, config| {
+            let result = process(mov, ContentType::Memo, Some("Typed foreground mix"), config)
+                .expect("typed mixed audio must pass the ambient-token guard");
+            let rendered = fs::read_to_string(result.path).unwrap();
+            assert_typed_mix_reached_transcriber(&rendered);
+        });
+    }
+
+    #[test]
+    #[cfg(all(unix, not(feature = "whisper")))]
+    fn background_two_stem_mix_reaches_typed_authorized_transcription() {
+        with_deterministic_native_mix(|mov, config| {
+            let artifact = transcribe_to_artifact(
+                mov,
+                ContentType::Memo,
+                Some("Typed background mix"),
+                config,
+                &BackgroundPipelineContext::default(),
+                None,
+            )
+            .expect("typed mixed audio must pass the ambient-token guard");
+            assert_typed_mix_reached_transcriber(&artifact.transcript);
+        });
     }
 
     #[test]
@@ -7729,6 +11226,33 @@ mod prepare_transcription_input_tests {
         assert!(recording_health.capture_warnings[0]
             .message
             .contains("call/remote audio only"));
+    }
+
+    #[test]
+    fn repairs_unfinalized_voice_header_before_selecting_survivor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mov = dir.path().join("repair-single.mov");
+        let voice = dir.path().join("repair-single.voice.wav");
+        let system = dir.path().join("repair-single.system.wav");
+        fs::write(&mov, b"x").unwrap();
+        write_unfinalized_f32_wav(&voice, true);
+        fs::write(&system, b"").unwrap();
+
+        let result = prepare_transcription_input(&mov).expect("repaired voice stem is recoverable");
+        let PreparedTranscriptionInput::SingleStem { path, .. } = result else {
+            panic!("repaired voice stem must be selected without decoding the mov")
+        };
+        assert_eq!(path, voice.canonicalize().unwrap());
+
+        let bytes = fs::read(&voice).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            (bytes.len() - 8) as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[0xffc..0x1000].try_into().unwrap()),
+            (bytes.len() - 0x1000) as u32
+        );
     }
 
     #[test]
@@ -7793,33 +11317,6 @@ mod prepare_transcription_input_tests {
             result,
             PreparedTranscriptionInput::SingleStem { path, .. } if path == canonical_voice
         ));
-    }
-
-    #[test]
-    fn degrades_to_single_healthy_stem_after_header_repair() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mov = dir.path().join("repair-single.mov");
-        let voice = dir.path().join("repair-single.voice.wav");
-        let system = dir.path().join("repair-single.system.wav");
-        fs::write(&mov, b"x").unwrap();
-        write_unfinalized_f32_wav(&voice, true);
-        fs::write(&system, b"").unwrap();
-
-        let result = prepare_transcription_input_with_mixer(&mov, |_, _, _| {
-            Err("mixer must not run for a single healthy stem".into())
-        })
-        .expect("repaired voice stem is recoverable");
-
-        let canonical_voice = voice.canonicalize().unwrap();
-        assert!(matches!(
-            result,
-            PreparedTranscriptionInput::SingleStem { path, .. } if path == canonical_voice
-        ));
-        let repaired = fs::read(&voice).unwrap();
-        assert_eq!(
-            u32::from_le_bytes(repaired[0xffc..0x1000].try_into().unwrap()),
-            (repaired.len() - 0x1000) as u32
-        );
     }
 
     #[test]
@@ -7893,28 +11390,82 @@ mod prepare_transcription_input_tests {
         write_digital_silence_wav(&system);
 
         let result = prepare_transcription_input(&mov);
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("two silent stems must fail clearly"),
-        };
         assert!(matches!(
-            &error,
-            MinutesError::Transcribe(
+            result,
+            Err(MinutesError::Transcribe(
                 crate::error::TranscribeError::NativeCaptureStemMixUnavailable { .. }
-            )
+            ))
         ));
-        let message = error.to_string();
-        assert!(message.contains("digitally silent"), "{message}");
-        assert!(message.contains("files remain available"), "{message}");
-        assert!(
-            !message.contains("mixed via ffmpeg first"),
-            "the user must never be told to run the internal mix: {message}"
-        );
+    }
+
+    #[test]
+    fn background_stem_validation_recovers_valid_system_sibling_without_mov_fallback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mov = dir.path().join("invalid-member.mov");
+        let voice = dir.path().join("invalid-member.voice.wav");
+        let system = dir.path().join("invalid-member.system.wav");
+        fs::write(&mov, b"mov must never be decoded").unwrap();
+        fs::write(&voice, vec![b'x'; 200_000]).unwrap();
+        write_audible_wav(&system);
+
+        let result = prepare_transcription_input(&mov).expect("valid system survivor");
+        let PreparedTranscriptionInput::SingleStem {
+            path,
+            recording_health,
+        } = result
+        else {
+            panic!("invalid voice plus valid system must select system survivor")
+        };
+        assert_eq!(path, system.canonicalize().unwrap());
+        assert!(recording_health.capture_warnings.iter().any(|warning| {
+            matches!(&warning.kind, crate::diarize::FailureKind::Other { code }
+                if code == crate::health::NATIVE_CALL_INVALID_STEM_CODE)
+                && warning.source == crate::diarize::CaptureSource::Voice
+                && warning.message.contains("invalid or corrupt")
+        }));
+        assert!(mov.exists());
+        assert!(voice.exists());
+        assert!(system.exists());
+    }
+
+    #[test]
+    fn background_stem_validation_recovers_valid_voice_sibling_without_mov_fallback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mov = dir.path().join("invalid-system.mov");
+        let voice = dir.path().join("invalid-system.voice.wav");
+        let system = dir.path().join("invalid-system.system.wav");
+        fs::write(&mov, b"mov must never be decoded").unwrap();
+        write_audible_wav(&voice);
+        fs::write(&system, vec![b'x'; 200_000]).unwrap();
+
+        let result = prepare_transcription_input(&mov).expect("valid voice survivor");
+        let PreparedTranscriptionInput::SingleStem {
+            path,
+            recording_health,
+        } = result
+        else {
+            panic!("valid voice plus invalid system must select voice survivor")
+        };
+        assert_eq!(path, voice.canonicalize().unwrap());
+        assert!(recording_health.capture_warnings.iter().any(|warning| {
+            matches!(&warning.kind, crate::diarize::FailureKind::Other { code }
+                if code == crate::health::NATIVE_CALL_INVALID_STEM_CODE)
+                && warning.source == crate::diarize::CaptureSource::System
+                && warning.message.contains("invalid or corrupt")
+        }));
+        assert!(mov.exists());
+        assert!(voice.exists());
+        assert!(system.exists());
     }
 
     #[cfg(unix)]
     #[test]
     fn canonicalizes_symlinked_mov_to_find_stems() {
+        let _env_lock = crate::test_home_env_lock();
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
         // The .mov plus its stems live in one tempdir; the symlink lives
         // in another. discover_stem_plan called on the un-canonicalized
         // symlink path would look for stems in the wrong directory and
@@ -7926,12 +11477,17 @@ mod prepare_transcription_input_tests {
         std::os::unix::fs::symlink(&target_mov, &link)
             .expect("symlink creation must succeed on unix");
 
-        let result = prepare_with_fake_mixer(&link)
+        let result = prepare_transcription_input(&link)
             .expect("symlink resolution must succeed and stems must be found");
         let PreparedTranscriptionInput::Mixed(handle) = result else {
             panic!("symlinked .mov must resolve and mix its stems")
         };
-        assert!(handle.as_path().exists(), "mixed PCM must exist post-mix");
+        assert!(
+            authorized_audio_stdin(handle.processing_path())
+                .unwrap()
+                .is_some(),
+            "mixed PCM capability must remain registered post-mix"
+        );
 
         // Drop the handle before the tempdirs so cleanup is observable.
         drop(handle);

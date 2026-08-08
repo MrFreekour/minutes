@@ -50,6 +50,10 @@ dist/
 # Exception: bundled demo asset (include_bytes! at compile time)
 !crates/assets/demo.wav
 !tests/eval/fixtures/audio/apple-speech-dictation.wav
+# Exception: committed AAC fixture for the bounded decode worker. Encoding it on
+# demand would let the test skip on exactly the machines it exists to cover.
+!crates/core/resources/decode-fixture-tone.m4a
+!crates/core/resources/decode-fixture-chained.ogg
 !tests/eval/fixtures/audio/apple-speech-meeting.wav
 # Exception: parity-test fixtures (deterministic WAVs derived from
 # demo.wav by examples/build_parity_fixtures.rs; committed so
@@ -82,6 +86,7 @@ site/tsconfig.tsbuildinfo
 
 # Tauri build-time staged resources (built by tauri/src-tauri/build.rs)
 tauri/src-tauri/resources/
+archive/src-tauri/gen/
 
 # Release note drafts (local working docs; release body is copied into GitHub)
 notes-release-v*.md

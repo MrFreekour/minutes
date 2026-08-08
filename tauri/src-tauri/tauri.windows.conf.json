@@ -11,6 +11,11 @@
       "nsis": {
         "installMode": "currentUser"
       }
-    }
+    },
+    "resources": [
+      "resources/assistant-skill-bundle/**/*",
+      "vcruntime140*.dll",
+      "msvcp140*.dll"
+    ]
   }
 }

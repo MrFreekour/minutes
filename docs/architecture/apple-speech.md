@@ -1,43 +1,55 @@
 # Apple Speech Scope
 
 This document describes the **current shipped scope** of Minutes' experimental
-Apple Speech path. It is intentionally practical and user-facing.
+Apple Speech integration. It is intentionally practical and user-facing.
 
 If you want the benchmark evidence that informed this experiment, see
 [`docs/designs/apple-speech-benchmark-2026-04-22.md`](designs/apple-speech-benchmark-2026-04-22.md).
 
 ## Current product scope
 
-As of the current `main` branch:
+Apple Speech is not yet selectable for live, dictation, recording-sidecar, or
+batch transcription. Existing preferences remain fail-closed to sealed local
+Whisper while the candidate transport completes signed macOS runtime
+acceptance.
 
-- `engine = "apple-speech"` is an **experimental standalone live-transcript
-  path**.
-- It applies to `minutes live`.
-- Dictation can opt into Apple Speech finalization with
-  `[dictation] backend = "apple-speech"` on macOS when DictationTranscriber is
-  available. Whisper still powers progressive partial text and remains the
-  fallback.
-- It does not apply to `minutes record` or post-recording / batch
-  transcription.
-- The desktop settings UI can surface Apple Speech availability, but it does
-  **not** currently let you switch the main transcription engine to Apple
-  Speech from the settings picker.
-- To use Apple Speech, configure standalone live transcript or dictation
-  through the config file / CLI-driven flows instead of the desktop
-  transcription-engine dropdown.
+The candidate replaces the pathname handoff with a dedicated service embedded
+in the app. Minutes sends bounded 16 kHz mono sample bytes over a nonce-bound,
+one-request XPC connection. The service constructs an `AVAudioPCMBuffer`
+directly; it accepts no audio pathname, executable, environment, or attachment
+and creates no named plaintext utterance file.
+
+- the parent requires the service's exact CodeDirectory hash and Team identity
+  before the content-free handshake
+- the service reciprocally authenticates the signed Minutes parent before
+  accepting any sample frame
+- source, ad-hoc, missing-service, altered-service, and unconfirmed-exit cases
+  stay on Whisper
+- the App-Sandbox-only service has immutable process, address-space, byte, and
+  wall-clock ceilings and exits after one terminal response
+
+The product gate remains off until an explicitly authorized signed development
+app proves the exact reviewed SHA on macOS 26, including the hostile same-UID
+open-holder regression and fallback behavior. A positive source compile,
+unsigned build, or operating-system capability probe is not that proof.
+
+The exact candidate includes a fixed-input, non-product
+`--apple-speech-transport-acceptance` route. It accepts no caller audio or path
+and does not make Apple Speech selectable. After the separately gated signing
+job has destroyed its credentials, a no-secret successor job can invoke that
+route from the signed app while a same-UID process watches and holds newly
+created temporary files. The resulting content-free receipt is acceptance
+evidence only after that protected workflow actually runs for the exact SHA.
 
 ## Fallback behavior
 
-If standalone live transcript is configured to use Apple Speech and Apple
-Speech cannot run or fails mid-session, Minutes falls back in this order:
+Standalone live transcript and dictation currently resolve Apple Speech to:
 
-1. a ready Parakeet backend, if one is available
-2. Whisper, if Parakeet is unavailable or also fails
+1. Whisper
 
-That means Apple Speech is not a replacement for the rest of the transcription
-stack. It is an experimental first-choice backend for standalone live mode
-and opt-in dictation finalization, with the existing local engines still
-providing the safety net.
+No current fallback branch creates a named plaintext Apple Speech WAV. After
+the signed runtime gate passes, the intended live fallback order is Apple
+Speech, separately selectable Parakeet if available, then Whisper.
 
 ## What Apple Speech does not do today
 
@@ -47,6 +59,8 @@ Apple Speech does **not** currently:
 - provide dictation partials before finalization
 - replace post-recording batch transcription or watcher processing
 - become selectable from the desktop settings transcription-engine picker
+- receive private recording or dictation audio while the signed runtime
+  acceptance gate is closed
 
 ## Related docs
 

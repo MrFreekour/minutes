@@ -331,7 +331,7 @@ post_record_skill: minutes-soap-review
 - Gallery landing page on useminutes.app
 
 ### Phase 5: graph schema extensions
-- Custom extract fields flow into `graph.db`
+- Custom extract fields flow into disposable, policy-authorized graph projections
 - Domain-aware MCP graph tools (query across medical, legal, sales templates)
 - Cross-template queries ("all SOAP notes where diagnosis includes X")
 

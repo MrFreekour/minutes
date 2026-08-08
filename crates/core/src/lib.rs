@@ -2,7 +2,22 @@
 
 pub mod apple_fm;
 pub mod apple_speech;
+pub mod apple_speech_worker;
+pub(crate) mod audio_budget;
+pub mod audio_decode_worker;
 pub mod autoresearch;
+pub(crate) mod bounded_child;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_graph_xpc;
+
+/// Activate a previously validated MCP process-audio outer process group.
+/// The CLI must also hold the helper's live supervisor capability; the core
+/// repeats the Unix parent/group topology checks before changing child-launch
+/// behavior.
+#[cfg(unix)]
+pub fn install_validated_outer_process_group(process_group: i32) -> std::io::Result<()> {
+    bounded_child::install_validated_outer_process_group(process_group)
+}
 #[cfg(any(test, all(feature = "streaming", feature = "whisper")))]
 pub(crate) mod bounded_inference;
 pub mod calendar;
@@ -30,7 +45,9 @@ pub mod error;
 pub mod events;
 pub mod ffmpeg;
 pub mod graph;
+pub mod graph_worker;
 pub mod health;
+pub mod i18n;
 pub mod jobs;
 pub mod knowledge;
 pub mod knowledge_extract;
@@ -56,12 +73,15 @@ pub mod parakeet_sidecar;
 pub(crate) mod person_identity;
 pub mod pid;
 pub mod pipeline;
+pub mod policy_fs;
 pub mod process_trace;
 pub mod resummarize;
 pub mod retention;
 // Shared mono-downmix + decimation resampler (used by capture and streaming)
 pub(crate) mod resample;
 pub mod screen;
+#[cfg(any(target_os = "macos", target_os = "windows", all(test, unix)))]
+pub(crate) mod sealed_audio;
 pub mod search;
 pub mod search_index;
 pub mod sensitive;
@@ -165,4 +185,36 @@ pub use vad::{Vad, VadEngine, VadResult};
 pub fn install_whisper_logging_hooks() {
     #[cfg(feature = "whisper")]
     whisper_rs::install_logging_hooks();
+}
+/// Whether a worker-capable binary sits beside the test harness, answered once.
+///
+/// Several tests assert this as a precondition rather than skipping silently, and
+/// each answer copies the ~250 MB debug executable into an immutable snapshot.
+///
+/// WHAT THIS ACTUALLY SAVES, measured rather than assumed, because the first
+/// version of this comment cited a 26% suite regression that does not reproduce:
+/// about 0.4 s across the three call sites, two avoided binds at roughly 0.2 s
+/// each. Run-to-run noise on the same machine is larger than that. It is kept
+/// because it is free and directionally right, not because it rescued anything.
+///
+/// "The answer cannot change during a run" would be too strong: `bind` can fail
+/// transiently under memory pressure or a full temp filesystem, which is the
+/// documented flake behind track-1 item 10. What is true is that a transient
+/// first-call failure caches `false` and then fails all three preconditions
+/// loudly, which is the safe direction.
+#[cfg(test)]
+pub(crate) fn test_worker_binary_is_available() -> bool {
+    use std::sync::OnceLock;
+
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        crate::audio_decode_worker::bounded_decode_fallback_available(
+            &crate::config::Config::default(),
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::test_support::home_env_lock()
 }

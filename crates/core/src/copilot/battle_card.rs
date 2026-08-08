@@ -61,20 +61,24 @@ impl BattleCard {
         let mut card = Self::default();
         let mut source_errors = Vec::new();
 
-        // Rebuild before reading graph-derived context so a cache created by
-        // older code cannot retain a meeting that is restricted today. If the
-        // rebuild fails, omit graph context instead of consulting stale data.
-        let graph_ready = match graph::rebuild_index(config) {
-            Ok(_) => true,
-            Err(error) => {
-                source_errors.push(format!("graph rebuild: {error}"));
-                false
-            }
-        };
-
-        if graph_ready {
-            match graph::relationship_map(config) {
-                Ok(people) => {
+        // One attested, process-private projection supplies both panels. This
+        // avoids rebuilding the whole corpus two or three times for one card.
+        #[cfg(test)]
+        let relationship_context = graph::relationship_context(config);
+        #[cfg(not(test))]
+        let relationship_context = crate::graph_worker::run_policy_projection_worker(
+            config,
+            graph::PolicyProjectionRequest::RelationshipContext { limit: 8 },
+        )
+        .and_then(|response| match response {
+            graph::PolicyProjectionResponse::RelationshipContext(context) => Ok(context),
+            _ => Err("policy graph worker returned the wrong relationship response".into()),
+        })
+        .map_err(|error| graph::GraphError::Io(std::io::Error::other(error)));
+        match relationship_context {
+            Ok(context) => {
+                {
+                    let people = context.people;
                     card.people = people
                         .into_iter()
                         .take(8)
@@ -91,13 +95,8 @@ impl BattleCard {
                         })
                         .collect();
                 }
-                Err(error) => source_errors.push(format!("graph people: {error}")),
-            }
-        }
-
-        if graph_ready {
-            match graph::query_commitments(config, None) {
-                Ok(commitments) => {
+                {
+                    let commitments = context.commitments;
                     card.open_commitments = commitments
                         .into_iter()
                         .take(10)
@@ -118,8 +117,8 @@ impl BattleCard {
                         })
                         .collect();
                 }
-                Err(error) => source_errors.push(format!("graph commitments: {error}")),
             }
+            Err(error) => source_errors.push(format!("graph context: {error}")),
         }
 
         let filters = search::SearchFilters::default();
@@ -291,8 +290,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = Config::default();
-        config.output_dir = meetings;
+        let config = Config {
+            output_dir: meetings,
+            ..Config::default()
+        };
         let card = BattleCard::assemble(&config, "pricing").unwrap();
 
         assert!(card.rendered.contains("Sam Lee"));

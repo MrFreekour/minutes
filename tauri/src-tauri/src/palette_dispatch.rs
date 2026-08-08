@@ -319,16 +319,6 @@ fn confirm_speaker_for_meeting(
     )
     .map_err(|e| format!("could not write speaker overlay: {}", e))?;
 
-    tauri::async_runtime::spawn_blocking(|| {
-        let config = Config::load();
-        if let Err(e) = minutes_core::graph::rebuild_index(&config) {
-            eprintln!(
-                "[palette] speaker overlay saved, but graph rebuild failed: {}",
-                e
-            );
-        }
-    });
-
     Ok(())
 }
 

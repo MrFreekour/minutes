@@ -49,6 +49,14 @@ try {
   for (const name of manifestToolNames) {
     assert(toolNames.has(name), `tools/list is missing manifest tool ${name}`);
   }
+  for (const retired of ["qmd_collection_status", "register_qmd_collection"]) {
+    assert(!toolNames.has(retired), `tools/list still advertises retired ${retired}`);
+    assert(!manifestToolNames.has(retired), `manifest still advertises retired ${retired}`);
+  }
+  assert(
+    toolNames.has("knowledge_status"),
+    "tools/list is missing cleanup-attested knowledge_status"
+  );
   for (const name of [
     "start_copilot",
     "stop_copilot",
@@ -102,8 +110,22 @@ try {
     arguments: { goal: "verify MCP control boundary", surface: "stdout" },
   });
   const engineAttached = started.structuredContent?.active === true;
+  const trustBoundaryBlocked = started.isError === true;
 
-  if (engineAttached) {
+  if (trustBoundaryBlocked) {
+    assert(
+      started.structuredContent?.active !== true,
+      "a blocked agent trust boundary must never phantom-activate copilot"
+    );
+    const message = started.content?.map((entry) => entry.text ?? "").join(" ") ?? "";
+    assert(
+      /qmd cleanup|agent trust boundary/i.test(message),
+      "a blocked start_copilot must explain the local trust-boundary remediation"
+    );
+    console.log(
+      "NOTE: QMD retirement is not attested in this environment — verified fail-closed start; engine-active and guided-setup paths skipped"
+    );
+  } else if (engineAttached) {
     assert(started.isError !== true, "an active start_copilot must not be an error");
     assert(
       started.structuredContent?.nudge_stream?.attached === true,

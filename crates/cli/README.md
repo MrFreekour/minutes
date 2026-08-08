@@ -4,7 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/silverstein/minutes/blob/main/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/silverstein/minutes?style=social)](https://github.com/silverstein/minutes)
 
-**Open-source conversation memory for AI assistants.** Record meetings, capture voice memos, search everything — your AI remembers every conversation you've had.
+**Open-source conversation memory for AI assistants.** Record meetings, capture
+voice memos, and search policy-authorized history while keeping restricted
+conversations out of agent results by default.
 
 [Website](https://useminutes.app) | [GitHub](https://github.com/silverstein/minutes) | [MCP Server](https://www.npmjs.com/package/minutes-mcp) | [Desktop App](https://github.com/silverstein/minutes/releases)
 
@@ -21,12 +23,21 @@ Or via Homebrew on macOS:
 brew tap silverstein/tap && brew install minutes
 ```
 
+On macOS, the signed desktop app runs relationship projections in its bundled,
+App-Sandboxed helper. Standalone, Cargo, source-built, and ad-hoc installs run
+an exact second instance of the already-running Minutes executable. On every
+supported macOS version, the parent starts the worker suspended in an isolated
+process group, verifies the live child's kernel CodeDirectory hash before it
+can execute or receive source bytes, and retires the whole group before reaping
+its leader. The child enforces the same no-descendants, memory, descriptor, and
+wall-clock ceilings. Restricted conversations remain excluded in every channel.
+
 ## Quick start
 
 ```bash
 minutes record                # Start recording
 minutes stop                  # Stop and transcribe
-minutes search "pricing"      # Search across all meetings
+minutes search "pricing"      # Search normal meetings by default
 minutes actions               # Open action items
 ```
 
@@ -36,8 +47,8 @@ minutes actions               # Open action items
 - **Transcribe** locally with whisper.cpp (Apple Silicon optimized)
 - **Diarize** speakers with pyannote-rs (native Rust, no Python)
 - **Extract** action items, decisions, and people into structured YAML frontmatter
-- **Search** across all conversations by keyword, person, or topic
-- **Track** commitments and relationships across meetings
+- **Search** normal conversations by keyword, person, or topic; restricted access requires an explicit audited override
+- **Build** bounded process-private relationship rankings, commitments, person profiles, aliases, and topic research
 - **Sync** voice memos from your phone via iCloud/Dropbox/any folder sync
 - **Integrate** with Claude, Cursor, Windsurf, Obsidian via MCP
 
@@ -50,8 +61,8 @@ minutes actions               # Open action items
 | `minutes process <file>` | Transcribe an audio file |
 | `minutes search <query>` | Full-text search across meetings |
 | `minutes actions` | List open action items |
-| `minutes people` | Relationship intelligence |
-| `minutes commitments` | Track what you promised who |
+| `minutes people` | Rank relationships and surface losing-touch signals from an ephemeral policy-safe projection |
+| `minutes commitments` | Query commitments from an ephemeral policy-safe projection |
 | `minutes watch` | Auto-process voice memos from a folder |
 | `minutes dictate` | Speak-to-text (clipboard + daily note) |
 | `minutes health` | System diagnostics |
@@ -85,7 +96,7 @@ Works with Obsidian, Logseq, grep, or any markdown tool.
 | Transcription | whisper.cpp, local, multiple model sizes |
 | Speaker diarization | pyannote-rs (native Rust, ~34MB models) |
 | Voice activity detection | Silero VAD (prevents hallucination loops) |
-| Audio formats | m4a, mp3, wav, ogg, webm (ffmpeg or symphonia) |
+| Audio formats | wav directly; m4a, mp3, ogg, webm, mp4, mov, and aac with ffmpeg |
 | GPU acceleration | Metal, CoreML (macOS), CUDA (Linux/Windows), ROCm/HIP, Vulkan |
 | Phone voice memos | Folder watcher + iCloud/Dropbox/Syncthing |
 | MCP server | 15 tools + 7 resources for Claude/Cursor/Windsurf |

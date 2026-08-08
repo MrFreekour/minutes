@@ -2,6 +2,12 @@ name: Release Windows Desktop
 
 on:
   workflow_dispatch:
+    inputs:
+      validation_only:
+        description: "Run only the Windows Job memory-enforcement regression"
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -14,8 +20,29 @@ env:
   TAURI_CLI_VERSION: "2.10.1"
 
 jobs:
+  windows_job_memory_validation:
+    name: Validate Windows Job memory enforcement
+    if: github.event_name == 'workflow_dispatch' && inputs.validation_only
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Execute focused Job Object regression
+        run: >-
+          cargo test -p minutes-core --no-default-features --lib
+          bounded_child::windows_tests::windows_job_memory_limit_refuses_committed_memory_over_budget
+          -- --exact --nocapture --test-threads=1
+
   release_readiness:
     name: Release readiness
+    if: github.event_name != 'workflow_dispatch' || !inputs.validation_only
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -98,6 +125,25 @@ jobs:
         shell: bash
         run: cp -f target/release/minutes-app.exe minutes-desktop-windows-x64.exe
 
+      # The raw exe imports the Visual C++ runtime, which Windows does not
+      # include, so on a clean PC it exits 0xC0000135 printing nothing (#657).
+      # The NSIS installer carries the runtime via bundle.resources; anyone
+      # taking the bare binary gets nothing. Publish a zip that carries it too,
+      # and keep the bare exe for existing links.
+      - name: Package the raw desktop binary with its runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'minutes-desktop-windows-x64'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'minutes-desktop-windows-x64.exe' (Join-Path $stage 'minutes-app.exe') -Force
+          # build.rs already staged these next to the crate for the bundle.
+          $staged = Get-ChildItem 'tauri/src-tauri/vcruntime140*.dll','tauri/src-tauri/msvcp140*.dll' -ErrorAction SilentlyContinue
+          if (-not $staged) { throw 'build.rs staged no runtime DLLs; the desktop zip would repeat #657' }
+          $staged | ForEach-Object { Copy-Item $_.FullName $stage -Force }
+          Compress-Archive -Path "$stage/*" -DestinationPath 'minutes-desktop-windows-x64.zip' -Force
+          Write-Host ("desktop zip MB: {0:N2}" -f ((Get-Item 'minutes-desktop-windows-x64.zip').Length/1MB))
+
       - name: Rename NSIS installer
         shell: bash
         run: |
@@ -114,6 +160,7 @@ jobs:
           name: minutes-desktop-windows-x64
           path: |
             minutes-desktop-windows-x64.exe
+            minutes-desktop-windows-x64.zip
             minutes-desktop-windows-x64-setup.exe
           if-no-files-found: error
 
@@ -123,4 +170,5 @@ jobs:
         with:
           files: |
             minutes-desktop-windows-x64.exe
+            minutes-desktop-windows-x64.zip
             minutes-desktop-windows-x64-setup.exe

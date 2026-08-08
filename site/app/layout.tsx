@@ -15,7 +15,7 @@ const instrumentSerif = Instrument_Serif({
 export const metadata: Metadata = {
   title: "minutes — open-source conversation memory",
   description:
-    "Record meetings, capture voice memos, search everything. Local transcription with whisper.cpp, structured markdown, Claude-native. Free forever.",
+    "Record meetings, capture voice memos, and search policy-authorized history. Local transcription with whisper.cpp, structured markdown, Claude-native. Free forever.",
   metadataBase: new URL("https://useminutes.app"),
   alternates: { canonical: "/" },
   icons: {

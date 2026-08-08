@@ -460,7 +460,7 @@ const Scene5: React.FC = () => {
           marginTop: 10,
         }}
       >
-        your AI remembers every conversation you've had
+        your AI remembers what you authorize
       </div>
 
       <div style={{ display: "flex", gap: 40, marginTop: 44 }}>

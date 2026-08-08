@@ -4,17 +4,816 @@ use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
 use schemars::JsonSchema;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ──────────────────────────────────────────────────────────────
 // Meeting/memo markdown output.
 // All files written with 0600 permissions (owner read/write only)
 // because transcripts contain sensitive conversation content.
 // ──────────────────────────────────────────────────────────────
+
+/// Directory names reserved for inactive/recovery material. Agent-facing
+/// corpus walkers must prune these components consistently so an archived or
+/// failed artifact cannot become live merely because a different derived
+/// surface traversed the output root.
+pub const INACTIVE_CORPUS_DIRS: &[&str] = &["archive", "processed", "failed", "failed-captures"];
+
+pub fn is_inactive_corpus_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|candidate| {
+        candidate.starts_with('.')
+            || INACTIVE_CORPUS_DIRS
+                .iter()
+                .any(|excluded| candidate.eq_ignore_ascii_case(excluded))
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StableMarkdownSnapshot {
+    pub path: PathBuf,
+    pub content: String,
+    pub content_sha256: [u8; 32],
+    pub file_identity: StableMarkdownFileIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StableMarkdownFileIdentity {
+    first: u64,
+    second: u64,
+}
+
+/// Exact, content-free allowlist for one active-corpus aggregate operation.
+///
+/// Candidates that cannot be read as a stable, bounded, UTF-8 Markdown
+/// snapshot are absent. Aggregate readers must consume only paths in this
+/// allowlist and re-attest each snapshot against its identity and hash; a bad
+/// neighbor can then be excluded without authorizing bytes that were not part
+/// of the pre-operation revision.
+#[derive(Debug, Clone)]
+pub(crate) struct StableActiveCorpusRevision {
+    canonical_root: PathBuf,
+    entries: BTreeMap<PathBuf, StableMarkdownAttestation>,
+    budget: ActiveCorpusReadBudget,
+}
+
+impl PartialEq for StableActiveCorpusRevision {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_root == other.canonical_root && self.entries == other.entries
+    }
+}
+
+impl Eq for StableActiveCorpusRevision {}
+
+/// One shared resource envelope for every native aggregate corpus surface.
+///
+/// The JavaScript SDK/MCP lease has the same byte and directory ceilings.
+/// Native search keeps its own content-free allowlist, but must still stop an
+/// attacker from turning that allowlist into unbounded work before a provider
+/// is invoked.
+pub(crate) const ACTIVE_CORPUS_MAX_FILE_COUNT: usize = 4_096;
+pub(crate) const ACTIVE_CORPUS_MAX_DIRECTORY_COUNT: usize = 512;
+pub(crate) const ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES: u64 = 80 * 1024 * 1024;
+pub(crate) const ACTIVE_CORPUS_MAX_RETAINED_PATH_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS: usize = 2;
+/// One materialization can read each pre-authorized source during index
+/// construction, before the transactional write, after the write, and once
+/// more when converting a result into user-visible bytes.
+pub(crate) const ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES: usize = 4;
+
+/// Slowest storage the authorization deadline is willing to call a hang.
+///
+/// Meetings routinely live on iCloud Drive, Dropbox, or an external disk, and
+/// a first read there can be a network fetch rather than a local one. Anything
+/// at or above this rate must be able to finish the whole documented envelope
+/// without tripping the deadline.
+pub(crate) const ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+
+/// Times a snapshot physically reads each file for every byte it charges.
+///
+/// `read_bounded_markdown_twice` reads the file, seeks back to zero, and reads
+/// it again to prove the bytes did not change underneath it, but the budget
+/// charges `content.len()` once. Wall-clock cost therefore tracks twice the
+/// authorized byte count, so a deadline derived from authorized bytes alone
+/// understates the time the same work needs by exactly this factor.
+pub(crate) const ACTIVE_CORPUS_PHYSICAL_READS_PER_SNAPSHOT: u64 = 2;
+
+/// Bytes one authorization may legitimately read at the documented ceiling.
+///
+/// Each attempt makes a pre-snapshot pass, a materialization phase worth
+/// `ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES` passes, and a post-snapshot
+/// pass, and the whole thing may run `ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS`
+/// times under one shared deadline.
+///
+/// This is the *charged* total, which is what the byte ceiling governs. It is
+/// deliberately not the number of bytes read from the disk: see
+/// `ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES` for that.
+pub(crate) const ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES: u64 = ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES
+    * (1 + ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES as u64 + 1)
+    * ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS as u64;
+
+/// Bytes actually pulled off the disk for that same worst case.
+///
+/// The deadline is wall-clock, so it has to be sized against this rather than
+/// the charged total.
+pub(crate) const ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES: u64 =
+    ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES * ACTIVE_CORPUS_PHYSICAL_READS_PER_SNAPSHOT;
+
+/// Absolute wall-clock ceiling for one corpus authorization.
+///
+/// Derived, not chosen. A hardcoded 15s silently required 128 MB/s of real
+/// read throughput to get the documented 80 MB ceiling through all six passes
+/// of both attempts, each of which reads every file twice, so a corpus that
+/// fit every published limit still failed on ordinary storage (issue #679). It
+/// surfaced as an intermittent CI failure, but the same arithmetic fails a real
+/// user whose meetings sit on a synced folder.
+///
+/// Deriving it keeps the two consistent: raise the byte ceiling, add a
+/// materialization pass, or add a verification reread, and the deadline
+/// follows, instead of quietly tightening the throughput this code demands.
+///
+/// This bounds cooperative checks between filesystem operations, so it is a
+/// backstop rather than the primary control. The byte, file, and directory
+/// ceilings bound the work itself, and agent-facing SDK/MCP reads wrap this
+/// boundary in a supervised, killable worker.
+///
+/// It also bounds `graph`'s corpus capture, which holds a projection lease
+/// while it runs, so a slow disk now refuses a competing projection for longer
+/// than it used to. That is the intended trade: the alternative was failing a
+/// projection the ceilings permit.
+const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS: u64 =
+    ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES.div_ceil(ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC);
+
+// Round up, never down: a floor-divided deadline would promise a throughput
+// floor it does not actually honor whenever the division is inexact.
+//
+// A floor throughput at or above the worst-case total would still truncate to
+// zero and fail every authorization instantly, so reject that at compile time
+// rather than shipping a build where search never succeeds.
+const _: () = assert!(
+    ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS > 0,
+    "corpus authorization deadline truncated to zero seconds: the assumed floor throughput is \
+     at least the worst-case physical byte total"
+);
+
+pub(crate) const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE: Duration =
+    Duration::from_secs(ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS);
+
+#[derive(Debug, Default)]
+struct ActiveCorpusReadUsage {
+    file_count: usize,
+    directory_count: usize,
+    authorized_bytes: u64,
+    retained_path_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+/// Shared cumulative limits for an in-process active-corpus read.
+///
+/// The deadline is checked between filesystem operations; it cannot interrupt
+/// a kernel syscall that is already blocked. Agent-facing SDK/MCP reads add a
+/// supervised, killable worker around this cooperative native boundary.
+pub(crate) struct ActiveCorpusReadBudget {
+    max_file_count: usize,
+    max_directory_count: usize,
+    max_authorized_bytes: u64,
+    max_retained_path_bytes: usize,
+    deadline: Instant,
+    usage: Arc<Mutex<ActiveCorpusReadUsage>>,
+}
+
+impl ActiveCorpusReadBudget {
+    pub(crate) fn new() -> Self {
+        Self::new_until(Instant::now() + ACTIVE_CORPUS_AUTHORIZATION_DEADLINE)
+    }
+
+    pub(crate) fn new_until(deadline: Instant) -> Self {
+        Self {
+            max_file_count: ACTIVE_CORPUS_MAX_FILE_COUNT,
+            max_directory_count: ACTIVE_CORPUS_MAX_DIRECTORY_COUNT,
+            max_authorized_bytes: ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES,
+            max_retained_path_bytes: ACTIVE_CORPUS_MAX_RETAINED_PATH_BYTES,
+            deadline,
+            usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
+        }
+    }
+
+    /// Start one separately bounded corpus pass under this operation's same
+    /// absolute deadline.
+    ///
+    /// A search operation has several mandatory full-corpus passes
+    /// (pre-snapshot, ephemeral index materialization, and post-snapshot).
+    /// Sharing one usage counter made a corpus that fit the documented
+    /// per-pass ceiling fail merely because it was safely reread. A fresh pass
+    /// resets only the counters; it cannot extend the deadline or raise any
+    /// individual-pass ceiling.
+    pub(crate) fn fresh_pass(&self) -> Self {
+        Self {
+            max_file_count: self.max_file_count,
+            max_directory_count: self.max_directory_count,
+            max_authorized_bytes: self.max_authorized_bytes,
+            max_retained_path_bytes: self.max_retained_path_bytes,
+            deadline: self.deadline,
+            usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
+        }
+    }
+
+    /// Start the bounded materialization phase after a regular pre-snapshot
+    /// has already proved that the corpus itself fits the base ceiling.
+    ///
+    /// This phase may perform up to four mandatory reads of each allowlisted
+    /// source, but it keeps the same absolute deadline and a finite aggregate
+    /// envelope. The pre- and post-snapshot passes continue to enforce the
+    /// unmultiplied corpus ceiling.
+    pub(crate) fn fresh_materialization_pass(&self) -> Self {
+        let multiplier = ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES;
+        Self {
+            max_file_count: self.max_file_count.saturating_mul(multiplier),
+            max_directory_count: self.max_directory_count.saturating_mul(multiplier),
+            max_authorized_bytes: self.max_authorized_bytes.saturating_mul(multiplier as u64),
+            max_retained_path_bytes: self.max_retained_path_bytes.saturating_mul(multiplier),
+            deadline: self.deadline,
+            usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
+        }
+    }
+
+    pub(crate) fn check_deadline(&self) -> Result<(), ActiveCorpusRevisionError> {
+        if Instant::now() >= self.deadline {
+            Err(ActiveCorpusRevisionError::Deadline)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn consume(
+        &self,
+        files: usize,
+        directories: usize,
+        bytes: u64,
+    ) -> Result<(), ActiveCorpusRevisionError> {
+        self.check_deadline()?;
+        let mut usage = self
+            .usage
+            .lock()
+            .map_err(|_| ActiveCorpusRevisionError::Budget)?;
+        let file_count = usage
+            .file_count
+            .checked_add(files)
+            .ok_or(ActiveCorpusRevisionError::Budget)?;
+        let directory_count = usage
+            .directory_count
+            .checked_add(directories)
+            .ok_or(ActiveCorpusRevisionError::Budget)?;
+        let authorized_bytes = usage
+            .authorized_bytes
+            .checked_add(bytes)
+            .ok_or(ActiveCorpusRevisionError::Budget)?;
+        if file_count > self.max_file_count
+            || directory_count > self.max_directory_count
+            || authorized_bytes > self.max_authorized_bytes
+        {
+            return Err(ActiveCorpusRevisionError::Budget);
+        }
+        usage.file_count = file_count;
+        usage.directory_count = directory_count;
+        usage.authorized_bytes = authorized_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn consume_path(&self, path: &Path) -> Result<(), ActiveCorpusRevisionError> {
+        self.check_deadline()?;
+        let mut usage = self
+            .usage
+            .lock()
+            .map_err(|_| ActiveCorpusRevisionError::Budget)?;
+        let retained_path_bytes = usage
+            .retained_path_bytes
+            .checked_add(path.as_os_str().as_encoded_bytes().len())
+            .ok_or(ActiveCorpusRevisionError::Budget)?;
+        if retained_path_bytes > self.max_retained_path_bytes {
+            return Err(ActiveCorpusRevisionError::Budget);
+        }
+        usage.retained_path_bytes = retained_path_bytes;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        max_file_count: usize,
+        max_directory_count: usize,
+        max_authorized_bytes: u64,
+        deadline_after: Duration,
+    ) -> Self {
+        Self {
+            max_file_count,
+            max_directory_count,
+            max_authorized_bytes,
+            max_retained_path_bytes: ACTIVE_CORPUS_MAX_RETAINED_PATH_BYTES,
+            deadline: Instant::now() + deadline_after,
+            usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_paths(
+        max_file_count: usize,
+        max_directory_count: usize,
+        max_authorized_bytes: u64,
+        max_retained_path_bytes: usize,
+        deadline_after: Duration,
+    ) -> Self {
+        Self {
+            max_file_count,
+            max_directory_count,
+            max_authorized_bytes,
+            max_retained_path_bytes,
+            deadline: Instant::now() + deadline_after,
+            usage: Arc::new(Mutex::new(ActiveCorpusReadUsage::default())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveCorpusRevisionError {
+    Unavailable,
+    Traversal,
+    Budget,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableMarkdownAttestation {
+    content_sha256: [u8; 32],
+    file_identity: StableMarkdownFileIdentity,
+}
+
+impl StableActiveCorpusRevision {
+    pub(crate) fn budget(&self) -> ActiveCorpusReadBudget {
+        self.budget.clone()
+    }
+
+    pub(crate) fn with_read_budget(mut self, budget: ActiveCorpusReadBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.entries.keys().map(PathBuf::as_path)
+    }
+
+    pub(crate) fn contains_path(&self, path: &Path) -> bool {
+        bind_lexical_markdown_path(path, &self.canonical_root)
+            .is_some_and(|bound| self.entries.contains_key(&bound))
+    }
+
+    /// Re-read one candidate through the descriptor-stable path and require
+    /// exact agreement with the pre-operation allowlist.
+    pub(crate) fn read_snapshot(&self, path: &Path) -> Option<StableMarkdownSnapshot> {
+        self.budget.check_deadline().ok()?;
+        let snapshot =
+            read_stable_active_markdown_with_budget(path, &self.canonical_root, &self.budget)?;
+        self.budget
+            .consume(1, 0, snapshot.content.len() as u64)
+            .ok()?;
+        self.budget.check_deadline().ok()?;
+        let expected = self.entries.get(&snapshot.path)?;
+        (expected.content_sha256 == snapshot.content_sha256
+            && expected.file_identity == snapshot.file_identity)
+            .then_some(snapshot)
+    }
+}
+
+pub(crate) fn stable_markdown_file_identity(file: &File) -> Option<StableMarkdownFileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return None;
+        }
+        Some(StableMarkdownFileIdentity {
+            first: metadata.dev(),
+            second: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let (volume, index) = windows_markdown_file_identity(file)?;
+        Some(StableMarkdownFileIdentity {
+            first: u64::from(volume),
+            second: index,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn same_markdown_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn windows_markdown_file_identity(file: &File) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as _, &mut information as *mut _)
+    };
+    if succeeded == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || information.nNumberOfLinks != 1
+    {
+        return None;
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Some((information.dwVolumeSerialNumber, file_index))
+}
+
+#[cfg(unix)]
+fn markdown_path_still_identifies(file: &File, path: &Path) -> bool {
+    let Ok(opened) = file.metadata() else {
+        return false;
+    };
+    let Ok(current) = fs::metadata(path) else {
+        return false;
+    };
+    current.is_file() && same_markdown_file_identity(&opened, &current)
+}
+
+#[cfg(windows)]
+fn markdown_path_still_identifies(file: &File, path: &Path) -> bool {
+    let Some(opened_identity) = windows_markdown_file_identity(file) else {
+        return false;
+    };
+    let Ok(current) = open_markdown_no_follow(path) else {
+        return false;
+    };
+    windows_markdown_file_identity(&current) == Some(opened_identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn markdown_path_still_identifies(_file: &File, _path: &Path) -> bool {
+    false
+}
+
+fn open_markdown_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ);
+    }
+    options.open(path)
+}
+
+fn read_bounded_markdown_twice(
+    file: &mut File,
+    expected_len: u64,
+    mut check_deadline: impl FnMut() -> Option<()>,
+    between_reads: impl FnOnce(),
+) -> Option<Vec<u8>> {
+    if expected_len > crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_len).ok()?);
+    let mut first_chunk = [0u8; 16 * 1024];
+    loop {
+        check_deadline()?;
+        let read = file.read(&mut first_chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        let end = bytes.len().checked_add(read)?;
+        if end as u64 > expected_len || end as u64 > crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&first_chunk[..read]);
+    }
+    if bytes.len() as u64 != expected_len
+        || bytes.len() as u64 > crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES
+    {
+        return None;
+    }
+
+    between_reads();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut offset = 0usize;
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        check_deadline()?;
+        let read = file.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        let end = offset.checked_add(read)?;
+        if end > bytes.len() || bytes[offset..end] != chunk[..read] {
+            return None;
+        }
+        offset = end;
+    }
+    (offset == bytes.len()).then_some(bytes)
+}
+
+fn normalized_absolute_lexical_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::ParentDir => return None,
+        }
+    }
+    Some(normalized)
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+/// Rebind a caller's lexical path beneath the already-canonical corpus root
+/// without following any below-root symlink or Windows reparse component.
+///
+/// The ancestor lookup preserves legitimate platform aliases for the corpus
+/// root itself (for example macOS `/var` -> `/private/var`) while every
+/// user-controlled component below that root is inspected with
+/// `symlink_metadata` before the final file is opened.
+fn bind_lexical_markdown_path(path: &Path, canonical_root: &Path) -> Option<PathBuf> {
+    let lexical_path = normalized_absolute_lexical_path(path)?;
+    let lexical_root = lexical_path
+        .ancestors()
+        .find(|ancestor| ancestor.canonicalize().ok().as_deref() == Some(canonical_root))?;
+    let relative = lexical_path.strip_prefix(lexical_root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+
+    let mut rebound = canonical_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        if is_inactive_corpus_dir_name(name) {
+            return None;
+        }
+        rebound.push(name);
+        let metadata = fs::symlink_metadata(&rebound).ok()?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return None;
+        }
+    }
+    Some(rebound)
+}
+
+/// Read one active-corpus markdown file as a stable descriptor-backed byte
+/// snapshot. The path is rebound to the canonical root, inactive/recovery
+/// components are denied, the final component is opened no-follow on Unix,
+/// and two complete reads plus descriptor/path metadata must agree.
+///
+/// Returning `None` is deliberately fail-closed and privacy-safe: callers must
+/// not distinguish malformed, unreadable, replaced, outside-root, or unstable
+/// candidates in agent-facing output.
+pub(crate) fn read_stable_active_markdown(
+    path: &Path,
+    canonical_root: &Path,
+) -> Option<StableMarkdownSnapshot> {
+    read_stable_active_markdown_with_hooks(path, canonical_root, |_| {}, |_| {}, |_| {})
+}
+
+pub(crate) fn read_stable_active_markdown_with_budget(
+    path: &Path,
+    canonical_root: &Path,
+    budget: &ActiveCorpusReadBudget,
+) -> Option<StableMarkdownSnapshot> {
+    read_stable_active_markdown_with_budget_and_hooks(
+        path,
+        canonical_root,
+        Some(budget),
+        |_| {},
+        |_| {},
+        |_| {},
+    )
+}
+
+fn read_stable_active_markdown_with_hooks(
+    path: &Path,
+    canonical_root: &Path,
+    after_canonicalize: impl FnMut(&Path),
+    between_reads: impl FnMut(&Path),
+    after_second_read: impl FnMut(&Path),
+) -> Option<StableMarkdownSnapshot> {
+    read_stable_active_markdown_with_budget_and_hooks(
+        path,
+        canonical_root,
+        None,
+        after_canonicalize,
+        between_reads,
+        after_second_read,
+    )
+}
+
+fn read_stable_active_markdown_with_budget_and_hooks(
+    path: &Path,
+    canonical_root: &Path,
+    budget: Option<&ActiveCorpusReadBudget>,
+    mut after_canonicalize: impl FnMut(&Path),
+    mut between_reads: impl FnMut(&Path),
+    mut after_second_read: impl FnMut(&Path),
+) -> Option<StableMarkdownSnapshot> {
+    let check_deadline = || {
+        budget
+            .map(|budget| budget.check_deadline().ok())
+            .unwrap_or(Some(()))
+    };
+    check_deadline()?;
+    let canonical_path = bind_lexical_markdown_path(path, canonical_root)?;
+    if let Some(budget) = budget {
+        budget.consume_path(&canonical_path).ok()?;
+    }
+    canonical_path.to_str()?;
+    let relative = canonical_path.strip_prefix(canonical_root).ok()?;
+    if canonical_path.extension().and_then(|value| value.to_str()) != Some("md")
+        || relative.components().any(|component| match component {
+            std::path::Component::Normal(name) => is_inactive_corpus_dir_name(name),
+            _ => true,
+        })
+    {
+        return None;
+    }
+
+    after_canonicalize(&canonical_path);
+
+    let mut file = open_markdown_no_follow(&canonical_path).ok()?;
+    let opened_before = file.metadata().ok()?;
+    if !crate::policy_fs::opened_regular_file_is_safe(&file)
+        || opened_before.len() > crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES
+    {
+        return None;
+    }
+    if !markdown_path_still_identifies(&file, &canonical_path) {
+        return None;
+    }
+
+    let bytes =
+        read_bounded_markdown_twice(&mut file, opened_before.len(), check_deadline, || {
+            between_reads(&canonical_path)
+        })?;
+    let opened_mid = file.metadata().ok()?;
+    after_second_read(&canonical_path);
+
+    let opened_after = file.metadata().ok()?;
+    let canonical_after = canonical_path.canonicalize().ok()?;
+    if canonical_after != canonical_path
+        || !canonical_after.starts_with(canonical_root)
+        || !opened_mid.is_file()
+        || !opened_after.is_file()
+        || !crate::policy_fs::opened_regular_file_is_safe(&file)
+        || !markdown_path_still_identifies(&file, &canonical_path)
+        || opened_before.len() != opened_mid.len()
+        || opened_mid.len() != opened_after.len()
+        || opened_before.modified().ok() != opened_mid.modified().ok()
+        || opened_mid.modified().ok() != opened_after.modified().ok()
+    {
+        return None;
+    }
+
+    let content = String::from_utf8(bytes).ok()?;
+    Some(StableMarkdownSnapshot {
+        path: canonical_path,
+        content_sha256: Sha256::digest(content.as_bytes()).into(),
+        file_identity: stable_markdown_file_identity(&file)?,
+        content,
+    })
+}
+
+/// Build a content-free allowlist of every stable active Markdown snapshot.
+///
+/// Per-file failures are excluded: aggregate surfaces never consume a path
+/// absent from this revision. Traversal failures still make the whole revision
+/// unavailable because an unknown subtree cannot be bounded safely. Comparing
+/// the complete before/after allowlists detects files becoming readable,
+/// unreadable, added, removed, replaced, or changed during the operation.
+#[cfg(test)]
+pub(crate) fn stable_active_corpus_revision(root: &Path) -> Option<StableActiveCorpusRevision> {
+    stable_active_corpus_revision_with_budget(root, ActiveCorpusReadBudget::new()).ok()
+}
+
+pub(crate) fn stable_active_corpus_revision_with_budget(
+    root: &Path,
+    budget: ActiveCorpusReadBudget,
+) -> Result<StableActiveCorpusRevision, ActiveCorpusRevisionError> {
+    budget.check_deadline()?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| ActiveCorpusRevisionError::Unavailable)?;
+    budget.consume_path(&canonical_root)?;
+    let mut entries = BTreeMap::new();
+    let mut excluded_candidates = 0usize;
+    let walker = walkdir::WalkDir::new(&canonical_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !is_inactive_corpus_dir_name(entry.file_name())
+        });
+    for entry in walker {
+        budget.check_deadline()?;
+        let entry = entry.map_err(|_| ActiveCorpusRevisionError::Traversal)?;
+        budget.consume_path(entry.path())?;
+        if entry.file_type().is_dir() {
+            // Inactive directories are yielded once even though filter_entry
+            // prunes their descendants. They are outside the active corpus and
+            // therefore do not consume its directory budget.
+            if entry.depth() == 0 || !is_inactive_corpus_dir_name(entry.file_name()) {
+                budget.consume(0, 1, 0)?;
+            }
+            continue;
+        }
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
+        {
+            continue;
+        }
+        budget.consume(1, 0, 0)?;
+        let Some(snapshot) =
+            read_stable_active_markdown_with_budget(entry.path(), &canonical_root, &budget)
+        else {
+            // Do not log candidate paths: malformed or restricted-looking
+            // names are themselves conversation metadata on agent-loaded log
+            // surfaces. Aggregate the warning to keep hostile corpora bounded.
+            excluded_candidates = excluded_candidates.saturating_add(1);
+            continue;
+        };
+        budget.check_deadline()?;
+        budget.consume(0, 0, snapshot.content.len() as u64)?;
+        budget.consume_path(&snapshot.path)?;
+        entries.insert(
+            snapshot.path,
+            StableMarkdownAttestation {
+                content_sha256: snapshot.content_sha256,
+                file_identity: snapshot.file_identity,
+            },
+        );
+    }
+    if excluded_candidates > 0 {
+        tracing::warn!(
+            excluded_candidates,
+            "excluded unreadable or unstable active Markdown candidates from aggregate revision"
+        );
+    }
+    budget.check_deadline()?;
+    Ok(StableActiveCorpusRevision {
+        canonical_root,
+        entries,
+        budget,
+    })
+}
 
 /// Content types for output files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -96,8 +895,24 @@ pub enum CapturePolicy {
 pub enum Sensitivity {
     /// Standard meeting artifact.
     Normal,
-    /// Restricted artifact; agent surfaces enforce this in a later wave.
+    /// Restricted artifact; agent surfaces exclude it unless an explicit,
+    /// surface-specific audited override exists.
     Restricted,
+}
+
+/// Deserialize a sensitivity field that is known to be present.
+///
+/// `Option<Sensitivity>` normally maps an explicit YAML null (`null`, `~`, or
+/// an empty value) to `None`, which is indistinguishable from a legacy file
+/// that genuinely omitted the field. Sensitivity is an authorization input,
+/// so present-but-null must remain policy-uncertain and fail parsing. The
+/// field-level `default` on [`Frontmatter::sensitivity`] still preserves the
+/// backwards-compatible omitted-field case.
+fn deserialize_present_sensitivity<'de, D>(deserializer: D) -> Result<Option<Sensitivity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Sensitivity::deserialize(deserializer).map(Some)
 }
 
 /// Human debrief state for no-capture meeting artifacts.
@@ -322,7 +1137,11 @@ pub struct Frontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CapturePolicy>,
     /// Sensitivity designation. Absent means the normal sensitivity policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_sensitivity",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sensitivity: Option<Sensitivity>,
     /// Debrief completion state for no-capture meetings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -609,7 +1428,7 @@ fn render_markdown(
     transcript: &str,
     summary: Option<&str>,
     user_notes: Option<&str>,
-    retry_audio_path: &Path,
+    retry_audio_path: Option<&Path>,
 ) -> Result<String, MarkdownError> {
     let yaml = serde_yaml::to_string(frontmatter)
         .map_err(|e| MarkdownError::SerializationError(e.to_string()))?;
@@ -627,14 +1446,16 @@ fn render_markdown(
         if let Some(diagnosis) = &frontmatter.filter_diagnosis {
             content.push_str(&format!("**Diagnosis**: {}\n\n", diagnosis));
         }
-        content.push_str(&format!(
-            "**Retry audio**: `{}`\n\n",
-            retry_audio_path.display()
-        ));
-        content.push_str(&format!(
-            "To retry after adjusting your transcription settings:\n`minutes process {}`\n\n",
-            retry_audio_path.display()
-        ));
+        if let Some(retry_audio_path) = retry_audio_path {
+            content.push_str(&format!(
+                "**Retry audio**: `{}`\n\n",
+                retry_audio_path.display()
+            ));
+            content.push_str(&format!(
+                "To retry after adjusting your transcription settings:\n`minutes process {}`\n\n",
+                retry_audio_path.display()
+            ));
+        }
     }
 
     if let Some(notes) = user_notes {
@@ -675,6 +1496,48 @@ pub fn write_with_retry_path(
     retry_audio_path: Option<&Path>,
     config: &Config,
 ) -> Result<WriteResult, MarkdownError> {
+    write_with_retry_policy(
+        frontmatter,
+        transcript,
+        summary,
+        user_notes,
+        retry_audio_path,
+        false,
+        config,
+    )
+}
+
+/// Write markdown without embedding an audio retry path.
+///
+/// Descriptor-authorized processing uses this variant so a no-speech artifact
+/// cannot disclose either the proof-bound processing path or its ambient source.
+pub(crate) fn write_without_retry_path(
+    frontmatter: &Frontmatter,
+    transcript: &str,
+    summary: Option<&str>,
+    user_notes: Option<&str>,
+    config: &Config,
+) -> Result<WriteResult, MarkdownError> {
+    write_with_retry_policy(
+        frontmatter,
+        transcript,
+        summary,
+        user_notes,
+        None,
+        true,
+        config,
+    )
+}
+
+fn write_with_retry_policy(
+    frontmatter: &Frontmatter,
+    transcript: &str,
+    summary: Option<&str>,
+    user_notes: Option<&str>,
+    retry_audio_path: Option<&Path>,
+    omit_retry_path: bool,
+    config: &Config,
+) -> Result<WriteResult, MarkdownError> {
     let output_dir = match frontmatter.r#type {
         ContentType::Memo => config.output_dir.join("memos"),
         ContentType::Meeting => config.output_dir.clone(),
@@ -692,12 +1555,17 @@ pub fn write_with_retry_path(
         frontmatter.recorded_by.as_deref(),
     );
     let path = resolve_collision(&output_dir, &slug);
+    let retry_audio_path = if omit_retry_path {
+        None
+    } else {
+        Some(retry_audio_path.unwrap_or(&path))
+    };
     let content = render_markdown(
         frontmatter,
         transcript,
         summary,
         user_notes,
-        retry_audio_path.unwrap_or(&path),
+        retry_audio_path,
     )?;
 
     // Write file with appropriate permissions
@@ -742,21 +1610,69 @@ pub fn rewrite_with_retry_path(
     user_notes: Option<&str>,
     retry_audio_path: Option<&Path>,
 ) -> Result<WriteResult, MarkdownError> {
+    rewrite_with_retry_policy(
+        path,
+        frontmatter,
+        transcript,
+        summary,
+        user_notes,
+        retry_audio_path,
+        false,
+    )
+}
+
+/// Rewrite markdown without embedding an audio retry path.
+pub(crate) fn rewrite_without_retry_path(
+    path: &Path,
+    frontmatter: &Frontmatter,
+    transcript: &str,
+    summary: Option<&str>,
+    user_notes: Option<&str>,
+) -> Result<WriteResult, MarkdownError> {
+    rewrite_with_retry_policy(
+        path,
+        frontmatter,
+        transcript,
+        summary,
+        user_notes,
+        None,
+        true,
+    )
+}
+
+fn rewrite_with_retry_policy(
+    path: &Path,
+    frontmatter: &Frontmatter,
+    transcript: &str,
+    summary: Option<&str>,
+    user_notes: Option<&str>,
+    retry_audio_path: Option<&Path>,
+    omit_retry_path: bool,
+) -> Result<WriteResult, MarkdownError> {
+    let retry_audio_path = if omit_retry_path {
+        None
+    } else {
+        Some(retry_audio_path.unwrap_or(path))
+    };
     let content = render_markdown(
         frontmatter,
         transcript,
         summary,
         user_notes,
-        retry_audio_path.unwrap_or(path),
+        retry_audio_path,
     )?;
     let tmp = path.with_extension("md.tmp");
-    fs::write(&tmp, content)?;
+    let mut file = File::create(&tmp)?;
+    file.write_all(content.as_bytes())?;
     let mode = match frontmatter.visibility {
         Some(Visibility::Team) => 0o640,
         _ => 0o600,
     };
     set_permissions(&tmp, mode)?;
+    file.sync_all()?;
+    drop(file);
     fs::rename(&tmp, path)?;
+    sync_markdown_directory(path)?;
 
     let word_count = transcript.split_whitespace().count();
     Ok(WriteResult {
@@ -765,6 +1681,22 @@ pub fn rewrite_with_retry_path(
         word_count,
         content_type: frontmatter.r#type,
     })
+}
+
+#[cfg(unix)]
+fn sync_markdown_directory(path: &Path) -> Result<(), MarkdownError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| MarkdownError::Io(std::io::Error::other("markdown path has no parent")))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_markdown_directory(_path: &Path) -> Result<(), MarkdownError> {
+    // The exact file is flushed above. std does not offer a portable parent
+    // directory fsync on Windows.
+    Ok(())
 }
 
 /// Rename an existing meeting markdown file in place.
@@ -1267,11 +2199,11 @@ pub fn atomic_rewrite_preserving_mode_guarded(
 }
 
 /// Set file permissions to the given mode (Unix only; no-op on Windows).
-fn set_permissions(path: &Path, _mode: u32) -> Result<(), MarkdownError> {
+fn set_permissions(_path: &Path, _mode: u32) -> Result<(), MarkdownError> {
     #[cfg(unix)]
     {
         let perms = fs::Permissions::from_mode(_mode);
-        fs::set_permissions(path, perms)?;
+        fs::set_permissions(_path, perms)?;
     }
     Ok(())
 }
@@ -1468,6 +2400,426 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn stable_markdown_snapshot_reads_exact_active_bytes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("meeting.md");
+        fs::write(&path, "stable markdown canary").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let snapshot = read_stable_active_markdown(&path, &canonical_root).unwrap();
+        assert_eq!(snapshot.path, path.canonicalize().unwrap());
+        assert_eq!(snapshot.content, "stable markdown canary");
+        assert_eq!(snapshot.content_sha256.len(), 32);
+    }
+
+    #[test]
+    fn inactive_corpus_classifier_is_hidden_and_ascii_case_insensitive() {
+        for inactive in [
+            "archive",
+            "Archive",
+            "PROCESSED",
+            "Failed",
+            "FAILED-CAPTURES",
+            ".git",
+            ".private",
+        ] {
+            assert!(is_inactive_corpus_dir_name(std::ffi::OsStr::new(inactive)));
+        }
+        assert!(!is_inactive_corpus_dir_name(std::ffi::OsStr::new("active")));
+    }
+
+    #[test]
+    fn stable_markdown_snapshot_rejects_inactive_non_file_and_invalid_content() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        for inactive in ["Archive", "FAILED-CAPTURES", ".git", ".private"] {
+            let path = root.join(inactive).join("canary.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "inactive canary").unwrap();
+            assert!(read_stable_active_markdown(&path, &canonical_root).is_none());
+        }
+
+        let directory = root.join("directory.md");
+        fs::create_dir_all(&directory).unwrap();
+        assert!(read_stable_active_markdown(&directory, &canonical_root).is_none());
+
+        let invalid = root.join("invalid.md");
+        fs::write(&invalid, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_stable_active_markdown(&invalid, &canonical_root).is_none());
+    }
+
+    #[test]
+    fn active_corpus_revision_excludes_bad_neighbor_and_binds_exact_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let stable = root.join("stable.md");
+        let invalid = root.join("invalid.md");
+        fs::write(&stable, "stable aggregate canary").unwrap();
+        fs::write(&invalid, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let revision = stable_active_corpus_revision(&root).unwrap();
+        let canonical_stable = stable.canonicalize().unwrap();
+        let paths = revision.paths().collect::<Vec<_>>();
+        assert_eq!(paths, vec![canonical_stable.as_path()]);
+        assert_eq!(
+            revision.read_snapshot(&stable).unwrap().content,
+            "stable aggregate canary"
+        );
+        assert!(revision.read_snapshot(&invalid).is_none());
+
+        fs::write(&stable, "changed aggregate canary").unwrap();
+        assert!(revision.read_snapshot(&stable).is_none());
+    }
+
+    #[test]
+    fn active_corpus_revision_enforces_shared_file_directory_and_byte_budgets() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("first.md"), "12").unwrap();
+        fs::write(root.join("second.md"), "345").unwrap();
+
+        let generous_deadline = Duration::from_secs(60);
+        let files = ActiveCorpusReadBudget::for_test(1, 2, 1024, generous_deadline);
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, files).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+
+        let directories = ActiveCorpusReadBudget::for_test(2, 1, 1024, generous_deadline);
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, directories).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+
+        let bytes = ActiveCorpusReadBudget::for_test(2, 2, 4, generous_deadline);
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, bytes).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+
+        let paths = ActiveCorpusReadBudget::for_test_with_paths(2, 2, 1024, 1, generous_deadline);
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, paths).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+    }
+
+    #[test]
+    fn active_corpus_revision_budget_is_cumulative_across_passes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("meeting.md"), "12").unwrap();
+        let shared = ActiveCorpusReadBudget::for_test(1, 1, 2, Duration::from_secs(60));
+
+        stable_active_corpus_revision_with_budget(&root, shared.clone()).unwrap();
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, shared).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+    }
+
+    #[test]
+    fn active_corpus_fresh_pass_resets_usage_but_not_the_deadline_or_limits() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("meeting.md"), "12").unwrap();
+        let operation = ActiveCorpusReadBudget::for_test(1, 1, 2, Duration::from_secs(60));
+
+        stable_active_corpus_revision_with_budget(&root, operation.fresh_pass()).unwrap();
+        stable_active_corpus_revision_with_budget(&root, operation.fresh_pass()).unwrap();
+
+        let expired = ActiveCorpusReadBudget::for_test(1, 1, 2, Duration::ZERO).fresh_pass();
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, expired).unwrap_err(),
+            ActiveCorpusRevisionError::Deadline
+        );
+    }
+
+    #[test]
+    fn materialization_pass_is_bounded_to_four_authorized_reads() {
+        let operation = ActiveCorpusReadBudget::for_test(1, 1, 2, Duration::from_secs(60));
+        let materialization = operation.fresh_materialization_pass();
+
+        materialization.consume(4, 4, 8).unwrap();
+        assert_eq!(
+            materialization.consume(1, 0, 0).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+        assert_eq!(
+            materialization.consume(0, 0, 1).unwrap_err(),
+            ActiveCorpusRevisionError::Budget
+        );
+    }
+
+    #[test]
+    fn active_corpus_revision_uses_a_monotonic_deadline() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("meeting.md"), "deadline canary").unwrap();
+
+        let expired = ActiveCorpusReadBudget::for_test(
+            ACTIVE_CORPUS_MAX_FILE_COUNT,
+            ACTIVE_CORPUS_MAX_DIRECTORY_COUNT,
+            ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            stable_active_corpus_revision_with_budget(&root, expired).unwrap_err(),
+            ActiveCorpusRevisionError::Deadline
+        );
+    }
+
+    #[test]
+    fn stable_markdown_snapshot_rejects_external_hard_link_and_oversized_sources() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let linked = root.join("linked.md");
+        fs::write(&linked, "linked canary").unwrap();
+        fs::hard_link(&linked, outside.join("linked-alias.md")).unwrap();
+        assert!(read_stable_active_markdown(&linked, &canonical_root).is_none());
+
+        let oversized = root.join("oversized.md");
+        let file = File::create(&oversized).unwrap();
+        file.set_len(crate::policy_fs::MAX_BOUND_TEXT_FILE_BYTES + 1)
+            .unwrap();
+        assert!(read_stable_active_markdown(&oversized, &canonical_root).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_markdown_snapshot_rejects_outside_symlink_and_final_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        let outside = temp.path().join("outside.md");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "outside canary").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let linked = root.join("linked.md");
+        symlink(&outside, &linked).unwrap();
+        assert!(read_stable_active_markdown(&linked, &canonical_root).is_none());
+
+        let real = root.join("real.md");
+        fs::write(&real, "in-root target canary").unwrap();
+        let in_root_link = root.join("in-root-link.md");
+        symlink(&real, &in_root_link).unwrap();
+        assert!(read_stable_active_markdown(&in_root_link, &canonical_root).is_none());
+
+        let real_dir = root.join("real-dir");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::write(real_dir.join("nested.md"), "nested target canary").unwrap();
+        let linked_dir = root.join("linked-dir");
+        symlink(&real_dir, &linked_dir).unwrap();
+        assert!(
+            read_stable_active_markdown(&linked_dir.join("nested.md"), &canonical_root).is_none()
+        );
+
+        let swapped = root.join("swapped.md");
+        fs::write(&swapped, "original canary").unwrap();
+        let result = read_stable_active_markdown_with_hooks(
+            &swapped,
+            &canonical_root,
+            |canonical_path| {
+                fs::remove_file(canonical_path).unwrap();
+                symlink(&outside, canonical_path).unwrap();
+            },
+            |_| {},
+            |_| {},
+        );
+        assert!(result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_markdown_snapshot_rejects_in_place_and_post_read_path_mutation() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let in_place = root.join("in-place.md");
+        fs::write(&in_place, "AAAA").unwrap();
+        let changed_between_reads = read_stable_active_markdown_with_hooks(
+            &in_place,
+            &canonical_root,
+            |_| {},
+            |canonical_path| fs::write(canonical_path, "BBBB").unwrap(),
+            |_| {},
+        );
+        assert!(changed_between_reads.is_none());
+
+        let swapped = root.join("post-read.md");
+        let original = root.join("post-read-original.md");
+        fs::write(&swapped, "same-length-canary").unwrap();
+        let changed_after_second_read = read_stable_active_markdown_with_hooks(
+            &swapped,
+            &canonical_root,
+            |_| {},
+            |_| {},
+            |canonical_path| {
+                fs::rename(canonical_path, &original).unwrap();
+                fs::write(canonical_path, "same-length-canary").unwrap();
+            },
+        );
+        assert!(changed_after_second_read.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_markdown_snapshot_rejects_regular_file_to_fifo_swap_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let path = root.join("fifo-swap.md");
+        fs::write(&path, "fifo swap canary").unwrap();
+
+        let started = Instant::now();
+        let snapshot = read_stable_active_markdown_with_hooks(
+            &path,
+            &canonical_root,
+            |canonical_path| {
+                fs::remove_file(canonical_path).unwrap();
+                let path = std::ffi::CString::new(canonical_path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            },
+            |_| {},
+            |_| {},
+        );
+        assert!(snapshot.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn authorization_deadline_admits_the_documented_ceiling_on_slow_storage() {
+        // #679: the deadline was a hardcoded 15s while the ceilings allowed
+        // 960 MB of charged reads, and every snapshot reads each file twice,
+        // so a corpus that fit every published limit still failed unless the
+        // disk sustained 128 MB/s. It showed up as an intermittent CI failure;
+        // the same arithmetic fails a user whose meetings live on iCloud Drive
+        // or an external disk.
+        //
+        // Pin the relationship, not the number: whichever ceiling moves, the
+        // deadline has to stay reachable at the assumed floor throughput.
+        let charged = ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES;
+        assert_eq!(
+            charged,
+            ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES
+                * (1 + ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES as u64 + 1)
+                * ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS as u64,
+            "charged-byte derivation drifted from the pass and attempt counts"
+        );
+
+        // The deadline is wall clock, so it must be sized against bytes read
+        // from the disk, not bytes charged to the budget. Modelling charged
+        // bytes is what let a 2x undercount survive the first version of this
+        // test: `read_bounded_markdown_twice` reads every file a second time
+        // to prove it did not change, and the budget charges that once.
+        let physical = ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES;
+        assert_eq!(
+            physical,
+            charged * ACTIVE_CORPUS_PHYSICAL_READS_PER_SNAPSHOT,
+            "physical-byte derivation drifted from the per-snapshot reread count"
+        );
+
+        let deadline_secs = ACTIVE_CORPUS_AUTHORIZATION_DEADLINE.as_secs();
+        assert!(
+            deadline_secs > 0,
+            "a sub-second deadline cannot carry the documented ceiling on any storage"
+        );
+
+        // Compare rates as a cross-multiplication rather than dividing, so an
+        // inexact ratio cannot be rounded into a pass. Dividing here let a
+        // deadline one second short of the requirement satisfy the assertion.
+        assert!(
+            physical <= ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC * deadline_secs,
+            "the deadline of {deadline_secs}s carries only {} B at the \
+             {ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC} B/s floor this envelope promises to \
+             tolerate, short of the {physical} B the documented ceiling can require; raise the \
+             deadline or lower the ceiling (#679)",
+            ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC * deadline_secs
+        );
+    }
+
+    #[test]
+    fn stable_markdown_snapshot_checks_deadline_between_read_passes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("deadline.md");
+        fs::write(&path, "deadline read canary").unwrap();
+        let budget = ActiveCorpusReadBudget::new_until(Instant::now() + Duration::from_millis(5));
+
+        let snapshot = read_stable_active_markdown_with_budget_and_hooks(
+            &path,
+            &root.canonicalize().unwrap(),
+            Some(&budget),
+            |_| {},
+            |_| std::thread::sleep(Duration::from_millis(10)),
+            |_| {},
+        );
+        assert!(snapshot.is_none());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn stable_markdown_snapshot_rejects_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let invalid_name = std::ffi::OsString::from_vec(b"invalid-\xff.md".to_vec());
+        let path = root.join(invalid_name);
+        fs::write(&path, "path canary").unwrap();
+        assert!(read_stable_active_markdown(&path, &root.canonicalize().unwrap()).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_markdown_snapshot_holds_windows_write_and_delete_sharing_closed() {
+        use std::cell::Cell;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("meetings");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("windows.md");
+        fs::write(&path, "windows canary").unwrap();
+        let mutation_denied = Cell::new(false);
+        let snapshot = read_stable_active_markdown_with_hooks(
+            &path,
+            &root.canonicalize().unwrap(),
+            |_| {},
+            |canonical_path| {
+                mutation_denied.set(fs::write(canonical_path, "replaced canary").is_err())
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(mutation_denied.get());
+        assert_eq!(snapshot.content, "windows canary");
+    }
+
     fn test_frontmatter() -> Frontmatter {
         Frontmatter {
             title: "Test Meeting".into(),
@@ -1578,6 +2930,36 @@ mod tests {
         assert!(with_sensitive.contains("capture: none"));
         assert!(with_sensitive.contains("sensitivity: restricted"));
         assert!(with_sensitive.contains("debrief: pending"));
+    }
+
+    #[test]
+    fn frontmatter_distinguishes_missing_sensitivity_from_invalid_present_values() {
+        let base = "title: Test\ntype: meeting\ndate: 2026-06-10T10:00:00-07:00\n";
+        let legacy: Frontmatter = serde_yaml::from_str(base).unwrap();
+        assert_eq!(legacy.sensitivity, None);
+
+        for invalid in [
+            "null",
+            "~",
+            "",
+            "confidential",
+            "[normal]",
+            "{policy: normal}",
+        ] {
+            let yaml = format!("{base}sensitivity: {invalid}\n");
+            assert!(
+                serde_yaml::from_str::<Frontmatter>(&yaml).is_err(),
+                "present policy value must fail closed: {invalid:?}"
+            );
+        }
+
+        for valid in ["normal", "restricted"] {
+            let yaml = format!("{base}sensitivity: {valid}\n");
+            assert!(
+                serde_yaml::from_str::<Frontmatter>(&yaml).is_ok(),
+                "valid policy value should parse: {valid}"
+            );
+        }
     }
 
     #[test]
@@ -2635,5 +4017,25 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(section_text(body, all[0]), "a");
         assert_eq!(section_text(body, all[1]), "b");
+    }
+
+    #[test]
+    fn authorized_no_speech_output_omits_every_retry_path() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let fm = Frontmatter {
+            status: Some(OutputStatus::NoSpeech),
+            filter_diagnosis: Some("synthetic authorized audio contained no speech".into()),
+            ..test_frontmatter()
+        };
+
+        let result = write_without_retry_path(&fm, "", None, None, &config).unwrap();
+        let content = fs::read_to_string(&result.path).unwrap();
+        assert!(content.contains("No speech detected"));
+        assert!(!content.contains("minutes process"));
+        assert!(!content.contains(result.path.display().to_string().as_str()));
     }
 }
