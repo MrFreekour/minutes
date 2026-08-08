@@ -1077,8 +1077,17 @@ fn run_ocr_worker(operation: &str) -> i32 {
         return 64;
     }
     use std::io::{Read, Write};
+    // Bounded on the way in, mirroring the standalone worker: this embedded
+    // copy is the one `BoundedTranscriber::bind(current_exe)` actually runs
+    // in the app, so an unbounded read here would leave production trusting
+    // the parent's size check while only the test binary held on its own.
     let mut image = Vec::new();
-    if std::io::stdin().lock().read_to_end(&mut image).is_err() {
+    if std::io::stdin()
+        .lock()
+        .take(minutes_archive_ocr::MAX_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut image)
+        .is_err()
+    {
         return 65;
     }
     let outcome = std::panic::catch_unwind(|| minutes_archive_ocr::recognize_page(&image));
