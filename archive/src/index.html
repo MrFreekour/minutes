@@ -62,7 +62,7 @@
               <span class="step-number">4</span>
               <div>
                 <strong>Search exact evidence</strong>
-                <span>Searchable PDF, Word, OpenDocument, RTF, and text.</span>
+                <span>Searchable PDF, Word, OpenDocument, RTF, text, and scans read on-device.</span>
               </div>
             </li>
           </ol>
@@ -94,10 +94,19 @@
                   a separate authorization boundary.
                 </p>
               </div>
-              <button id="add-locations" class="button button-secondary" type="button">
-                <span aria-hidden="true">＋</span>
-                Choose locations
-              </button>
+              <div class="location-actions">
+                <button id="add-locations" class="button button-secondary" type="button">
+                  <span aria-hidden="true">＋</span>
+                  Choose locations
+                </button>
+                <button id="skip-folders" class="button button-secondary" type="button" disabled>
+                  <span aria-hidden="true">−</span>
+                  Skip folders
+                </button>
+                <button id="clear-skipped" class="button button-quiet" type="button" hidden>
+                  Clear skipped
+                </button>
+              </div>
             </div>
 
             <div id="empty-locations" class="empty-state">
@@ -213,11 +222,16 @@
               <div>
                 <p class="section-label">Optional next gate</p>
                 <strong>Build a temporary document search index</strong>
+                <p id="build-forecast" class="build-forecast" hidden></p>
                 <p>
                   This explicitly opens searchable <code>.pdf</code>,
                   <code>.docx</code>, <code>.doc</code>, <code>.odt</code>,
                   <code>.rtf</code>, <code>.txt</code>, <code>.text</code>,
-                  and <code>.md</code> files. Every converted byte goes to a
+                  and <code>.md</code> files, and reads scanned images
+                  (<code>.png</code>, <code>.jpg</code>, <code>.tiff</code>,
+                  <code>.heic</code>) with the on-device text recognizer. A
+                  scan's text is a machine's reading and is never quoted as
+                  source language. Every converted byte goes to a
                   bounded, network-denied converter. Exact search plus the
                   revision-pinned macOS semantic model run in separate
                   network-denied workers; source text, FTS rows, and
@@ -261,6 +275,9 @@
             <div class="progress-track" aria-hidden="true">
               <span></span>
             </div>
+            <p id="indexing-progress" class="indexing-progress" aria-live="polite">
+              Starting…
+            </p>
             <button id="cancel-indexing" class="button button-quiet" type="button">
               Cancel and discard
             </button>
@@ -271,9 +288,9 @@
               <div>
                 <p class="section-label">Evidence-first document pilot</p>
                 <h2>Search the approved archive</h2>
-                <p id="vault-summary">
-                  The private document index is ready in memory.
-                </p>
+                <div id="vault-summary">
+                  <p>The private document index is ready in memory.</p>
+                </div>
               </div>
               <button id="back-to-census" class="button button-secondary" type="button">
                 Census report
@@ -336,7 +353,7 @@
       </div>
 
       <footer>
-        <span>Private evidence build</span>
+        <span id="build-identity">Private evidence build</span>
         <span aria-hidden="true">•</span>
         <span>Networking disabled by design</span>
         <span aria-hidden="true">•</span>

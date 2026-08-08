@@ -92,6 +92,18 @@ pub struct ApprovedRoot {
     identity: FileIdentity,
 }
 
+impl ApprovedRoot {
+    /// The real path of this root.
+    ///
+    /// Deliberately not public to the interface -- it is used only to hand a
+    /// path to Finder, inside the Rust side, and never crosses the IPC
+    /// boundary. The webview names a document by opaque id and gets no path
+    /// back.
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
 impl std::fmt::Debug for ApprovedRoot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ApprovedRoot([redacted])")
@@ -99,8 +111,23 @@ impl std::fmt::Debug for ApprovedRoot {
 }
 
 /// Establishes native directory capabilities from explicit folder-picker
-/// results.
+/// results, refusing the batch if the set-level invariants do not hold.
 pub fn approve_roots(roots: &[PathBuf]) -> Result<Vec<ApprovedRoot>, CensusError> {
+    let approved = authorize_roots(roots)?;
+    validate_approved_roots(&approved)?;
+    Ok(approved)
+}
+
+/// Authorizes each folder-picker result on its own, leaving the set-level
+/// invariants to the caller.
+///
+/// A caller adding to a set that is already approved wants a redundant choice
+/// *folded into* the location that covers it, not the whole selection refused;
+/// it pairs this with `reduce_approved_roots` and then asserts
+/// `validate_approved_roots` on what survives. `approve_roots` remains the
+/// all-or-nothing form, and every per-location refusal above still applies
+/// here -- this relaxes nothing about what may be approved.
+pub fn authorize_roots(roots: &[PathBuf]) -> Result<Vec<ApprovedRoot>, CensusError> {
     if roots.is_empty() {
         return Err(CensusError::NoRoots);
     }
@@ -150,8 +177,34 @@ pub fn approve_roots(roots: &[PathBuf]) -> Result<Vec<ApprovedRoot>, CensusError
         });
     }
 
-    validate_approved_roots(&approved)?;
     Ok(approved)
+}
+
+/// Returns the indices of the roots that no *other* root already covers, in
+/// input order.
+///
+/// Choosing a folder twice, or choosing one inside a folder that is already
+/// approved, is not a mistake worth refusing. The containing root already
+/// carries authority over everything beneath it, so keeping it alone reaches
+/// exactly the same documents and counts each of them once -- which is the
+/// property `validate_approved_roots` exists to protect. Refusing instead threw
+/// away every *other* folder in the same selection and reported only "the
+/// approved locations overlap", naming neither folder.
+///
+/// Exact duplicates and firmlink aliases contain each other, so the tie is
+/// broken by input order: the earlier index wins, which lets a caller put its
+/// existing locations first and keep their identity when the same folder is
+/// chosen again.
+pub fn reduce_approved_roots(roots: &[ApprovedRoot]) -> Vec<usize> {
+    (0..roots.len())
+        .filter(|&index| {
+            !roots.iter().enumerate().any(|(other, candidate)| {
+                other != index
+                    && root_contains(candidate, &roots[index])
+                    && (other < index || !root_contains(&roots[index], candidate))
+            })
+        })
+        .collect()
 }
 
 /// Checks set-level duplicate and overlap invariants without re-authorizing
@@ -239,6 +292,38 @@ fn ancestor_identities(start: &Path) -> HashSet<FileIdentity> {
 /// comparing device and inode rather than path text.
 fn root_contains(ancestor: &ApprovedRoot, descendant: &ApprovedRoot) -> bool {
     ancestor_identities(&descendant.canonical_path).contains(&ancestor.identity)
+}
+
+/// The path of `descendant` inside `ancestor`, or `None` if `ancestor` does
+/// not actually contain it.
+///
+/// Decided the way `root_contains` decides -- by walking real parent
+/// identities -- and the components are collected on the same walk. A
+/// `strip_prefix` on the canonical path strings would disagree with the
+/// containment check whenever the two roots were approved through different
+/// firmlink spellings of the same directory, and a caller that folds one root
+/// into another needs the relative path to mean exactly what the fold meant.
+pub fn relative_path_within(ancestor: &ApprovedRoot, descendant: &ApprovedRoot) -> Option<PathBuf> {
+    let mut components = Vec::new();
+    let mut current = descendant.canonical_path.clone();
+    loop {
+        let metadata = fs::metadata(&current).ok()?;
+        if std_metadata_identity(&metadata, &current) == ancestor.identity {
+            components.reverse();
+            let mut relative = PathBuf::new();
+            for component in components {
+                relative.push(component);
+            }
+            return Some(relative);
+        }
+        let name = current.file_name()?.to_os_string();
+        let parent = current.parent()?.to_path_buf();
+        if parent == current {
+            return None;
+        }
+        components.push(name);
+        current = parent;
+    }
 }
 
 /// Compatibility helper for trusted native diagnostics.
@@ -788,6 +873,25 @@ pub(crate) fn open_approved_root(root: &ApprovedRoot) -> Result<Dir, CensusError
     Ok(directory)
 }
 
+/// Device and inode of a std metadata, matching `cap_metadata_identity`.
+///
+/// The reveal path is resolved with `std::fs` rather than a capability handle,
+/// because Finder needs a real path; the identity check is the same one the
+/// evidence fence uses, so a file swapped since indexing is refused.
+#[cfg(unix)]
+pub(crate) fn portable_identity_for(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        first: metadata.dev(),
+        second: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn portable_identity_for(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
 #[cfg(unix)]
 fn cap_metadata_identity_portable(metadata: &CapMetadata) -> Option<FileIdentity> {
     Some(cap_metadata_identity(metadata))
@@ -852,7 +956,13 @@ fn category_for_extension(extension: &str) -> &'static str {
         ".doc" | ".docm" | ".docx" | ".dot" | ".dotm" | ".dotx" | ".odt" | ".rtf" | ".rtfd"
         | ".wpd" | ".wps" => "word_processing",
         ".eml" | ".mbox" | ".msg" | ".olm" | ".ost" | ".pst" => "email",
-        ".htm" | ".html" | ".md" | ".text" | ".txt" | ".xml" => "plain_text",
+        // Split from markup deliberately. These are the plain-text formats the
+        // index actually opens; ".htm", ".html" and ".xml" are not, and one row
+        // holding both reported a coverage number that read as searchable when
+        // most of it was not. In a large folder that is the difference between
+        // "13,046 documents you can search" and a few hundred.
+        ".md" | ".text" | ".txt" => "plain_text",
+        ".htm" | ".html" | ".xml" => "markup",
         ".bmp" | ".gif" | ".heic" | ".jpeg" | ".jpg" | ".png" | ".tif" | ".tiff" => "image_or_scan",
         ".csv" | ".numbers" | ".ods" | ".xls" | ".xlsb" | ".xlsm" | ".xlsx" => "spreadsheet",
         ".key" | ".odp" | ".ppt" | ".pptm" | ".pptx" => "presentation",
@@ -1194,6 +1304,76 @@ mod tests {
             validate_roots(&[root, child]),
             Err(CensusError::OverlappingRoots)
         );
+    }
+
+    /// Folding must cost the owner nothing but the redundant entry.
+    ///
+    /// The regression this pins: picking a folder and something inside it used
+    /// to refuse the entire batch, so every *unrelated* folder chosen in the
+    /// same trip through the picker was discarded too and the owner was left
+    /// with an empty list and the word "overlap". Here the unrelated root
+    /// survives, the child folds into its parent, and the census still counts
+    /// the document that lives inside the folded child.
+    #[test]
+    fn a_folder_inside_an_approved_folder_folds_in_and_keeps_the_rest() {
+        let temp = TempDir::new().expect("temp");
+        let parent = synthetic_root(&temp, "parent");
+        let child = parent.join("child");
+        fs::create_dir(&child).expect("child");
+        let unrelated = synthetic_root(&temp, "unrelated");
+        fs::write(child.join("buried.pdf"), b"buried").expect("buried file");
+        fs::write(unrelated.join("separate.docx"), b"separate").expect("separate file");
+
+        let authorized = authorize_roots(&[parent.clone(), child, unrelated.clone()])
+            .expect("each folder is approvable on its own");
+        let kept = reduce_approved_roots(&authorized);
+        assert_eq!(kept, vec![0, 2], "the child folds into its parent");
+
+        let surviving = kept
+            .iter()
+            .map(|&index| authorized[index].clone())
+            .collect::<Vec<_>>();
+        // Reduction is what makes the set valid, so the invariant check is now
+        // an assertion that reduction worked rather than a refusal.
+        validate_approved_roots(&surviving).expect("the reduced set holds the invariant");
+
+        let report = scan_roots(
+            &[parent, unrelated],
+            CensusLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("census over the reduced set");
+        assert_eq!(
+            report.summary.regular_files, 2,
+            "the document inside the folded child is still counted, exactly once"
+        );
+    }
+
+    /// The earlier entry wins, so a caller that lists what it already has first
+    /// keeps those locations -- and their ids -- when the same folder is
+    /// chosen again.
+    #[test]
+    fn the_same_folder_chosen_twice_keeps_the_first_entry() {
+        let temp = TempDir::new().expect("temp");
+        let root = synthetic_root(&temp, "root");
+        let authorized =
+            authorize_roots(&[root.clone(), root.clone(), root]).expect("authorize duplicates");
+        assert_eq!(reduce_approved_roots(&authorized), vec![0]);
+    }
+
+    /// Nesting more than one deep still collapses to the outermost folder.
+    #[test]
+    fn a_chain_of_nested_folders_reduces_to_the_outermost() {
+        let temp = TempDir::new().expect("temp");
+        let outer = synthetic_root(&temp, "outer");
+        let middle = outer.join("middle");
+        fs::create_dir(&middle).expect("middle");
+        let inner = middle.join("inner");
+        fs::create_dir(&inner).expect("inner");
+
+        // Deepest first, to prove the result does not depend on picker order.
+        let authorized = authorize_roots(&[inner, middle, outer]).expect("authorize chain");
+        assert_eq!(reduce_approved_roots(&authorized), vec![2]);
     }
 
     #[test]

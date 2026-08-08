@@ -5,14 +5,16 @@ use minutes_archive_convert::{
     WORKER_MARKER as CONVERT_WORKER_MARKER,
 };
 use minutes_archive_core::retrieval::{LegalSearchResponse, VaultId};
+use minutes_archive_core::vault::BuildProgress;
 use minutes_archive_core::vault::{
     build_authorized_document_vault, AuthorizedDocumentVault, DocumentVaultBuildReport,
-    DocumentVaultLimits,
+    DocumentVaultLimits, ExcludedFolder,
 };
 use minutes_archive_core::{
-    approve_roots, scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits,
-    CensusReport, CensusStatus,
+    authorize_roots, reduce_approved_roots, relative_path_within, scan_approved_roots,
+    validate_approved_roots, ApprovedRoot, CensusLimits, CensusReport, CensusStatus,
 };
+use minutes_archive_ocr::{BoundedTranscriber, WORKER_MARKER as OCR_WORKER_MARKER};
 use minutes_archive_semantic::{
     run_worker_process as run_semantic_worker, BoundedSemanticEngine,
     WORKER_MARKER as SEMANTIC_WORKER_MARKER,
@@ -27,6 +29,18 @@ use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 const NATIVE_LIFECYCLE_SELFTEST_MARKER: &str = "--archive-native-lifecycle-selftest";
+/// Proves the SIGNED application can actually run its own workers.
+///
+/// Everything else was verified on a build that could not do this. A
+/// Developer ID signature with the hardened runtime is bound to its bundle, so
+/// when the workers were copied to a temp directory and run from there, the
+/// copy failed validation and the kernel killed it -- every notarized build
+/// was unable to index a single document. Signature, staple, Gatekeeper and
+/// launch all passed, the window opened, and the first click on "Build
+/// document pilot" failed. The gap was that local testing used an
+/// ad-hoc-signed app, whose copy runs fine, and CI exercised the unsigned
+/// build. This mode closes it: run it against the notarized artifact.
+const SIGNED_WORKER_SELFTEST_MARKER: &str = "--archive-signed-worker-selftest";
 
 #[derive(Debug)]
 struct ApprovedLocation {
@@ -43,6 +57,12 @@ struct ScanControl {
 #[derive(Debug, Default)]
 struct SessionState {
     locations: Vec<ApprovedLocation>,
+    /// Folders inside approved locations that the build must not enter.
+    ///
+    /// Chosen through the same native panel as the locations themselves, so a
+    /// folder path still never crosses into the webview in either direction --
+    /// the interface asks for the panel and is told a count.
+    exclusions: Vec<SessionExclusion>,
     last_report: Option<CensusReport>,
     text_vault: Option<AuthorizedDocumentVault>,
     scan: ScanControl,
@@ -59,6 +79,13 @@ struct ArchiveState {
     /// `exit(0)` leaves both 40 MB snapshots behind. Registering the paths at
     /// creation lets the purge reclaim them whichever way the app exits.
     live_snapshots: Arc<Mutex<Vec<std::path::PathBuf>>>,
+    /// Live counts for the build in flight, polled by the interface.
+    ///
+    /// A build over tens of thousands of documents with no visible progress is
+    /// indistinguishable from a hung one. Counts only -- no filename, no path,
+    /// nothing derived from a document -- so this cannot become a channel for
+    /// anything but the two numbers.
+    build_progress: Mutex<Arc<BuildProgress>>,
 }
 
 impl Default for ArchiveState {
@@ -67,6 +94,7 @@ impl Default for ArchiveState {
             session: Mutex::new(SessionState::default()),
             next_location_id: AtomicU64::new(1),
             live_snapshots: Arc::new(Mutex::new(Vec::new())),
+            build_progress: Mutex::new(Arc::new(BuildProgress::default())),
         }
     }
 }
@@ -78,13 +106,76 @@ struct LocationSummary {
     label: String,
 }
 
+/// The result of a folder-picker round.
+///
+/// `folded` counts the chosen folders that some approved location already
+/// covers. They are not failures and not losses -- every document beneath them
+/// is still indexed through the containing location -- but the owner picked
+/// them deliberately and is owed an account of where they went.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocationChoice {
+    locations: Vec<LocationSummary>,
+    folded: usize,
+    /// Skipped folders cancelled because the owner explicitly chose them.
+    ///
+    /// Choosing a folder in the picker is the owner's latest word on it, and it
+    /// beats an older skip. The count is reported because the skip was also
+    /// deliberate once, and its silent disappearance would be the same lie in
+    /// the other direction.
+    unskipped: usize,
+    /// Skipped folders forgotten because the location holding them was folded.
+    ///
+    /// Silently dropping these reads *more* than the owner asked for, not less,
+    /// so nothing is lost from the index -- but the folder they pointed at was
+    /// excluded on purpose. On the archive this pilot is for that is 2,873
+    /// screenshots and roughly seventeen minutes of text recognition arriving
+    /// unannounced, in an index they believed excluded them.
+    forgotten_skips: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapState {
+    /// Which build this is, for a support conversation.
+    ///
+    /// The version alone does not identify a build: two candidates carried the
+    /// same version and one of them could not index a single document. The
+    /// short digest of the running executable is what the signed provenance
+    /// record already names a candidate by, so it is the thing to ask for when
+    /// someone reports a problem -- and it is computed from the file on disk
+    /// rather than compiled in, so it cannot claim to be a build it is not.
+    build_identity: String,
     locations: Vec<LocationSummary>,
     scan_running: bool,
     report: Option<CensusReport>,
     text_vault_report: Option<DocumentVaultBuildReport>,
+}
+
+/// Version plus a short digest of the executable that is actually running.
+///
+/// Reads nothing but its own binary and reaches no network -- the whole point
+/// of this application is that it does not, and knowing which build you have
+/// must not be the exception. Auto-update was considered and deliberately not
+/// wired: docs/investigations/auto-update-evaluation.md holds the decision, and
+/// a shipped updater endpoint sat in the configuration for a while contradicting
+/// the "networking disabled by design" line in this app's own footer.
+fn build_identity() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let digest = std::env::current_exe()
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&bytes);
+            digest
+                .iter()
+                .take(6)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| "unidentified".to_string());
+    format!("v{version} · build {digest}")
 }
 
 fn lock_error() -> String {
@@ -113,10 +204,70 @@ fn ensure_scan_idle(session: &SessionState) -> Result<(), String> {
     Ok(())
 }
 
+/// Counts for the build in flight.
+///
+/// Polled rather than pushed: two integers on a timer needs no event channel,
+/// and a channel that exists only to carry progress is a channel that could
+/// later carry something else. Nothing derived from a document crosses here.
+#[derive(serde::Serialize)]
+struct UiBuildProgress {
+    examined: u64,
+    indexed: u64,
+}
+
+/// Show a document in Finder, named by opaque id.
+///
+/// The interface has never received a path and still does not: it sends back
+/// the id it was given on the card, and the path is resolved here, used to ask
+/// Finder to select the file, and dropped. Nothing about the location crosses
+/// into the webview, so the property the census screen states -- "the interface
+/// receives opaque location numbers, not folder paths" -- is unchanged.
+#[tauri::command]
+fn reveal_archive_document(
+    document_id: String,
+    state: tauri::State<'_, ArchiveState>,
+) -> Result<(), String> {
+    let document_id = minutes_archive_core::retrieval::DocumentId::parse(document_id)
+        .map_err(|_| "That document could not be identified.".to_string())?;
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "Minutes Archive could not read its session.".to_string())?;
+    let vault = session
+        .text_vault
+        .as_ref()
+        .ok_or_else(|| "There is no open index.".to_string())?;
+    // Refuses if the file moved, changed identity, or is no longer a regular
+    // file inside its approved root -- the same check a quotation gets.
+    let path = vault
+        .source_path_for_reveal(&document_id)
+        .ok_or_else(|| "That source is no longer where it was indexed.".to_string())?;
+    std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(&path)
+        .status()
+        .map_err(|_| "Finder could not be asked to show the document.".to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn archive_index_progress(state: tauri::State<'_, ArchiveState>) -> UiBuildProgress {
+    let progress = state
+        .build_progress
+        .lock()
+        .map(|slot| Arc::clone(&slot))
+        .unwrap_or_default();
+    UiBuildProgress {
+        examined: progress.examined(),
+        indexed: progress.indexed(),
+    }
+}
+
 #[tauri::command]
 fn archive_bootstrap(state: State<'_, ArchiveState>) -> Result<BootstrapState, String> {
     let session = state.session.lock().map_err(|_| lock_error())?;
     Ok(BootstrapState {
+        build_identity: build_identity(),
         locations: location_summaries(&session.locations),
         scan_running: session.scan.running,
         report: session.last_report.clone(),
@@ -131,7 +282,7 @@ fn archive_bootstrap(state: State<'_, ArchiveState>) -> Result<BootstrapState, S
 async fn choose_archive_locations(
     app: tauri::AppHandle,
     state: State<'_, ArchiveState>,
-) -> Result<Vec<LocationSummary>, String> {
+) -> Result<LocationChoice, String> {
     {
         let session = state.session.lock().map_err(|_| lock_error())?;
         ensure_scan_idle(&session)?;
@@ -147,7 +298,12 @@ async fn choose_archive_locations(
     native_panel_state::forget();
     let Some(selected) = selected else {
         let session = state.session.lock().map_err(|_| lock_error())?;
-        return Ok(location_summaries(&session.locations));
+        return Ok(LocationChoice {
+            folded: 0,
+            forgotten_skips: 0,
+            unskipped: 0,
+            locations: location_summaries(&session.locations),
+        });
     };
 
     let selected = selected
@@ -157,27 +313,302 @@ async fn choose_archive_locations(
                 .map_err(|_| "The selected location is not a local folder.".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let new_roots = approve_roots(&selected).map_err(safe_census_error)?;
+    let new_roots = authorize_roots(&selected).map_err(safe_census_error)?;
 
     let mut session = state.session.lock().map_err(|_| lock_error())?;
     ensure_scan_idle(&session)?;
+
+    // A folder chosen twice, or chosen inside one that is already approved, is
+    // folded into the location that covers it. Refusing the batch instead
+    // discarded every other folder the owner had just picked and left them
+    // with an empty list and the word "overlap".
+    //
+    // Existing locations come first so that re-choosing an approved folder
+    // keeps the location already on screen, id and all, rather than replacing
+    // it with an identical one.
+    let existing = session.locations.len();
     let mut combined = session
         .locations
         .iter()
         .map(|location| location.root.clone())
         .collect::<Vec<_>>();
     combined.extend(new_roots.iter().cloned());
-    validate_approved_roots(&combined).map_err(safe_census_error)?;
+    let kept = reduce_approved_roots(&combined);
+    let folded = combined.len().saturating_sub(kept.len());
 
-    for root in new_roots {
-        session.locations.push(ApprovedLocation {
-            id: state.next_location_id.fetch_add(1, Ordering::Relaxed),
-            root,
-        });
+    let surviving = kept
+        .iter()
+        .map(|&index| combined[index].clone())
+        .collect::<Vec<_>>();
+    validate_approved_roots(&surviving).map_err(safe_census_error)?;
+
+    let mut locations = Vec::with_capacity(kept.len());
+    for index in kept {
+        match session.locations.get(index) {
+            Some(location) if index < existing => locations.push(ApprovedLocation {
+                id: location.id,
+                root: location.root.clone(),
+            }),
+            _ => locations.push(ApprovedLocation {
+                id: state.next_location_id.fetch_add(1, Ordering::Relaxed),
+                root: combined[index].clone(),
+            }),
+        }
     }
+    session.locations = locations;
+    // Choosing a folder is the owner's latest word on it, and it must beat an
+    // older "skip". Without this, approving a previously skipped folder folds
+    // it into the location that covers it, the interface says "covered by that
+    // one" -- and the exclusion goes on suppressing it, so the owner is told
+    // the folder is in while the build deliberately never reads it. An
+    // exclusion equal to the chosen folder, or an ancestor of it, is the one
+    // doing the suppressing and is dropped; an exclusion strictly inside it
+    // does not contradict the choice and stays.
+    let session = &mut *session;
+    let unskipped = cancel_contradicted_skips(
+        &session.locations,
+        &mut session.exclusions,
+        &combined[existing..],
+    );
+    // A location folded into one that covers it takes its skipped folders with
+    // it. They were named relative to a root that is no longer in the list, and
+    // silently reattaching them to the containing root would skip folders the
+    // owner never pointed at.
+    let surviving_ids = session
+        .locations
+        .iter()
+        .map(|location| location.id)
+        .collect::<Vec<_>>();
+    let skips_before = session.exclusions.len();
+    session
+        .exclusions
+        .retain(|exclusion| surviving_ids.contains(&exclusion.location_id));
+    let forgotten_skips = skips_before.saturating_sub(session.exclusions.len());
     session.last_report = None;
     session.text_vault = None;
-    Ok(location_summaries(&session.locations))
+    Ok(LocationChoice {
+        folded,
+        forgotten_skips,
+        unskipped,
+        locations: location_summaries(&session.locations),
+    })
+}
+
+/// A skipped folder, held against the location's stable id rather than its
+/// position in the list.
+///
+/// `ExcludedFolder` names its root by index, which is correct for one build and
+/// wrong to store: removing a location, or folding one into a folder that
+/// covers it, renumbers everything after it, and an exclusion would quietly
+/// start skipping a folder in some other location. The index is derived at
+/// build time from the list as it stands then, and an exclusion whose location
+/// is gone simply does not appear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionExclusion {
+    location_id: u64,
+    relative_path: std::path::PathBuf,
+}
+
+/// Cancels every skip the owner's newest folder choices contradict, and says
+/// how many.
+///
+/// Choosing a folder in the picker is the owner's latest word on it, and it
+/// must beat an older "skip". Without this, approving a previously skipped
+/// folder folds it into the location that covers it, the interface says
+/// "covered by that one" -- and the exclusion goes on suppressing it, so the
+/// owner is told the folder is in while the build deliberately never reads it.
+///
+/// An exclusion equal to the chosen folder, or an ancestor of it, is the one
+/// doing the suppressing and is dropped. An exclusion strictly *inside* the
+/// chosen folder does not contradict the choice and stays. A chosen folder
+/// that became its own location resolves to itself with an empty relative
+/// path, which no stored exclusion can equal or be an ancestor of, so nothing
+/// is dropped for it.
+fn cancel_contradicted_skips(
+    locations: &[ApprovedLocation],
+    exclusions: &mut Vec<SessionExclusion>,
+    chosen: &[ApprovedRoot],
+) -> usize {
+    let mut unskipped = 0usize;
+    for root in chosen {
+        let Some((keeper_id, relative)) = locations.iter().find_map(|location| {
+            relative_path_within(&location.root, root).map(|relative| (location.id, relative))
+        }) else {
+            continue;
+        };
+        let before = exclusions.len();
+        exclusions.retain(|exclusion| {
+            exclusion.location_id != keeper_id
+                || exclusion.relative_path.as_os_str().is_empty()
+                || !(relative == exclusion.relative_path
+                    || relative.starts_with(&exclusion.relative_path))
+        });
+        unskipped += before - exclusions.len();
+    }
+    unskipped
+}
+
+/// Resolves stored exclusions against the locations as they stand right now.
+fn exclusions_for_build(session: &SessionState) -> Vec<ExcludedFolder> {
+    session
+        .exclusions
+        .iter()
+        .filter_map(|exclusion| {
+            let root_index = session
+                .locations
+                .iter()
+                .position(|location| location.id == exclusion.location_id)?;
+            Some(ExcludedFolder {
+                root_index,
+                relative_path: exclusion.relative_path.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What a round of the "skip folders" panel did.
+///
+/// Counts only. `outside` is the number of chosen folders that are not inside
+/// any approved location -- they are not silently dropped, because an operator
+/// who believes a folder is being skipped and is wrong ends up with an index
+/// they cannot account for.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExclusionChoice {
+    skipped: usize,
+    outside: usize,
+    refused_whole_location: usize,
+    /// Every folder currently being skipped, counted here rather than tallied
+    /// by the interface. A running total kept on the other side of the boundary
+    /// drifts the moment a location is removed, and a confidently wrong count
+    /// of what is being skipped is worse than none.
+    total: usize,
+}
+
+/// Choose folders inside approved locations that the build must not read.
+///
+/// A thirty-year archive is not uniformly relevant: the folder that prompted
+/// this held 2,873 screenshots and screen recordings, which cost OCR time and
+/// index nothing an attorney would search for. The alternative was to approve
+/// the parent whole or not at all.
+#[tauri::command]
+async fn choose_archive_exclusions(
+    app: tauri::AppHandle,
+    state: State<'_, ArchiveState>,
+) -> Result<ExclusionChoice, String> {
+    {
+        let session = state.session.lock().map_err(|_| lock_error())?;
+        ensure_scan_idle(&session)?;
+        if session.locations.is_empty() {
+            return Err("Approve at least one location before choosing what to skip.".to_string());
+        }
+    }
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Choose folders to skip")
+        .blocking_pick_folders();
+    native_panel_state::forget();
+    let Some(selected) = selected else {
+        let session = state.session.lock().map_err(|_| lock_error())?;
+        return Ok(ExclusionChoice {
+            skipped: 0,
+            outside: 0,
+            refused_whole_location: 0,
+            total: session.exclusions.len(),
+        });
+    };
+
+    let mut session = state.session.lock().map_err(|_| lock_error())?;
+    ensure_scan_idle(&session)?;
+    let mut choice = ExclusionChoice {
+        skipped: 0,
+        outside: 0,
+        refused_whole_location: 0,
+        total: 0,
+    };
+
+    for path in selected {
+        let Ok(path) = path.into_path() else {
+            choice.outside += 1;
+            continue;
+        };
+        let Ok(canonical) = fs::canonicalize(&path) else {
+            choice.outside += 1;
+            continue;
+        };
+        let Some((root_index, location_id, relative)) = session
+            .locations
+            .iter()
+            .enumerate()
+            .find_map(|(index, location)| {
+                canonical
+                    .strip_prefix(location.root.canonical_path())
+                    .ok()
+                    .map(|relative| (index, location.id, relative.to_path_buf()))
+            })
+        else {
+            choice.outside += 1;
+            continue;
+        };
+        // An empty relative path is the approved location itself. Excluding it
+        // would silently index nothing from that location while it still sat
+        // in the list looking approved; removing the location says the same
+        // thing honestly.
+        if relative.as_os_str().is_empty() {
+            choice.refused_whole_location += 1;
+            continue;
+        }
+        // The prefix match above is on strings. Confirm it by identity before
+        // trusting it, the same way roots are compared: the folder reached by
+        // rejoining the relative path to the root must be the folder that was
+        // actually picked.
+        let rejoined = session.locations[root_index]
+            .root
+            .canonical_path()
+            .join(&relative);
+        let same_folder = fs::metadata(&rejoined)
+            .ok()
+            .zip(fs::metadata(&canonical).ok())
+            .is_some_and(|(left, right)| {
+                use std::os::unix::fs::MetadataExt;
+                left.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
+            });
+        if !same_folder {
+            choice.outside += 1;
+            continue;
+        }
+
+        let exclusion = SessionExclusion {
+            location_id,
+            relative_path: relative,
+        };
+        if !session.exclusions.contains(&exclusion) {
+            session.exclusions.push(exclusion);
+        }
+        choice.skipped += 1;
+    }
+
+    if choice.skipped > 0 {
+        session.last_report = None;
+        session.text_vault = None;
+    }
+    choice.total = session.exclusions.len();
+    Ok(choice)
+}
+
+/// Forget every skipped folder, so the next build reads the locations whole.
+#[tauri::command]
+fn clear_archive_exclusions(state: State<'_, ArchiveState>) -> Result<usize, String> {
+    let mut session = state.session.lock().map_err(|_| lock_error())?;
+    ensure_scan_idle(&session)?;
+    let cleared = session.exclusions.len();
+    session.exclusions.clear();
+    if cleared > 0 {
+        session.last_report = None;
+        session.text_vault = None;
+    }
+    Ok(cleared)
 }
 
 #[tauri::command]
@@ -194,6 +625,12 @@ fn remove_archive_location(
     if session.locations.len() == before {
         return Err("That approved location is no longer available.".to_string());
     }
+    // Skipped folders belong to the location that contained them. Leaving them
+    // behind means a later location could inherit them by id reuse, and it
+    // makes the count of what is being skipped a lie.
+    session
+        .exclusions
+        .retain(|exclusion| exclusion.location_id != location_id);
     session.last_report = None;
     session.text_vault = None;
     Ok(location_summaries(&session.locations))
@@ -354,7 +791,7 @@ async fn build_archive_text_vault(
     state: State<'_, ArchiveState>,
 ) -> Result<DocumentVaultBuildReport, String> {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let roots = {
+    let (roots, exclusions) = {
         let mut session = state.session.lock().map_err(|_| lock_error())?;
         if session.locations.is_empty() {
             return Err("Choose at least one archive location first.".to_string());
@@ -370,16 +807,28 @@ async fn build_archive_text_vault(
         session.scan.running = true;
         session.scan.cancelled = Some(Arc::clone(&cancelled));
         session.text_vault = None;
-        session
+        // Resolved here, against the location list as it stands, so a stored
+        // exclusion can never point at a location that has since moved.
+        let exclusions = exclusions_for_build(&session);
+        let roots = session
             .locations
             .iter()
             .map(|location| location.root.clone())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (roots, exclusions)
     };
 
     let worker_executable = std::env::current_exe()
         .map_err(|_| "Minutes Archive could not bind its document converter.".to_string())?;
-    let snapshot_registry = Arc::clone(&state.live_snapshots);
+    // Kept live: `purge_session` drains it, and a worker that needs scratch
+    // space again should register here. Nothing populates it today.
+    let _snapshot_registry = Arc::clone(&state.live_snapshots);
+    // Reset before the build, so a second build does not continue the first
+    // one's numbers.
+    let progress = Arc::new(BuildProgress::default());
+    if let Ok(mut slot) = state.build_progress.lock() {
+        *slot = Arc::clone(&progress);
+    }
     let build_result = tauri::async_runtime::spawn_blocking(move || {
         let vault_id = VaultId::parse("local-private-vault")
             .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
@@ -390,21 +839,25 @@ async fn build_archive_text_vault(
         // optional aid the interface already labels review-not-verified. A Mac
         // without Apple's linguistic asset previously got NO search at all.
         let semantic_engine = BoundedSemanticEngine::bind(&worker_executable).ok();
-        // Register both snapshots before the long build starts. Until the
-        // vault exists these objects live only in this blocking task, so a
-        // close during the build would otherwise leave both directories.
-        if let Ok(mut registry) = snapshot_registry.lock() {
-            registry.push(converter.snapshot_directory().to_path_buf());
-            if let Some(engine) = semantic_engine.as_ref() {
-                registry.push(engine.snapshot_directory().to_path_buf());
-            }
-        }
+        // Same reasoning for the recogniser: a Mac where Vision cannot start
+        // must still index everything that is not a scan. Scans then stay
+        // counted as needing OCR, which is what they were before this existed.
+        let transcriber = BoundedTranscriber::bind(&worker_executable).ok();
+        // Neither worker copies itself any more -- both execute in place from
+        // the bundle -- so there is no snapshot directory left to reclaim. The
+        // registry stays because it is what `purge_session` drains, and a
+        // future worker that does need scratch space should register it here.
         build_authorized_document_vault(
             vault_id,
             &roots,
-            DocumentVaultLimits::default(),
+            DocumentVaultLimits {
+                excluded_paths: exclusions,
+                ..DocumentVaultLimits::default()
+            },
             &cancelled,
             &converter,
+            transcriber.as_ref(),
+            Some(progress.as_ref()),
             semantic_engine,
         )
         .map_err(|error| error.to_string())
@@ -442,6 +895,12 @@ async fn build_archive_text_vault(
 /// silently reach the webview.
 #[derive(serde::Serialize)]
 struct UiEvidenceCard {
+    /// The opaque id, so a card can ask for itself to be shown in Finder.
+    ///
+    /// An id, never a path: it means nothing outside this session and resolves
+    /// only against sources the vault already holds. The interface still
+    /// receives no filename and no location.
+    document_id: String,
     document_title: String,
     provision_heading: Option<String>,
     source_anchor: String,
@@ -455,6 +914,7 @@ struct UiEvidenceCard {
 impl From<&minutes_archive_core::retrieval::EvidenceCard> for UiEvidenceCard {
     fn from(card: &minutes_archive_core::retrieval::EvidenceCard) -> Self {
         Self {
+            document_id: card.document_id.as_str().to_string(),
             document_title: card.document_title.clone(),
             provision_heading: card.provision_heading.clone(),
             source_anchor: card.source_anchor.clone(),
@@ -469,6 +929,7 @@ impl From<&minutes_archive_core::retrieval::EvidenceCard> for UiEvidenceCard {
 
 #[derive(serde::Serialize)]
 struct UiSemanticCard {
+    document_id: String,
     document_title: String,
     provision_heading: Option<String>,
     source_anchor: String,
@@ -477,6 +938,36 @@ struct UiSemanticCard {
     source_converter: String,
     why_suggested: String,
     index_fresh: bool,
+}
+
+/// A passage read out of an image, kept apart from every card that quotes a
+/// source. The field names differ from `UiEvidenceCard` on purpose: the
+/// interface cannot render one as the other by reaching for `exact_excerpt`.
+#[derive(serde::Serialize)]
+struct UiTranscribedCard {
+    document_id: String,
+    document_title: String,
+    page_anchor: String,
+    transcribed_text: String,
+    lowest_line_confidence: f32,
+    transcriber: String,
+    why_transcribed: String,
+    index_fresh: bool,
+}
+
+impl From<&minutes_archive_core::retrieval::TranscribedCard> for UiTranscribedCard {
+    fn from(card: &minutes_archive_core::retrieval::TranscribedCard) -> Self {
+        Self {
+            document_id: card.document_id.as_str().to_string(),
+            document_title: card.document_title.clone(),
+            page_anchor: card.page_anchor.clone(),
+            transcribed_text: card.transcribed_text.clone(),
+            lowest_line_confidence: card.lowest_line_confidence,
+            transcriber: card.transcriber.clone(),
+            why_transcribed: card.why_transcribed.clone(),
+            index_fresh: card.index_fresh,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -492,6 +983,7 @@ struct UiSearchResponse {
     evidence: Vec<UiEvidenceCard>,
     documents: Vec<UiDocumentCard>,
     semantic_suggestions: Vec<UiSemanticCard>,
+    transcriptions: Vec<UiTranscribedCard>,
     lexical_candidates_considered: usize,
     semantic_candidates_considered: usize,
     semantic_query_applied: bool,
@@ -521,6 +1013,7 @@ impl From<LegalSearchResponse> for UiSearchResponse {
                 .semantic_suggestions
                 .iter()
                 .map(|card| UiSemanticCard {
+                    document_id: card.document_id.as_str().to_string(),
                     document_title: card.document_title.clone(),
                     provision_heading: card.provision_heading.clone(),
                     source_anchor: card.source_anchor.clone(),
@@ -530,6 +1023,11 @@ impl From<LegalSearchResponse> for UiSearchResponse {
                     why_suggested: card.why_suggested.clone(),
                     index_fresh: card.index_fresh,
                 })
+                .collect(),
+            transcriptions: response
+                .transcriptions
+                .iter()
+                .map(UiTranscribedCard::from)
                 .collect(),
             lexical_candidates_considered: response.lexical_candidates_considered,
             semantic_candidates_considered: response.semantic_candidates_considered,
@@ -556,13 +1054,120 @@ fn search_archive_text_vault(
         .map_err(|error| error.to_string())
 }
 
+/// Bind the converter to this executable and convert one synthetic document.
+///
+/// Deliberately end to end through the real `BoundedConverter`: the failure
+/// this exists to catch was in binding, not in parsing, and it only appears
+/// when the running executable carries a bundle-bound signature.
+/// The recognizer worker, reached through the same binary as the others.
+///
+/// Its absence is what made `BoundedTranscriber::bind` fail: the marker fell
+/// through to the GUI branch, so binding launched a second copy of the
+/// application instead of a worker, the self-test never passed, and every scan
+/// was silently skipped as an unsupported format. Nothing reported it, because
+/// the engine is optional by design and `.ok()` swallowed the failure.
+fn run_ocr_worker(operation: &str) -> i32 {
+    if minutes_archive_ocr::install_worker_security_boundary().is_err() {
+        return 70;
+    }
+    if operation == "sandbox-self-test" {
+        return minutes_archive_ocr::sandbox_self_test();
+    }
+    if operation != "recognize" {
+        return 64;
+    }
+    use std::io::{Read, Write};
+    // Bounded on the way in, mirroring the standalone worker: this embedded
+    // copy is the one `BoundedTranscriber::bind(current_exe)` actually runs
+    // in the app, so an unbounded read here would leave production trusting
+    // the parent's size check while only the test binary held on its own.
+    let mut image = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(minutes_archive_ocr::MAX_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut image)
+        .is_err()
+    {
+        return 65;
+    }
+    let outcome = std::panic::catch_unwind(|| minutes_archive_ocr::recognize_page(&image));
+    let Ok(Ok(page)) = outcome else {
+        return 66;
+    };
+    let Ok(encoded) = serde_json::to_vec(&page) else {
+        return 67;
+    };
+    if std::io::stdout().lock().write_all(&encoded).is_err() {
+        return 68;
+    }
+    0
+}
+
+fn run_signed_worker_selftest() -> i32 {
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("signed-worker-selftest: current_exe failed: {error}");
+            return 70;
+        }
+    };
+    let converter = match minutes_archive_convert::BoundedConverter::bind(&executable) {
+        Ok(converter) => converter,
+        Err(error) => {
+            eprintln!("signed-worker-selftest: converter bind failed: {error}");
+            return 71;
+        }
+    };
+    // A minimal synthetic document, inline so the check needs no fixture on
+    // the runner and never touches a real file.
+    const SOURCE: &[u8] =
+        b"7. CONFIDENTIALITY\nConfidential Information includes affiliate data.\n";
+    match converter.convert(minutes_archive_convert::SourceFormat::Docx, SOURCE) {
+        Ok(_) => {}
+        Err(minutes_archive_convert::WorkerError::SourceRefused) => {
+            // Expected: those bytes are not a real DOCX container. What
+            // matters is that the worker ran and answered, which it cannot do
+            // if the signature check killed it.
+        }
+        Err(error) => {
+            eprintln!("signed-worker-selftest: worker did not run: {error}");
+            return 72;
+        }
+    }
+    // The recognizer is bound against THIS binary, not the standalone worker.
+    // Exercising the standalone one is what let a missing marker ship: that
+    // executable of course understood its own marker, while the application it
+    // actually runs inside did not, and binding it launched a second copy of
+    // the app instead of a worker.
+    if let Err(error) = minutes_archive_ocr::BoundedTranscriber::bind(&executable) {
+        eprintln!("signed-worker-selftest: recognizer bind failed: {error}");
+        return 73;
+    }
+    match minutes_archive_semantic::BoundedSemanticEngine::bind(&executable) {
+        Ok(_) => println!("signed_worker_selftest=passed converter=bound ocr=bound semantic=bound"),
+        // Absent on a runner without Apple's linguistic asset, which is not a
+        // signing failure and must not fail the check.
+        Err(error) => println!(
+            "signed_worker_selftest=passed converter=bound ocr=bound semantic=unavailable ({error})"
+        ),
+    }
+    0
+}
+
 fn main() {
+    // One descriptor per indexed document, held for the session so the
+    // live-source fence can re-read through it. macOS gives a GUI application a
+    // soft limit of 256, which stopped a build at 237 of 16,621 and reported
+    // the rest as unreadable. The implementation lives in archive-core so a
+    // harness can lower the ceiling and prove this still completes; nothing in
+    // `main` is reachable from a test.
+    minutes_archive_core::vault::raise_open_file_ceiling();
     let mut arguments = std::env::args();
     let _program = arguments.next();
     let marker = arguments.next();
     if matches!(
         marker.as_deref(),
-        Some(CONVERT_WORKER_MARKER | SEMANTIC_WORKER_MARKER)
+        Some(CONVERT_WORKER_MARKER | SEMANTIC_WORKER_MARKER | OCR_WORKER_MARKER)
     ) {
         let operation = arguments.next().unwrap_or_default();
         if arguments.next().is_some() {
@@ -571,9 +1176,32 @@ fn main() {
         let status = match marker.as_deref() {
             Some(CONVERT_WORKER_MARKER) => run_convert_worker(&operation),
             Some(SEMANTIC_WORKER_MARKER) => run_semantic_worker(&operation),
+            Some(OCR_WORKER_MARKER) => run_ocr_worker(&operation),
             _ => unreachable!("worker marker was already validated"),
         };
         std::process::exit(status);
+    }
+    if marker.as_deref() == Some(SIGNED_WORKER_SELFTEST_MARKER) {
+        if arguments.next().is_some() {
+            std::process::exit(64);
+        }
+        std::process::exit(run_signed_worker_selftest());
+    }
+    // An unrecognised flag must never reach the GUI branch.
+    //
+    // This is how a missing worker marker became a second copy of the
+    // application on the owner's screen: `BoundedTranscriber::bind` launched
+    // this binary with the OCR marker, nothing matched, and execution fell
+    // through to `tauri::Builder`. The bind then failed, every scan was skipped
+    // as unsupported, and the visible symptom was a window nobody asked for
+    // stealing focus mid-build. Refusing anything flag-shaped that is not
+    // understood turns that whole class of mistake into an immediate exit.
+    if marker
+        .as_deref()
+        .is_some_and(|value| value.starts_with("--") && value != NATIVE_LIFECYCLE_SELFTEST_MARKER)
+    {
+        eprintln!("Minutes Archive: unrecognised option");
+        std::process::exit(64);
     }
     let native_lifecycle_selftest = marker.as_deref() == Some(NATIVE_LIFECYCLE_SELFTEST_MARKER);
     if native_lifecycle_selftest && arguments.next().is_some() {
@@ -639,11 +1267,15 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             archive_bootstrap,
             choose_archive_locations,
+            choose_archive_exclusions,
+            clear_archive_exclusions,
             remove_archive_location,
             run_archive_census,
             cancel_archive_census,
             export_archive_census,
             build_archive_text_vault,
+            archive_index_progress,
+            reveal_archive_document,
             search_archive_text_vault,
         ])
         .build(tauri::generate_context!())
@@ -785,6 +1417,8 @@ fn purge_session(app_handle: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    use minutes_archive_core::approve_roots;
+
     /// Exporting the census must never overwrite a hard-linked document.
     ///
     /// An independent reviewer found that `refuse_link_target` rejects
@@ -856,13 +1490,17 @@ mod tests {
             serde_json::to_string(&UiSearchResponse::from(response)).expect("serialize projection");
 
         // The full record really does carry these; the projection must not.
-        for field in [
-            "sha256",
-            "byte_len",
-            "vault_id",
-            "document_id",
-            "lexical_rank",
-        ] {
+        //
+        // `document_id` was on this list and has been deliberately removed from
+        // it, so that a card can ask for its own source to be shown in Finder.
+        // What that reveals is nothing: the id is a synthetic counter,
+        // `document-{n:016x}`, generated during the build and meaningless
+        // outside the session. It is not derived from the filename, the path or
+        // the contents, and `valid_opaque_id` restricts it to lowercase
+        // alphanumerics and hyphens, so a path could not be smuggled through it
+        // even by accident. The path itself is resolved behind the boundary and
+        // never returned. The assertion below pins that.
+        for field in ["sha256", "byte_len", "vault_id", "lexical_rank"] {
             assert!(
                 full.contains(field),
                 "fixture no longer exercises {field}; this test would pass vacuously"
@@ -876,6 +1514,17 @@ mod tests {
         assert!(projected.contains("exact_excerpt"));
         assert!(projected.contains("why_matched"));
         assert!(projected.contains("source_anchor"));
+
+        // The id crosses, and it is opaque. Nothing about where the document
+        // lives goes with it.
+        assert!(
+            projected.contains("document_id"),
+            "cards cannot ask for their source without an id"
+        );
+        assert!(
+            !projected.contains("probe-doc.txt") && !projected.contains('/'),
+            "the projection carried a filename or a path: {projected}"
+        );
     }
 
     use super::*;
@@ -921,6 +1570,139 @@ mod tests {
         );
         assert!(!serialized.contains("client-alpha"));
         assert!(!serialized.contains("client-beta"));
+    }
+
+    /// Choosing a folder must cancel the skip that was suppressing it.
+    ///
+    /// The contradiction this pins: approve a location, skip a folder inside
+    /// it, then choose that folder in the picker because you changed your
+    /// mind. The fold reports it as "covered" by the containing location --
+    /// and without cancellation the exclusion keeps suppressing it, so the
+    /// owner is told the folder is in while the build never reads it. The
+    /// index the owner believes in and the index that exists diverge, which is
+    /// the one failure this application must never have.
+    #[test]
+    fn choosing_a_skipped_folder_cancels_the_skip_and_nothing_else() {
+        let temp = TempDir::new().expect("temp");
+        let parent = temp.path().join("life");
+        let attachments = parent.join("attachments");
+        let deeper = attachments.join("movs");
+        let other = parent.join("matters");
+        fs::create_dir_all(&deeper).expect("folders");
+        fs::create_dir_all(&other).expect("other");
+
+        let mut roots = approve_roots(std::slice::from_ref(&parent)).expect("approve parent");
+        let locations = vec![ApprovedLocation {
+            id: 7,
+            root: roots.remove(0),
+        }];
+        let mut exclusions = vec![
+            SessionExclusion {
+                location_id: 7,
+                relative_path: std::path::PathBuf::from("attachments"),
+            },
+            // Inside the chosen folder: does not contradict the choice.
+            SessionExclusion {
+                location_id: 7,
+                relative_path: std::path::PathBuf::from("attachments/movs"),
+            },
+            // Unrelated: must survive untouched.
+            SessionExclusion {
+                location_id: 7,
+                relative_path: std::path::PathBuf::from("matters"),
+            },
+        ];
+
+        // The owner picks the skipped folder itself.
+        let chosen = approve_roots(&[attachments]).expect("approve attachments");
+        let unskipped = cancel_contradicted_skips(&locations, &mut exclusions, &chosen);
+
+        assert_eq!(unskipped, 1, "exactly the suppressing skip is cancelled");
+        assert!(
+            !exclusions
+                .iter()
+                .any(|exclusion| exclusion.relative_path.as_os_str() == "attachments"),
+            "the skip that suppressed the chosen folder survived"
+        );
+        assert!(
+            exclusions
+                .iter()
+                .any(|exclusion| exclusion.relative_path.as_os_str() == "attachments/movs"),
+            "a skip inside the chosen folder was wrongly cancelled"
+        );
+        assert!(
+            exclusions
+                .iter()
+                .any(|exclusion| exclusion.relative_path.as_os_str() == "matters"),
+            "an unrelated skip was wrongly cancelled"
+        );
+
+        // Choosing deeper than the skip: the ancestor skip is the suppressor
+        // and must be cancelled too.
+        let mut exclusions = vec![SessionExclusion {
+            location_id: 7,
+            relative_path: std::path::PathBuf::from("attachments"),
+        }];
+        let chosen = approve_roots(&[deeper]).expect("approve deeper");
+        assert_eq!(
+            cancel_contradicted_skips(&locations, &mut exclusions, &chosen),
+            1,
+            "an ancestor skip suppresses the chosen folder and must be cancelled"
+        );
+    }
+
+    /// A skipped folder must follow its location, not its position.
+    ///
+    /// Exclusions are stored against the location's stable id and resolved to a
+    /// root index only at build time. Storing the index instead would mean that
+    /// removing the first location silently moved every exclusion onto whatever
+    /// location took its place -- folders the owner never pointed at would stop
+    /// being read, with only a count to show for it, which is the one failure
+    /// this build cannot have.
+    #[test]
+    fn a_skipped_folder_follows_its_location_when_the_list_changes() {
+        let temp = TempDir::new().expect("temp");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).expect("first");
+        fs::create_dir(&second).expect("second");
+        let mut roots = approve_roots(&[first, second]).expect("approve synthetic roots");
+        let mut session = SessionState {
+            locations: vec![
+                ApprovedLocation {
+                    id: 7,
+                    root: roots.remove(0),
+                },
+                ApprovedLocation {
+                    id: 8,
+                    root: roots.remove(0),
+                },
+            ],
+            exclusions: vec![SessionExclusion {
+                location_id: 8,
+                relative_path: std::path::PathBuf::from("attachments"),
+            }],
+            ..SessionState::default()
+        };
+
+        let resolved = exclusions_for_build(&session);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].root_index, 1, "second location is at index 1");
+
+        // Drop the first location. The exclusion still belongs to location 8,
+        // which has moved to index 0.
+        session.locations.retain(|location| location.id != 7);
+        let resolved = exclusions_for_build(&session);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].root_index, 0,
+            "the exclusion followed its location instead of staying at index 1"
+        );
+
+        // Drop the location it belongs to. The exclusion resolves to nothing
+        // rather than attaching itself to a location that never had it.
+        session.locations.clear();
+        assert!(exclusions_for_build(&session).is_empty());
     }
 
     #[test]

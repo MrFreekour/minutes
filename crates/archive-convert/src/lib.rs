@@ -173,30 +173,47 @@ struct WorkerResponse {
 }
 
 pub struct BoundedConverter {
-    _snapshot_directory: tempfile::TempDir,
     executable_path: PathBuf,
+    /// Held open with `O_NOFOLLOW` for the object's lifetime. The descriptor
+    /// pins one inode, so the digest below is re-read from the same file no
+    /// matter what happens to the path.
     executable: fs::File,
+    executable_identity: FileIdentity,
     executable_bytes: u64,
     executable_digest: [u8; 32],
 }
 
+/// Device and inode of the pinned worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
 impl std::fmt::Debug for BoundedConverter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BoundedConverter([private immutable worker snapshot])")
+        formatter.write_str("BoundedConverter([pinned worker executable])")
     }
 }
 
 impl BoundedConverter {
-    /// Path of the private worker snapshot directory.
-    ///
-    /// Exposed so the app can reclaim it explicitly. `exit(0)` does not
-    /// unwind, and during a vault build this object lives inside a blocking
-    /// task rather than in shared session state, so nothing the close handler
-    /// can reach owns it and no destructor will run.
-    pub fn snapshot_directory(&self) -> &Path {
-        self._snapshot_directory.path()
-    }
-
     pub fn bind(worker_executable: &Path) -> Result<Self, WorkerError> {
         let canonical =
             fs::canonicalize(worker_executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
@@ -212,7 +229,7 @@ impl BoundedConverter {
             use std::os::unix::fs::OpenOptionsExt;
             source_options.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut source = source_options
+        let source = source_options
             .open(&canonical)
             .map_err(|_| WorkerError::ExecutableUnavailable)?;
         let source_metadata = source
@@ -222,51 +239,35 @@ impl BoundedConverter {
             return Err(WorkerError::ExecutableUnavailable);
         }
 
-        let snapshot_directory = tempfile::Builder::new()
-            .prefix("minutes-archive-worker-")
-            .tempdir()
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        #[cfg(unix)]
-        fs::set_permissions(
-            snapshot_directory.path(),
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-        )
-        .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        let executable_path = snapshot_directory.path().join("worker");
-        let mut snapshot_options = fs::OpenOptions::new();
-        snapshot_options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            snapshot_options.mode(0o500);
-        }
-        let mut snapshot = snapshot_options
-            .open(&executable_path)
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        std::io::copy(&mut source, &mut snapshot)
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        snapshot
-            .sync_all()
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            snapshot
-                .set_permissions(fs::Permissions::from_mode(0o500))
-                .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        }
-        drop(snapshot);
-        let executable =
-            fs::File::open(&executable_path).map_err(|_| WorkerError::ExecutableUnavailable)?;
+        // The worker executes in place, from inside the application bundle.
+        //
+        // It used to be copied to a private temp directory and run from there,
+        // so the bytes could not change between verification and use. That is
+        // sound reasoning and it produced an app that could not work at all: a
+        // Developer ID signature with the hardened runtime is bound to its
+        // bundle, so the copy fails validation -- `codesign` reports "invalid
+        // Info.plist (plist or signature have been modified)" -- and the kernel
+        // SIGKILLs it the moment it is exec'd. Every notarized build was
+        // therefore unable to build an index, while every test passed, because
+        // local testing used an ad-hoc-signed app (whose copy runs fine) and CI
+        // exercised the unsigned build.
+        //
+        // The property the copy provided is kept without it. This descriptor
+        // pins one inode for the object's lifetime, and `verify_executable`
+        // re-reads the digest through it and confirms the path still resolves
+        // to that same inode before every launch. A swapped file changes the
+        // inode and is refused; a rewritten one changes the digest and is
+        // refused.
+        let executable_identity = file_identity(&source_metadata);
         let (executable_bytes, executable_digest) =
-            digest_file(&executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
+            digest_file(&source).map_err(|_| WorkerError::ExecutableUnavailable)?;
         if executable_bytes != source_metadata.len() {
             return Err(WorkerError::ExecutableUnavailable);
         }
         let converter = Self {
-            _snapshot_directory: snapshot_directory,
-            executable_path,
-            executable,
+            executable_path: canonical,
+            executable: source,
+            executable_identity,
             executable_bytes,
             executable_digest,
         };
@@ -310,19 +311,35 @@ impl BoundedConverter {
         }
     }
 
+    /// Confirm the worker is still the exact file this object bound to.
+    ///
+    /// Runs immediately before every launch. The write-bit refusal that used
+    /// to live here was possible only because the worker was a private copy
+    /// the code had just created at mode 0500; an application bundle's
+    /// executable is 0755 like every other installed binary, so demanding no
+    /// write bits would refuse every real installation. Identity and content
+    /// are what actually matter, and both are checked against the descriptor
+    /// opened at bind time rather than against the path.
     fn verify_executable(&self) -> Result<(), WorkerError> {
         let metadata = fs::symlink_metadata(&self.executable_path)
             .map_err(|_| WorkerError::ExecutableUnavailable)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(WorkerError::ExecutableUnavailable);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o222 != 0 {
-                return Err(WorkerError::ExecutableUnavailable);
-            }
+        // The path must still lead to the inode this object pinned. A binary
+        // swapped in beneath us lands on a different one.
+        if file_identity(&metadata) != self.executable_identity {
+            return Err(WorkerError::ExecutableUnavailable);
         }
+        let pinned = self
+            .executable
+            .metadata()
+            .map_err(|_| WorkerError::ExecutableUnavailable)?;
+        if file_identity(&pinned) != self.executable_identity {
+            return Err(WorkerError::ExecutableUnavailable);
+        }
+        // Re-read through the descriptor, so this measures the pinned inode
+        // and not whatever the path happens to name now.
         let (bytes, digest) =
             digest_file(&self.executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
         if bytes != self.executable_bytes || digest != self.executable_digest {
@@ -421,6 +438,39 @@ struct WorkerOutput {
     stdout: Vec<u8>,
 }
 
+/// Measure the pinned worker without moving anyone's file offset.
+///
+/// This used to rewind a `try_clone` of the descriptor. `try_clone` is `dup`,
+/// and duplicated descriptors share one open file description and therefore one
+/// offset: rewinding the clone rewinds the original. Two threads verifying the
+/// worker at the same moment then read each other's bytes and both conclude the
+/// executable had been swapped underneath them. That is precisely what happened
+/// the first time document extraction ran on more than one thread -- every
+/// concurrent conversion failed as "unavailable or mutable" while the file on
+/// disk had not changed at all. Positional reads have no shared cursor to race
+/// over, and the check still measures the pinned inode rather than the path.
+#[cfg(unix)]
+fn digest_file(file: &fs::File) -> Result<(u64, [u8; 32]), std::io::Error> {
+    use std::os::unix::fs::FileExt;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut offset = 0u64;
+    loop {
+        match file.read_at(&mut buffer, offset) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                offset = offset.saturating_add(read as u64);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((offset, hasher.finalize().into()))
+}
+
+#[cfg(not(unix))]
 fn digest_file(file: &fs::File) -> Result<(u64, [u8; 32]), std::io::Error> {
     use std::io::{Seek, SeekFrom};
 
