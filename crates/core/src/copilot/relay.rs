@@ -1362,8 +1362,16 @@ mod tests {
     ///
     /// The race being absorbed is documented in #529 and #656: the server's
     /// retirement of a dropped client is not ordered against accepting the
-    /// next one, so a freshly connected client can see EOF immediately. It
-    /// resolves in milliseconds and reports as `Io(UnexpectedEof)`.
+    /// next one, so a freshly connected client can see the peer teardown
+    /// immediately. It resolves in milliseconds.
+    ///
+    /// Which errno that teardown surfaces as is platform-dependent, so this
+    /// reuses the same classification the production reconnect path applies
+    /// (see `CaptureRelayClient::read_frame`): a clean `UnexpectedEof`, plus
+    /// the `BrokenPipe`/`ConnectionReset`/`ConnectionAborted` family that
+    /// `is_handshake_teardown_error` documents on macOS under CPU contention.
+    /// Matching only `UnexpectedEof` here would leave the test failing
+    /// immediately on exactly the races production is written to absorb.
     ///
     /// A timeout is different in kind. `try_wait_for_frame` waits 3s per frame
     /// and reports `InvalidData("timed out ...")`, which means replay itself
@@ -1374,14 +1382,14 @@ mod tests {
     /// failure then surfaced as a CI timeout with no test named, instead of an
     /// assertion pointing at the broken invariant.
     ///
-    /// So: retry EOF fast, fail everything else immediately.
+    /// So: retry connection teardown fast, fail everything else immediately.
     const RECONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+    /// Floor on attempts, so a slow attempt cannot consume the whole wall-clock
+    /// budget and reduce this to a single try.
+    const RECONNECT_MIN_ATTEMPTS: u32 = 3;
 
-    fn is_transient_reconnect_eof(error: &CaptureRelayError) -> bool {
-        matches!(
-            error,
-            CaptureRelayError::Io(io_error) if io_error.kind() == io::ErrorKind::UnexpectedEof
-        )
+    fn is_transient_reconnect_error(error: &CaptureRelayError) -> bool {
+        is_unexpected_eof(error) || is_handshake_teardown_error(error)
     }
 
     fn read_reconnect_cycle_with_retry(
@@ -1389,25 +1397,31 @@ mod tests {
         cursor: RelayCursor,
         seq: u64,
     ) -> RelayCursor {
-        let deadline = Instant::now() + RECONNECT_RETRY_BUDGET;
+        let started = Instant::now();
+        let deadline = started + RECONNECT_RETRY_BUDGET;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             match read_reconnect_cycle(discovery_path, cursor.clone(), seq) {
                 Ok(next) => return next,
-                Err(error) if !is_transient_reconnect_eof(&error) => panic!(
+                Err(error) if !is_transient_reconnect_error(&error) => panic!(
                     "reconnect cycle {seq} failed on attempt {attempt} with a non-transient \
-                     error: {error:?}. Only an immediate EOF during reconnect is retried; \
-                     anything else means replay is broken."
+                     error: {error:?}. Only an immediate connection teardown during reconnect \
+                     is retried; anything else means replay is broken."
                 ),
-                Err(error) if Instant::now() < deadline => {
+                // The budget is wall-clock, but an attempt is not instant: a
+                // frame wait can burn 3s before the teardown surfaces, so a
+                // slow first attempt could exhaust the whole budget and leave
+                // this at one try. Honour a floor of RECONNECT_MIN_ATTEMPTS so
+                // the retry cannot silently degrade to no retry at all.
+                Err(error) if attempt < RECONNECT_MIN_ATTEMPTS || Instant::now() < deadline => {
                     eprintln!("reconnect cycle {seq} attempt {attempt} retrying after {error:?}");
                     thread::sleep(Duration::from_millis(20));
                 }
                 Err(error) => panic!(
                     "reconnect cycle {seq} still hitting the reconnect race after {attempt} \
                      attempts in {:?}: {error:?}",
-                    RECONNECT_RETRY_BUDGET
+                    started.elapsed()
                 ),
             }
         }
