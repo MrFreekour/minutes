@@ -585,10 +585,16 @@ describe("stable corpus lease", () => {
             operationCalls += 1;
           },
           {
-            timeoutMs: 500,
+            // `baselineCalls` is asserted to be 1, so the budget has to
+            // survive worker startup before afterBaseline is even reached, or
+            // the lease fails first and the count is zero. Same shape as the
+            // stall test below, which did exactly that on a loaded runner.
+            // The hook still outlasts the budget, which is the property under
+            // test; the budget just no longer races startup.
+            timeoutMs: 2_000,
             afterBaseline: () => {
               baselineCalls += 1;
-              return new Promise((resolve) => setTimeout(resolve, 750));
+              return new Promise((resolve) => setTimeout(resolve, 3_000));
             },
           }
         )
@@ -644,17 +650,48 @@ describe("stable corpus lease", () => {
     await withCorpus(async (root) => {
       writeFileSync(join(root, "meeting.md"), "stalled finalize canary");
       let projections = 0;
+      // End the operation from the projection itself rather than by running
+      // out the clock. The assertion below is that the projection DID run, so
+      // a wall-clock budget has to be longer than worker startup or the lease
+      // fails first and the count is zero. That is a property of the runner,
+      // not of the code: startup measures ~80ms unloaded here and this test
+      // budgeted 500ms, which held locally and did not on a loaded macOS
+      // runner. `operationDeadlineForTest` fires the same parent deadline the
+      // timeout would, at a point the test controls.
+      let forceOperationDeadline!: () => void;
+      const operationDeadline = new Promise<void>((resolve) => {
+        forceOperationDeadline = resolve;
+      });
       await expect(
         withStableCorpusLease(
           root,
           () => {
             projections += 1;
+            forceOperationDeadline();
             return "MUST_NOT_PUBLISH";
           },
-          { timeoutMs: 500, workerStallPhaseForTest: "before-authorized" }
+          {
+            // Below vitest's 15s testTimeout on purpose: if the
+            // deterministic deadline ever fails to fire, the lease still
+            // refuses with its own message instead of vitest killing the test
+            // with a less useful timeout. Still ~75x the measured worst-case
+            // startup, so it cannot race.
+            timeoutMs: 10_000,
+            workerStallPhaseForTest: "before-authorized",
+            operationDeadlineForTest: operationDeadline,
+          }
         )
       ).rejects.toThrow("stable meeting corpus authorization failed");
+      // The rejection is the non-publication proof: a published projection
+      // would have resolved to MUST_NOT_PUBLISH instead.
       expect(projections).toBe(1);
+      // And the stalled worker has to be reaped, not merely abandoned. Without
+      // this the deterministic deadline could satisfy the assertions above
+      // while leaving a wedged child holding admission, which is the failure
+      // this scenario exists to catch.
+      await expect(
+        withStableCorpusLease(root, () => "reused")
+      ).resolves.toBe("reused");
     });
   });
 
@@ -934,6 +971,37 @@ describe("stable corpus lease", () => {
           onWatcherReady: ({ controls }) => controls.suppressNextFence(),
         })
       ).rejects.toThrow("stable meeting corpus authorization failed");
+    });
+  });
+
+  it("reports the documented refusal when the budget expires, whichever guard trips", async () => {
+    // An exhausted budget can be noticed by several guards, and only some sit
+    // inside the worker machinery that wraps refusals. The ones outside it
+    // used to escape as the raw "meeting corpus authorization deadline
+    // elapsed", so callers saw two different sentences for one condition
+    // depending only on which guard won. CI hit it on a contended Windows
+    // runner, where a short budget can expire between computing the deadline
+    // and the next statement checking it.
+    //
+    // This pins the contract rather than a route: the smallest budget the API
+    // accepts is reliably gone by the time some guard notices, and every guard
+    // has to produce the same sentence. Which one fires is timing-dependent
+    // and deliberately not asserted -- claiming a specific one would be the
+    // same kind of unverified detail this fix exists to remove.
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "elapsed budget canary");
+      let projections = 0;
+      await expect(
+        withStableCorpusLease(
+          root,
+          () => {
+            projections += 1;
+            return "unreachable";
+          },
+          { timeoutMs: 1 }
+        )
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+      expect(projections).toBe(0);
     });
   });
 
