@@ -30,6 +30,34 @@ fn with_stable_active_corpus<T>(
     with_stable_active_corpus_with_hooks(dir, operation, || {}, || {})
 }
 
+/// Name which limit stopped a corpus pass, without describing the corpus.
+///
+/// The previous message collapsed every cause into "could not be verified
+/// safely", so a deadline overrun and a corpus genuinely over the byte ceiling
+/// were indistinguishable. Diagnosing #679 needed a controlled experiment to
+/// recover a fact the error already had.
+///
+/// This is a deliberate, bounded disclosure rather than no disclosure. The
+/// text reaches CLI and desktop callers, so one who cannot read restricted
+/// meetings can now tell an unopenable corpus from an oversized one, a walk
+/// failure, or an exhausted deadline. It exposes no content, path, or count,
+/// and each state is a whole-corpus condition the caller can already provoke
+/// and observe by timing an ordinary search against the published ceilings.
+/// The diagnosability is worth that; naming a file or a count would not be.
+fn corpus_authorization_error(stage: &str, error: ActiveCorpusRevisionError) -> SearchError {
+    let cause = match error {
+        ActiveCorpusRevisionError::Unavailable => "the corpus could not be opened",
+        // Every walk error lands here, including permission denials and files
+        // that vanish mid-walk, so this must not claim an unsafe path.
+        ActiveCorpusRevisionError::Traversal => "the corpus could not be walked",
+        ActiveCorpusRevisionError::Budget => "the corpus exceeds a documented size ceiling",
+        ActiveCorpusRevisionError::Deadline => "the authorization deadline elapsed",
+    };
+    SearchError::Io(std::io::Error::other(format!(
+        "meeting corpus could not be {stage} safely: {cause}"
+    )))
+}
+
 fn with_stable_active_corpus_with_hooks<T>(
     dir: &Path,
     mut operation: impl FnMut(&StableActiveCorpusRevision) -> Result<T, SearchError>,
@@ -47,11 +75,7 @@ fn with_stable_active_corpus_with_hooks<T>(
         // while all passes share one absolute operation deadline. This keeps
         // safe rereads from making an otherwise supported corpus unavailable.
         let before = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
-            .map_err(|_| {
-                SearchError::Io(std::io::Error::other(
-                    "meeting corpus could not be verified safely",
-                ))
-            })?
+            .map_err(|error| corpus_authorization_error("verified", error))?
             .with_read_budget(envelope.fresh_materialization_pass());
         after_precheck();
         envelope.check_deadline().map_err(|_| {
@@ -66,13 +90,8 @@ fn with_stable_active_corpus_with_hooks<T>(
             ))
         })?;
         before_postcheck();
-        let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass()).map_err(
-            |_| {
-                SearchError::Io(std::io::Error::other(
-                    "meeting corpus could not be reverified safely",
-                ))
-            },
-        )?;
+        let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
+            .map_err(|error| corpus_authorization_error("reverified", error))?;
         if before == after {
             return Ok(value);
         }
