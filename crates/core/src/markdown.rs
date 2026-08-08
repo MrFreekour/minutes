@@ -97,43 +97,71 @@ pub(crate) const ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES: usize = 4;
 /// without tripping the deadline.
 pub(crate) const ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
 
+/// Times a snapshot physically reads each file for every byte it charges.
+///
+/// `read_bounded_markdown_twice` reads the file, seeks back to zero, and reads
+/// it again to prove the bytes did not change underneath it, but the budget
+/// charges `content.len()` once. Wall-clock cost therefore tracks twice the
+/// authorized byte count, so a deadline derived from authorized bytes alone
+/// understates the time the same work needs by exactly this factor.
+pub(crate) const ACTIVE_CORPUS_PHYSICAL_READS_PER_SNAPSHOT: u64 = 2;
+
 /// Bytes one authorization may legitimately read at the documented ceiling.
 ///
 /// Each attempt makes a pre-snapshot pass, a materialization phase worth
 /// `ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES` passes, and a post-snapshot
 /// pass, and the whole thing may run `ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS`
 /// times under one shared deadline.
+///
+/// This is the *charged* total, which is what the byte ceiling governs. It is
+/// deliberately not the number of bytes read from the disk: see
+/// `ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES` for that.
 pub(crate) const ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES: u64 = ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES
     * (1 + ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES as u64 + 1)
     * ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS as u64;
 
+/// Bytes actually pulled off the disk for that same worst case.
+///
+/// The deadline is wall-clock, so it has to be sized against this rather than
+/// the charged total.
+pub(crate) const ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES: u64 =
+    ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES * ACTIVE_CORPUS_PHYSICAL_READS_PER_SNAPSHOT;
+
 /// Absolute wall-clock ceiling for one corpus authorization.
 ///
-/// Derived, not chosen. A hardcoded 15s silently required 64 MB/s sustained to
-/// read the documented 80 MB ceiling through all six passes of both attempts,
-/// so a corpus that fit every published limit still failed on ordinary storage
-/// (issue #679). It surfaced as an intermittent CI failure, but the same
-/// arithmetic fails a real user whose meetings sit on a synced folder.
+/// Derived, not chosen. A hardcoded 15s silently required 128 MB/s of real
+/// read throughput to get the documented 80 MB ceiling through all six passes
+/// of both attempts, each of which reads every file twice, so a corpus that
+/// fit every published limit still failed on ordinary storage (issue #679). It
+/// surfaced as an intermittent CI failure, but the same arithmetic fails a real
+/// user whose meetings sit on a synced folder.
 ///
-/// Deriving it keeps the two consistent: raise the byte ceiling or add a
-/// materialization pass and the deadline follows, instead of quietly
-/// tightening the throughput this code demands.
+/// Deriving it keeps the two consistent: raise the byte ceiling, add a
+/// materialization pass, or add a verification reread, and the deadline
+/// follows, instead of quietly tightening the throughput this code demands.
 ///
 /// This bounds cooperative checks between filesystem operations, so it is a
 /// backstop rather than the primary control. The byte, file, and directory
 /// ceilings bound the work itself, and agent-facing SDK/MCP reads wrap this
 /// boundary in a supervised, killable worker.
+///
+/// It also bounds `graph`'s corpus capture, which holds a projection lease
+/// while it runs, so a slow disk now refuses a competing projection for longer
+/// than it used to. That is the intended trade: the alternative was failing a
+/// projection the ceilings permit.
 const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS: u64 =
-    ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES / ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC;
+    ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES.div_ceil(ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC);
 
-// Integer division, so a floor throughput at or above the worst-case total
-// would truncate to a zero-second deadline and fail every authorization
-// instantly. Reject that at compile time rather than shipping a build where
-// search never succeeds.
+// Round up, never down: a floor-divided deadline would promise a throughput
+// floor it does not actually honor whenever the division is inexact.
+//
+// A floor throughput at or above the worst-case total would still truncate to
+// zero and fail every authorization instantly, so reject that at compile time
+// rather than shipping a build where search never succeeds.
 const _: () = assert!(
     ACTIVE_CORPUS_AUTHORIZATION_DEADLINE_SECS > 0,
     "corpus authorization deadline truncated to zero seconds: the assumed floor throughput is \
-     at least the worst-case authorized byte total"
+     at least the worst-case physical byte total"
 );
 
 pub(crate) const ACTIVE_CORPUS_AUTHORIZATION_DEADLINE: Duration =
@@ -2685,29 +2713,51 @@ mod tests {
     #[test]
     fn authorization_deadline_admits_the_documented_ceiling_on_slow_storage() {
         // #679: the deadline was a hardcoded 15s while the ceilings allowed
-        // 960 MB of authorized reads, so a corpus that fit every published
-        // limit still failed unless the disk sustained 64 MB/s. It showed up
-        // as an intermittent CI failure; the same arithmetic fails a user
-        // whose meetings live on iCloud Drive or an external disk.
+        // 960 MB of charged reads, and every snapshot reads each file twice,
+        // so a corpus that fit every published limit still failed unless the
+        // disk sustained 128 MB/s. It showed up as an intermittent CI failure;
+        // the same arithmetic fails a user whose meetings live on iCloud Drive
+        // or an external disk.
         //
         // Pin the relationship, not the number: whichever ceiling moves, the
         // deadline has to stay reachable at the assumed floor throughput.
-        let worst_case_bytes = ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES;
-        let required = ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES
-            * (1 + ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES as u64 + 1)
-            * ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS as u64;
+        let charged = ACTIVE_CORPUS_WORST_CASE_AUTHORIZED_BYTES;
         assert_eq!(
-            worst_case_bytes, required,
-            "worst-case byte derivation drifted from the pass and attempt counts"
+            charged,
+            ACTIVE_CORPUS_MAX_AUTHORIZED_BYTES
+                * (1 + ACTIVE_CORPUS_MAX_MATERIALIZATION_READ_PASSES as u64 + 1)
+                * ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS as u64,
+            "charged-byte derivation drifted from the pass and attempt counts"
         );
 
-        let implied_bytes_per_sec =
-            worst_case_bytes / ACTIVE_CORPUS_AUTHORIZATION_DEADLINE.as_secs();
+        // The deadline is wall clock, so it must be sized against bytes read
+        // from the disk, not bytes charged to the budget. Modelling charged
+        // bytes is what let a 2x undercount survive the first version of this
+        // test: `read_bounded_markdown_twice` reads every file a second time
+        // to prove it did not change, and the budget charges that once.
+        let physical = ACTIVE_CORPUS_WORST_CASE_PHYSICAL_BYTES;
+        assert_eq!(
+            physical,
+            charged * ACTIVE_CORPUS_PHYSICAL_READS_PER_SNAPSHOT,
+            "physical-byte derivation drifted from the per-snapshot reread count"
+        );
+
+        let deadline_secs = ACTIVE_CORPUS_AUTHORIZATION_DEADLINE.as_secs();
         assert!(
-            implied_bytes_per_sec <= ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC,
-            "the deadline demands {implied_bytes_per_sec} B/s sustained to read the documented \
-             ceiling, above the {ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC} B/s floor this \
-             envelope promises to tolerate; raise the deadline or lower the ceiling (#679)"
+            deadline_secs > 0,
+            "a sub-second deadline cannot carry the documented ceiling on any storage"
+        );
+
+        // Compare rates as a cross-multiplication rather than dividing, so an
+        // inexact ratio cannot be rounded into a pass. Dividing here let a
+        // deadline one second short of the requirement satisfy the assertion.
+        assert!(
+            physical <= ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC * deadline_secs,
+            "the deadline of {deadline_secs}s carries only {} B at the \
+             {ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC} B/s floor this envelope promises to \
+             tolerate, short of the {physical} B the documented ceiling can require; raise the \
+             deadline or lower the ceiling (#679)",
+            ACTIVE_CORPUS_MIN_ASSUMED_READ_BYTES_PER_SEC * deadline_secs
         );
     }
 
