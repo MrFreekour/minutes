@@ -1,4 +1,5 @@
 import { PublicFooter } from "@/components/public-footer";
+import { comparisonArticleSchema } from "@/lib/schema";
 
 type ComparisonRow = {
   label: string;
@@ -48,8 +49,9 @@ type ComparePageProps = {
   notRightFitSection: string[];
   evaluatedSection: string[];
   sources: SourceLink[];
-  /** Optional per-page override; defaults to the shared review date. */
-  lastReviewed?: string;
+  /** ISO date this page was last fact-checked. Required: a shared default
+   * silently understated the review date on pages that forgot to pass one. */
+  lastReviewed: string;
   /** Optional data-flow diagram (only some comparisons carry one). */
   architecture?: Architecture;
 };
@@ -145,11 +147,25 @@ export function ComparePage({
   notRightFitSection,
   evaluatedSection,
   sources,
-  lastReviewed = "2026-04-09",
+  lastReviewed,
   architecture,
 }: ComparePageProps) {
+  // Every comparison page is served at the markdown twin's path minus ".md".
+  const path = markdownHref.replace(/\.md$/, "");
+  const jsonLd = comparisonArticleSchema({
+    competitorLabel,
+    path,
+    description: heroSummary,
+    lastReviewed,
+    sources,
+  });
+
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
           minutes

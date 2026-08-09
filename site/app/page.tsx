@@ -8,6 +8,7 @@ import {
   MINUTES_TEST_COUNT,
   WINDOWS_SETUP_EXE,
 } from "@/lib/release";
+import { organizationSchema, softwareApplicationSchema } from "@/lib/schema";
 
 const featureGrid = [
   {
@@ -349,6 +350,15 @@ function HomeFlowCard({
 export default function Home() {
   return (
     <div className="pb-16">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify([
+            organizationSchema(),
+            softwareApplicationSchema(),
+          ]),
+        }}
+      />
       <MemoryCompoundsHero />
       <main className="mx-auto max-w-[840px] px-6 sm:px-8">
 
