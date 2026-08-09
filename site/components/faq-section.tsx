@@ -20,11 +20,11 @@ export function FaqSection({ items }: { items: ReadonlyArray<FaqItem> }) {
         </span>
         <div className="h-px flex-1 bg-[var(--border)]" />
       </div>
-      <dl className="divide-y divide-[color:var(--border)] border-y border-[color:var(--border)]">
+      <div className="divide-y divide-[color:var(--border)] border-y border-[color:var(--border)]">
         {items.map((item) => (
           <details key={item.question} className="faq-disclosure group py-4">
             <summary className="flex cursor-pointer list-none items-start justify-between gap-4 text-[15px] font-medium leading-7 text-[var(--text)] marker:content-none">
-              <dt>{item.question}</dt>
+              <span>{item.question}</span>
               <span
                 aria-hidden="true"
                 className="mt-1 shrink-0 font-mono text-[13px] text-[var(--text-secondary)] transition-transform group-open:rotate-45"
@@ -32,12 +32,12 @@ export function FaqSection({ items }: { items: ReadonlyArray<FaqItem> }) {
                 +
               </span>
             </summary>
-            <dd className="mt-3 pr-8 text-[15px] leading-8 text-[var(--text-secondary)]">
+            <div className="mt-3 pr-8 text-[15px] leading-8 text-[var(--text-secondary)]">
               {item.answer}
-            </dd>
+            </div>
           </details>
         ))}
-      </dl>
+      </div>
     </section>
   );
 }
