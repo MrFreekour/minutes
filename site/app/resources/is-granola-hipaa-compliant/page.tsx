@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
+import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { faqPageSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Is Granola HIPAA compliant?",
@@ -10,44 +12,24 @@ export const metadata: Metadata = {
   },
 };
 
-const faqJsonLd = {
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  mainEntity: [
-    {
-      "@type": "Question",
-      name: "Is Granola HIPAA compliant?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "No. Granola's official documentation states: 'Granola is not currently HIPAA compliant and should not be used to store or process Protected Health Information (PHI) at this time.' This applies to every plan, including Enterprise.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Does Granola sign BAAs?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "No. Granola's docs state it 'cannot sign Business Associate Agreements (BAAs)' on any plan, and give no timeline for HIPAA compliance.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "What security does Granola actually offer?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "A genuinely decent cloud posture for non-PHI work: SOC 2 Type 2 (achieved July 2025), GDPR with a standard DPA, audio deleted after transcription, and contractual bans on OpenAI/Anthropic training on customer data. Transcripts and notes are stored on US AWS servers.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "What should clinicians use instead for recorded conversations?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Either a vendor that offers a BAA in a documented configuration (Otter Enterprise, Fireflies Enterprise with Private Storage, Fathom's published BAA), or an on-device tool where no vendor ever receives the audio — such as Minutes, open source, which transcribes and stores everything on your own machine, so no BAA is needed because no disclosure occurs.",
-      },
-    },
-  ],
-} as const;
+const faqs = [
+  {
+    question: "Is Granola HIPAA compliant?",
+    answer: "No. Granola's official documentation states: 'Granola is not currently HIPAA compliant and should not be used to store or process Protected Health Information (PHI) at this time.' This applies to every plan, including Enterprise.",
+  },
+  {
+    question: "Does Granola sign BAAs?",
+    answer: "No. Granola's docs state it 'cannot sign Business Associate Agreements (BAAs)' on any plan, and give no timeline for HIPAA compliance.",
+  },
+  {
+    question: "What security does Granola actually offer?",
+    answer: "A genuinely decent cloud posture for non-PHI work: SOC 2 Type 2 (achieved July 2025), GDPR with a standard DPA, audio deleted after transcription, and contractual bans on OpenAI/Anthropic training on customer data. Transcripts and notes are stored on US AWS servers.",
+  },
+  {
+    question: "What should clinicians use instead for recorded conversations?",
+    answer: "Either a vendor that offers a BAA in a documented configuration (Otter Enterprise, Fireflies Enterprise with Private Storage, Fathom's published BAA), or an on-device tool where no vendor ever receives the audio — such as Minutes, open source, which transcribes and stores everything on your own machine, so no BAA is needed because no disclosure occurs.",
+  },
+] as const;
 
 const sources = [
   {
@@ -82,7 +64,7 @@ export default function IsGranolaHipaaCompliantPage() {
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqPageSchema(faqs)) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -207,6 +189,8 @@ export default function IsGranolaHipaaCompliantPage() {
           </a>
         </div>
       </section>
+
+      <FaqSection items={faqs} />
 
       <section className="mt-14">
         <SectionLabel label="Sources" />
