@@ -2,9 +2,9 @@
 
 Last reviewed: 2026-08-09
 
-There is a ten-second fix that works even when you are not the host, and almost nobody knows it.
+There is a one-line fix that works even when you are not the host, and almost nobody knows it.
 
-## The ten-second answer
+## The one-line answer
 
 Type `stop otter` into the Zoom meeting chat. The Notetaker leaves.
 
@@ -25,7 +25,7 @@ This ejects the bot from the current meeting only.
 
 In Otter: **Integrations → Meetings → Default auto-join settings → "Meetings I manually select."**
 
-**The gotcha:** changing the default does *not* apply retroactively to calendar events you already customized. If you ever toggled auto-join on for a specific recurring meeting, that event keeps its own setting and Otter keeps joining it regardless of the new default. Open the calendar view in Otter and turn those events off individually. This is the most common reason people believe they disabled Otter and then watch it walk into a call the following week.
+**The gotcha:** changing the default does *not* apply retroactively to calendar events you already customized. If you ever toggled auto-join on for a specific recurring meeting, that event keeps its own setting and Otter keeps joining it regardless of the new default. Open the calendar view in Otter and turn those events off individually. Otter documents the behavior but publishes no figures on how often it bites. Check it first when you believe you disabled Otter and then watch it walk into a call the following week.
 
 Stronger: disconnect the Google or Microsoft calendar from Otter entirely. A notetaker that cannot read your calendar cannot discover your meeting links, so there is nothing left to auto-join.
 
@@ -37,10 +37,10 @@ You cannot reach into another person's Otter account and turn their bot off. In 
 
 - **Ask.** "Could you drop the notetaker for this one?" is ordinary etiquette now, and the owner can remove it in one click. For a sensitive conversation this beats any technical control.
 - **Type the chat command.** Works from any seat in the room.
-- **Waiting Room plus authentication.** The strongest standing control. Notetaker bots cannot sign in to Zoom accounts, so requiring authenticated users blocks most of them outright.
-- **Admin app controls.** Zoom admins can restrict or allow-list third-party apps under Admin → Advanced → App Marketplace, and audit installs under Apps on Account. The only option that scales past one meeting.
+- **Waiting Room plus authentication.** The strongest standing control, though not a guarantee. Requiring authenticated users blocks some standalone bot participants, and the Waiting Room lets you admit only people you recognize. It does not stop a notetaker running through an attendee you already admitted; Cornell's IT guidance says this helps prevent bot access rather than eliminating it.
+- **Admin app controls.** Zoom admins can disable or remove installed apps at marketplace.zoom.us → Manage → Admin App Management → Apps on Account. Scope matters: this stops users on your account from running the app, but does not restrict external participants who bring their own.
 
-**The limit, stated plainly:** some notetakers no longer join as a separate participant. They capture audio through an attendee's own authenticated session, so there is no bot in the participant list and no Zoom setting that stops it. Waiting rooms and authentication defeat bots that dial in. Nothing defeats a participant who is recording. That has always been true of meetings; AI just made it cheaper.
+**The limit, stated plainly:** some notetakers no longer join as a separate participant. They capture through an attendee's own authenticated session, so there is no bot in the participant list to remove, and admission controls do not reach that case. Disabling local recording may block tools that depend on Zoom's own recording channel, which is worth doing, but Zoom cannot prevent out-of-band capture by a participant or a separate device in the room. That has always been true of meetings; AI just made it cheaper.
 
 ## The version of this problem that solves itself
 

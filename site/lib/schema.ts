@@ -5,11 +5,11 @@
  * the markup cannot drift from the copy.
  *
  * That rule is why `faqPageSchema` takes the same array the page renders through
- * `<FaqSection>` rather than a separate literal. Until 2026-08-09 nine resource
- * pages hand-rolled FAQPage JSON-LD that appeared nowhere in their visible copy
- * (0 of 36 answers rendered), which is a structured-data violation Google can
- * penalize. Pairing the builder with the component makes the compliant thing the
- * easy thing: you cannot emit the markup without also rendering the content.
+ * `<FaqSection>` rather than a separate literal. Until 2026-08-09 every resource
+ * page hand-rolled FAQPage JSON-LD that appeared nowhere in its visible copy, a
+ * structured-data violation Google can penalize. Pairing the builder with the
+ * component makes the compliant thing the easy thing: you cannot emit the markup
+ * without also rendering the content.
  *
  * Comparison pages still emit no FAQPage, because they have no FAQ section.
  */
