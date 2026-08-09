@@ -10,7 +10,8 @@ use crate::retrieval::{
     interpret_legal_query, normalize_converted_document, normalize_text_document,
     normalize_transcribed_document, CurrentRevisionSet, DocumentId, LegalIndex, LegalQuery,
     LegalSearchResponse, NormalizedDocument, ProvisionBoundaries, RetrievalError, SourceRevision,
-    VaultId, MAX_NORMALIZED_DOCUMENT_BYTES, MAX_QUERY_CHARS, MAX_SEMANTIC_PROVISIONS,
+    TextProvenance, VaultId, MAX_NORMALIZED_DOCUMENT_BYTES, MAX_QUERY_CHARS,
+    MAX_SEMANTIC_PROVISIONS,
 };
 use crate::{
     cap_identity_matches, cap_metadata_identity_portable, cap_metadata_is_link_or_reparse,
@@ -1205,6 +1206,65 @@ enum ExtractionOutcome {
     ConverterUnavailable,
 }
 
+/// Send a conversion down the road its text origin has earned.
+///
+/// A copier's OCR layer extracts like text and is not text: the characters
+/// are a machine's reading of a page image. When the converter's typed
+/// verdict says so, the document takes the transcription road -- the only
+/// road that produces `Transcribed` -- so the reader sees it as what it is
+/// and nothing ever quotes it as the exact language of the source. The
+/// converter name says what actually read the page, because it was not this
+/// build's recogniser.
+fn normalize_conversion_by_origin(
+    document_id: DocumentId,
+    title: &str,
+    bytes: &[u8],
+    converted: &minutes_archive_convert::ConvertedDocument,
+) -> Result<NormalizedDocument, RetrievalError> {
+    if converted.text_origin == minutes_archive_convert::TextOrigin::MachineReadLayer {
+        normalize_transcribed_document(
+            document_id,
+            title,
+            bytes,
+            "pdf-embedded-ocr-layer-v1",
+            &machine_read_pages(converted),
+        )
+    } else {
+        normalize_converted_document(document_id, title, bytes, converted)
+    }
+}
+
+/// Regroup a demoted PDF's page-anchored blocks into transcription pages.
+///
+/// The PDF converter anchors every block `page:NNNN`, so the page number is
+/// recovered from the anchor rather than re-derived. A block whose anchor
+/// does not parse lands on page zero instead of being dropped: losing text
+/// during a demotion would turn a safety rule into a coverage gap. The
+/// confidence is `None` -- an embedded layer reports none.
+fn machine_read_pages(
+    converted: &minutes_archive_convert::ConvertedDocument,
+) -> Vec<(u32, String, Option<f32>)> {
+    let mut pages: Vec<(u32, String)> = Vec::new();
+    for block in &converted.blocks {
+        let page_number = block
+            .source_anchor
+            .strip_prefix("page:")
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .unwrap_or(0);
+        match pages.last_mut() {
+            Some((current, text)) if *current == page_number => {
+                text.push('\n');
+                text.push_str(&block.text);
+            }
+            _ => pages.push((page_number, block.text.clone())),
+        }
+    }
+    pages
+        .into_iter()
+        .map(|(page_number, text)| (page_number, text, None))
+        .collect()
+}
+
 /// The one expensive step, with no access to the index, the counters, or
 /// anything else the build shares.
 ///
@@ -1251,7 +1311,7 @@ fn extract_document(
             {
                 return Err(ExtractionOutcome::OcrRequired);
             }
-            normalize_converted_document(document_id.clone(), title, bytes, &converted)
+            normalize_conversion_by_origin(document_id.clone(), title, bytes, &converted)
         }
         SourceKind::Scanned => {
             let Some(transcriber) = transcriber else {
@@ -1282,7 +1342,7 @@ fn extract_document(
                 title,
                 bytes,
                 minutes_archive_ocr::TRANSCRIBER,
-                &[(1, text, page.lowest_confidence())],
+                &[(1, text, Some(page.lowest_confidence()))],
             )
         }
     };
@@ -1489,6 +1549,7 @@ fn index_extracted_batch(
         }
         let source_kind = pending.source_kind;
         let source_len = pending.source_len;
+        let text_provenance = normalized.text_provenance;
         sources.insert(
             pending.document_id,
             AuthorizedSource {
@@ -1508,9 +1569,19 @@ fn index_extracted_batch(
                 counters.inferred_boundary_documents.saturating_add(1);
         }
         match source_kind {
+            // Counted by what the index actually holds, not by the file
+            // extension: a PDF whose text layer was a copier's embedded OCR is
+            // indexed as a transcription, and counting it as a searchable PDF
+            // would overstate what the archive can quote -- the exact
+            // overstatement the transcribed counter exists to prevent.
             SourceKind::Converted(SourceFormat::Pdf) => {
-                counters.searchable_pdf_documents =
-                    counters.searchable_pdf_documents.saturating_add(1);
+                if text_provenance == TextProvenance::Transcribed {
+                    counters.transcribed_documents =
+                        counters.transcribed_documents.saturating_add(1);
+                } else {
+                    counters.searchable_pdf_documents =
+                        counters.searchable_pdf_documents.saturating_add(1);
+                }
             }
             SourceKind::Converted(SourceFormat::Docx) => {
                 counters.docx_documents = counters.docx_documents.saturating_add(1);
@@ -2271,5 +2342,76 @@ mod tests {
         assert_eq!(report.indexed_documents, 5);
         assert!(report.budget_reached);
         assert_eq!(report.documents_left_unread, 35);
+    }
+
+    /// A converter verdict of `MachineReadLayer` sends the document down the
+    /// transcription road, whole.
+    ///
+    /// The failure this pins down: a scanned PDF carrying a copier's embedded
+    /// OCR extracts like any text layer, and before the typed verdict it
+    /// normalized as `Extracted` -- a machine's reading of a fax, quotable as
+    /// the exact language of the source. Demotion must change provenance, the
+    /// converter attribution, and nothing about whether the text is seen.
+    #[test]
+    fn a_machine_read_text_layer_normalizes_as_transcribed_not_extracted() {
+        let block = |page: &str, text: &str| minutes_archive_convert::ConvertedBlock {
+            is_heading: None,
+            source_anchor: page.to_string(),
+            text: text.to_string(),
+            flow: minutes_archive_convert::AnchorFlow::HardBoundary,
+        };
+        let mut converted = minutes_archive_convert::ConvertedDocument {
+            format: minutes_archive_convert::SourceFormat::Pdf,
+            blocks: vec![
+                block("page:0001", "7. CONFIDENTIALITY"),
+                block(
+                    "page:0001",
+                    "Confidential Information includes affiliate data.",
+                ),
+                block("page:0004", "Neither party may assign this Agreement."),
+            ],
+            warnings: vec![minutes_archive_convert::PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()],
+            text_origin: minutes_archive_convert::TextOrigin::MachineReadLayer,
+        };
+
+        let transcribed = normalize_conversion_by_origin(
+            DocumentId::parse("copier-scan").expect("id"),
+            "Copier Scan",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalize");
+        assert_eq!(transcribed.text_provenance, TextProvenance::Transcribed);
+        assert_eq!(
+            transcribed.provision_boundaries,
+            ProvisionBoundaries::Inferred
+        );
+        assert_eq!(transcribed.converter, "pdf-embedded-ocr-layer-v1");
+        // Same-page blocks fold into one page reading; the page number in the
+        // anchor is the page the scanner named, not a renumbering.
+        assert_eq!(transcribed.provisions.len(), 2);
+        assert_eq!(transcribed.provisions[0].anchor, "page:0001");
+        assert_eq!(transcribed.provisions[1].anchor, "page:0004");
+        assert!(transcribed.provisions[0].text.contains("affiliate data"));
+        assert!(
+            transcribed
+                .provisions
+                .iter()
+                .all(|provision| provision.transcription_confidence.is_none()),
+            "an embedded layer reports no confidence, and none may be invented"
+        );
+
+        // The same blocks with an author-written verdict stay extracted, so
+        // the demotion above cannot be the normalizer's general behaviour.
+        converted.text_origin = minutes_archive_convert::TextOrigin::AuthorWritten;
+        let extracted = normalize_conversion_by_origin(
+            DocumentId::parse("born-digital").expect("id"),
+            "Born Digital",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalize");
+        assert_eq!(extracted.text_provenance, TextProvenance::Extracted);
+        assert_eq!(extracted.converter, "pdf-extract-0.12.0-v1");
     }
 }

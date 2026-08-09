@@ -72,7 +72,6 @@ const census = {
 const vaultReport = {
   schema: "minutes.archive-document-vault.v1",
   vault_id: "local-private-vault",
-  document_id: "document-0000000000000001",
   approved_locations: 1,
   indexed_documents: 3,
   inferred_boundary_documents: 0,
@@ -135,7 +134,6 @@ const evidence = {
     {
       vault_id: "local-private-vault",
       document_id: "document-0000000000000001",
-      document_id: "document-0000000000000001",
       document_title: "Synthetic Agreement",
       provision_heading: "7. CONFIDENTIALITY",
       source_anchor: "section:0001",
@@ -155,7 +153,6 @@ const evidence = {
   semantic_suggestions: [
     {
       vault_id: "local-private-vault",
-      document_id: "document-0000000000000001",
       document_id: "document-0000000000000002",
       document_title: "Meaning Similar Agreement",
       provision_heading: "8. NONDISCLOSURE",
@@ -174,7 +171,6 @@ const evidence = {
   transcriptions: [
     {
       vault_id: "local-private-vault",
-      document_id: "document-0000000000000001",
       document_id: "document-0000000000000003",
       document_title: "Scanned Exhibit C",
       page_anchor: "page:0004",

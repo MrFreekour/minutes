@@ -246,7 +246,7 @@ pub fn normalize_transcribed_document(
     title: impl Into<String>,
     source_bytes: &[u8],
     transcriber: impl Into<String>,
-    pages: &[(u32, String, f32)],
+    pages: &[(u32, String, Option<f32>)],
 ) -> Result<NormalizedDocument, RetrievalError> {
     let provisions = pages
         .iter()
@@ -259,7 +259,12 @@ pub fn normalize_transcribed_document(
                 anchor: format!("page:{page_number:04}"),
                 heading: None,
                 sentence_count: sentence_count(text),
-                transcription_confidence: Some(confidence.clamp(0.0, 1.0)),
+                // `None` means no recogniser reported one -- an embedded OCR
+                // layer states no confidence -- and is stored as such rather
+                // than invented. The card layer presents an unreported
+                // confidence as zero, the reading least likely to be trusted
+                // more than it should be.
+                transcription_confidence: confidence.map(|value| value.clamp(0.0, 1.0)),
                 text: text.clone(),
             }
         })
@@ -2029,6 +2034,28 @@ impl LegalIndex {
                 contains_any_concept(&searchable, &query.excluded_concepts);
             let positive_evidence = !matched.is_empty() || exact_phrase_matched;
 
+            // Provenance decides before anything aggregates. A machine's
+            // reading of a page must not build the document card -- not its
+            // matched concepts, not its exact-phrase claim -- or a scan whose
+            // only matches are in transcribed passages would surface as a
+            // document card claiming matches across zero provisions. A
+            // matching transcription leaves as its own card, saying what it
+            // is, and the exclusion filter applies to it here the same way it
+            // does on the same-provision path.
+            let Some(extracted) = candidate.as_extracted() else {
+                if positive_evidence
+                    && !excluded_concept_matched
+                    && transcriptions.len() < query.limit
+                {
+                    transcriptions.push(candidate.transcribed_card(
+                        &self.vault_id,
+                        matched,
+                        candidate.transcription_confidence.unwrap_or(0.0),
+                    ));
+                }
+                continue;
+            };
+
             let entry = documents
                 .entry(candidate.document_id.clone())
                 .or_insert_with(|| DocumentAccumulator {
@@ -2049,27 +2076,13 @@ impl LegalIndex {
             entry.excluded_concept_matched |= excluded_concept_matched;
             if positive_evidence {
                 // A document-scope card also carries excerpts, so it is built
-                // through the witness like the others. A transcription that
-                // matched leaves as its own card instead.
-                let extracted = candidate.as_extracted();
-                if extracted.is_none() {
-                    if transcriptions.len() < query.limit {
-                        transcriptions.push(candidate.transcribed_card(
-                            &self.vault_id,
-                            matched.clone(),
-                            candidate.transcription_confidence.unwrap_or(0.0),
-                        ));
-                    }
-                    continue;
-                }
+                // through the witness like the others.
                 if entry.criterion_evidence.len() < MAX_DOCUMENT_EVIDENCE_PROVISIONS {
-                    entry.criterion_evidence.push(
-                        extracted.expect("checked immediately above").evidence_card(
-                            &self.vault_id,
-                            matched,
-                            None,
-                        ),
-                    );
+                    entry.criterion_evidence.push(extracted.evidence_card(
+                        &self.vault_id,
+                        matched,
+                        None,
+                    ));
                 } else {
                     entry.criterion_evidence_truncated = true;
                 }
@@ -2539,6 +2552,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized = normalize_converted_document(
             DocumentId::parse("break-caption").expect("id"),
@@ -2614,6 +2628,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized = normalize_converted_document(
             DocumentId::parse("structured-docx").expect("id"),
@@ -2664,6 +2679,7 @@ mod tests {
                 })
                 .collect(),
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         }
     }
 
@@ -2697,10 +2713,14 @@ mod tests {
                 (
                     1,
                     "CONFIDENTIALITY. The Recipient shall protect it.".into(),
-                    0.94,
+                    Some(0.94),
                 ),
-                (2, "   ".into(), 0.10),
-                (3, "Neither party may assign this Agreement.".into(), 0.41),
+                (2, "   ".into(), Some(0.10)),
+                (
+                    3,
+                    "Neither party may assign this Agreement.".into(),
+                    Some(0.41),
+                ),
             ],
         )
         .expect("normalize");
@@ -2769,12 +2789,13 @@ mod tests {
                 response.evidence.is_empty(),
                 "{scope:?} quoted a transcription as exact evidence"
             );
+            // Not merely "no excerpts on the card" -- no card. A document
+            // whose only matches are a machine's reading has no extracted
+            // ground to stand on, and a card with populated matched_concepts
+            // over zero proof provisions reads as authoritative anyway.
             assert!(
-                response
-                    .documents
-                    .iter()
-                    .all(|document| document.criterion_evidence.is_empty()),
-                "{scope:?} carried transcribed excerpts on a document card"
+                response.documents.is_empty(),
+                "{scope:?} built a document card out of transcribed matches"
             );
         }
 
@@ -2833,6 +2854,75 @@ mod tests {
             .expect("search");
         assert!(
             !control.evidence.is_empty(),
+            "the control must match, or the refusal above proves nothing"
+        );
+    }
+
+    /// An excluded concept filters transcriptions on every retrieval path.
+    ///
+    /// The document-scope path used to drop the document card correctly but
+    /// still return the transcription card carrying the excluded term -- the
+    /// user's exclusion silently ignored for exactly the passages that need
+    /// the most care.
+    #[test]
+    fn an_excluded_concept_filters_transcriptions_on_every_path() {
+        let mut normalized = normalize_text_document(
+            DocumentId::parse("scanned-exhibit").expect("id"),
+            "Scanned Exhibit",
+            b"7. CONFIDENTIALITY\nConfidential Information includes affiliate data. \
+              Neither party may assign this Agreement.\n",
+        )
+        .expect("normalize");
+        normalized.text_provenance = TextProvenance::Transcribed;
+
+        let revisions = CurrentRevisionSet::from_documents([&normalized]);
+        let mut index =
+            LegalIndex::new(VaultId::parse("scan-vault").expect("vault")).expect("index");
+        index.replace_document(&normalized).expect("ingest");
+
+        for scope in [MatchScope::SameProvision, MatchScope::AnywhereInDocument] {
+            let response = index
+                .search(
+                    index.vault_id(),
+                    LegalQuery {
+                        raw: "confidentiality without assignment".to_string(),
+                        scope,
+                        required_concepts: vec![LegalConcept::Confidentiality],
+                        excluded_concepts: vec![LegalConcept::Assignment],
+                        exact_phrase: None,
+                        max_sentences: None,
+                        limit: 10,
+                    },
+                    &revisions,
+                )
+                .expect("search");
+            assert!(
+                response.transcriptions.is_empty(),
+                "{scope:?} returned a transcription carrying the excluded concept"
+            );
+            assert!(response.evidence.is_empty(), "{scope:?}");
+            assert!(response.documents.is_empty(), "{scope:?}");
+        }
+
+        // Without the exclusion the same transcription does come back, so the
+        // refusals above cannot pass merely because nothing matched.
+        let control = index
+            .search(
+                index.vault_id(),
+                LegalQuery {
+                    raw: "confidentiality".to_string(),
+                    scope: MatchScope::AnywhereInDocument,
+                    required_concepts: vec![LegalConcept::Confidentiality],
+                    excluded_concepts: Vec::new(),
+                    exact_phrase: None,
+                    max_sentences: None,
+                    limit: 10,
+                },
+                &revisions,
+            )
+            .expect("search");
+        assert!(
+            !control.transcriptions.is_empty(),
             "the control must match, or the refusal above proves nothing"
         );
     }
@@ -4038,6 +4128,7 @@ mod tests {
             format: SourceFormat::Pdf,
             blocks: Vec::new(),
             warnings: vec!["ocr_required_or_no_extractable_text".to_string()],
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let error = normalize_converted_document(
             DocumentId::parse("blank-scan").expect("id"),
@@ -4092,6 +4183,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized_pdf = normalize_converted_document(
             DocumentId::parse("converted-pdf").expect("id"),
@@ -4127,6 +4219,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized_docx = normalize_converted_document(
             DocumentId::parse("converted-docx").expect("id"),
