@@ -12,10 +12,16 @@ const instrumentSerif = Instrument_Serif({
   display: "swap",
 });
 
+// Title and description target the queries that actually drive impressions
+// here ("minutes app", "minute app"), which were converting at 1.5% CTR from
+// positions 4 to 7. Free and open source lead because they are the two claims
+// no paid competitor in that SERP can make. Every negative below is literal:
+// there is no signup, no API key is required, and the app is MIT licensed.
+// Deliberately not "no cloud" — optional summarization can use a cloud LLM.
 export const metadata: Metadata = {
-  title: "minutes — open-source conversation memory",
+  title: "Minutes: free, open-source meeting notes app",
   description:
-    "Record meetings, capture voice memos, and search policy-authorized history. Local transcription with whisper.cpp, structured markdown, Claude-native. Free forever.",
+    "Records meetings, calls, and voice memos, then transcribes them on your own machine. Searchable markdown you own. No account, no API keys, no subscription.",
   metadataBase: new URL("https://useminutes.app"),
   alternates: { canonical: "/" },
   icons: {
@@ -24,18 +30,18 @@ export const metadata: Metadata = {
     ],
   },
   openGraph: {
-    title: "minutes — open-source conversation memory",
+    title: "Minutes: free, open-source meeting notes app",
     description:
-      "Record meetings, capture voice memos, ask your AI what was decided. Local transcription, structured markdown, free forever.",
+      "Records meetings, calls, and voice memos, transcribed on your own machine. Searchable markdown you own. Free and open source.",
     type: "website",
     url: "https://useminutes.app",
     siteName: "minutes",
   },
   twitter: {
     card: "summary",
-    title: "minutes — open-source conversation memory",
+    title: "Minutes: free, open-source meeting notes app",
     description:
-      "Record meetings, capture voice memos, ask your AI what was decided. Local, free, MIT licensed.",
+      "Meetings, calls, and voice memos transcribed on your own machine. Markdown you own. Free, MIT licensed.",
   },
 };
 
