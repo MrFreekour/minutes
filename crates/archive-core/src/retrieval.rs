@@ -246,7 +246,7 @@ pub fn normalize_transcribed_document(
     title: impl Into<String>,
     source_bytes: &[u8],
     transcriber: impl Into<String>,
-    pages: &[(u32, String, f32)],
+    pages: &[(u32, String, Option<f32>)],
 ) -> Result<NormalizedDocument, RetrievalError> {
     let provisions = pages
         .iter()
@@ -259,7 +259,12 @@ pub fn normalize_transcribed_document(
                 anchor: format!("page:{page_number:04}"),
                 heading: None,
                 sentence_count: sentence_count(text),
-                transcription_confidence: Some(confidence.clamp(0.0, 1.0)),
+                // `None` means no recogniser reported one -- an embedded OCR
+                // layer states no confidence -- and is stored as such rather
+                // than invented. The card layer presents an unreported
+                // confidence as zero, the reading least likely to be trusted
+                // more than it should be.
+                transcription_confidence: confidence.map(|value| value.clamp(0.0, 1.0)),
                 text: text.clone(),
             }
         })
@@ -2547,6 +2552,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized = normalize_converted_document(
             DocumentId::parse("break-caption").expect("id"),
@@ -2622,6 +2628,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized = normalize_converted_document(
             DocumentId::parse("structured-docx").expect("id"),
@@ -2672,6 +2679,7 @@ mod tests {
                 })
                 .collect(),
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         }
     }
 
@@ -2705,10 +2713,14 @@ mod tests {
                 (
                     1,
                     "CONFIDENTIALITY. The Recipient shall protect it.".into(),
-                    0.94,
+                    Some(0.94),
                 ),
-                (2, "   ".into(), 0.10),
-                (3, "Neither party may assign this Agreement.".into(), 0.41),
+                (2, "   ".into(), Some(0.10)),
+                (
+                    3,
+                    "Neither party may assign this Agreement.".into(),
+                    Some(0.41),
+                ),
             ],
         )
         .expect("normalize");
@@ -4116,6 +4128,7 @@ mod tests {
             format: SourceFormat::Pdf,
             blocks: Vec::new(),
             warnings: vec!["ocr_required_or_no_extractable_text".to_string()],
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let error = normalize_converted_document(
             DocumentId::parse("blank-scan").expect("id"),
@@ -4170,6 +4183,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized_pdf = normalize_converted_document(
             DocumentId::parse("converted-pdf").expect("id"),
@@ -4205,6 +4219,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
         };
         let normalized_docx = normalize_converted_document(
             DocumentId::parse("converted-docx").expect("id"),
