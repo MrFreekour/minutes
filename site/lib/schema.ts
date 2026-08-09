@@ -2,9 +2,16 @@
  *
  * Schema.org markup must describe content that is actually visible on the page.
  * Every field produced here is derived from data the page already renders, so
- * the markup cannot drift from the copy. Notably there is no FAQPage builder:
- * FAQPage requires visible question/answer content, and the comparison pages do
- * not have an FAQ section today.
+ * the markup cannot drift from the copy.
+ *
+ * That rule is why `faqPageSchema` takes the same array the page renders through
+ * `<FaqSection>` rather than a separate literal. Until 2026-08-09 nine resource
+ * pages hand-rolled FAQPage JSON-LD that appeared nowhere in their visible copy
+ * (0 of 36 answers rendered), which is a structured-data violation Google can
+ * penalize. Pairing the builder with the component makes the compliant thing the
+ * easy thing: you cannot emit the markup without also rendering the content.
+ *
+ * Comparison pages still emit no FAQPage, because they have no FAQ section.
  */
 
 const SITE_URL = "https://useminutes.app";
@@ -79,6 +86,27 @@ function competitorSchema(label: string) {
     "@type": "SoftwareApplication",
     name: label.replace(/\s*\([^)]*\)\s*$/, ""),
     applicationCategory: "BusinessApplication",
+  };
+}
+
+/** One question and its answer, rendered visibly and emitted as markup. */
+export type FaqItem = { question: string; answer: string };
+
+/** Structured data for a page's FAQ.
+ *
+ * Pass the exact array the page renders through `<FaqSection>`. Google requires
+ * FAQPage content to be visible to the user, so emitting this for questions that
+ * only exist in JSON-LD is a violation, not a shortcut.
+ */
+export function faqPageSchema(items: ReadonlyArray<FaqItem>) {
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: items.map((item) => ({
+      "@type": "Question",
+      name: item.question,
+      acceptedAnswer: { "@type": "Answer", text: item.answer },
+    })),
   };
 }
 
