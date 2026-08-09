@@ -15,12 +15,28 @@ falls back to Whisper (with a warning) so a recording never breaks.
 ## Quick Start (recommended)
 
 ```bash
-# Build with the sherpa engine, then download + enable the model in one step:
-cargo build --release -p minutes-cli --features engine-sherpa
+# Build with the sherpa engine, then download + enable the model in one step.
+# On macOS, engine-sherpa cannot coexist with the default `diarize` feature in
+# one binary (issue #683; the build refuses with a compile error), so drop the
+# defaults and re-add whisper:
+cargo build --release -p minutes-cli --no-default-features --features whisper,engine-sherpa,metal
 rm -f ~/.local/bin/minutes && cp target/release/minutes ~/.local/bin/minutes
 
 minutes setup --sherpa     # downloads the int8 ONNX model + sets engine = "sherpa"
 ```
+
+> **macOS single-binary constraint (issue #683).** sherpa-onnx's static bundle
+> and pyannote's dependencies each vendor their own ONNX Runtime (1.17.1 vs
+> ort-sys 1.22.0) and their own kaldi-native-fbank. A Mach-O image keeps one
+> definition per symbol, so whichever copy wins the link serves both stacks:
+> measured on arm64, every resolution breaks either voice enrollment (ORT API
+> 17/22 mismatch, or SIGABRT in feature extraction) or sherpa itself (SIGABRT).
+> ONNX Runtime could be unified upward because its C API is backward
+> compatible, but kaldi-native-fbank has no ABI contract, and colliding mangled
+> names with divergent layouts are undefined behavior. `crates/core/src/lib.rs`
+> therefore refuses the combination at compile time until the sherpa stack is
+> isolated behind its own namespace. Linux and Windows are unaffected (dynamic
+> sherpa resolves against its own bundled libraries).
 
 > **Platform note.** On macOS, `engine-sherpa` links sherpa-onnx statically, so
 > the binary is self-contained and the copy above just works. On Linux and
@@ -167,15 +183,17 @@ The `engine-sherpa` Cargo feature must be enabled at build time:
 
 ```bash
 # Core library check
-cargo check -p minutes-core --features engine-sherpa
+cargo check -p minutes-core --no-default-features --features engine-sherpa
 
-# CLI build
-cargo build --release -p minutes-cli --features engine-sherpa
+# CLI build (macOS: --no-default-features is required, see the constraint above)
+cargo build --release -p minutes-cli --no-default-features --features whisper,engine-sherpa,metal
 ```
 
-The feature is opt-in and not included in the default build. Whisper is still
-the default feature, so a normal `--features engine-sherpa` build includes both
-Whisper and Sherpa unless you also pass `--no-default-features`.
+The feature is opt-in and not included in the default build. The CLI's default
+features are `whisper` and `diarize`, so a plain `--features engine-sherpa`
+build would include Whisper, Sherpa, and diarization; on macOS that
+combination refuses to compile (issue #683), which is why the commands above
+drop the defaults and re-add `whisper` explicitly.
 
 `sherpa-rs-sys` builds sherpa-onnx through CMake, so a working CMake toolchain
 must be available during the build.
@@ -200,7 +218,9 @@ Change `engine = "whisper"` in config.toml. No model deletion is required.
 The binary was built without the `engine-sherpa` feature. Rebuild with:
 
 ```bash
-cargo build -p minutes-cli --features engine-sherpa
+# macOS: the defaults include diarize, which cannot share a binary with
+# engine-sherpa (issue #683), so drop them and re-add whisper:
+cargo build -p minutes-cli --no-default-features --features whisper,engine-sherpa,metal
 ```
 
 ### "sherpa model not found"
