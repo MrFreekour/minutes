@@ -78,6 +78,29 @@ claim, never a same-provision answer.
   scanner pipelines do this; if one surfaces in the pilot, it becomes a new
   signal, not a loosened threshold.
 
+## Validation against real files
+
+Synthetic tests prove the detector detects what it was coded to detect;
+these runs prove the signature holds in the wild
+(`crates/archive-convert/examples/text_origin_census.rs`, 2026-08-09):
+
+- **True positive, real generator.** A page of a real fixture PDF was
+  rasterized at 150dpi and OCR'd by locally installed Tesseract in its PDF
+  output mode — the same invisible-text-behind-image construction scanner
+  firmware embeds (several pipelines literally bundle Tesseract). Verdict:
+  `MachineReadLayer`, detected through genuinely compressed content streams,
+  with the text still extracted. The **baseline at the pilot candidate
+  converts the same file as ordinary blocks** — i.e., before this guard it
+  indexed as `Extracted` and its OCR text was quotable as exact evidence.
+- **No false positives.** All 6 real born-digital fixtures under
+  `tests/fixtures/archive-real-pdf/` and 31 of 40 real PDFs swept from the
+  operator's own Documents/Downloads/Desktop verdicted `AuthorWritten`;
+  0 verdicted `MachineReadLayer`. A real phone scan with no text layer
+  ("Scan Mar 20, 2023") correctly took the no-extractable-text road. The
+  remaining files failed conversion for pre-existing reasons (1 over input
+  budget, 6 `MalformedOutput`, 1 pre-existing `MalformedSource` fixture) —
+  verified identical at the baseline commit.
+
 ## Tests
 
 - `crates/archive-convert`: copier signature detected end-to-end through real
