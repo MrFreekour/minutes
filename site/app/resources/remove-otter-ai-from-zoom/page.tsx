@@ -6,7 +6,7 @@ import { faqPageSchema } from "@/lib/schema";
 export const metadata: Metadata = {
   title: "How to remove Otter AI from Zoom",
   description:
-    "Remove Otter Notetaker from a Zoom call in ten seconds, even if you are not the host, then stop it coming back. Includes the auto-join setting that silently ignores your change, and what you can actually do about someone else's bot.",
+    "Remove Otter Notetaker from a Zoom call immediately, even if you are not the host, then stop it coming back. Includes the auto-join setting that silently ignores your change, and what you can actually do about someone else's bot.",
   alternates: {
     canonical: "/resources/remove-otter-ai-from-zoom",
   },
@@ -31,7 +31,7 @@ const faqs = [
   },
   {
     question: "How do I block other people's AI notetakers from my Zoom meetings?",
-    answer: "Enable the Waiting Room and require authenticated users. Notetaker bots cannot sign in to Zoom accounts, so authentication blocks most of them. Admins can also restrict third-party apps under Admin, Advanced, App Marketplace. The gap: some bots stream through a participant's own authenticated session rather than joining separately, and no Zoom setting stops that.",
+    answer: "Enable the Waiting Room and admit only recognized attendees, and require authenticated users. That blocks some standalone bot participants, but it is not a guarantee: notetakers operating through an already-admitted attendee's own authenticated session are unaffected. Admins can disable or remove installed apps at marketplace.zoom.us under Manage, Admin App Management, Apps on Account, which stops internal users from running them but does not restrict external participants. Disabling local recording may block tools that rely on Zoom's recording channel; nothing in Zoom prevents out-of-band capture by a participant or a separate device.",
   },
 ] as const;
 
@@ -105,10 +105,10 @@ export default function RemoveOtterFromZoomPage() {
           How to remove Otter AI from Zoom
         </h1>
         <p className="mt-5 text-[17px] leading-8 text-[var(--text-secondary)]">
-          There is a ten-second fix that works even when you are not the host, and almost
-          nobody knows it. Below: the immediate removal, the setting that stops Otter coming
-          back (including the one that silently ignores you), and an honest account of what you
-          can and cannot do about somebody else&rsquo;s bot.
+          There is a one-line fix that works even when you are not the host, and almost nobody
+          knows it. Below: the immediate removal, the setting that stops Otter coming back
+          (including the one that silently ignores you), and an honest account of what you can
+          and cannot do about somebody else&rsquo;s bot.
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
@@ -121,7 +121,7 @@ export default function RemoveOtterFromZoomPage() {
       </section>
 
       <section className="mt-14 max-w-[800px]">
-        <SectionLabel label="The Ten-Second Answer" />
+        <SectionLabel label="The One-Line Answer" />
         <div className="space-y-4 text-[15px] leading-8 text-[var(--text-secondary)]">
           <p>
             Type{" "}
@@ -196,8 +196,9 @@ export default function RemoveOtterFromZoomPage() {
               view in Otter and turn those events off individually.
             </p>
             <p className="mt-3">
-              This is the single most common reason people believe they disabled Otter and then
-              watch it walk into a call the following week.
+              Otter documents the behavior but publishes no figures on how often it bites. It is
+              worth checking first when you believe you disabled Otter and then watch it walk
+              into a call the following week.
             </p>
           </div>
           <p>
@@ -235,28 +236,32 @@ export default function RemoveOtterFromZoomPage() {
               <span className="font-medium text-[var(--text)]">
                 Waiting Room plus authentication.
               </span>{" "}
-              The strongest standing control. Notetaker bots cannot sign in to Zoom accounts, so
-              requiring authenticated users blocks most of them outright, and the Waiting Room
-              gives you a look at anything that still turns up before it hears anything.
+              The strongest standing control, though not a guarantee. Requiring authenticated
+              users blocks some standalone bot participants, and the Waiting Room lets you admit
+              only people you recognize before anything hears the room. It does not stop a
+              notetaker running through an attendee you have already admitted, and Cornell&rsquo;s
+              IT guidance is explicit that this only helps prevent bot access rather than
+              eliminating it.
             </li>
             <li>
               <span className="font-medium text-[var(--text)]">Admin app controls.</span> Zoom
-              admins can restrict or allow-list third-party apps under{" "}
+              admins can disable or remove installed apps at{" "}
               <span className="font-medium text-[var(--text)]">
-                Admin → Advanced → App Marketplace
+                marketplace.zoom.us → Manage → Admin App Management → Apps on Account
               </span>
-              , and review what users have already installed under Apps on Account. This is the
-              only option that scales past a single meeting.
+              . Read the scope carefully: this stops users on your account from running the app.
+              It does not restrict external participants who bring their own.
             </li>
           </ul>
           <p>
             And the limit worth stating plainly, because the pages that sell you a blocker will
             not: some notetakers no longer join as a separate participant at all. They capture
-            audio through an attendee&rsquo;s own authenticated session, which means there is no
-            bot in the participant list to remove and no Zoom setting that stops it. Waiting
-            rooms and authentication defeat the bots that dial in. Nothing defeats a
-            participant who is recording. That has always been true of meetings; AI just made it
-            cheaper.
+            through an attendee&rsquo;s own authenticated session, so there is no bot in the
+            participant list to remove. Admission controls do not reach that case. Disabling
+            local recording may block tools that depend on Zoom&rsquo;s own recording channel,
+            which is worth doing, but Zoom cannot prevent genuinely out-of-band capture by a
+            participant or a separate device in the room. That has always been true of meetings;
+            AI just made it cheaper.
           </p>
         </div>
       </section>
