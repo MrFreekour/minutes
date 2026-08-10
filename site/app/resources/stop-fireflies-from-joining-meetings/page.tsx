@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
-import { faqPageSchema } from "@/lib/schema";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "How to stop Fireflies from joining your meetings",
@@ -66,12 +66,17 @@ const sources = [
 ] as const;
 
 
+const LAST_REVIEWED = "2026-08-09";
+
 export default function StopFirefliesJoiningPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqPageSchema(faqs)) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/stop-fireflies-from-joining-meetings", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -108,7 +113,7 @@ export default function StopFirefliesJoiningPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-08-09
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             How-to guide

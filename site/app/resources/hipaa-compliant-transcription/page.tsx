@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
-import { faqPageSchema } from "@/lib/schema";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "HIPAA-compliant transcription: what the rule actually requires",
@@ -108,12 +108,17 @@ const sources = [
   { label: "Minutes security & privacy architecture", href: "/security" },
 ] as const;
 
+const LAST_REVIEWED = "2026-08-10";
+
 export default function HipaaTranscriptionPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqPageSchema(faqs)) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/hipaa-compliant-transcription", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -151,7 +156,7 @@ export default function HipaaTranscriptionPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-08-10
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Sourced answer

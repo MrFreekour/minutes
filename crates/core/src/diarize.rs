@@ -2169,6 +2169,16 @@ fn merge_remote_diarization_into_stem_result(
     }
 }
 
+/// Speakers a diarization result actually attributes speech to.
+///
+/// Descriptive, not a safety gate: it reports what the diarizer found so the
+/// attribution debug record can say how many people were in a stem. Diagnosing
+/// issue #169 needed a code trace to establish that nothing anywhere reported
+/// this, which is why it is recorded even when it changes no decision.
+pub(crate) fn attributed_speaker_count(result: &DiarizationResult) -> usize {
+    meaningful_speaker_count_excluding(result, &[])
+}
+
 fn meaningful_speaker_count_excluding(result: &DiarizationResult, ignored: &[&str]) -> usize {
     let mut speaker_durations: std::collections::HashMap<&str, f64> =
         std::collections::HashMap::new();

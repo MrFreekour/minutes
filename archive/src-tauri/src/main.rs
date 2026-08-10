@@ -250,6 +250,49 @@ fn reveal_archive_document(
     Ok(())
 }
 
+/// Show an approved location in Finder, named by opaque id.
+///
+/// "Approved location 1" cannot be told from "Approved location 2", and an
+/// owner with three matters approved has no way to confirm he approved the
+/// folders he meant to. The obvious fix -- put the folder's name on the row --
+/// is the wrong one: in a practice the folder name is the sensitive part
+/// ("Smith v. Acme -- privileged" says more than any path does), and sending
+/// it would turn a checkable rule, no filesystem-derived string crosses into
+/// the webview, into a judgement call every later feature has to make again.
+///
+/// So the answer is the one the evidence cards already use. The webview sends
+/// back the id it was given; the path is resolved here, handed to Finder, and
+/// dropped. The owner sees the real folder in its real place, which answers
+/// the question better than a label could, and nothing crosses.
+#[tauri::command]
+fn reveal_archive_location(
+    location_id: u64,
+    state: tauri::State<'_, ArchiveState>,
+) -> Result<(), String> {
+    let session = state.session.lock().map_err(|_| lock_error())?;
+    let location = session
+        .locations
+        .iter()
+        .find(|location| location.id == location_id)
+        .ok_or_else(|| "That location is no longer approved.".to_string())?;
+    let path = location.root.canonical_path();
+    // The same care the document reveal takes: a location that was replaced
+    // by a symlink, or is no longer a directory, is refused rather than
+    // followed. Approval was granted to a folder, not to whatever now sits
+    // at its path.
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| "That location is no longer readable.".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("That location is no longer the folder that was approved.".to_string());
+    }
+    std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(path)
+        .status()
+        .map_err(|_| "Finder could not be asked to show the location.".to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn archive_index_progress(state: tauri::State<'_, ArchiveState>) -> UiBuildProgress {
     let progress = state
@@ -1276,6 +1319,7 @@ fn main() {
             build_archive_text_vault,
             archive_index_progress,
             reveal_archive_document,
+            reveal_archive_location,
             search_archive_text_vault,
         ])
         .build(tauri::generate_context!())
@@ -1570,6 +1614,50 @@ mod tests {
         );
         assert!(!serialized.contains("client-alpha"));
         assert!(!serialized.contains("client-beta"));
+    }
+
+    /// Revealing a location resolves its path here and never hands one out.
+    ///
+    /// The reveal exists because the labels are deliberately
+    /// indistinguishable, so it must not become the hole the labels avoid:
+    /// the command takes the same opaque id the interface was given, and the
+    /// only thing it returns is success or a sentence.
+    #[test]
+    fn revealing_a_location_takes_an_opaque_id_and_returns_no_path() {
+        let temp = TempDir::new().expect("temp");
+        let client_alpha = temp.path().join("client-alpha");
+        fs::create_dir(&client_alpha).expect("alpha");
+        let mut roots = approve_roots(std::slice::from_ref(&client_alpha)).expect("approve");
+        let locations = [ApprovedLocation {
+            id: 7,
+            root: roots.remove(0),
+        }];
+
+        // The lookup the command performs, on the id the interface holds.
+        let found = locations
+            .iter()
+            .find(|location| location.id == 7)
+            .expect("the approved id must resolve");
+        assert_eq!(
+            found.root.canonical_path(),
+            client_alpha.canonicalize().expect("canonical")
+        );
+
+        // An id the session does not know resolves to nothing, so a stale or
+        // invented id cannot reach the filesystem at all.
+        assert!(locations.iter().all(|location| location.id != 99));
+
+        // A location replaced by a symlink is refused rather than followed:
+        // approval was granted to a folder, not to whatever now sits there.
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).expect("elsewhere");
+        let swapped = temp.path().join("swapped");
+        std::os::unix::fs::symlink(&elsewhere, &swapped).expect("symlink");
+        let metadata = fs::symlink_metadata(&swapped).expect("metadata");
+        assert!(
+            metadata.file_type().is_symlink(),
+            "the guard's condition must be the one that fires here"
+        );
     }
 
     /// Choosing a folder must cancel the skip that was suppressing it.

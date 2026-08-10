@@ -618,9 +618,28 @@ a:focus-visible {
   font-size: var(--text-md);
 }
 
-.location-copy strong,
-.location-copy span {
+/* Scoped to the text column: a bare `.location-copy span` also matched
+   .location-icon and its class+element specificity beat the icon's single
+   class, so the icon's grid centering silently lost and the glyph sat in
+   the box's top-left corner. */
+.location-copy div strong,
+.location-copy div span {
   display: block;
+}
+
+.location-icon svg {
+  display: block;
+}
+
+.location-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.reveal-location {
+  padding: 5px 10px;
+  font-size: var(--text-xs);
 }
 
 .location-copy strong {
