@@ -516,6 +516,14 @@ function renderVaultSummary(report) {
       } read by the text reader — you can search these, but they are a machine reading a picture, so they are never quoted as the document\u0027s own words.`,
     });
   }
+  const mixedProvenanceDocuments = report.mixed_provenance_documents ?? 0;
+  if (mixedProvenanceDocuments > 0) {
+    notes.push({
+      text: `${mixedProvenanceDocuments.toLocaleString()} document${
+        mixedProvenanceDocuments === 1 ? " has" : "s have"
+      } both readable text and pages containing a page-sized picture. Readable pages can be quoted; picture-based pages are shown only as a machine reading and must be checked against the source.`,
+    });
+  }
   if (report.unsupported_files_skipped > 0 || report.ocr_required_files > 0) {
     notes.push({
       text: `${report.unsupported_files_skipped.toLocaleString()} file${

@@ -138,6 +138,35 @@ The "Evidence fidelity" row above is exact about excerpts, revisions, and
 anchors -- the excerpt is genuinely the source text at the cited anchor -- but
 provision *extent* in a structureless PDF is inferred.
 
+**Reveal is a check-then-open race.** `source_path_for_reveal` re-verifies the
+source revision and then hands a path to `/usr/bin/open -R`. A process that
+rewrites the file between that check and Finder resolving the path can make
+Finder show a document that no longer matches the quotation. The race requires
+a process actively changing the owner's own filesystem, and it affects only
+what Finder displays: the quoted text was checked against the source bytes at
+response time. Rechecking immediately before reveal was tried and retained;
+it cannot make Finder consume the already-verified file handle because Finder's
+reveal interface accepts a path.
+
+**Folder exclusions can be defeated by inode reuse.** A skipped folder is
+bound to its device and inode. If it is deleted and the filesystem is forced to
+reuse that inode for a new folder at the same relative path, the skip applies
+to the wrong folder without a separate warning. This requires deliberate local
+manipulation of the owner's own filesystem between choosing the skip and
+building the vault. Path-only binding was tried and rejected because an
+ordinary rename defeated it; inspection and identity capture now happen
+together, but closing the inode-reuse gap would require holding an open
+directory capability across the build, which is a separate design.
+
+**A page-sized image makes its page unquotable.** A born-digital chart, figure,
+full-page letterhead or watermark can therefore turn that page into a
+machine-read card rather than an exact quotation. Other readable pages in the
+same document remain quotable. Two visibility rules based on text rendering
+mode and drawing order were tried; nested PDF objects defeated them, and they
+also demoted ordinary documents based on facts that did not establish what a
+reader could see. The broader page rule is the deliberate price of provenance
+that does not depend on analysing the rendered page.
+
 ## Stop-ship criteria
 
 The pilot must not be delivered if the reviewer finds any unresolved issue

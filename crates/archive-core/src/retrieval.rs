@@ -175,6 +175,11 @@ pub struct NormalizedProvision {
     pub heading: Option<String>,
     pub text: String,
     pub sentence_count: u32,
+    /// Whether this passage came from source text or from a page image.
+    ///
+    /// This is the quoting decision. Document provenance is only a summary
+    /// and must never be substituted for it.
+    pub text_provenance: TextProvenance,
     /// The recogniser's weakest line on the page this came from, for a
     /// transcription. `None` for text the file carried itself.
     ///
@@ -192,9 +197,12 @@ pub struct NormalizedDocument {
     pub revision: SourceRevision,
     pub converter: String,
     pub provision_boundaries: ProvisionBoundaries,
-    /// Whether this document's characters came from the file or from reading
-    /// an image of it. Decided at conversion and never inferred later.
+    /// Summary only: transcribed iff every provision is transcribed.
+    /// Quotability always reads `NormalizedProvision::text_provenance`.
     pub text_provenance: TextProvenance,
+    /// The converter found both readable and machine-read pages, including a
+    /// machine-read page that happened to yield no provision text.
+    pub has_mixed_page_provenance: bool,
     pub provisions: Vec<NormalizedProvision>,
 }
 
@@ -226,15 +234,17 @@ pub fn normalize_text_document(
         converter: "utf8-text-v1".to_string(),
         provision_boundaries: ProvisionBoundaries::Declared,
         text_provenance: TextProvenance::Extracted,
+        has_mixed_page_provenance: false,
         provisions,
     })
 }
 
 /// Turn a page reading into an indexable document.
 ///
-/// The only entry point that produces `TextProvenance::Transcribed`, and the
-/// reason `normalize_converted_document` can state `Extracted` unconditionally:
-/// the two roads never cross.
+/// The OCR entry point marks every resulting provision `Transcribed`.
+/// Converted PDFs can also mark individual provisions transcribed when their
+/// page carries a scan-sized raster; unlike this path, they may be mixed with
+/// extracted provisions from readable pages in the same document.
 ///
 /// One provision per page, anchored to the page. A transcription has no
 /// section structure to cite -- the recogniser reports lines and confidences,
@@ -258,6 +268,7 @@ pub fn normalize_transcribed_document(
                 anchor: format!("page:{page_number:04}"),
                 heading: None,
                 sentence_count: sentence_count(text),
+                text_provenance: TextProvenance::Transcribed,
                 // `None` means no recogniser reported one -- an embedded OCR
                 // layer states no confidence -- and is stored as such rather
                 // than invented. The card layer presents an unreported
@@ -284,6 +295,7 @@ pub fn normalize_transcribed_document(
         // nothing there to declare.
         provision_boundaries: ProvisionBoundaries::Inferred,
         text_provenance: TextProvenance::Transcribed,
+        has_mixed_page_provenance: false,
         provisions,
     })
 }
@@ -308,6 +320,7 @@ pub fn normalize_converted_document(
         .validate()
         .map_err(|_| RetrievalError::InvalidDocumentText)?;
     let provisions = segment_anchored_blocks(converted)?;
+    let text_provenance = document_text_provenance(&provisions);
     Ok(NormalizedDocument {
         document_id,
         title,
@@ -336,10 +349,11 @@ pub fn normalize_converted_document(
         // PDF and RTF record where text sits, not where a clause ends, so
         // neither can ever declare a boundary. Word, OpenDocument and DOCX
         // state where their sections begin and are trusted for it.
-        // Every format handled here hands over characters the author wrote.
-        // A transcription reaches the index through its own entry point, so
-        // this can never be reached with `Transcribed` by accident.
-        text_provenance: TextProvenance::Extracted,
+        // Summary only. A mixed document stays searchable while the
+        // provision rows keep its machine-read pages out of quotations.
+        text_provenance,
+        has_mixed_page_provenance: !converted.machine_read_anchors.is_empty()
+            && converted.text_origin == minutes_archive_convert::TextOrigin::AuthorWritten,
         provision_boundaries: match converted.format {
             SourceFormat::Pdf | SourceFormat::Rtf => ProvisionBoundaries::Inferred,
             SourceFormat::Docx | SourceFormat::Doc | SourceFormat::Odt => {
@@ -489,6 +503,8 @@ fn segment_anchored_blocks(
     let mut body_anchor = None::<String>;
     let mut body = Vec::<String>::new();
     let mut page_lines = Vec::<String>::new();
+    let mut previous_anchor = None::<String>;
+    let mut previous_provenance = None::<TextProvenance>;
 
     // A page boundary is layout, not structure. It used to flush, which
     // finalized whatever clause was mid-sentence at the bottom of a page: the
@@ -563,6 +579,36 @@ fn segment_anchored_blocks(
     };
 
     for block in &converted.blocks {
+        let block_provenance = if converted
+            .machine_read_anchors
+            .contains(&block.source_anchor)
+        {
+            TextProvenance::Transcribed
+        } else {
+            TextProvenance::Extracted
+        };
+        if previous_anchor
+            .as_deref()
+            .is_some_and(|anchor| anchor != block.source_anchor)
+            && previous_provenance.is_some_and(|provenance| provenance != block_provenance)
+        {
+            // A provision may wrap across ordinary page boundaries, but it
+            // may never combine quotable source text with a machine reading.
+            // Split exactly where page provenance changes so the readable
+            // half remains quotable and the scanned half cannot inherit its
+            // neighbour's anchor.
+            flush(
+                &mut segments,
+                &mut heading,
+                &mut heading_anchor,
+                &mut body_anchor,
+                &mut body,
+                true,
+            );
+            page_lines.clear();
+        }
+        previous_anchor = Some(block.source_anchor.clone());
+        previous_provenance = Some(block_provenance);
         page_lines.push(block.text.clone());
         let page_wraps = block.flow == AnchorFlow::HardBoundary
             && block_wraps_to_next_page(&page_lines.join("\n"), &boilerplate);
@@ -728,7 +774,11 @@ fn segment_anchored_blocks(
                 anchor: format!("{source_anchor}/section:{ordinal:04}"),
                 heading,
                 sentence_count: sentence_count(&text),
-                // Segmenters here only ever see text the file carried.
+                text_provenance: if converted.machine_read_anchors.contains(&source_anchor) {
+                    TextProvenance::Transcribed
+                } else {
+                    TextProvenance::Extracted
+                },
                 transcription_confidence: None,
                 text,
             }
@@ -805,7 +855,7 @@ fn segment_legal_provisions(text: &str) -> Result<Vec<NormalizedProvision>, Retr
                 anchor: format!("section:{ordinal:04}"),
                 heading,
                 sentence_count: sentence_count(&text),
-                // Segmenters here only ever see text the file carried.
+                text_provenance: TextProvenance::Extracted,
                 transcription_confidence: None,
                 text,
             }
@@ -1208,12 +1258,10 @@ pub struct EvidenceCard {
 
 /// How the text under a document was obtained.
 ///
-/// A file either carries its own characters or it does not. A PDF, a Word
-/// document and a text file all hand over text the author wrote. A scan hands
-/// over an image, and any text is a machine's reading of it.
-///
-/// This is a property of the source, decided once at conversion, and it is the
-/// only thing that decides whether a passage may be quoted as evidence.
+/// A provision either carries the source's characters or a machine's reading
+/// of an image. This value on the provision row is the only thing that decides
+/// whether the passage may be quoted as evidence; the document value is only
+/// a summary for reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextProvenance {
@@ -1221,6 +1269,18 @@ pub enum TextProvenance {
     Extracted,
     /// The characters are a reading of an image and may be wrong.
     Transcribed,
+}
+
+fn document_text_provenance(provisions: &[NormalizedProvision]) -> TextProvenance {
+    if !provisions.is_empty()
+        && provisions
+            .iter()
+            .all(|provision| provision.text_provenance == TextProvenance::Transcribed)
+    {
+        TextProvenance::Transcribed
+    } else {
+        TextProvenance::Extracted
+    }
 }
 
 /// A passage read out of an image.
@@ -1557,6 +1617,7 @@ impl LegalIndex {
                     heading,
                     body,
                     transcription_confidence UNINDEXED,
+                    text_provenance UNINDEXED,
                     tokenize = 'unicode61 remove_diacritics 2'
                 );
                 ",
@@ -1807,7 +1868,7 @@ impl LegalIndex {
                     d.revision_bytes,
                     d.converter,
                     d.provision_boundaries,
-                    d.text_provenance,
+                    p.text_provenance,
                     p.transcription_confidence
                 FROM provisions p
                 JOIN documents d ON d.document_id = p.document_id
@@ -1865,7 +1926,7 @@ impl LegalIndex {
                 d.revision_bytes,
                 d.converter,
                 d.provision_boundaries,
-                d.text_provenance,
+                p.text_provenance,
                 p.transcription_confidence
             FROM provisions p
             JOIN documents d ON d.document_id = p.document_id
@@ -2249,8 +2310,8 @@ fn replace_document_transaction(
         transaction
             .execute(
                 "
-                INSERT INTO provisions (document_id, ordinal, anchor, heading, body, transcription_confidence)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                INSERT INTO provisions (document_id, ordinal, anchor, heading, body, transcription_confidence, text_provenance)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ",
                 params![
                     document.document_id.as_str(),
@@ -2259,6 +2320,7 @@ fn replace_document_transaction(
                     provision.heading,
                     provision.text,
                     provision.transcription_confidence.map(f64::from),
+                    text_provenance_to_db(provision.text_provenance),
                 ],
             )
             .map_err(|_| RetrievalError::IndexUnavailable)?;
@@ -2582,6 +2644,7 @@ mod tests {
             ],
             warnings: Vec::new(),
             text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: BTreeSet::new(),
         };
         let normalized = normalize_converted_document(
             DocumentId::parse("break-caption").expect("id"),
@@ -2658,6 +2721,7 @@ mod tests {
             ],
             warnings: Vec::new(),
             text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: BTreeSet::new(),
         };
         let normalized = normalize_converted_document(
             DocumentId::parse("structured-docx").expect("id"),
@@ -2709,6 +2773,7 @@ mod tests {
                 .collect(),
             warnings: Vec::new(),
             text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: BTreeSet::new(),
         }
     }
 
@@ -2764,6 +2829,10 @@ mod tests {
         assert_eq!(document.provisions.len(), 2);
         assert_eq!(document.provisions[0].anchor, "page:0001");
         assert_eq!(document.provisions[1].anchor, "page:0003");
+        assert!(document
+            .provisions
+            .iter()
+            .all(|provision| provision.text_provenance == TextProvenance::Transcribed));
         assert!(
             document
                 .provisions
@@ -2792,6 +2861,9 @@ mod tests {
         .expect("normalize");
         // Stands in for what an OCR converter will produce.
         normalized.text_provenance = TextProvenance::Transcribed;
+        for provision in &mut normalized.provisions {
+            provision.text_provenance = TextProvenance::Transcribed;
+        }
 
         let revisions = CurrentRevisionSet::from_documents([&normalized]);
         let mut index =
@@ -2862,6 +2934,9 @@ mod tests {
         // And the same document, extracted, does answer -- so the assertions
         // above cannot pass merely because nothing matched.
         normalized.text_provenance = TextProvenance::Extracted;
+        for provision in &mut normalized.provisions {
+            provision.text_provenance = TextProvenance::Extracted;
+        }
         let revisions = CurrentRevisionSet::from_documents([&normalized]);
         let mut index =
             LegalIndex::new(VaultId::parse("control-vault").expect("vault")).expect("index");
@@ -2887,6 +2962,87 @@ mod tests {
         );
     }
 
+    /// The document summary is deliberately extracted for a mixed document.
+    /// If either candidate query reads that summary instead of the provision
+    /// row, page two becomes quotable and this test fails on both retrieval
+    /// paths.
+    #[test]
+    fn a_scanned_page_inside_a_readable_document_is_never_quoted() {
+        let mut document = normalize_text_document(
+            DocumentId::parse("mixed-pages").expect("id"),
+            "Mixed Pages",
+            b"1. CONFIDENTIALITY\nConfidential Information on the first readable page.\n\n\
+              2. CONFIDENTIALITY\nConfidential Information read from the scanned page.\n\n\
+              3. CONFIDENTIALITY\nConfidential Information on the third readable page.",
+        )
+        .expect("normalize");
+        assert_eq!(
+            document.provisions.len(),
+            3,
+            "the fixture must exercise three pages"
+        );
+        for (index, provision) in document.provisions.iter_mut().enumerate() {
+            provision.anchor = format!("page:{:04}", index + 1);
+            provision.text_provenance = if index == 1 {
+                TextProvenance::Transcribed
+            } else {
+                TextProvenance::Extracted
+            };
+        }
+        document.text_provenance = document_text_provenance(&document.provisions);
+        assert_eq!(
+            document.text_provenance,
+            TextProvenance::Extracted,
+            "a mixed document summary must not demote its readable pages"
+        );
+
+        let revisions = CurrentRevisionSet::from_documents([&document]);
+        let mut index =
+            LegalIndex::new(VaultId::parse("mixed-vault").expect("vault")).expect("index");
+        index.replace_document(&document).expect("ingest");
+
+        for scope in [MatchScope::SameProvision, MatchScope::AnywhereInDocument] {
+            let response = index
+                .search(
+                    index.vault_id(),
+                    LegalQuery {
+                        raw: "confidentiality".to_string(),
+                        scope,
+                        required_concepts: vec![LegalConcept::Confidentiality],
+                        excluded_concepts: Vec::new(),
+                        exact_phrase: None,
+                        max_sentences: None,
+                        limit: 10,
+                    },
+                    &revisions,
+                )
+                .expect("search");
+
+            let evidence = match scope {
+                MatchScope::SameProvision => &response.evidence,
+                MatchScope::AnywhereInDocument => &response.documents[0].criterion_evidence,
+            };
+            let quoted_anchors = evidence
+                .iter()
+                .map(|card| card.source_anchor.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                quoted_anchors,
+                BTreeSet::from(["page:0001", "page:0003"]),
+                "{scope:?} did not preserve exactly the two readable pages"
+            );
+            assert_eq!(
+                response.transcriptions.len(),
+                1,
+                "{scope:?} did not return the scanned page only as a transcription"
+            );
+            assert_eq!(response.transcriptions[0].page_anchor, "page:0002");
+            assert!(response.transcriptions[0]
+                .transcribed_text
+                .contains("scanned page"));
+        }
+    }
+
     /// An excluded concept filters transcriptions on every retrieval path.
     ///
     /// The document-scope path used to drop the document card correctly but
@@ -2903,6 +3059,9 @@ mod tests {
         )
         .expect("normalize");
         normalized.text_provenance = TextProvenance::Transcribed;
+        for provision in &mut normalized.provisions {
+            provision.text_provenance = TextProvenance::Transcribed;
+        }
 
         let revisions = CurrentRevisionSet::from_documents([&normalized]);
         let mut index =
@@ -4158,6 +4317,7 @@ mod tests {
             blocks: Vec::new(),
             warnings: vec!["ocr_required_or_no_extractable_text".to_string()],
             text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: BTreeSet::new(),
         };
         let error = normalize_converted_document(
             DocumentId::parse("blank-scan").expect("id"),
@@ -4213,6 +4373,7 @@ mod tests {
             ],
             warnings: Vec::new(),
             text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: BTreeSet::from(["page:0002".to_string()]),
         };
         let normalized_pdf = normalize_converted_document(
             DocumentId::parse("converted-pdf").expect("id"),
@@ -4230,6 +4391,19 @@ mod tests {
             "page:0002/section:0002"
         );
         assert_eq!(normalized_pdf.converter, "pdf-extract-0.12.0-v1");
+        assert_eq!(
+            normalized_pdf.provisions[0].text_provenance,
+            TextProvenance::Extracted
+        );
+        assert_eq!(
+            normalized_pdf.provisions[1].text_provenance,
+            TextProvenance::Transcribed
+        );
+        assert_eq!(
+            normalized_pdf.text_provenance,
+            TextProvenance::Extracted,
+            "a document is summarized as transcribed only when every provision is"
+        );
 
         let docx = ConvertedDocument {
             format: SourceFormat::Docx,
@@ -4249,6 +4423,7 @@ mod tests {
             ],
             warnings: Vec::new(),
             text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: BTreeSet::new(),
         };
         let normalized_docx = normalize_converted_document(
             DocumentId::parse("converted-docx").expect("id"),
@@ -4266,6 +4441,51 @@ mod tests {
             Some("7. CONFIDENTIALITY")
         );
         assert_eq!(normalized_docx.converter, "docx-xml-0.41.0-v1");
+    }
+
+    #[test]
+    fn a_provision_is_split_when_page_provenance_changes() {
+        let mut converted = anchored(
+            SourceFormat::Pdf,
+            vec![
+                (
+                    None,
+                    "page:0001",
+                    "Confidential Information continues",
+                    AnchorFlow::HardBoundary,
+                ),
+                (
+                    None,
+                    "page:0002",
+                    "across the scanned page without safe quotation.",
+                    AnchorFlow::HardBoundary,
+                ),
+            ],
+        );
+        converted.machine_read_anchors = BTreeSet::from(["page:0002".to_string()]);
+        let normalized = normalize_converted_document(
+            DocumentId::parse("mixed-wrap").expect("id"),
+            "Mixed Wrap",
+            b"%PDF-synthetic",
+            &converted,
+        )
+        .expect("normalize");
+
+        assert_eq!(
+            normalized.provisions.len(),
+            2,
+            "a provenance transition must split text that would otherwise wrap across pages"
+        );
+        assert_eq!(normalized.provisions[0].anchor, "page:0001/section:0001");
+        assert_eq!(
+            normalized.provisions[0].text_provenance,
+            TextProvenance::Extracted
+        );
+        assert_eq!(normalized.provisions[1].anchor, "page:0002/section:0002");
+        assert_eq!(
+            normalized.provisions[1].text_provenance,
+            TextProvenance::Transcribed
+        );
     }
 
     #[test]

@@ -85,6 +85,7 @@ const vaultReport = {
   docx_documents: 1,
   duplicate_files_skipped: 0,
   transcribed_documents: 4,
+  mixed_provenance_documents: 2,
   budget_reached: true,
   documents_left_unread: 5000,
   directories_left_unread: 3,
@@ -483,6 +484,7 @@ try {
           !vaultSummary.includes("have a second name elsewhere on the disk (3)") ||
           !vaultSummary.includes("9,023 items could not be read") ||
           !vaultSummary.includes("4 scanned pages read by the text reader") ||
+          !vaultSummary.includes("2 documents have both readable text and pages containing a page-sized picture") ||
           !vaultSummary.includes("This index is PARTIAL") ||
           !vaultSummary.includes("5,000 documents were not read") ||
           !vaultSummary.includes("3 folders were too deep to enter") ||

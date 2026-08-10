@@ -245,6 +245,8 @@ pub struct TextVaultBuildReport {
     pub excluded_folder_changes: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
     pub transcribed_documents: u64,
+    /// Documents containing both quotable source text and machine-read pages.
+    pub mixed_provenance_documents: u64,
     pub directory_errors: u64,
     pub source_content_persisted: bool,
     pub retrieval_index_persisted: bool,
@@ -629,6 +631,7 @@ struct BuildCounters {
     excluded_directories: u64,
     excluded_folder_changes: u64,
     transcribed_documents: u64,
+    mixed_provenance_documents: u64,
     indexed_bytes: u64,
     unsupported_files_skipped: u64,
     oversized_files_skipped: u64,
@@ -652,6 +655,20 @@ struct BuildCounters {
 fn note_semantic_capacity_skip(counters: &mut BuildCounters) {
     counters.semantic_coverage_partial = true;
     counters.semantic_provisions_skipped = counters.semantic_provisions_skipped.saturating_add(1);
+}
+
+fn note_mixed_provenance_document(counters: &mut BuildCounters, document: &NormalizedDocument) {
+    let has_transcribed = document
+        .provisions
+        .iter()
+        .any(|provision| provision.text_provenance == TextProvenance::Transcribed);
+    let has_extracted = document
+        .provisions
+        .iter()
+        .any(|provision| provision.text_provenance == TextProvenance::Extracted);
+    if document.has_mixed_page_provenance || has_transcribed && has_extracted {
+        counters.mixed_provenance_documents = counters.mixed_provenance_documents.saturating_add(1);
+    }
 }
 
 /// Live counts for a build in flight.
@@ -1175,6 +1192,7 @@ fn build_authorized_vault(
         excluded_directories: counters.excluded_directories,
         excluded_folder_changes: counters.excluded_folder_changes,
         transcribed_documents: counters.transcribed_documents,
+        mixed_provenance_documents: counters.mixed_provenance_documents,
         directory_errors: counters.directory_errors,
         source_content_persisted: false,
         retrieval_index_persisted: false,
@@ -1231,63 +1249,19 @@ enum ExtractionOutcome {
     ConverterUnavailable,
 }
 
-/// Send a conversion down the road its text origin has earned.
+/// Normalize conversion output with the page provenance carried by the
+/// converter.
 ///
-/// A copier's OCR layer extracts like text and is not text: the characters
-/// are a machine's reading of a page image. When the converter's typed
-/// verdict says so, the document takes the transcription road -- the only
-/// road that produces `Transcribed` -- so the reader sees it as what it is
-/// and nothing ever quotes it as the exact language of the source. The
-/// converter name says what actually read the page, because it was not this
-/// build's recogniser.
+/// `text_origin` is a document summary only. Routing on it here would demote
+/// every readable page beside one scanned exhibit; the normalizer instead
+/// marks each provision from its page anchor.
 fn normalize_conversion_by_origin(
     document_id: DocumentId,
     title: &str,
     bytes: &[u8],
     converted: &minutes_archive_convert::ConvertedDocument,
 ) -> Result<NormalizedDocument, RetrievalError> {
-    if converted.text_origin == minutes_archive_convert::TextOrigin::MachineReadLayer {
-        normalize_transcribed_document(
-            document_id,
-            title,
-            bytes,
-            "pdf-embedded-ocr-layer-v1",
-            &machine_read_pages(converted),
-        )
-    } else {
-        normalize_converted_document(document_id, title, bytes, converted)
-    }
-}
-
-/// Regroup a demoted PDF's page-anchored blocks into transcription pages.
-///
-/// The PDF converter anchors every block `page:NNNN`, so the page number is
-/// recovered from the anchor rather than re-derived. A block whose anchor
-/// does not parse lands on page zero instead of being dropped: losing text
-/// during a demotion would turn a safety rule into a coverage gap. The
-/// confidence is `None` -- an embedded layer reports none.
-fn machine_read_pages(
-    converted: &minutes_archive_convert::ConvertedDocument,
-) -> Vec<(u32, String, Option<f32>)> {
-    let mut pages: Vec<(u32, String)> = Vec::new();
-    for block in &converted.blocks {
-        let page_number = block
-            .source_anchor
-            .strip_prefix("page:")
-            .and_then(|digits| digits.parse::<u32>().ok())
-            .unwrap_or(0);
-        match pages.last_mut() {
-            Some((current, text)) if *current == page_number => {
-                text.push('\n');
-                text.push_str(&block.text);
-            }
-            _ => pages.push((page_number, block.text.clone())),
-        }
-    }
-    pages
-        .into_iter()
-        .map(|(page_number, text)| (page_number, text, None))
-        .collect()
+    normalize_converted_document(document_id, title, bytes, converted)
 }
 
 /// The one expensive step, with no access to the index, the counters, or
@@ -1567,6 +1541,11 @@ fn index_extracted_batch(
                 }
             }
         } else {
+            if counters.semantic_coverage_partial {
+                counters.semantic_provisions_skipped = counters
+                    .semantic_provisions_skipped
+                    .saturating_add(normalized.provisions.len() as u64);
+            }
             index
                 .replace_document(&normalized)
                 .map_err(VaultError::from)?;
@@ -1574,6 +1553,7 @@ fn index_extracted_batch(
         let source_kind = pending.source_kind;
         let source_len = pending.source_len;
         let text_provenance = normalized.text_provenance;
+        note_mixed_provenance_document(counters, &normalized);
         sources.insert(
             pending.document_id,
             AuthorizedSource {
@@ -2181,6 +2161,14 @@ mod tests {
                 "{failure:?} after {answers} answers degraded silently; partial suggestion \
                  coverage must be reported"
             );
+            assert_eq!(
+                report
+                    .semantic_provisions_indexed
+                    .saturating_add(report.semantic_provisions_skipped),
+                36,
+                "{failure:?} after {answers} answers did not count every one of the 36 \
+                 provisions as either prepared or skipped"
+            );
 
             // The product is exact evidence, and it must be untouched.
             let response = vault
@@ -2481,16 +2469,9 @@ mod tests {
         assert_eq!(report.documents_left_unread, 35);
     }
 
-    /// A converter verdict of `MachineReadLayer` sends the document down the
-    /// transcription road, whole.
-    ///
-    /// The failure this pins down: a scanned PDF carrying a copier's embedded
-    /// OCR extracts like any text layer, and before the typed verdict it
-    /// normalized as `Extracted` -- a machine's reading of a fax, quotable as
-    /// the exact language of the source. Demotion must change provenance, the
-    /// converter attribution, and nothing about whether the text is seen.
+    /// The converter summary never replaces page provenance.
     #[test]
-    fn a_machine_read_text_layer_normalizes_as_transcribed_not_extracted() {
+    fn a_machine_read_page_is_demoted_without_demoting_its_readable_neighbour() {
         let block = |page: &str, text: &str| minutes_archive_convert::ConvertedBlock {
             is_heading: None,
             source_anchor: page.to_string(),
@@ -2508,39 +2489,46 @@ mod tests {
                 block("page:0004", "Neither party may assign this Agreement."),
             ],
             warnings: vec![minutes_archive_convert::PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()],
-            text_origin: minutes_archive_convert::TextOrigin::MachineReadLayer,
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: std::collections::BTreeSet::from(["page:0001".to_string()]),
         };
 
-        let transcribed = normalize_conversion_by_origin(
+        let mixed = normalize_conversion_by_origin(
             DocumentId::parse("copier-scan").expect("id"),
             "Copier Scan",
             b"%PDF-synthetic",
             &converted,
         )
         .expect("normalize");
-        assert_eq!(transcribed.text_provenance, TextProvenance::Transcribed);
-        assert_eq!(
-            transcribed.provision_boundaries,
-            ProvisionBoundaries::Inferred
-        );
-        assert_eq!(transcribed.converter, "pdf-embedded-ocr-layer-v1");
-        // Same-page blocks fold into one page reading; the page number in the
-        // anchor is the page the scanner named, not a renumbering.
-        assert_eq!(transcribed.provisions.len(), 2);
-        assert_eq!(transcribed.provisions[0].anchor, "page:0001");
-        assert_eq!(transcribed.provisions[1].anchor, "page:0004");
-        assert!(transcribed.provisions[0].text.contains("affiliate data"));
+        assert_eq!(mixed.text_provenance, TextProvenance::Extracted);
         assert!(
-            transcribed
-                .provisions
-                .iter()
-                .all(|provision| provision.transcription_confidence.is_none()),
-            "an embedded layer reports no confidence, and none may be invented"
+            mixed.has_mixed_page_provenance,
+            "the page-level machine-read verdict must survive normalization"
+        );
+        assert_eq!(mixed.provision_boundaries, ProvisionBoundaries::Inferred);
+        assert_eq!(mixed.converter, "pdf-extract-0.12.0-v1");
+        assert_eq!(mixed.provisions.len(), 2);
+        assert_eq!(
+            mixed.provisions[0].text_provenance,
+            TextProvenance::Transcribed
+        );
+        assert_eq!(mixed.provisions[0].anchor, "page:0001/section:0001");
+        assert!(mixed.provisions[0].text.contains("affiliate data"));
+        assert_eq!(
+            mixed.provisions[1].text_provenance,
+            TextProvenance::Extracted
+        );
+        assert_eq!(mixed.provisions[1].anchor, "page:0004/section:0002");
+        let mut counters = BuildCounters::default();
+        note_mixed_provenance_document(&mut counters, &mixed);
+        assert_eq!(
+            counters.mixed_provenance_documents, 1,
+            "the build report must disclose this mixed document"
         );
 
-        // The same blocks with an author-written verdict stay extracted, so
-        // the demotion above cannot be the normalizer's general behaviour.
-        converted.text_origin = minutes_archive_convert::TextOrigin::AuthorWritten;
+        // Clearing the page verdict makes the same page extracted. The
+        // unchanged document summary proves it was never the quoting gate.
+        converted.machine_read_anchors.clear();
         let extracted = normalize_conversion_by_origin(
             DocumentId::parse("born-digital").expect("id"),
             "Born Digital",
@@ -2550,5 +2538,14 @@ mod tests {
         .expect("normalize");
         assert_eq!(extracted.text_provenance, TextProvenance::Extracted);
         assert_eq!(extracted.converter, "pdf-extract-0.12.0-v1");
+        assert!(extracted
+            .provisions
+            .iter()
+            .all(|provision| provision.text_provenance == TextProvenance::Extracted));
+        note_mixed_provenance_document(&mut counters, &extracted);
+        assert_eq!(
+            counters.mixed_provenance_documents, 1,
+            "an entirely readable document must not inflate the mixed count"
+        );
     }
 }

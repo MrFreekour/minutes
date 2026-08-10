@@ -628,17 +628,12 @@ async fn choose_archive_exclusions(
             choice.outside += 1;
             continue;
         };
-        let Some((root_index, location_id, relative)) = session
-            .locations
-            .iter()
-            .enumerate()
-            .find_map(|(index, location)| {
-                canonical
-                    .strip_prefix(location.root.canonical_path())
-                    .ok()
-                    .map(|relative| (index, location.id, relative.to_path_buf()))
-            })
-        else {
+        let Some((location_id, relative)) = session.locations.iter().find_map(|location| {
+            canonical
+                .strip_prefix(location.root.canonical_path())
+                .ok()
+                .map(|relative| (location.id, relative.to_path_buf()))
+        }) else {
             choice.outside += 1;
             continue;
         };
@@ -650,28 +645,13 @@ async fn choose_archive_exclusions(
             choice.refused_whole_location += 1;
             continue;
         }
-        // The prefix match above is on strings. Confirm it by identity before
-        // trusting it, the same way roots are compared: the folder reached by
-        // rejoining the relative path to the root must be the folder that was
-        // actually picked.
-        let rejoined = session.locations[root_index]
-            .root
-            .canonical_path()
-            .join(&relative);
-        let same_folder = fs::metadata(&rejoined)
+        // One inspection both verifies that the selected path is still a
+        // directory and captures the identity the exclusion will bind. A
+        // second lookup here let a rename/replacement land between those two
+        // facts and transferred the skip to the replacement.
+        let Some(identity) = fs::symlink_metadata(&canonical)
             .ok()
-            .zip(fs::metadata(&canonical).ok())
-            .is_some_and(|(left, right)| {
-                use std::os::unix::fs::MetadataExt;
-                left.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
-            });
-        if !same_folder {
-            choice.outside += 1;
-            continue;
-        }
-
-        let Some(identity) = fs::metadata(&canonical)
-            .ok()
+            .filter(|metadata| metadata.is_dir())
             .and_then(|metadata| portable_identity_for(&metadata))
         else {
             choice.outside += 1;
@@ -1761,9 +1741,10 @@ mod tests {
         let card = &projected["documents"][0];
 
         assert_eq!(card["criterion_evidence_truncated"], true);
-        assert!(card["why_matched"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("assignment")));
+        assert_eq!(
+            card["why_matched"],
+            "Matched confidentiality, assignment across 64 provisions in this document."
+        );
         assert_eq!(
             card["matched_concepts"],
             serde_json::json!(["confidentiality", "assignment"])
@@ -1778,8 +1759,8 @@ mod tests {
                 })
             });
         assert!(
-            assignment_is_shown || card["criterion_evidence_truncated"] == true,
-            "the late assignment match was neither shown nor disclosed"
+            assignment_is_shown,
+            "concept-preserving displacement did not put the late assignment evidence on the card"
         );
     }
 
