@@ -170,18 +170,21 @@ export type CorpusLeaseHooks = {
   /** Test-only deterministic parent deadline after the projection has started. */
   operationDeadlineForTest?: Promise<void>;
   /**
-   * Test-only worker termination grace, in milliseconds.
+   * Test-only: treat worker termination as unconfirmed, whatever really happened.
    *
-   * Whether a kill is confirmed inside the grace window is a race that a test
-   * cannot force: SIGKILL is untrappable, so no fixture can refuse to die on
-   * cue. Shortening the window to zero makes the unconfirmed path
-   * deterministic instead.
+   * Whether a kill is confirmed inside the grace window is a race a test cannot
+   * force: SIGKILL is untrappable, so no fixture can refuse to die on cue, and
+   * a shortened window is not enough either. A never-fed child dies almost
+   * immediately, so the termination promise usually wins even a zero-length
+   * race, and a test written that way passes without ever entering the branch
+   * it claims to cover.
    *
-   * Safe as a knob because it can only make the parent more conservative. A
-   * shorter grace means more kills go unconfirmed, and an unconfirmed kill of
-   * a worker that was told which corpus to read still poisons the process.
+   * A boolean forces the branch instead. It is also the least powerful shape
+   * available: no delay to coerce, nothing to hold cleanup open, and it can
+   * only make the parent more conservative, since an unconfirmed kill of a
+   * worker that knew the corpus still poisons.
    */
-  workerTerminationGraceMsForTest?: number;
+  forceUnconfirmedTerminationForTest?: boolean;
 };
 
 type RootIdentity = {
@@ -1825,6 +1828,9 @@ async function dispatchStableCorpusLease<T>(
   let protocolQueue: Promise<void> = Promise.resolve();
   let releaseReservation = true;
   let releaseWorkerAdmission = true;
+  // Guards the admission slot against a double release when a late-reaped
+  // child's termination promise resolves after the cleanup block already ran.
+  let workerAdmissionReleased = false;
   // Whether the `begin` message, the only thing that tells the child which
   // corpus to read, was actually handed to the child's stdin. Authority is the
   // write itself, never anything the child echoes back, and never merely
@@ -2195,16 +2201,18 @@ async function dispatchStableCorpusLease<T>(
   } finally {
     if (!terminated) {
       killCorpusWorker(child);
-      const confirmed = await Promise.race([
-        termination.then(() => true),
-        new Promise<boolean>((resolve) => {
-          const timer = setTimeout(
-            () => resolve(false),
-            hooks.workerTerminationGraceMsForTest ?? CORPUS_WORKER_TERMINATION_GRACE_MS
-          );
-          timer.unref();
-        }),
-      ]);
+      const confirmed = hooks.forceUnconfirmedTerminationForTest
+        ? false
+        : await Promise.race([
+            termination.then(() => true),
+            new Promise<boolean>((resolve) => {
+              const timer = setTimeout(
+                () => resolve(false),
+                CORPUS_WORKER_TERMINATION_GRACE_MS
+              );
+              timer.unref();
+            }),
+          ]);
       // An unconfirmed kill means the child might still be running, and a
       // child that knows the corpus root might still be reading it. Retaining
       // its reservation and refusing further workers is the right answer to
@@ -2217,10 +2225,30 @@ async function dispatchStableCorpusLease<T>(
       // later lease until restart protects nothing. That case is reachable in
       // ordinary use, not just in tests, whenever a short budget expires while
       // the worker is still starting (issue #689).
-      if (!confirmed && corpusRootDisclosed) {
-        corpusWorkerPoisoned = true;
-        releaseReservation = false;
-        releaseWorkerAdmission = false;
+      if (!confirmed) {
+        if (corpusRootDisclosed) {
+          corpusWorkerPoisoned = true;
+          releaseReservation = false;
+          releaseWorkerAdmission = false;
+        } else {
+          // The child holds no corpus bytes, so its memory reservation is
+          // released below. Its admission slot is a different question: the
+          // kill is unconfirmed, so the process may genuinely still exist, and
+          // that cap counts live workers rather than retained bytes.
+          //
+          // Releasing it immediately would let repeated failures accumulate
+          // unbounded uncharged children; holding it forever would leak a slot
+          // for a child that, in the overwhelming majority of cases, died a
+          // moment after the grace expired. So the slot is handed to the
+          // termination promise and freed if and when the child is actually
+          // reaped, which is neither of those extremes.
+          releaseWorkerAdmission = false;
+          void termination.then(() => {
+            if (workerAdmissionReleased) return;
+            workerAdmissionReleased = true;
+            activeCorpusWorkerCount = Math.max(0, activeCorpusWorkerCount - 1);
+          });
+        }
       }
     }
     if (operationActive) {
@@ -2240,7 +2268,8 @@ async function dispatchStableCorpusLease<T>(
         releaseWorkerAdmission = false;
       }
     }
-    if (releaseWorkerAdmission) {
+    if (releaseWorkerAdmission && !workerAdmissionReleased) {
+      workerAdmissionReleased = true;
       activeCorpusWorkerCount = Math.max(0, activeCorpusWorkerCount - 1);
     }
     if (releaseReservation) releaseCorpusMemory(reservation);
