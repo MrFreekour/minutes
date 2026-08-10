@@ -9792,6 +9792,33 @@ fn store_recall_history_if_still_authorized(
     true
 }
 
+/// Loopback enforcement for local-only egress destinations.
+///
+/// A bare hostname is not evidence of a loopback destination. The guard runs
+/// once, but the HTTP client resolves the name again at request time through
+/// the system resolver, so accepting the literal string `localhost` trusts
+/// whatever NSS happens to return. A poisoned or merely misconfigured entry
+/// would send meeting context to a remote host while the URL still reads as
+/// local, which defeats the only claim this guard exists to make.
+///
+/// Resolve here instead and require *every* returned address to be loopback,
+/// failing closed when resolution yields nothing or errors. An IP literal is
+/// checked directly and never resolved.
+fn recall_destination_is_loopback(host: &str, port: u16) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = bare.parse::<std::net::IpAddr>() {
+        return address.is_loopback();
+    }
+    use std::net::ToSocketAddrs;
+    match (host, port).to_socket_addrs() {
+        Ok(addresses) => {
+            let resolved: Vec<_> = addresses.collect();
+            !resolved.is_empty() && resolved.iter().all(|a| a.ip().is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
 fn recall_ollama_chat_url(raw: &str) -> Result<String, String> {
     let mut url = reqwest::Url::parse(raw)
         .map_err(|_| "Recall Ollama URL must be a valid loopback HTTP URL.".to_string())?;
@@ -9810,12 +9837,8 @@ fn recall_ollama_chat_url(raw: &str) -> Result<String, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "Recall Ollama URL is missing a loopback host.".to_string())?;
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
+    let is_loopback =
+        recall_destination_is_loopback(host, url.port_or_known_default().unwrap_or(80));
     if !is_loopback {
         return Err("Recall Ollama is local-only; remote destinations are refused.".into());
     }
@@ -9851,12 +9874,8 @@ fn recall_openai_compatible_chat_url(raw: &str) -> Result<String, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "Recall OpenAI-compatible URL is missing a loopback host.".to_string())?;
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
+    let is_loopback =
+        recall_destination_is_loopback(host, url.port_or_known_default().unwrap_or(80));
     if !is_loopback {
         return Err(
             "Recall OpenAI-compatible chat is local-only; remote destinations are refused.".into(),
@@ -12053,6 +12072,61 @@ mod tests {
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
+
+    /// Loopback enforcement must judge the destination, not the spelling.
+    ///
+    /// Both Recall chat guards previously accepted the literal string
+    /// `localhost` without resolving it, while the HTTP client resolved it
+    /// again at request time. These pin the resolved-address behavior so that
+    /// hole cannot reopen quietly.
+    #[test]
+    fn loopback_guard_accepts_ip_literals_without_resolving() {
+        assert!(recall_destination_is_loopback("127.0.0.1", 11434));
+        assert!(recall_destination_is_loopback("[::1]", 1234));
+        assert!(recall_destination_is_loopback("127.7.7.7", 80));
+    }
+
+    #[test]
+    fn loopback_guard_refuses_routable_literals() {
+        assert!(!recall_destination_is_loopback("0.0.0.0", 80));
+        assert!(!recall_destination_is_loopback("10.0.0.5", 80));
+        assert!(!recall_destination_is_loopback("[::ffff:8.8.8.8]", 80));
+    }
+
+    #[test]
+    fn loopback_guard_fails_closed_on_unresolvable_names() {
+        // Never resolves, so there is no evidence the destination is local.
+        assert!(!recall_destination_is_loopback(
+            "definitely-not-a-real-host.invalid",
+            80
+        ));
+    }
+
+    #[test]
+    fn loopback_guard_resolves_localhost_rather_than_trusting_the_name() {
+        // On a sane host this resolves to loopback and is accepted. The point
+        // of the assertion is that acceptance now flows through resolution:
+        // if NSS mapped `localhost` elsewhere, this would refuse instead.
+        let accepted = recall_destination_is_loopback("localhost", 11434);
+        let resolved_all_loopback = {
+            use std::net::ToSocketAddrs;
+            match ("localhost", 11434u16).to_socket_addrs() {
+                Ok(addresses) => {
+                    let resolved: Vec<_> = addresses.collect();
+                    !resolved.is_empty() && resolved.iter().all(|a| a.ip().is_loopback())
+                }
+                Err(_) => false,
+            }
+        };
+        assert_eq!(accepted, resolved_all_loopback);
+    }
+
+    #[test]
+    fn recall_chat_urls_refuse_remote_destinations() {
+        assert!(recall_ollama_chat_url("http://example.com:11434").is_err());
+        assert!(recall_openai_compatible_chat_url("http://example.com:1234/v1").is_err());
+        assert!(recall_openai_compatible_chat_url("http://127.0.0.1@evil.com/v1").is_err());
+    }
 
     fn test_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
