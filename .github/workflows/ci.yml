@@ -21,12 +21,21 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      site: ${{ steps.filter.outputs.site }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
+            site:
+              # The landing page is the product demo, and nothing in CI
+              # compiled it until now: a TypeScript major bump merged green
+              # here while never having been built, because the only site job
+              # checks release constants. Cloudflare Pages would have caught a
+              # broken build at deploy time, after merge.
+              - 'site/**'
+              - '.github/workflows/ci.yml'
             rust:
               - 'tauri/**'
               # Enumerated, not 'crates/**'. crates/mcp and crates/sdk are npm
@@ -647,6 +656,31 @@ jobs:
       - name: Verify site release constants match manifest
         run: node scripts/sync_site_release_version.mjs --check
 
+  site_build:
+    name: Site Build
+    needs: changes
+    if: needs.changes.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install site dependencies
+        working-directory: site
+        run: npm ci
+
+      # `next build` type-checks as part of the build (no ignoreBuildErrors in
+      # next.config), so this covers both compilation and types in one step.
+      - name: Build the site
+        working-directory: site
+        run: npm run build
+
   agents_sync:
     name: Agents Skill Sync
     runs-on: ubuntu-latest
@@ -755,6 +789,7 @@ jobs:
       - skills_compiler
       - agents_sync
       - site_release_consistency
+      - site_build
       - llms_sync
       - live_sidekick_eval
     if: always()
