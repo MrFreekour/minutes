@@ -1,3 +1,5 @@
+import type { Metadata } from "next";
+
 /** Shared JSON-LD builders for structured data.
  *
  * Schema.org markup must describe content that is actually visible on the page.
@@ -106,6 +108,66 @@ export function faqPageSchema(items: ReadonlyArray<FaqItem>) {
       "@type": "Question",
       name: item.question,
       acceptedAnswer: { "@type": "Answer", text: item.answer },
+    })),
+  };
+}
+
+type ResourceSchemaInput = {
+  /** The page's own `metadata` export, so title and description cannot drift. */
+  metadata: Metadata;
+  /** Site-relative canonical path, e.g. "/resources/remove-otter-ai-from-zoom". */
+  path: string;
+  /** ISO date the page was last fact-checked; becomes dateModified. */
+  lastReviewed: string;
+  /** The page's visible Sources list, emitted as citations. */
+  sources?: ReadonlyArray<{ label: string; href: string }>;
+};
+
+/** Next's Metadata title is a union; every resource page uses a plain string. */
+function titleText(title: Metadata["title"]): string {
+  if (typeof title === "string") return title;
+  if (title && typeof title === "object") {
+    if ("absolute" in title && typeof title.absolute === "string") {
+      return title.absolute;
+    }
+    if ("default" in title && typeof title.default === "string") {
+      return title.default;
+    }
+  }
+  return "";
+}
+
+/** Structured data for a `/resources/*` guide or answer page.
+ *
+ * These pages carry the two signals that drive AI citation, sourced claims and
+ * a visible review date, but only in prose. This makes both machine-readable.
+ * Title and description are read from the page's own `metadata` export rather
+ * than restated, so the markup cannot disagree with the `<title>`.
+ *
+ * Emit alongside `faqPageSchema` where the page has a visible FAQ; the two are
+ * separate top-level objects in one JSON-LD array.
+ */
+export function resourceArticleSchema({
+  metadata,
+  path,
+  lastReviewed,
+  sources = [],
+}: ResourceSchemaInput) {
+  return {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    headline: titleText(metadata.title),
+    description: metadata.description ?? "",
+    url: absolute(path),
+    mainEntityOfPage: { "@type": "WebPage", "@id": absolute(path) },
+    dateModified: lastReviewed,
+    inLanguage: "en",
+    author: author(),
+    publisher: organizationSchema(),
+    citation: sources.map((source) => ({
+      "@type": "CreativeWork",
+      name: source.label,
+      url: source.href,
     })),
   };
 }
