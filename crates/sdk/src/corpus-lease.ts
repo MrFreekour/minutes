@@ -169,6 +169,19 @@ export type CorpusLeaseHooks = {
     | "before-authorized";
   /** Test-only deterministic parent deadline after the projection has started. */
   operationDeadlineForTest?: Promise<void>;
+  /**
+   * Test-only worker termination grace, in milliseconds.
+   *
+   * Whether a kill is confirmed inside the grace window is a race that a test
+   * cannot force: SIGKILL is untrappable, so no fixture can refuse to die on
+   * cue. Shortening the window to zero makes the unconfirmed path
+   * deterministic instead.
+   *
+   * Safe as a knob because it can only make the parent more conservative. A
+   * shorter grace means more kills go unconfirmed, and an unconfirmed kill of
+   * a worker that was told which corpus to read still poisons the process.
+   */
+  workerTerminationGraceMsForTest?: number;
 };
 
 type RootIdentity = {
@@ -1812,6 +1825,12 @@ async function dispatchStableCorpusLease<T>(
   let protocolQueue: Promise<void> = Promise.resolve();
   let releaseReservation = true;
   let releaseWorkerAdmission = true;
+  // Whether the `begin` message, the only thing that tells the child which
+  // corpus to read, was actually handed to the child's stdin. Authority is the
+  // write itself, never anything the child echoes back, and never merely
+  // reaching the call site: `send` declines to write once the lease has
+  // settled or the pipe is gone.
+  let corpusRootDisclosed = false;
 
   const child = spawn(invocation.binary, invocation.args, {
     detached: process.platform !== "win32",
@@ -1837,13 +1856,15 @@ async function dispatchStableCorpusLease<T>(
   // and the message has nowhere useful to go.
   child.stdin?.on("error", () => {});
 
-  const send = (message: unknown): void => {
+  /** Write a protocol line, reporting whether it actually reached the pipe. */
+  const send = (message: unknown): boolean => {
     const serialized = JSON.stringify(message);
     if (Buffer.byteLength(serialized) > CORPUS_WORKER_PROTOCOL_MAX_BYTES || !child.stdin) {
       throw new CorpusLeaseBudgetError("meeting corpus worker protocol exceeded its budget");
     }
-    if (settled || child.stdin.destroyed || child.killed) return;
+    if (settled || child.stdin.destroyed || child.killed) return false;
     child.stdin.write(serialized + "\n");
+    return true;
   };
 
   try {
@@ -1887,7 +1908,9 @@ async function dispatchStableCorpusLease<T>(
         retainedPathBytes: number;
       };
       let stream: SnapshotStream | undefined;
-      const streamAck = (): void => send({ type: "stream-ack" });
+      const streamAck = (): void => {
+        send({ type: "stream-ack" });
+      };
       const handleProtocolLine = async (line: string): Promise<void> => {
         if (settled) return;
         let message: any;
@@ -2146,16 +2169,24 @@ async function dispatchStableCorpusLease<T>(
           });
       });
       try {
-        send({
-          type: "begin",
-          request: {
-            root,
-            budgets,
-            timeoutMs,
-            hookNames: workerHookNames(hooks),
-            stallPhase: hooks.workerStallPhaseForTest,
-          } satisfies CorpusLeaseWorkerRequest,
-        });
+        // Buffering means a `true` here proves the bytes were handed to the
+        // pipe, not that the child read them. That asymmetry is deliberate:
+        // over-reporting disclosure costs a conservative poisoning, while
+        // under-reporting would skip one that is required.
+        if (
+          send({
+            type: "begin",
+            request: {
+              root,
+              budgets,
+              timeoutMs,
+              hookNames: workerHookNames(hooks),
+              stallPhase: hooks.workerStallPhaseForTest,
+            } satisfies CorpusLeaseWorkerRequest,
+          })
+        ) {
+          corpusRootDisclosed = true;
+        }
       } catch {
         fail("meeting corpus worker request was invalid");
       }
@@ -2167,11 +2198,26 @@ async function dispatchStableCorpusLease<T>(
       const confirmed = await Promise.race([
         termination.then(() => true),
         new Promise<boolean>((resolve) => {
-          const timer = setTimeout(() => resolve(false), CORPUS_WORKER_TERMINATION_GRACE_MS);
+          const timer = setTimeout(
+            () => resolve(false),
+            hooks.workerTerminationGraceMsForTest ?? CORPUS_WORKER_TERMINATION_GRACE_MS
+          );
           timer.unref();
         }),
       ]);
-      if (!confirmed) {
+      // An unconfirmed kill means the child might still be running, and a
+      // child that knows the corpus root might still be reading it. Retaining
+      // its reservation and refusing further workers is the right answer to
+      // that, and stays the answer.
+      //
+      // A child killed before `begin` reached it is a different animal: the
+      // protocol is the only way it learns which directory to read, and it
+      // does nothing before that message. It cannot be holding corpus bytes,
+      // so charging the process for bytes it never read and blocking every
+      // later lease until restart protects nothing. That case is reachable in
+      // ordinary use, not just in tests, whenever a short budget expires while
+      // the worker is still starting (issue #689).
+      if (!confirmed && corpusRootDisclosed) {
         corpusWorkerPoisoned = true;
         releaseReservation = false;
         releaseWorkerAdmission = false;

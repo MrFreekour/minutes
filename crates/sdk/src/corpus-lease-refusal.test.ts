@@ -67,4 +67,66 @@ describe("stable corpus lease refusal contract", () => {
       expect(projections).toBe(0);
     });
   });
+
+  // These two share this file's isolation for the same reason as the test
+  // above: they deliberately drive the worker-poisoning path, which is
+  // process-global. Vitest runs each file in its own process, so a poisoned
+  // outcome cannot leak into the main corpus suite.
+  //
+  // Whether a kill is confirmed inside the grace window is a race no test can
+  // force, since SIGKILL is untrappable. `workerTerminationGraceMsForTest: 0`
+  // makes every kill unconfirmed instead, which is the state the race
+  // produces, so the two cases below differ only in whether the child was
+  // told which corpus to read.
+  it("keeps working after an unconfirmed kill of a worker that never learned the corpus", async () => {
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "never fed canary");
+      // A one-millisecond budget expires while the worker is still starting,
+      // so `begin` is never written and the child cannot hold corpus bytes.
+      await expect(
+        withStableCorpusLease(root, () => "unreachable", {
+          timeoutMs: 1,
+          workerTerminationGraceMsForTest: 0,
+        })
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+
+      // Issue #689: this used to refuse with "requires a process restart"
+      // until the host process was restarted, and to keep the killed lease's
+      // memory reservation charged forever.
+      await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
+        "recovered"
+      );
+    });
+  });
+
+  // Must stay LAST in this file: it deliberately poisons the worker path, and
+  // unlike the two above it leaves the process unusable on purpose. The
+  // opening assertion turns that ordering requirement into a detectable
+  // failure rather than a silent one, since anything added after this test
+  // would inherit the poison.
+  it("still fails closed after an unconfirmed kill of a worker that knew the corpus", async () => {
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "disclosed canary");
+      // Everything before this point must have left the process usable.
+      await expect(withStableCorpusLease(root, () => "clean")).resolves.toBe(
+        "clean"
+      );
+      // A generous budget lets `begin` reach the child, so the worker knows
+      // which directory to read. Stalling it forces the kill, and the
+      // zero-length grace makes that kill unconfirmed. This must still poison:
+      // relaxing it for this case is the regression the change above must not
+      // introduce.
+      await expect(
+        withStableCorpusLease(root, () => "unreachable", {
+          timeoutMs: 2_000,
+          workerStallPhaseForTest: "before-baseline",
+          workerTerminationGraceMsForTest: 0,
+        })
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+
+      await expect(
+        withStableCorpusLease(root, () => "must not run")
+      ).rejects.toThrow("requires a process restart");
+    });
+  });
 });
