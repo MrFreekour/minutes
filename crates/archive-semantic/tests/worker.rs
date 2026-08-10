@@ -17,41 +17,102 @@ fn bound_worker_denies_network_and_personal_files_before_embedding() {
     assert_eq!(second.len(), APPLE_ENGLISH_SENTENCE_DIMENSION);
 }
 
-/// The app terminates with `app_handle().exit(0)`, which does not unwind, so
-/// no destructor runs at exit. The worker snapshot directory is owned by a
-/// `TempDir` whose cleanup is `Drop`, and it was surviving the process as a
-/// 40 MB copy of the executable in $TMPDIR. The close handler now releases
-/// the session explicitly while the process is still alive; this asserts the
-/// drop chain that relies on actually reclaims the snapshot.
+/// Binding must not copy the executable anywhere.
+///
+/// This began as a leak test: the worker was copied to $TMPDIR and, because
+/// the app exits with `app_handle().exit(0)` and never unwinds, a 40 MB copy
+/// survived the process. The copy is gone entirely now -- a Developer ID
+/// signature with the hardened runtime is bound to its bundle, so a copied
+/// executable fails validation and is SIGKILLed on exec, which made every
+/// notarized build unable to run its workers at all. The worker runs in place
+/// and the descriptor opened at bind time pins the inode instead.
+///
+/// So the property to hold is stronger than reclaiming a copy: none is made.
 #[cfg(target_os = "macos")]
 #[test]
-fn dropping_the_engine_reclaims_its_worker_snapshot() {
+fn binding_the_engine_copies_the_executable_nowhere() {
     use minutes_archive_semantic::BoundedSemanticEngine;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    // Ask the engine which directory is its own rather than inspecting the
-    // shared temp directory. The previous version diffed the set of
-    // `minutes-archive-semantic-*` directories before and after binding, which
-    // only excludes ones that already existed -- a sibling test in this same
-    // binary binds its own engine concurrently, so its snapshot landed inside
-    // the diff and the count was 2. It failed on a hosted runner while passing
-    // locally, purely on scheduling. Nothing about the drop chain was wrong;
-    // the observation was.
     let executable = env!("CARGO_BIN_EXE_minutes-archive-semantic");
+    let before = worker_copies_in_temp();
     let engine = BoundedSemanticEngine::bind(Path::new(executable)).expect("bind");
-    let snapshot = PathBuf::from(engine.snapshot_directory());
-    assert!(
-        snapshot.file_name().is_some_and(|name| name
-            .to_string_lossy()
-            .starts_with("minutes-archive-semantic-")),
-        "unexpected snapshot location {}",
-        snapshot.display()
+    let during = worker_copies_in_temp();
+    assert_eq!(
+        during, before,
+        "binding created a copy of the executable in the temp directory"
     );
-    assert!(snapshot.exists(), "snapshot must exist while bound");
     drop(engine);
-    assert!(
-        !snapshot.exists(),
-        "dropping the engine must reclaim {}",
-        snapshot.display()
+}
+
+#[cfg(target_os = "macos")]
+fn worker_copies_in_temp() -> usize {
+    // Counted rather than diffed by name: sibling tests in this binary bind
+    // their own engines concurrently, and an earlier version of this test
+    // failed on a hosted runner purely on that scheduling.
+    std::fs::read_dir(std::env::temp_dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("minutes-archive-semantic-")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Verifying the pinned worker from several threads at once must agree.
+///
+/// The digest used to be taken by rewinding a `try_clone` of the descriptor.
+/// `try_clone` is `dup`: the duplicate shares one open file description and
+/// therefore one offset, so concurrent verifications read each other's bytes
+/// and each concludes the executable was replaced underneath it. The converter
+/// carried the identical defect and it cost 40 of 60 documents on the first
+/// build that extracted on more than one thread; here it had simply not been
+/// reached yet, because one caller happens to drive the session from a single
+/// thread today.
+///
+/// Nothing about the file changes during this test, so every verification must
+/// succeed. With the shared offset restored this fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn concurrent_verification_of_the_pinned_worker_agrees() {
+    use minutes_archive_semantic::BoundedSemanticEngine;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    let executable = env!("CARGO_BIN_EXE_minutes-archive-semantic");
+    let engine = Arc::new(BoundedSemanticEngine::bind(Path::new(executable)).expect("bind"));
+
+    let failures = std::thread::scope(|scope| {
+        let workers = (0..8)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                scope.spawn(move || {
+                    let mut failures = 0;
+                    for _ in 0..24 {
+                        // Opening a session re-verifies the pinned executable,
+                        // which is the path that took the digest.
+                        if engine.open_session().is_err() {
+                            failures += 1;
+                        }
+                    }
+                    failures
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("thread"))
+            .sum::<usize>()
+    });
+
+    assert_eq!(
+        failures, 0,
+        "concurrent verification reported the worker as swapped while nothing touched it"
     );
 }

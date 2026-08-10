@@ -1313,17 +1313,23 @@ mod tests {
 
         server.publish_transcript_for_test(utterance("second"));
         server.publish_nudge(nudge("nudge-2"));
-        let mut second = CaptureRelayClient::connect_from(&discovery_path, cursor).unwrap();
-        let transcript = wait_for_frame(&mut second, |frame| {
-            matches!(frame, RelayFrame::Transcript { seq: 2, .. })
-        });
-        let replayed_nudge = wait_for_frame(&mut second, |frame| {
-            matches!(frame, RelayFrame::Nudge { seq: 2, .. })
-        });
-        assert!(matches!(transcript, RelayFrame::Transcript { seq: 2, .. }));
-        assert!(matches!(replayed_nudge, RelayFrame::Nudge { seq: 2, .. }));
-        assert_eq!(second.cursor().transcript_seq, 2);
-        assert_eq!(second.cursor().nudge_seq, 2);
+
+        // Reconnect through the retrying helper rather than a bare
+        // connect + wait_for_frame. The server's retirement of the dropped
+        // client is not ordered against accepting the next one, so a freshly
+        // connected client can observe EOF immediately; on Windows named pipes
+        // that happened in 5 of 25 runs (#656).
+        //
+        // An established consumer surfacing that as an error is deliberate
+        // production behavior, established in #529 and relied on by
+        // `repeated_reconnects_replay_each_cursor_advance` directly below, so
+        // the test retries instead of the client swallowing it. Replay is
+        // cursor-based, so a retry resumes from the same cursor and the
+        // invariant under test is unchanged: some (re)connection must deliver
+        // transcript 2 and nudge 2, and only those.
+        let resumed = read_reconnect_cycle_with_retry(&discovery_path, cursor, 2);
+        assert_eq!(resumed.transcript_seq, 2);
+        assert_eq!(resumed.nudge_seq, 2);
     }
 
     #[test]
@@ -1352,24 +1358,73 @@ mod tests {
         }
     }
 
+    /// Retry only the transient reconnect race, and only briefly.
+    ///
+    /// The race being absorbed is documented in #529 and #656: the server's
+    /// retirement of a dropped client is not ordered against accepting the
+    /// next one, so a freshly connected client can see the peer teardown
+    /// immediately. It resolves in milliseconds.
+    ///
+    /// Which errno that teardown surfaces as is platform-dependent, so this
+    /// reuses the same classification the production reconnect path applies
+    /// (see `CaptureRelayClient::read_frame`): a clean `UnexpectedEof`, plus
+    /// the `BrokenPipe`/`ConnectionReset`/`ConnectionAborted` family that
+    /// `is_handshake_teardown_error` documents on macOS under CPU contention.
+    /// Matching only `UnexpectedEof` here would leave the test failing
+    /// immediately on exactly the races production is written to absorb.
+    ///
+    /// A timeout is different in kind. `try_wait_for_frame` waits 3s per frame
+    /// and reports `InvalidData("timed out ...")`, which means replay itself
+    /// did not deliver. Retrying that is never useful and is actively harmful:
+    /// at two frames per attempt it costs 6s a time, and
+    /// `repeated_reconnects_replay_each_cursor_advance` runs 40 cycles, so a
+    /// real break burned tens of minutes against a 4 minute job timeout. The
+    /// failure then surfaced as a CI timeout with no test named, instead of an
+    /// assertion pointing at the broken invariant.
+    ///
+    /// So: retry connection teardown fast, fail everything else immediately.
+    const RECONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+    /// Floor on attempts, so a slow attempt cannot consume the whole wall-clock
+    /// budget and reduce this to a single try.
+    const RECONNECT_MIN_ATTEMPTS: u32 = 3;
+
+    fn is_transient_reconnect_error(error: &CaptureRelayError) -> bool {
+        is_unexpected_eof(error) || is_handshake_teardown_error(error)
+    }
+
     fn read_reconnect_cycle_with_retry(
         discovery_path: &Path,
         cursor: RelayCursor,
         seq: u64,
     ) -> RelayCursor {
-        for attempt in 1..=10u32 {
+        let started = Instant::now();
+        let deadline = started + RECONNECT_RETRY_BUDGET;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
             match read_reconnect_cycle(discovery_path, cursor.clone(), seq) {
                 Ok(next) => return next,
-                Err(error) if attempt < 10 => {
+                Err(error) if !is_transient_reconnect_error(&error) => panic!(
+                    "reconnect cycle {seq} failed on attempt {attempt} with a non-transient \
+                     error: {error:?}. Only an immediate connection teardown during reconnect \
+                     is retried; anything else means replay is broken."
+                ),
+                // The budget is wall-clock, but an attempt is not instant: a
+                // frame wait can burn 3s before the teardown surfaces, so a
+                // slow first attempt could exhaust the whole budget and leave
+                // this at one try. Honour a floor of RECONNECT_MIN_ATTEMPTS so
+                // the retry cannot silently degrade to no retry at all.
+                Err(error) if attempt < RECONNECT_MIN_ATTEMPTS || Instant::now() < deadline => {
                     eprintln!("reconnect cycle {seq} attempt {attempt} retrying after {error:?}");
                     thread::sleep(Duration::from_millis(20));
                 }
-                Err(error) => {
-                    panic!("reconnect cycle {seq} failed after {attempt} attempts: {error:?}")
-                }
+                Err(error) => panic!(
+                    "reconnect cycle {seq} still hitting the reconnect race after {attempt} \
+                     attempts in {:?}: {error:?}",
+                    started.elapsed()
+                ),
             }
         }
-        unreachable!("retry loop returns or panics")
     }
 
     fn read_reconnect_cycle(

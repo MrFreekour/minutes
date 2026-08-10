@@ -88,6 +88,8 @@ fn main() {
         DocumentVaultLimits::default(),
         &AtomicBool::new(false),
         &converter,
+        None,
+        None,
         Some(semantic_engine),
     )
     .expect("build vault");

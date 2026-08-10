@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Legal transcription software: what confidentiality actually requires",
@@ -10,36 +13,20 @@ export const metadata: Metadata = {
   },
 };
 
-const faqJsonLd = {
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  mainEntity: [
-    {
-      "@type": "Question",
-      name: "What's the difference between legal transcription services and legal transcription software?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Services use human transcriptionists and can produce certified transcripts admissible in court proceedings. Software produces working transcripts instantly and privately for internal use — depositions prep, client meetings, dictated memos. Most firms need both, for different jobs: certification is a human service; speed and confidentiality for internal work is a software job.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Is AI transcription safe for privileged conversations?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "It depends on the architecture. Cloud AI transcription sends privileged audio to a third party under that vendor's terms — a disclosure your ethics counsel has to analyze. On-device transcription (software that runs entirely on your own machine) involves no third party, so there is no vendor disclosure to analyze. Device security and consent obligations remain yours either way.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Can software-generated transcripts be used in court?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Software transcripts are working documents, not certified transcripts. Court-grade transcripts of proceedings generally require a certified transcriptionist or court reporter. Use software for speed and confidentiality on internal material; hire certification when the transcript itself must be evidence.",
-      },
-    },
-  ],
-} as const;
+const faqs = [
+  {
+    question: "What's the difference between legal transcription services and legal transcription software?",
+    answer: "Services use human transcriptionists and can produce certified transcripts admissible in court proceedings. Software produces working transcripts instantly and privately for internal use — depositions prep, client meetings, dictated memos. Most firms need both, for different jobs: certification is a human service; speed and confidentiality for internal work is a software job.",
+  },
+  {
+    question: "Is AI transcription safe for privileged conversations?",
+    answer: "It depends on the architecture. Cloud AI transcription sends privileged audio to a third party under that vendor's terms — a disclosure your ethics counsel has to analyze. On-device transcription (software that runs entirely on your own machine) involves no third party, so there is no vendor disclosure to analyze. Device security and consent obligations remain yours either way.",
+  },
+  {
+    question: "Can software-generated transcripts be used in court?",
+    answer: "Software transcripts are working documents, not certified transcripts. Court-grade transcripts of proceedings generally require a certified transcriptionist or court reporter. Use software for speed and confidentiality on internal material; hire certification when the transcript itself must be evidence.",
+  },
+] as const;
 
 const sources = [
   {
@@ -54,23 +41,18 @@ const sources = [
   { label: "Minutes on GitHub (MIT)", href: "https://github.com/silverstein/minutes" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-07-11";
 
 export default function LegalTranscriptionSoftwarePage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/legal-transcription-software", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -105,7 +87,7 @@ export default function LegalTranscriptionSoftwarePage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-07-11
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Not legal advice
@@ -209,6 +191,8 @@ export default function LegalTranscriptionSoftwarePage() {
           </a>
         </div>
       </section>
+
+      <FaqSection items={faqs} />
 
       <section className="mt-14">
         <SectionLabel label="Sources" />

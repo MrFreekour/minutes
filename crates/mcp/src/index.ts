@@ -90,7 +90,10 @@ import {
   probeCapabilitiesSync,
   type CapabilityProbeResult,
 } from "./capabilities.js";
-import { downloadReleaseBinaryWithChecksum } from "./autoInstall.js";
+import {
+  downloadReleaseBinaryWithChecksum,
+  extractZipWithPowerShell,
+} from "./autoInstall.js";
 import {
   attachCaptureRelay,
   type CaptureRelayCursor,
@@ -2142,6 +2145,11 @@ function findMinutesBinary(): string {
   const candidates = [
     join(__dirname, "..", "..", "..", "target", "release", `minutes${ext}`),
     join(__dirname, "..", "..", "..", "target", "debug", `minutes${ext}`),
+    // Where the Windows auto-installer puts it: a Minutes-owned directory, so
+    // the MSVC runtime shipped beside the binary (#657) does not leak into a
+    // shared bin directory. Listed before ~/.cargo/bin so a fresh install wins
+    // over an older cargo-installed copy.
+    ...(isWindows ? [join(homedir(), ".minutes", "bin", `minutes${ext}`)] : []),
     join(homedir(), ".cargo", "bin", `minutes${ext}`),
     ...(isWindows
       ? []
@@ -2261,7 +2269,13 @@ function getReleaseBinaryName(): string | null {
 function getInstallDir(): string {
   const localBin = join(homedir(), ".local", "bin");
   if (process.platform === "win32") {
-    return join(homedir(), ".cargo", "bin"); // common writable dir on Windows
+    // A Minutes-owned directory, not ~/.cargo/bin. The Windows install ships
+    // the MSVC runtime beside the executable (#657), and Windows resolves an
+    // application's own directory ahead of the system path. Dropping those
+    // DLLs into the shared cargo bin directory would make every other
+    // cargo-installed tool launched from there load Minutes' pinned copies,
+    // and uninstalling would leave them behind.
+    return join(homedir(), ".minutes", "bin");
   }
   return localBin;
 }
@@ -2287,25 +2301,62 @@ async function tryAutoInstallAttempt(capabilityRepair: boolean = false): Promise
       const targetName = isWindows ? "minutes.exe" : "minutes";
       const targetPath = join(installDir, targetName);
 
-      console.error(`[Minutes] Downloading ${binaryName} from latest release...`);
-
       // Ensure install directory exists
       await mkdir(installDir, { recursive: true });
 
-      // Download with curl (available on macOS, Linux, and modern Windows),
-      // verify SHA256SUMS.txt, then move the verified binary into place.
-      await downloadReleaseBinaryWithChecksum({
-        binaryName,
-        targetPath,
-        execFileAsync,
-      });
-
-      // Make executable (not needed on Windows)
-      if (!isWindows) {
+      if (isWindows) {
+        // The Windows binary imports the MSVC runtime (VCRUNTIME140.dll,
+        // MSVCP140.dll and friends), which is not part of Windows. On a PC
+        // that has never had the Visual C++ Redistributable, the bare .exe
+        // exits 0xC0000135 (STATUS_DLL_NOT_FOUND) printing nothing at all, so
+        // the user sees the command silently do nothing (#657).
+        //
+        // The zip carries those four files beside minutes.exe. Windows
+        // resolves the application's own directory ahead of the system path,
+        // so extracting them next to the executable is sufficient and needs no
+        // installer and no admin rights. Verified on a clean Windows 11 VM.
+        const archiveName = "minutes-windows-x64.zip";
+        const archivePath = join(installDir, archiveName);
+        console.error(`[Minutes] Downloading ${archiveName} from latest release...`);
+        await downloadReleaseBinaryWithChecksum({
+          binaryName: archiveName,
+          targetPath: archivePath,
+          execFileAsync,
+        });
+        await extractZipWithPowerShell({
+          archivePath,
+          destDir: installDir,
+          execFileAsync,
+        });
+        await rm(archivePath, { force: true });
+        // Confirm the extraction actually produced the binary. The POSIX path
+        // gets this for free from rename(); without it a changed archive
+        // layout would report success while MINUTES_BIN points at nothing.
+        await stat(targetPath);
+      } else {
+        console.error(`[Minutes] Downloading ${binaryName} from latest release...`);
+        // Download with curl, verify SHA256SUMS.txt, then move the verified
+        // binary into place.
+        await downloadReleaseBinaryWithChecksum({
+          binaryName,
+          targetPath,
+          execFileAsync,
+        });
         await execFileAsync("chmod", ["+x", targetPath], { timeout: 5000 });
       }
 
       console.error(`[Minutes] ✓ Installed to ${targetPath}`);
+      // Everything this server runs uses the absolute path, and child
+      // processes get the directory prepended via mcpCliChildEnv. A terminal
+      // is a different matter: nothing adds this directory to the user's own
+      // PATH, so say so rather than leaving `minutes: command not found` as
+      // the first thing they see.
+      if (process.platform === "win32") {
+        console.error(
+          `[Minutes] To run 'minutes' in your own terminal, add ${installDir} to PATH:\n` +
+            `[Minutes]   setx PATH "%PATH%;${installDir}"   (new terminals only)`,
+        );
+      }
       MINUTES_BIN = targetPath;
       return true;
     } catch (e: any) {
@@ -2640,7 +2691,13 @@ const CLI_INSTALL_MSG =
   `  sudo ln -s /opt/homebrew/bin/minutes /usr/local/bin/minutes`;
 
 // Common binary locations that may not be in Claude Desktop's restricted PATH.
+//
+// ~/.minutes/bin is where the Windows auto-installer puts the CLI (#657). The
+// MCP server resolves it absolutely via MINUTES_BIN, but plugin skills shell
+// out to a bare `minutes`, so without this entry those fail right after an
+// otherwise successful install.
 const EXTRA_PATH_DIRS = [
+  join(homedir(), ".minutes", "bin"),
   join(homedir(), ".local", "bin"),
   join(homedir(), ".cargo", "bin"),
   "/opt/homebrew/bin",

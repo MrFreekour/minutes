@@ -9,9 +9,12 @@ const elements = {
   emptyLocations: document.querySelector("#empty-locations"),
   locationList: document.querySelector("#location-list"),
   addLocations: document.querySelector("#add-locations"),
+  skipFolders: document.querySelector("#skip-folders"),
+  clearSkipped: document.querySelector("#clear-skipped"),
   runCensus: document.querySelector("#run-census"),
   cancelCensus: document.querySelector("#cancel-census"),
   cancelIndexing: document.querySelector("#cancel-indexing"),
+  indexingProgress: document.querySelector("#indexing-progress"),
   startOver: document.querySelector("#start-over"),
   exportReport: document.querySelector("#export-report"),
   buildTextVault: document.querySelector("#build-text-vault"),
@@ -30,6 +33,7 @@ const elements = {
   categoryList: document.querySelector("#category-list"),
   signalsList: document.querySelector("#signals-list"),
   vaultSummary: document.querySelector("#vault-summary"),
+  buildForecast: document.querySelector("#build-forecast"),
   searchForm: document.querySelector("#search-form"),
   searchQuery: document.querySelector("#search-query"),
   searchSubmit: document.querySelector("#search-submit"),
@@ -38,6 +42,7 @@ const elements = {
   candidateCount: document.querySelector("#candidate-count"),
   searchStatus: document.querySelector("#search-status"),
   searchResults: document.querySelector("#search-results"),
+  buildIdentity: document.querySelector("#build-identity"),
 };
 
 let locations = [];
@@ -48,7 +53,8 @@ const categoryLabels = {
   pdf: "PDF",
   word_processing: "Word processing",
   email: "Email containers",
-  plain_text: "Plain text & HTML",
+  plain_text: "Plain text & Markdown",
+  markup: "HTML & XML (not searchable)",
   image_or_scan: "Images & scans",
   spreadsheet: "Spreadsheets",
   presentation: "Presentations",
@@ -87,6 +93,9 @@ function showView(name) {
 
 function setLocationControlsDisabled(disabled) {
   elements.addLocations.disabled = disabled;
+  // Nothing to skip until there is a location to skip inside of.
+  elements.skipFolders.disabled = disabled || locations.length === 0;
+  elements.clearSkipped.disabled = disabled;
   elements.runCensus.disabled = disabled || locations.length === 0;
   for (const button of elements.locationList.querySelectorAll("button")) {
     button.disabled = disabled;
@@ -107,7 +116,13 @@ function renderLocations(nextLocations) {
     const icon = document.createElement("span");
     icon.className = "location-icon";
     icon.setAttribute("aria-hidden", "true");
-    icon.textContent = "⌂";
+    // An inline folder glyph rather than a text character: the shipped fonts
+    // carry no U+2302 HOUSE, so the webview substituted a fallback font and
+    // drew a misaligned sliver in the icon box.
+    icon.innerHTML =
+      '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M1.75 4a1 1 0 0 1 1-1h3.3l1.5 1.8h5.7a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1z" ' +
+      'stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
     const text = document.createElement("div");
     const title = document.createElement("strong");
     title.textContent = location.label;
@@ -116,17 +131,40 @@ function renderLocations(nextLocations) {
     text.append(title, detail);
     copy.append(icon, text);
 
+    // Finder answers "which folder is this?" better than any label the
+    // interface could carry, and without a path crossing into it.
+    const reveal = document.createElement("button");
+    reveal.className = "button button-quiet reveal-location";
+    reveal.type = "button";
+    reveal.textContent = "Show in Finder";
+    reveal.setAttribute("aria-label", `Show ${location.label} in Finder`);
+    reveal.addEventListener("click", async () => {
+      reveal.disabled = true;
+      try {
+        await invoke("reveal_archive_location", { locationId: location.id });
+      } catch (error) {
+        showError(String(error));
+      } finally {
+        reveal.disabled = false;
+      }
+    });
+
     const remove = document.createElement("button");
     remove.className = "remove-location";
     remove.type = "button";
     remove.setAttribute("aria-label", `Remove ${location.label}`);
     remove.textContent = "×";
     remove.addEventListener("click", () => removeLocation(location.id));
-    item.append(copy, remove);
+
+    const actions = document.createElement("div");
+    actions.className = "location-actions";
+    actions.append(reveal, remove);
+    item.append(copy, actions);
     elements.locationList.append(item);
   }
 
   elements.runCensus.disabled = locations.length === 0;
+  elements.skipFolders.disabled = locations.length === 0;
   elements.setupStatus.textContent =
     locations.length === 0
       ? "Choose at least one location to continue."
@@ -139,7 +177,112 @@ async function chooseLocations() {
   hideError();
   setLocationControlsDisabled(true);
   try {
-    renderLocations(await invoke("choose_archive_locations"));
+    const choice = await invoke("choose_archive_locations");
+    renderLocations(choice.locations);
+    // Folders already covered by an approved location are folded in rather
+    // than refused. Say so plainly: they were chosen on purpose, and silence
+    // here reads as the app having ignored them.
+    if (choice.folded > 0) {
+      elements.setupStatus.textContent = `${elements.setupStatus.textContent} ${
+        choice.folded === 1 ? "One folder was" : `${choice.folded} folders were`
+      } already inside a folder you approved, so ${
+        choice.folded === 1 ? "it is" : "they are"
+      } covered by that one.`;
+    }
+    // A chosen folder beats an older skip, and the cancelled skip is said out
+    // loud: the skip was deliberate once too, and its silent disappearance
+    // would be the same lie in the other direction.
+    if (choice.unskipped > 0) {
+      elements.setupStatus.textContent = `${elements.setupStatus.textContent} ${
+        choice.unskipped === 1
+          ? "One folder you had skipped is"
+          : `${choice.unskipped} folders you had skipped are`
+      } no longer skipped, because you just chose ${
+        choice.unskipped === 1 ? "it" : "them"
+      }.`;
+    }
+    // Folding a location forgets the folders skipped inside it. That reads
+    // more than was asked for, never less, so nothing goes missing from the
+    // index -- but those folders were excluded deliberately, and finding out
+    // by watching an extra seventeen minutes of text recognition go by is not
+    // finding out.
+    if (choice.forgottenSkips > 0) {
+      elements.setupStatus.textContent = `${elements.setupStatus.textContent} ${
+        choice.forgottenSkips === 1
+          ? "One folder you had skipped is"
+          : `${choice.forgottenSkips} folders you had skipped are`
+      } no longer skipped, because the location holding ${
+        choice.forgottenSkips === 1 ? "it" : "them"
+      } was folded in. Choose them again under "Skip folders" if you still want ${
+        choice.forgottenSkips === 1 ? "it" : "them"
+      } left out.`;
+    }
+    lastReport = null;
+    vaultReport = null;
+  } catch (error) {
+    showError(error);
+  } finally {
+    setLocationControlsDisabled(false);
+  }
+}
+
+/// Folders chosen here are never read during a build.
+///
+/// The panel is the same native one used for locations, so the interface still
+/// receives no path -- only counts. Every outcome is reported, including the
+/// ones that did nothing: an operator who believes a folder is being skipped
+/// and is wrong ends up with an index they cannot account for.
+async function chooseSkippedFolders() {
+  hideError();
+  setLocationControlsDisabled(true);
+  try {
+    const choice = await invoke("choose_archive_exclusions");
+    // Skipping is reversible, and the way back has to be visible: a folder
+    // skipped by mistake is a folder silently missing from every search.
+    elements.clearSkipped.hidden = choice.total === 0;
+    const notes = [];
+    if (choice.skipped > 0) {
+      notes.push(
+        `${choice.total.toLocaleString()} folder${
+          choice.total === 1 ? "" : "s"
+        } will be skipped when the index is built.`,
+      );
+    }
+    if (choice.outside > 0) {
+      notes.push(
+        `${choice.outside.toLocaleString()} ${
+          choice.outside === 1 ? "folder is" : "folders are"
+        } not inside an approved location, so ${
+          choice.outside === 1 ? "it was" : "they were"
+        } not added.`,
+      );
+    }
+    if (choice.refusedWholeLocation > 0) {
+      notes.push(
+        "A whole approved location cannot be skipped — remove the location instead.",
+      );
+    }
+    if (notes.length > 0) {
+      elements.setupStatus.textContent = notes.join(" ");
+    }
+    lastReport = null;
+    vaultReport = null;
+  } catch (error) {
+    showError(error);
+  } finally {
+    setLocationControlsDisabled(false);
+  }
+}
+
+async function clearSkippedFolders() {
+  hideError();
+  setLocationControlsDisabled(true);
+  try {
+    const cleared = await invoke("clear_archive_exclusions");
+    elements.clearSkipped.hidden = true;
+    elements.setupStatus.textContent = `${cleared.toLocaleString()} skipped folder${
+      cleared === 1 ? "" : "s"
+    } restored. Every approved location will be read whole.`;
     lastReport = null;
     vaultReport = null;
   } catch (error) {
@@ -181,6 +324,45 @@ function createSignal(label, value) {
   return row;
 }
 
+// Say how long this will take BEFORE anyone commits to waiting.
+//
+// The census already knows the counts, so there is no reason to discover the
+// cost an hour in. The estimate is deliberately coarse and labelled as one:
+// scans dominate, each needing its own recognizer process, and a wrong precise
+// number is worse than an honest rough one.
+function renderBuildForecast(report) {
+  const forecast = elements.buildForecast;
+  if (!forecast) return;
+  const categories = report.categories ?? [];
+  const countFor = (name) =>
+    categories.find((category) => category.category === name)?.artifacts ?? 0;
+  const scans = countFor("image_or_scan");
+  const pdfs = countFor("pdf");
+  const wordProcessing = countFor("word_processing");
+  // Calibrated against a full-scale run, not a per-page guess: 16,621
+  // documents in that archive's own format mix -- 2,774 scans, 447 PDFs, 349
+  // Word -- took 1,028 seconds end to end. Extraction runs in parallel, which
+  // the old per-page arithmetic ignored, so it predicted 25 minutes for a
+  // build that takes 17. These rates keep a little headroom over the measured
+  // figure; a build that finishes early is a better surprise than one that
+  // runs past its own estimate.
+  const seconds = scans * 0.3 + (pdfs + wordProcessing) * 0.4;
+  if (seconds < 60) {
+    forecast.hidden = true;
+    return;
+  }
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  const parts = [];
+  if (scans > 0) parts.push(`${scans.toLocaleString()} scans`);
+  if (pdfs > 0) parts.push(`${pdfs.toLocaleString()} PDFs`);
+  if (wordProcessing > 0) parts.push(`${wordProcessing.toLocaleString()} Word documents`);
+  forecast.textContent =
+    `Roughly ${minutes} minute${minutes === 1 ? "" : "s"} to build, mostly ` +
+    `${parts.join(", ")}. Each is opened in its own sandboxed process. ` +
+    `The index is held in memory and rebuilt each session.`;
+  forecast.hidden = false;
+}
+
 function renderReport(report) {
   lastReport = report;
   const status = report.status.replaceAll("_", " ");
@@ -193,6 +375,7 @@ function renderReport(report) {
         ? "The census was cancelled. Partial counts were discarded from export."
         : "The census stopped at a safety boundary. Review the aggregate signals.";
 
+  renderBuildForecast(report);
   elements.metricArtifacts.textContent = report.summary.artifacts.toLocaleString();
   elements.metricLocations.textContent = report.summary.approved_locations.toLocaleString();
   elements.metricBytes.textContent = formatBytes(report.summary.regular_file_bytes);
@@ -297,36 +480,119 @@ async function exportReport() {
 
 function renderVaultSummary(report) {
   vaultReport = report;
-  // Defaulted, not asserted. A missing count must never blank the search view:
-  // throwing here hides every result behind a number the reader does not need.
+  // Every fact below was already disclosed; it was disclosed as one fifteen-line
+  // paragraph, which is the same as not disclosing it. An attorney opening this
+  // screen needs to know in one glance what is searchable, and then be able to
+  // find the caveat that applies to them. Nothing is dropped, and the warnings
+  // that change whether a negative result can be trusted are marked as such.
+  const lead = `${report.indexed_documents.toLocaleString()} supported document${
+    report.indexed_documents === 1 ? "" : "s"
+  } indexed (${formatBytes(report.indexed_bytes)}). All indexes exist only in memory.`;
+
+  const notes = [];
+  const formatBreakdown = [
+    `${report.searchable_pdf_documents.toLocaleString()} PDF`,
+    // One number for every word-processor format. The distinction that matters
+    // to counsel is how much became searchable, not which container it arrived in.
+    `${report.docx_documents.toLocaleString()} Word or OpenDocument`,
+  ].join(", ");
+  notes.push({ text: `Searchable formats: ${formatBreakdown}.` });
+
+  // Its own line. A scan that was read is searchable, but only as a
+  // transcription, and folding it into the indexed total would say the archive
+  // can quote more of itself than it can.
+  if ((report.transcribed_documents ?? 0) > 0) {
+    notes.push({
+      text: `${report.transcribed_documents.toLocaleString()} scanned page${
+        report.transcribed_documents === 1 ? "" : "s"
+      } read by text recognition — searchable as transcriptions, never quoted as source text.`,
+    });
+  }
+  if (report.unsupported_files_skipped > 0 || report.ocr_required_files > 0) {
+    notes.push({
+      text: `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
+        report.unsupported_files_skipped === 1 ? "" : "s"
+      } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
+        report.ocr_required_files === 1 ? "" : "s"
+      } are images of pages and carry no text to read.`,
+    });
+  }
+  // Folders the owner told the build not to enter. Deliberate, so not a
+  // warning -- but it is a coverage gap, and the reader weeks later (or a
+  // different reader entirely) was not in the room when the skip was chosen.
+  if ((report.excluded_directories ?? 0) > 0) {
+    notes.push({
+      text: `${report.excluded_directories.toLocaleString()} folder${
+        report.excluded_directories === 1 ? " was" : "s were"
+      } skipped at your request; nothing inside ${
+        report.excluded_directories === 1 ? "it" : "them"
+      } is in this index.`,
+    });
+  }
+  // Defaulted, not asserted: a missing count must never blank the search view.
   const inferredBoundaryDocuments = report.inferred_boundary_documents ?? 0;
-  elements.vaultSummary.textContent =
-    `${report.indexed_documents.toLocaleString()} supported document${
-      report.indexed_documents === 1 ? "" : "s"
-    } indexed (${formatBytes(report.indexed_bytes)}). ` +
-    `${report.searchable_pdf_documents.toLocaleString()} PDF, ` +
-    // One number for every word-processor format. The distinction that
-    // matters to counsel is how much became searchable, not which container
-    // it arrived in.
-    `${report.docx_documents.toLocaleString()} Word or OpenDocument. ` +
-    `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
-      report.unsupported_files_skipped === 1 ? "" : "s"
-    } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
-      report.ocr_required_files === 1 ? "" : "s"
-    } require OCR. ` +
-    // Defaulted, not asserted: a missing count must never blank the search
-    // view. Throwing here would hide every result behind a field the reader
-    // does not care about.
-    `${inferredBoundaryDocuments.toLocaleString()} indexed document${
-      inferredBoundaryDocuments === 1 ? "" : "s"
-    } cannot answer same-clause questions because the file does not record where a clause ends. ` +
-    (report.semantic_retrieval_enabled
+  if (inferredBoundaryDocuments > 0) {
+    notes.push({
+      text: `${inferredBoundaryDocuments.toLocaleString()} indexed document${
+        inferredBoundaryDocuments === 1 ? "" : "s"
+      } cannot answer same-clause questions because the file does not record where a clause ends.`,
+    });
+  }
+  notes.push({
+    text: report.semantic_retrieval_enabled
       ? `${report.semantic_provisions_indexed.toLocaleString()} provision suggestion vector${
           report.semantic_provisions_indexed === 1 ? "" : "s"
-        } built with the pinned macOS model inside its network-denied worker. `
-      : "Semantic suggestions are unavailable on this Mac. ") +
-    describeDroppedSources(report) +
-    "All indexes exist only in memory.";
+        } built with the pinned macOS model inside its network-denied worker.`
+      : "Semantic suggestions are unavailable on this Mac.",
+  });
+  // Partial suggestion coverage is not the same as none. Exact search is
+  // complete either way; a reader who assumes the suggestions swept the whole
+  // archive would be wrong.
+  if (report.semantic_coverage_partial) {
+    notes.push({
+      warning: true,
+      text: "The on-device suggestion model stopped partway through this build, so meaning-based suggestions cover only part of the archive. Exact search covers all of it.",
+    });
+  }
+  const dropped = describeDroppedSources(report).trim();
+  if (dropped) {
+    notes.push({ text: dropped });
+  }
+  // A partial index must say so on its face. It is a real index and worth
+  // having, but a reader who thinks it covers the whole folder will draw a
+  // false conclusion from a negative result.
+  if (report.budget_reached) {
+    notes.push({
+      warning: true,
+      text:
+        `This index is PARTIAL: a limit was reached. ${(
+          report.documents_left_unread ?? 0
+        ).toLocaleString()} document${
+          report.documents_left_unread === 1 ? " was" : "s were"
+        } not read` +
+        ((report.directories_left_unread ?? 0) > 0
+          ? `, and ${report.directories_left_unread.toLocaleString()} folder${
+              report.directories_left_unread === 1 ? " was" : "s were"
+            } too deep to enter`
+          : "") +
+        ". Narrow the approved folders and rebuild before relying on a negative result.",
+    });
+  }
+
+  elements.vaultSummary.replaceChildren();
+  const leadLine = document.createElement("p");
+  leadLine.className = "vault-lead";
+  leadLine.textContent = lead;
+  const list = document.createElement("ul");
+  list.className = "vault-notes";
+  // Warnings first: they decide whether a negative result means anything.
+  for (const note of [...notes].sort((left, right) => (right.warning ? 1 : 0) - (left.warning ? 1 : 0))) {
+    const item = document.createElement("li");
+    if (note.warning) item.className = "is-warning";
+    item.textContent = note.text;
+    list.append(item);
+  }
+  elements.vaultSummary.append(leadLine, list);
 }
 
 // Documents that could not be indexed were counted and never shown. Counsel
@@ -347,7 +613,20 @@ function describeDroppedSources(report) {
     // than the folder holds -- a silent, total coverage loss.
     [report.symlinks_skipped, "were aliases or shortcuts"],
     [report.hard_links_skipped, "have a second name elsewhere on the disk"],
-    [report.metadata_errors, "could not be read"],
+    // Split five ways after a real archive reported 10,429 of ~16,600
+    // documents "could not be read" and the number could not be acted on.
+    // Permission denied is a thing a reader can fix; a file changing mid-read
+    // is not the same problem at all.
+    [report.permission_denied, "were blocked by macOS permissions"],
+    [report.unopenable, "could not be opened for another reason"],
+    [
+      report.open_file_limit_reached,
+      "were not reached before the app ran out of open files (restart and index a smaller folder)",
+    ],
+    [report.scans_unreadable, "were scans the text recognizer could not read"],
+    [report.entries_unstattable, "could not be examined at all"],
+    [report.identity_unavailable, "had no stable identity to pin"],
+    [report.changed_while_reading, "changed while being read"],
     [report.directory_errors, "were in unreadable folders"],
   ].filter(([count]) => count > 0);
   if (dropped.length === 0) {
@@ -367,9 +646,57 @@ function describeDroppedSources(report) {
   );
 }
 
+let indexingPoll = null;
+
+// Polled, not pushed. Two integers on a timer need no event channel, and a
+// channel opened for progress is a channel that could later carry something
+// else.
+function startIndexingProgress() {
+  const started = Date.now();
+  stopIndexingProgress();
+  const tick = async () => {
+    try {
+      const progress = await invoke("archive_index_progress");
+      const seconds = Math.max(1, Math.round((Date.now() - started) / 1000));
+      const rate = progress.examined / seconds;
+      // No percentage. The total is not known until the walk finishes, and a
+      // made-up denominator would be a number the reader could act on and
+      // should not.
+      const parts = [
+        `${progress.indexed.toLocaleString()} indexed`,
+        `${progress.examined.toLocaleString()} examined`,
+        `${formatElapsed(Date.now() - started)} elapsed`,
+      ];
+      if (rate >= 0.2) {
+        parts.push(`~${Math.round(rate)}/s`);
+      }
+      elements.indexingProgress.textContent = parts.join(" · ");
+    } catch {
+      // A failed poll is not worth surfacing; the build reports its own errors.
+    }
+  };
+  tick();
+  indexingPoll = setInterval(tick, 700);
+}
+
+function stopIndexingProgress() {
+  if (indexingPoll !== null) {
+    clearInterval(indexingPoll);
+    indexingPoll = null;
+  }
+}
+
+function formatElapsed(milliseconds) {
+  const total = Math.round(milliseconds / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
 async function buildTextVault() {
   hideError();
   showView("indexing");
+  startIndexingProgress();
   try {
     const report = await invoke("build_archive_text_vault");
     renderVaultSummary(report);
@@ -387,6 +714,10 @@ async function buildTextVault() {
     if (lastReport) renderReport(lastReport);
     else showView("setup");
     showError(error);
+  } finally {
+    // `finally`, so a build that errors does not leave a timer polling a
+    // command whose state has moved on.
+    stopIndexingProgress();
   }
 }
 
@@ -486,9 +817,34 @@ function evidenceCard(card, compact = false, semantic = false) {
   const why = document.createElement("p");
   why.className = "evidence-why";
   why.textContent = semantic ? card.why_suggested : card.why_matched;
-  article.append(header, excerpt, meta, why);
+  article.append(header, excerpt, meta, why, revealButton(card));
   if (semantic) article.classList.add("semantic-card");
   return article;
+}
+
+// Ask for the document by id and let the Rust side find it.
+//
+// The interface has no path to hand over and never gains one: it sends back
+// the opaque id it was given, and the resolution, the identity check and
+// Finder all happen behind the boundary. If the file has moved or changed
+// since it was indexed the request is refused rather than pointing at
+// whatever is there now.
+function revealButton(card) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "reveal-source";
+  button.textContent = "Show in Finder";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await invoke("reveal_archive_document", { documentId: card.document_id });
+    } catch (error) {
+      showError(error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
 }
 
 function documentCard(card) {
@@ -522,6 +878,45 @@ function documentCard(card) {
   return article;
 }
 
+// Deliberately not `evidenceCard` with a flag. A transcription has no exact
+// excerpt and no section anchor, and giving it the same builder is how it would
+// eventually acquire the same styling and be read as a quotation.
+function transcribedCard(card) {
+  const article = document.createElement("article");
+  // Its own class, not `evidence-card`. Sharing the base class is how a
+  // transcription would inherit quotation styling by default the next time
+  // someone edits it.
+  article.className = "transcription-card";
+
+  const title = document.createElement("h3");
+  title.textContent = card.document_title;
+  article.append(title);
+
+  const anchor = document.createElement("p");
+  anchor.className = "transcription-anchor";
+  anchor.textContent = `${card.page_anchor} · read by ${card.transcriber}`;
+  article.append(anchor);
+
+  const text = document.createElement("blockquote");
+  text.className = "transcribed-text";
+  text.textContent = card.transcribed_text;
+  article.append(text);
+
+  const confidence = document.createElement("p");
+  confidence.className = "transcription-confidence";
+  const percent = Math.round((card.lowest_line_confidence ?? 0) * 100);
+  confidence.textContent = `Lowest line confidence ${percent}%. Check this against the page before relying on it.`;
+  article.append(confidence);
+
+  const why = document.createElement("p");
+  why.className = "transcription-why";
+  why.textContent = card.why_transcribed;
+  article.append(why);
+  article.append(revealButton(card));
+
+  return article;
+}
+
 function renderSearchResponse(response) {
   renderQueryInterpretation(response);
   elements.searchResults.replaceChildren();
@@ -541,7 +936,21 @@ function renderSearchResponse(response) {
       elements.searchResults.append(evidenceCard(card, false, true));
     }
   }
-  const suggestionCount = response.semantic_suggestions.length;
+  // Transcriptions render through their own builder, never `evidenceCard`.
+  // A reading of a scan is not a quotation and must not look like one: no
+  // exact-excerpt styling, its own heading, and the confidence on every card.
+  const transcriptions = response.transcriptions ?? [];
+  if (transcriptions.length > 0) {
+    const heading = document.createElement("p");
+    heading.className = "transcription-heading";
+    heading.textContent =
+      "Read from scanned images · a machine's reading, not the document's own text";
+    elements.searchResults.append(heading);
+    for (const card of transcriptions) {
+      elements.searchResults.append(transcribedCard(card));
+    }
+  }
+  const suggestionCount = response.semantic_suggestions.length + transcriptions.length;
   if (verifiedCount === 0 && suggestionCount === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-results";
@@ -561,8 +970,10 @@ function renderSearchResponse(response) {
   const boundaryNote =
     (response.inferred_boundary_evidence_withdrawn ?? 0) > 0
       ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} searchable document${
-          response.inferred_boundary_evidence_withdrawn === 1 ? "" : "s"
-        } do not record where a clause ends, so they were excluded from same-clause questions.`
+          response.inferred_boundary_evidence_withdrawn === 1 ? " does" : "s do"
+        } not record where a clause ends, so ${
+          response.inferred_boundary_evidence_withdrawn === 1 ? "it was" : "they were"
+        } excluded from same-clause questions.`
       : "";
   elements.searchStatus.textContent =
     `${verifiedCount.toLocaleString()} current ${resultKind}${
@@ -612,6 +1023,12 @@ function backToCensus() {
 async function bootstrap() {
   try {
     const state = await invoke("archive_bootstrap");
+    // Which build this is, in the footer, because "what does yours say?" is
+    // where a support conversation starts. Two candidates once carried the
+    // same version number and only one of them could index anything.
+    if (state.buildIdentity) {
+      elements.buildIdentity.textContent = `Private evidence build · ${state.buildIdentity}`;
+    }
     renderLocations(state.locations);
     lastReport = state.report;
     vaultReport = state.textVaultReport;
@@ -631,6 +1048,8 @@ async function bootstrap() {
 }
 
 elements.addLocations.addEventListener("click", chooseLocations);
+elements.skipFolders.addEventListener("click", chooseSkippedFolders);
+elements.clearSkipped.addEventListener("click", clearSkippedFolders);
 elements.runCensus.addEventListener("click", runCensus);
 elements.cancelCensus.addEventListener("click", () => cancelOperation(elements.cancelCensus));
 elements.cancelIndexing.addEventListener("click", () => cancelOperation(elements.cancelIndexing));

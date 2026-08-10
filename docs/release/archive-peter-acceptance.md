@@ -58,7 +58,11 @@ cloud item, or protected location was unavailable.
 
 The searchable formats are searchable PDF, Word (`.docx` and legacy `.doc`),
 OpenDocument Text (`.odt`), Rich Text Format (`.rtf`), TXT, TEXT, and Markdown.
-Scanned PDFs are reported as requiring OCR.
+
+Scanned images (`.png`, `.jpg`, `.tiff`, `.heic` and similar) are read by
+macOS's own on-device text recognizer. Nothing is uploaded and no AI model
+outside your Mac is involved. Scanned PDFs -- a PDF that is really a picture of
+a page -- are still reported as requiring OCR rather than read.
 
 WordPerfect, Pages packages, PST/OLM/MSG mail containers, spreadsheets,
 presentations, macro-enabled documents (`.docm`), encrypted documents, and
@@ -124,6 +128,21 @@ Read the excerpt, which is always shown, before relying on such an answer.
 
 This is deliberate throughout: a wrong "same clause" answer to a lawyer is
 worse than no answer.
+
+**3. Text read from a scan is a reading, not a quotation.**
+
+A scan is a picture. To search it, the app has macOS read the page and tell it
+what the letters appear to say. That reading is usually good and sometimes
+wrong -- an old fax, a stamp across the text, a crooked photocopy.
+
+So those results are kept separate and look different. They are labelled as a
+machine's reading, they show how confident the recognizer was on the weakest
+line of the page, and they cite the page rather than a clause. The app will
+never present them as the document's own words, and will never say two things
+are "in the same clause" on the strength of a scan.
+
+Treat one as a pointer to the page, not as the language of the page. Go and
+look at the original before you rely on it.
 
 ## Stop and contact the pilot operator
 

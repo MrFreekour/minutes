@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import data from "./data.json";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 
 export const metadata: Metadata = {
   title: "Minutes MCP tools",
@@ -11,16 +12,6 @@ export const metadata: Metadata = {
   },
 };
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 function LinkPill({ href }: { href: string }) {
   return (
@@ -112,7 +103,7 @@ export default function MpcToolsPage() {
         <div className="space-y-8">
           {toolGroups.map(([group, tools]) => (
             <div key={group}>
-              <SectionLabel label={group} />
+              <SectionLabel label={group} level={3} />
               <div className="grid gap-4">
                 {tools.map((tool) => (
                   <div
@@ -140,7 +131,7 @@ export default function MpcToolsPage() {
         <div className="space-y-8">
           {resourceGroups.map(([group, resources]) => (
             <div key={group}>
-              <SectionLabel label={group} />
+              <SectionLabel label={group} level={3} />
               <div className="grid gap-4">
                 {resources.map((resource) => (
                   <div
@@ -168,7 +159,7 @@ export default function MpcToolsPage() {
         <div className="space-y-8">
           {promptGroups.map(([group, prompts]) => (
             <div key={group}>
-              <SectionLabel label={group} />
+              <SectionLabel label={group} level={3} />
               <div className="grid gap-4">
                 {prompts.map((prompt) => (
                   <div

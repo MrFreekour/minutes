@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "HIPAA-compliant AI note takers: the actual state of play",
@@ -10,44 +13,24 @@ export const metadata: Metadata = {
   },
 };
 
-const faqJsonLd = {
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  mainEntity: [
-    {
-      "@type": "Question",
-      name: "Which AI note takers are HIPAA compliant?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "As of July 2026, per each vendor's own documentation: Otter (Enterprise plan + signed BAA only), Fireflies (Enterprise + Private Storage + signed BAA, all three simultaneously), Fathom (publishes a blanket BAA; pricing lists HIPAA BAA under Enterprise), and Krisp (BAA on business/enterprise tiers). Granola states it is not HIPAA compliant and cannot sign BAAs. On-device tools like Minutes sit outside the BAA framework entirely because no vendor ever receives the audio.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Is any AI note taker 'HIPAA certified'?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "No. HHS certifies no product. 'HIPAA compliant' is a vendor self-attestation that its safeguards meet HIPAA requirements when used under a signed BAA. Any tool marketing itself as 'HIPAA certified' is being imprecise.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Does using a free or Pro plan of these tools violate HIPAA?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Recording PHI on a plan tier with no BAA in effect is an impermissible disclosure to a vendor, regardless of the vendor's general security quality. Every cloud vendor on this page gates its BAA to its top tier — free and mid-tier plans are not covered.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Why don't on-device note takers need a BAA?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "A BAA governs a vendor's handling of PHI it receives on your behalf. Software that captures, transcribes, and stores entirely on your own machine never gives the vendor the data — no business associate relationship is created, so there is nothing for a BAA to govern. Your own obligations (device encryption, access controls, patient consent) remain.",
-      },
-    },
-  ],
-} as const;
+const faqs = [
+  {
+    question: "Which AI note takers are HIPAA compliant?",
+    answer: "As of July 2026, per each vendor's own documentation: Otter (Enterprise plan + signed BAA only), Fireflies (Enterprise + Private Storage + signed BAA, all three simultaneously), Fathom (publishes a blanket BAA; pricing lists HIPAA BAA under Enterprise), and Krisp (BAA on business/enterprise tiers). Granola states it is not HIPAA compliant and cannot sign BAAs. On-device tools like Minutes sit outside the BAA framework entirely because no vendor ever receives the audio.",
+  },
+  {
+    question: "Is any AI note taker 'HIPAA certified'?",
+    answer: "No. HHS certifies no product. 'HIPAA compliant' is a vendor self-attestation that its safeguards meet HIPAA requirements when used under a signed BAA. Any tool marketing itself as 'HIPAA certified' is being imprecise.",
+  },
+  {
+    question: "Does using a free or Pro plan of these tools violate HIPAA?",
+    answer: "Recording PHI on a plan tier with no BAA in effect is an impermissible disclosure to a vendor, regardless of the vendor's general security quality. Every cloud vendor on this page gates its BAA to its top tier — free and mid-tier plans are not covered.",
+  },
+  {
+    question: "Why don't on-device note takers need a BAA?",
+    answer: "A BAA governs a vendor's handling of PHI it receives on your behalf. Software that captures, transcribes, and stores entirely on your own machine never gives the vendor the data — no business associate relationship is created, so there is nothing for a BAA to govern. Your own obligations (device encryption, access controls, patient consent) remain.",
+  },
+] as const;
 
 const vendors = [
   {
@@ -117,23 +100,18 @@ const sources = [
   { label: "Minutes security & privacy architecture", href: "/security" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-07-11";
 
 export default function HipaaCompliantAiNoteTakerPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/hipaa-compliant-ai-note-taker", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -167,7 +145,7 @@ export default function HipaaCompliantAiNoteTakerPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-07-11
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Sourced answer
@@ -204,7 +182,7 @@ export default function HipaaCompliantAiNoteTakerPage() {
               className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-6 shadow-[var(--shadow-panel)]"
             >
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="font-serif text-[22px] text-[var(--text)]">{v.name}</h2>
+                <h3 className="font-serif text-[22px] text-[var(--text)]">{v.name}</h3>
                 <span
                   className={`rounded-full px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em] ${
                     v.verdict === "No"
@@ -252,6 +230,18 @@ export default function HipaaCompliantAiNoteTakerPage() {
             control, patient consent). But the vendor-risk column of your HIPAA analysis goes to
             zero, permanently, on every &ldquo;plan.&rdquo;
           </p>
+          <p>
+            For why that follows from the rule rather than from a marketing claim, including the
+            definition that decides it and what on-device processing pointedly does{" "}
+            <em>not</em> excuse you from, see{" "}
+            <a
+              href="/resources/hipaa-compliant-transcription"
+              className="text-[var(--accent)] hover:underline"
+            >
+              what HIPAA actually requires of transcription
+            </a>
+            .
+          </p>
         </div>
       </section>
 
@@ -274,6 +264,8 @@ export default function HipaaCompliantAiNoteTakerPage() {
           </a>
         </div>
       </section>
+
+      <FaqSection items={faqs} />
 
       <section className="mt-14">
         <SectionLabel label="Sources" />

@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "How to remove AI notetaker bots from your meetings",
@@ -10,44 +13,24 @@ export const metadata: Metadata = {
   },
 };
 
-const faqJsonLd = {
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  mainEntity: [
-    {
-      "@type": "Question",
-      name: "How do I stop Otter from automatically joining my meetings?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "In Otter's settings, disable auto-join for calendar events (Otter Assistant / OtterPilot settings), or disconnect your calendar entirely so Otter can't see meeting links. To remove it from a live call, use the meeting platform's participant list to remove the bot like any attendee. Otter's help center documents both paths.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "How do I remove Fireflies (Fred) from a meeting?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Remove the Fireflies notetaker from the participant list as host, and in Fireflies settings change the autojoin rule (or disconnect the calendar) so it stops joining future calls. Fireflies' guide documents removal and autojoin settings.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Can I block all AI notetaker bots from my meetings?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Largely, yes: enable the waiting room, require sign-in, and admit only human participants — bots arrive as visible guest participants and can be denied or removed. But you cannot disable another attendee's bot from your side except by removing it per meeting or setting an organizational policy.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Is there a way to get AI meeting notes without any bot?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Yes — device-side capture. Tools like Minutes (open source, on-device) record audio directly on the participant's machine, so no bot ever appears in the meeting, and with Minutes the audio is also transcribed locally rather than uploaded. You should still tell participants you're recording; the difference is architectural, not a way around consent.",
-      },
-    },
-  ],
-} as const;
+const faqs = [
+  {
+    question: "How do I stop Otter from automatically joining my meetings?",
+    answer: "In Otter's settings, disable auto-join for calendar events (Otter Assistant / OtterPilot settings), or disconnect your calendar entirely so Otter can't see meeting links. To remove it from a live call, use the meeting platform's participant list to remove the bot like any attendee. Otter's help center documents both paths.",
+  },
+  {
+    question: "How do I remove Fireflies (Fred) from a meeting?",
+    answer: "Remove the Fireflies notetaker from the participant list as host, and in Fireflies settings change the autojoin rule (or disconnect the calendar) so it stops joining future calls. Fireflies' guide documents removal and autojoin settings.",
+  },
+  {
+    question: "Can I block all AI notetaker bots from my meetings?",
+    answer: "Largely, yes: enable the waiting room, require sign-in, and admit only human participants — bots arrive as visible guest participants and can be denied or removed. But you cannot disable another attendee's bot from your side except by removing it per meeting or setting an organizational policy.",
+  },
+  {
+    question: "Is there a way to get AI meeting notes without any bot?",
+    answer: "Yes — device-side capture. Tools like Minutes (open source, on-device) record audio directly on the participant's machine, so no bot ever appears in the meeting, and with Minutes the audio is also transcribed locally rather than uploaded. You should still tell participants you're recording; the difference is architectural, not a way around consent.",
+  },
+] as const;
 
 const sources = [
   {
@@ -65,23 +48,18 @@ const sources = [
   { label: "Minutes security & privacy architecture", href: "/security" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-07-11";
 
 export default function RemoveNotetakerBotsPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/remove-ai-notetaker-bots-from-meetings", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -119,7 +97,7 @@ export default function RemoveNotetakerBotsPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-07-11
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             How-to guide
@@ -149,13 +127,49 @@ export default function RemoveNotetakerBotsPage() {
             events, or disconnect Google/Microsoft calendar entirely so it never sees links. To
             eject it from one live meeting: open the participant list in Zoom/Meet/Teams and
             remove it like any attendee. Both procedures are in Otter&rsquo;s help center,
-            linked below.
+            linked below. Faster than either, and available to non-hosts: type{" "}
+            <code className="rounded-[4px] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-mono text-[13px] text-[var(--text)]">
+              stop otter
+            </code>{" "}
+            in the meeting chat. Full detail in{" "}
+            <a
+              href="/resources/remove-otter-ai-from-zoom"
+              className="text-[var(--accent)] hover:underline"
+            >
+              how to remove Otter AI from Zoom
+            </a>
+            .
           </p>
           <p>
             <span className="font-medium text-[var(--text)]">Fireflies (Fred).</span> Same
             pattern: Fireflies settings → autojoin rules (change to invite-only or off, or
             disconnect the calendar), and remove the notetaker from the participant list
-            mid-call. Fireflies&rsquo; own guide is linked below.
+            mid-call. Fireflies&rsquo; own guide is linked below. One detail worth knowing
+            before the call rather than during it: Fireflies says that removing the notetaker
+            within three minutes means no transcript or notes are created. Full detail in{" "}
+            <a
+              href="/resources/stop-fireflies-from-joining-meetings"
+              className="text-[var(--accent)] hover:underline"
+            >
+              how to stop Fireflies joining your meetings
+            </a>
+            .
+          </p>
+          <p>
+            <span className="font-medium text-[var(--text)]">
+              Zoom AI Companion and Teams Copilot are not this.
+            </span>{" "}
+            Inside their own platform they are features rather than participants, so there is
+            nothing in the list to eject and the controls are account and policy settings
+            instead. (Zoom AI Companion brought into a Google Meet or Teams meeting is the
+            exception: there it does join as a participant.) See{" "}
+            <a
+              href="/resources/turn-off-built-in-ai-notetakers"
+              className="text-[var(--accent)] hover:underline"
+            >
+              turning off built-in AI notetakers
+            </a>
+            .
           </p>
           <p>
             <span className="font-medium text-[var(--text)]">Anything else.</span> The pattern
@@ -241,6 +255,8 @@ export default function RemoveNotetakerBotsPage() {
           </a>
         </div>
       </section>
+
+      <FaqSection items={faqs} />
 
       <section className="mt-14">
         <SectionLabel label="Sources" />

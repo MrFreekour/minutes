@@ -127,6 +127,16 @@ summary:focus-visible {
   display: none;
 }
 
+/* FAQ disclosure rows. Safari draws its own triangle via a -webkit pseudo that
+   Tailwind's `marker:` variant cannot reach, same as the mobile menu above. */
+.faq-disclosure summary {
+  list-style: none;
+}
+
+.faq-disclosure summary::-webkit-details-marker {
+  display: none;
+}
+
 .marketing-mobile-links {
   position: absolute;
   top: calc(100% + 12px);

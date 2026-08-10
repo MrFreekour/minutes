@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "AI notetakers and attorney–client privilege",
@@ -10,44 +13,24 @@ export const metadata: Metadata = {
   },
 };
 
-const faqJsonLd = {
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  mainEntity: [
-    {
-      "@type": "Question",
-      name: "Does using an AI notetaker waive attorney–client privilege?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "There is no blanket answer — waiver is fact-specific and courts have not squarely resolved cloud AI notetakers. The risk vector is clear, though: privilege depends on confidentiality, and sending client conversations to a third-party cloud service is a disclosure that opposing counsel can probe. Vendor terms allowing human review or model training make the argument harder to defend.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "What does ABA Formal Opinion 512 say about AI tools and confidentiality?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "ABA Formal Opinion 512 (July 2024) addresses generative AI under Model Rule 1.6: lawyers must evaluate a tool's data handling before inputting client information, may need informed client consent for self-learning tools, and remain responsible for understanding where client data goes. It does not ban AI tools; it requires lawyers to actually understand the data flow.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Do I need consent to record client meetings?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Recording-consent law is separate from privilege and varies by state: some states require all-party consent, others one-party. Best practice for client conversations is explicit consent regardless of state law — it is also the professional norm.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "How does on-device transcription change the privilege analysis?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "If transcription runs entirely on the attorney's own machine and the transcript is a local file, no third party ever receives the communication — there is no vendor disclosure to analyze, no terms of service governing client data, and no vendor to subpoena. The remaining duties are the familiar ones: device security and access control.",
-      },
-    },
-  ],
-} as const;
+const faqs = [
+  {
+    question: "Does using an AI notetaker waive attorney–client privilege?",
+    answer: "There is no blanket answer — waiver is fact-specific and courts have not squarely resolved cloud AI notetakers. The risk vector is clear, though: privilege depends on confidentiality, and sending client conversations to a third-party cloud service is a disclosure that opposing counsel can probe. Vendor terms allowing human review or model training make the argument harder to defend.",
+  },
+  {
+    question: "What does ABA Formal Opinion 512 say about AI tools and confidentiality?",
+    answer: "ABA Formal Opinion 512 (July 2024) addresses generative AI under Model Rule 1.6: lawyers must evaluate a tool's data handling before inputting client information, may need informed client consent for self-learning tools, and remain responsible for understanding where client data goes. It does not ban AI tools; it requires lawyers to actually understand the data flow.",
+  },
+  {
+    question: "Do I need consent to record client meetings?",
+    answer: "Recording-consent law is separate from privilege and varies by state: some states require all-party consent, others one-party. Best practice for client conversations is explicit consent regardless of state law — it is also the professional norm.",
+  },
+  {
+    question: "How does on-device transcription change the privilege analysis?",
+    answer: "If transcription runs entirely on the attorney's own machine and the transcript is a local file, no third party ever receives the communication — there is no vendor disclosure to analyze, no terms of service governing client data, and no vendor to subpoena. The remaining duties are the familiar ones: device security and access control.",
+  },
+] as const;
 
 const sources = [
   {
@@ -65,23 +48,18 @@ const sources = [
   },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-07-11";
 
 export default function AiNotetakersPrivilegePage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/ai-notetakers-attorney-client-privilege", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -119,7 +97,7 @@ export default function AiNotetakersPrivilegePage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-07-11
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Not legal advice
@@ -242,6 +220,8 @@ export default function AiNotetakersPrivilegePage() {
           </a>
         </div>
       </section>
+
+      <FaqSection items={faqs} />
 
       <section className="mt-14">
         <SectionLabel label="Sources" />

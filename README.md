@@ -787,8 +787,20 @@ cargo install --path crates/cli
 
 ### Windows
 
+Download **`minutes-windows-x64.zip`** from the
+[latest release](https://github.com/silverstein/minutes/releases/latest), unzip
+it, and run `minutes.exe` from the unzipped folder.
+
+Use the zip rather than the bare `minutes-windows-x64.exe`. Minutes is built
+with MSVC and imports the Visual C++ runtime, which is not part of Windows. On
+a PC that has never had the Visual C++ Redistributable installed the bare
+executable exits immediately and prints nothing at all. The zip carries those
+runtime files beside the executable, so it works on a fresh machine with no
+install step and no admin rights. Keep the DLLs next to `minutes.exe` when you
+move it.
+
 ```powershell
-# Download pre-built binary from GitHub releases, or build from source:
+# Or build from source:
 # Requires: Rust, cmake, MSVC build tools, LLVM (for libclang)
 
 # Install LLVM (needed by whisper-rs bindgen):
@@ -963,8 +975,17 @@ minutes setup --diarization
 # Experimental engine: Sherpa (in-process sherpa-onnx running parakeet-tdt-0.6b-v3).
 # Newer multilingual model (EN/FR/ES and more EU languages), no Python. Opt-in and
 # NOT yet the recommended daily engine: in real-meeting A/B it trails the Parakeet
-# engine on segmentation/casing (see issue #369). Compile with `--features
-# engine-sherpa`, then enable in one command:
+# engine on segmentation/casing (see issue #369).
+#
+# macOS: engine-sherpa cannot be combined with the default `diarize` feature in
+# one binary. Both stacks vendor ONNX Runtime and kaldi-native-fbank, and the
+# static link can only keep one copy of each, which breaks voice enrollment or
+# sherpa itself depending on which copy wins (issue #683; the build refuses
+# with a compile error rather than shipping the broken combination). Build the
+# sherpa CLI without diarization:
+#   cargo build --release -p minutes-cli --no-default-features \
+#     --features whisper,engine-sherpa,metal
+# Then enable in one command:
 minutes setup --sherpa        # downloads the int8 ONNX model (~670MB) + sets engine = "sherpa"
 # If you select sherpa without the feature/model, transcription auto-falls-back
 # to Whisper (the bundled default), so a recording never breaks. See docs/architecture/sherpa-engine.md.
@@ -1068,7 +1089,11 @@ cd tauri/src-tauri
 cargo tauri build --ci --bundles nsis --no-sign
 ```
 
-Tagged GitHub releases can include both a Windows NSIS installer as `minutes-desktop-windows-x64-setup.exe` and a raw desktop binary as `minutes-desktop-windows-x64.exe`. The installer is currently unsigned, so treat it as an advanced-user / preview distribution surface until Windows signing is added.
+Tagged GitHub releases can include three Windows desktop assets: an NSIS installer as `minutes-desktop-windows-x64-setup.exe`, a portable archive as `minutes-desktop-windows-x64.zip`, and a raw desktop binary as `minutes-desktop-windows-x64.exe`. The installer is currently unsigned, so treat it as an advanced-user / preview distribution surface until Windows signing is added.
+
+**Use the installer or the zip, not the raw binary.** The desktop app imports the Visual C++ runtime, which Windows does not include. The installer and the zip both place those runtime files beside the executable; the raw `.exe` does not carry them, so on a PC without the Visual C++ Redistributable it exits immediately with no message (#657).
+
+The zip is the no-install option: unpack it anywhere and run `minutes-app.exe` from the extracted folder. Keep the runtime DLLs alongside it, since Windows resolves the application's own directory ahead of the system path and that is the whole reason the archive works.
 
 The desktop app adds a system tray icon, recording controls, audio visualizer, Recall, and a meeting list window. The current Windows desktop build covers recording, transcription, search, settings, and Recall. Calendar suggestions, call detection, tray copy/paste automation, and the native dictation hotkey remain macOS-only for now.
 

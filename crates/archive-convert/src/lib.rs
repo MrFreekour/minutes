@@ -93,11 +93,35 @@ pub struct ConvertedBlock {
     pub is_heading: Option<bool>,
 }
 
+/// Where a converted document's characters came from.
+///
+/// A typed verdict rather than a warning string, for the same reason
+/// provision boundaries stopped being one: a hard rule that depends on a
+/// value a caller can omit is not a rule. This field has no serde default on
+/// purpose -- a payload that does not state its origin fails to parse instead
+/// of quietly parsing as quotable.
+///
+/// `MachineReadLayer` names the copier side door: a scanned page whose PDF
+/// carries an OCR text layer the scanner embedded. The characters extract
+/// like any text layer, but they are a machine's reading of an image, and
+/// quoting them as the exact language of the source is the provenance failure
+/// the rest of this pipeline exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextOrigin {
+    /// The characters were written into the file by its author's software.
+    AuthorWritten,
+    /// The characters are an embedded machine reading of a page image.
+    MachineReadLayer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvertedDocument {
     pub format: SourceFormat,
     pub blocks: Vec<ConvertedBlock>,
     pub warnings: Vec<String>,
+    /// See [`TextOrigin`]. Required in the worker payload: no default.
+    pub text_origin: TextOrigin,
 }
 
 impl ConvertedDocument {
@@ -173,30 +197,47 @@ struct WorkerResponse {
 }
 
 pub struct BoundedConverter {
-    _snapshot_directory: tempfile::TempDir,
     executable_path: PathBuf,
+    /// Held open with `O_NOFOLLOW` for the object's lifetime. The descriptor
+    /// pins one inode, so the digest below is re-read from the same file no
+    /// matter what happens to the path.
     executable: fs::File,
+    executable_identity: FileIdentity,
     executable_bytes: u64,
     executable_digest: [u8; 32],
 }
 
+/// Device and inode of the pinned worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
 impl std::fmt::Debug for BoundedConverter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BoundedConverter([private immutable worker snapshot])")
+        formatter.write_str("BoundedConverter([pinned worker executable])")
     }
 }
 
 impl BoundedConverter {
-    /// Path of the private worker snapshot directory.
-    ///
-    /// Exposed so the app can reclaim it explicitly. `exit(0)` does not
-    /// unwind, and during a vault build this object lives inside a blocking
-    /// task rather than in shared session state, so nothing the close handler
-    /// can reach owns it and no destructor will run.
-    pub fn snapshot_directory(&self) -> &Path {
-        self._snapshot_directory.path()
-    }
-
     pub fn bind(worker_executable: &Path) -> Result<Self, WorkerError> {
         let canonical =
             fs::canonicalize(worker_executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
@@ -212,7 +253,7 @@ impl BoundedConverter {
             use std::os::unix::fs::OpenOptionsExt;
             source_options.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut source = source_options
+        let source = source_options
             .open(&canonical)
             .map_err(|_| WorkerError::ExecutableUnavailable)?;
         let source_metadata = source
@@ -222,51 +263,35 @@ impl BoundedConverter {
             return Err(WorkerError::ExecutableUnavailable);
         }
 
-        let snapshot_directory = tempfile::Builder::new()
-            .prefix("minutes-archive-worker-")
-            .tempdir()
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        #[cfg(unix)]
-        fs::set_permissions(
-            snapshot_directory.path(),
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-        )
-        .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        let executable_path = snapshot_directory.path().join("worker");
-        let mut snapshot_options = fs::OpenOptions::new();
-        snapshot_options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            snapshot_options.mode(0o500);
-        }
-        let mut snapshot = snapshot_options
-            .open(&executable_path)
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        std::io::copy(&mut source, &mut snapshot)
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        snapshot
-            .sync_all()
-            .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            snapshot
-                .set_permissions(fs::Permissions::from_mode(0o500))
-                .map_err(|_| WorkerError::ExecutableUnavailable)?;
-        }
-        drop(snapshot);
-        let executable =
-            fs::File::open(&executable_path).map_err(|_| WorkerError::ExecutableUnavailable)?;
+        // The worker executes in place, from inside the application bundle.
+        //
+        // It used to be copied to a private temp directory and run from there,
+        // so the bytes could not change between verification and use. That is
+        // sound reasoning and it produced an app that could not work at all: a
+        // Developer ID signature with the hardened runtime is bound to its
+        // bundle, so the copy fails validation -- `codesign` reports "invalid
+        // Info.plist (plist or signature have been modified)" -- and the kernel
+        // SIGKILLs it the moment it is exec'd. Every notarized build was
+        // therefore unable to build an index, while every test passed, because
+        // local testing used an ad-hoc-signed app (whose copy runs fine) and CI
+        // exercised the unsigned build.
+        //
+        // The property the copy provided is kept without it. This descriptor
+        // pins one inode for the object's lifetime, and `verify_executable`
+        // re-reads the digest through it and confirms the path still resolves
+        // to that same inode before every launch. A swapped file changes the
+        // inode and is refused; a rewritten one changes the digest and is
+        // refused.
+        let executable_identity = file_identity(&source_metadata);
         let (executable_bytes, executable_digest) =
-            digest_file(&executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
+            digest_file(&source).map_err(|_| WorkerError::ExecutableUnavailable)?;
         if executable_bytes != source_metadata.len() {
             return Err(WorkerError::ExecutableUnavailable);
         }
         let converter = Self {
-            _snapshot_directory: snapshot_directory,
-            executable_path,
-            executable,
+            executable_path: canonical,
+            executable: source,
+            executable_identity,
             executable_bytes,
             executable_digest,
         };
@@ -310,19 +335,35 @@ impl BoundedConverter {
         }
     }
 
+    /// Confirm the worker is still the exact file this object bound to.
+    ///
+    /// Runs immediately before every launch. The write-bit refusal that used
+    /// to live here was possible only because the worker was a private copy
+    /// the code had just created at mode 0500; an application bundle's
+    /// executable is 0755 like every other installed binary, so demanding no
+    /// write bits would refuse every real installation. Identity and content
+    /// are what actually matter, and both are checked against the descriptor
+    /// opened at bind time rather than against the path.
     fn verify_executable(&self) -> Result<(), WorkerError> {
         let metadata = fs::symlink_metadata(&self.executable_path)
             .map_err(|_| WorkerError::ExecutableUnavailable)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(WorkerError::ExecutableUnavailable);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o222 != 0 {
-                return Err(WorkerError::ExecutableUnavailable);
-            }
+        // The path must still lead to the inode this object pinned. A binary
+        // swapped in beneath us lands on a different one.
+        if file_identity(&metadata) != self.executable_identity {
+            return Err(WorkerError::ExecutableUnavailable);
         }
+        let pinned = self
+            .executable
+            .metadata()
+            .map_err(|_| WorkerError::ExecutableUnavailable)?;
+        if file_identity(&pinned) != self.executable_identity {
+            return Err(WorkerError::ExecutableUnavailable);
+        }
+        // Re-read through the descriptor, so this measures the pinned inode
+        // and not whatever the path happens to name now.
         let (bytes, digest) =
             digest_file(&self.executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
         if bytes != self.executable_bytes || digest != self.executable_digest {
@@ -421,6 +462,39 @@ struct WorkerOutput {
     stdout: Vec<u8>,
 }
 
+/// Measure the pinned worker without moving anyone's file offset.
+///
+/// This used to rewind a `try_clone` of the descriptor. `try_clone` is `dup`,
+/// and duplicated descriptors share one open file description and therefore one
+/// offset: rewinding the clone rewinds the original. Two threads verifying the
+/// worker at the same moment then read each other's bytes and both conclude the
+/// executable had been swapped underneath them. That is precisely what happened
+/// the first time document extraction ran on more than one thread -- every
+/// concurrent conversion failed as "unavailable or mutable" while the file on
+/// disk had not changed at all. Positional reads have no shared cursor to race
+/// over, and the check still measures the pinned inode rather than the path.
+#[cfg(unix)]
+fn digest_file(file: &fs::File) -> Result<(u64, [u8; 32]), std::io::Error> {
+    use std::os::unix::fs::FileExt;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut offset = 0u64;
+    loop {
+        match file.read_at(&mut buffer, offset) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                offset = offset.saturating_add(read as u64);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((offset, hasher.finalize().into()))
+}
+
+#[cfg(not(unix))]
 fn digest_file(file: &fs::File) -> Result<(u64, [u8; 32]), std::io::Error> {
     use std::io::{Seek, SeekFrom};
 
@@ -528,6 +602,10 @@ fn convert_via_anydoc(
         format,
         blocks,
         warnings,
+        // Word-processor formats carry the author's characters directly; a
+        // scan wrapped in one of these containers has no text to extract at
+        // all, so there is no embedded-reading case to detect here.
+        text_origin: TextOrigin::AuthorWritten,
     })
 }
 
@@ -542,6 +620,160 @@ fn inline_text(inlines: &[anydoc::model::Inline]) -> String {
         }
     }
     out
+}
+
+/// The pixel count below which an image cannot be a legible page scan.
+///
+/// A letterhead logo or signature image runs well under a tenth of this; the
+/// lowest-resolution readable page -- a standard fax at 1728x1100 -- is seven
+/// times it. Between the two there is no producer that embeds a page-sized
+/// raster under live text for a benign reason.
+const SCAN_IMAGE_MIN_PIXELS: i64 = 250_000;
+
+/// Pages examined for the embedded-reading signature.
+///
+/// Enough that no real agreement outruns it, bounded so a hostile page count
+/// cannot turn the verdict into unbounded work. A document whose signature
+/// pages sit past this many pages keeps its `AuthorWritten` verdict, which is
+/// the known limitation, not a crash.
+const TEXT_ORIGIN_PAGES_EXAMINED: usize = 500;
+
+/// Whether this PDF's text layer is a machine reading embedded behind images.
+///
+/// The signature is specific: a page that draws its text in an invisible
+/// rendering mode (`3 Tr` or `7 Tr`) *and* draws a page-sized image. That is
+/// how every scanner and copier that embeds OCR builds its output -- the image
+/// is the page, the hidden text makes it searchable. Both signals are
+/// required: invisible text alone appears in odd but authored PDFs, and a
+/// full-page image alone is a cover sheet or a poster. Demotion loses
+/// quotability, never truth, so a false negative here is worse than a false
+/// positive -- but a verdict that fired on half the archive would teach the
+/// operator to distrust it, so it stays on the two-signal signature.
+fn pdf_text_origin(doc: &lopdf::Document) -> TextOrigin {
+    for (index, (_page_number, page_id)) in doc.get_pages().into_iter().enumerate() {
+        if index >= TEXT_ORIGIN_PAGES_EXAMINED {
+            break;
+        }
+        if page_has_invisible_text(doc, page_id) && page_has_scan_sized_image(doc, page_id) {
+            return TextOrigin::MachineReadLayer;
+        }
+    }
+    TextOrigin::AuthorWritten
+}
+
+fn page_has_invisible_text(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool {
+    let Ok(content) = doc.get_page_content(page_id) else {
+        return false;
+    };
+    let Ok(content) = lopdf::content::Content::decode(&content) else {
+        return false;
+    };
+    content.operations.iter().any(|operation| {
+        operation.operator == "Tr"
+            && operation
+                .operands
+                .first()
+                .is_some_and(invisible_render_mode)
+    })
+}
+
+/// Text rendering modes that paint no glyphs: 3 fills and strokes nothing;
+/// 7 clips and paints nothing. OCR layers use these to sit behind the image.
+fn invisible_render_mode(operand: &lopdf::Object) -> bool {
+    match operand {
+        lopdf::Object::Integer(mode) => *mode == 3 || *mode == 7,
+        lopdf::Object::Real(mode) => *mode == 3.0 || *mode == 7.0,
+        _ => false,
+    }
+}
+
+fn page_has_scan_sized_image(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool {
+    let Ok((direct, inherited)) = doc.get_page_resources(page_id) else {
+        return false;
+    };
+    let mut resource_dictionaries = Vec::new();
+    if let Some(direct) = direct {
+        resource_dictionaries.push(direct);
+    }
+    for object_id in inherited {
+        if let Ok(dictionary) = doc.get_dictionary(object_id) {
+            resource_dictionaries.push(dictionary);
+        }
+    }
+    resource_dictionaries.iter().any(|resources| {
+        let Some(xobjects) =
+            resolved(doc, resources.get(b"XObject").ok()).and_then(|object| object.as_dict().ok())
+        else {
+            return false;
+        };
+        xobjects.iter().any(|(_name, object)| {
+            let Some(stream) = resolved(doc, Some(object)).and_then(|o| o.as_stream().ok()) else {
+                return false;
+            };
+            let is_image = resolved(doc, stream.dict.get(b"Subtype").ok())
+                .and_then(|object| object.as_name().ok())
+                .is_some_and(|name| name == b"Image");
+            if !is_image {
+                return false;
+            }
+            let width = resolved(doc, stream.dict.get(b"Width").ok())
+                .and_then(|object| object.as_i64().ok());
+            let height = resolved(doc, stream.dict.get(b"Height").ok())
+                .and_then(|object| object.as_i64().ok());
+            match (width, height) {
+                (Some(width), Some(height)) => {
+                    width.saturating_mul(height) >= SCAN_IMAGE_MIN_PIXELS
+                }
+                _ => false,
+            }
+        })
+    })
+}
+
+/// Follow at most one reference, which is how these dictionaries are written
+/// in practice; a chain of references resolves to nothing rather than looping.
+fn resolved<'a>(
+    doc: &'a lopdf::Document,
+    object: Option<&'a lopdf::Object>,
+) -> Option<&'a lopdf::Object> {
+    match object? {
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok(),
+        direct => Some(direct),
+    }
+}
+
+/// The share of characters a readable text layer can lose to encoding damage.
+///
+/// Well above any legitimate document -- operative legal text does not run
+/// twenty percent replacement characters, controls, and private-use glyphs --
+/// and well below the output of a broken `ToUnicode` CMap, which damages most
+/// of what it touches. Only the detectable classes are counted: a CMap that
+/// maps to the *wrong valid letters* is invisible to any ratio, and that
+/// limitation is documented rather than papered over.
+const GARBLED_TEXT_RATIO: f64 = 0.2;
+
+/// Below this much text a ratio is noise, and a short document is cheap for
+/// the reader to check against the source anyway.
+const GARBLED_TEXT_MIN_CHARS: usize = 200;
+
+fn text_layer_is_garbled(blocks: &[ConvertedBlock]) -> bool {
+    let mut total = 0usize;
+    let mut damaged = 0usize;
+    for block in blocks {
+        for character in block.text.chars() {
+            total += 1;
+            let private_use = ('\u{E000}'..='\u{F8FF}').contains(&character)
+                || ('\u{F0000}'..='\u{FFFFD}').contains(&character)
+                || ('\u{100000}'..='\u{10FFFD}').contains(&character);
+            if character == char::REPLACEMENT_CHARACTER
+                || (character.is_control() && character != '\n' && character != '\t')
+                || private_use
+            {
+                damaged += 1;
+            }
+        }
+    }
+    total >= GARBLED_TEXT_MIN_CHARS && (damaged as f64) / (total as f64) > GARBLED_TEXT_RATIO
 }
 
 fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
@@ -573,6 +805,23 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             });
         }
     }
+    // A text layer damaged past reading is not a text layer. Handing the
+    // blocks over anyway would quote mojibake as the exact language of the
+    // source; reporting the file as needing OCR is true -- the pages are
+    // there, the recogniser can read them -- and keeps the gap counted.
+    if !blocks.is_empty() && text_layer_is_garbled(&blocks) {
+        return Ok(ConvertedDocument {
+            format: SourceFormat::Pdf,
+            blocks: Vec::new(),
+            warnings: vec!["ocr_required_or_no_extractable_text".to_string()],
+            text_origin: TextOrigin::AuthorWritten,
+        });
+    }
+    let text_origin = if blocks.is_empty() {
+        TextOrigin::AuthorWritten
+    } else {
+        pdf_text_origin(&doc)
+    };
     let warnings = if blocks.is_empty() {
         vec!["ocr_required_or_no_extractable_text".to_string()]
     } else {
@@ -600,6 +849,7 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
         format: SourceFormat::Pdf,
         blocks,
         warnings,
+        text_origin,
     })
 }
 
@@ -1034,6 +1284,7 @@ fn docx_paragraphs(xml: &[u8]) -> Result<ConvertedDocument, ConversionError> {
         format: SourceFormat::Docx,
         blocks: paragraphs,
         warnings: Vec::new(),
+        text_origin: TextOrigin::AuthorWritten,
     })
 }
 
@@ -1322,20 +1573,7 @@ mod tests {
         cursor.into_inner()
     }
 
-    fn synthetic_pdf() -> Vec<u8> {
-        let stream = b"BT /F1 12 Tf 72 720 Td (7. CONFIDENTIALITY) Tj 0 -20 Td (Confidential Information includes affiliate data.) Tj ET";
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-            [
-                format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(),
-                stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-        ];
+    fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -1358,6 +1596,70 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    fn synthetic_pdf() -> Vec<u8> {
+        let stream = b"BT /F1 12 Tf 72 720 Td (7. CONFIDENTIALITY) Tj 0 -20 Td (Confidential Information includes affiliate data.) Tj ET";
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            [
+                format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(),
+                stream.to_vec(),
+                b"\nendstream".to_vec(),
+            ]
+            .concat(),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    /// A page built the way a scanner that embeds OCR builds one: a page-sized
+    /// image drawn over text in the requested rendering mode. `render_mode`
+    /// is spliced into the content stream (`"3 Tr "` for the copier
+    /// signature, `""` for ordinarily visible text); `with_image` controls
+    /// whether the page-sized raster is present at all.
+    fn synthetic_copier_pdf(render_mode: &str, with_image: bool) -> Vec<u8> {
+        let image_draw = if with_image {
+            "q 612 0 0 792 0 0 cm /Im1 Do Q "
+        } else {
+            ""
+        };
+        let stream = format!(
+            "{image_draw}BT /F1 12 Tf {render_mode}72 720 Td (7. CONFIDENTIALITY) Tj 0 -20 Td (Confidential Information includes affiliate data.) Tj ET"
+        )
+        .into_bytes();
+        let resources = if with_image {
+            "/Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >>"
+        } else {
+            "/Resources << /Font << /F1 4 0 R >> >>"
+        };
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] {resources} /Contents 5 0 R >>"
+            )
+            .into_bytes(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            [
+                format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(),
+                stream,
+                b"\nendstream".to_vec(),
+            ]
+            .concat(),
+        ];
+        if with_image {
+            // A 150dpi letter-size scan by its declared dimensions. The pixel
+            // data is a stub: the verdict reads /Width and /Height, and the
+            // extractor does not decode image bytes.
+            objects.push(
+                b"<< /Type /XObject /Subtype /Image /Width 1275 /Height 1650 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 3 >>\nstream\nIMG\nendstream"
+                    .to_vec(),
+            );
+        }
+        assemble_pdf(&objects)
     }
 
     #[test]
@@ -1669,6 +1971,82 @@ mod tests {
         assert_eq!(document.blocks[1].source_anchor, "page:0001");
         assert!(document.blocks[0].text.contains("CONFIDENTIALITY"));
         assert!(document.blocks[1].text.contains("affiliate data"));
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+    }
+
+    /// A scanner's embedded OCR layer is text that extracts and is not text
+    /// the author wrote, and the verdict must say so.
+    ///
+    /// The signature is invisible text (`3 Tr`) behind a page-sized image --
+    /// how every copier that embeds OCR builds its output. Before this
+    /// verdict existed, such a file converted exactly like a born-digital
+    /// PDF, and a machine's reading of a fax was quoted as the exact language
+    /// of the source.
+    #[test]
+    fn a_scanners_embedded_ocr_layer_is_reported_as_machine_read() {
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("3 Tr ", true))
+            .expect("convert");
+        assert!(
+            document.blocks.iter().any(|block| block.text.contains("CONFIDENTIALITY")),
+            "the reading is still extracted -- demotion changes what it may claim, not whether it is seen"
+        );
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    /// Both signals are required, in both directions: visible text over a
+    /// page image is a cover sheet or an exhibit reference, and invisible
+    /// text with no image is odd but authored. Firing on either alone would
+    /// demote born-digital documents and teach the operator to distrust the
+    /// verdict.
+    #[test]
+    fn the_machine_read_verdict_requires_both_signals() {
+        let visible_over_image =
+            convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("", true)).expect("convert");
+        assert_eq!(visible_over_image.text_origin, TextOrigin::AuthorWritten);
+
+        let invisible_without_image =
+            convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("3 Tr ", false))
+                .expect("convert");
+        assert_eq!(
+            invisible_without_image.text_origin,
+            TextOrigin::AuthorWritten
+        );
+    }
+
+    /// Clipping mode 7 paints nothing either; a copier that uses it instead
+    /// of 3 is the same side door.
+    #[test]
+    fn clip_mode_invisible_text_is_also_machine_read() {
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("7 Tr ", true))
+            .expect("convert");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    /// A text layer damaged past reading must not be quoted; it converts as
+    /// "needs OCR" so the pages can be read properly instead.
+    #[test]
+    fn a_garbled_text_layer_converts_as_needing_ocr() {
+        let block = |text: &str| ConvertedBlock {
+            is_heading: None,
+            source_anchor: "page:0001".to_string(),
+            text: text.to_string(),
+            flow: AnchorFlow::Continue,
+        };
+        // A broken ToUnicode CMap in practice: most characters land in the
+        // private use area, a few survive.
+        let mojibake = "\u{E01F}\u{E020}\u{E021} the \u{E022}\u{E023}\u{E024}\u{E025} shall \u{E026}\u{E027}\u{E028}\u{E029}"
+            .repeat(20);
+        assert!(text_layer_is_garbled(&[block(&mojibake)]));
+
+        // Operative legal text with ordinary punctuation and symbols is
+        // nowhere near the threshold.
+        let legal = "7.1 Indemnification. Provider shall indemnify, defend and hold harmless \
+                     the Buyer (including its affiliates) against 100% of Losses; see \u{00A7}7.3."
+            .repeat(5);
+        assert!(!text_layer_is_garbled(&[block(&legal)]));
+
+        // Below the minimum, a ratio is noise and the layer is kept.
+        assert!(!text_layer_is_garbled(&[block("\u{FFFD}\u{FFFD}\u{FFFD}")]));
     }
 
     #[test]
@@ -1682,6 +2060,7 @@ mod tests {
                 flow: AnchorFlow::HardBoundary,
             }],
             warnings: Vec::new(),
+            text_origin: TextOrigin::AuthorWritten,
         };
         assert_eq!(document.validate(), Err(ConversionError::MalformedOutput));
     }

@@ -45,6 +45,15 @@ fi
 echo "=== Installed-executable document and worker smoke ==="
 cargo run -p minutes-archive-core --example document_vault_smoke -- "$APP_EXECUTABLE"
 
+# Three documents cannot show a build stopping at 237 of 16,621, and a run
+# started from a terminal never has the 256-descriptor ceiling launchd gives a
+# GUI app. This one has both: archive scale, the app's real limit.
+echo "=== Archive-scale soak under the GUI descriptor ceiling ==="
+# 4,000, not the example's own default: below roughly 3,600 documents an
+# ordinary one-term query stays under the candidate ceiling no matter how low
+# the ceiling is set, so a smaller run cannot tell whether the guarantee holds.
+cargo run -p minutes-archive-core --example archive_pilot_soak -- "$APP_EXECUTABLE" 4000
+
 echo "=== Deterministic UI interaction smoke ==="
 node scripts/archive-ui-smoke.mjs
 

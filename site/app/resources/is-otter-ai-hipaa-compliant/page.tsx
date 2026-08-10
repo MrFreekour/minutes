@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Is Otter.ai HIPAA compliant?",
@@ -10,44 +13,24 @@ export const metadata: Metadata = {
   },
 };
 
-const faqJsonLd = {
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  mainEntity: [
-    {
-      "@type": "Question",
-      name: "Is Otter.ai HIPAA compliant?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Conditionally. Otter.ai announced HIPAA compliance in July 2025, but per its help center it is only available to Enterprise plan customers who sign a Business Associate Agreement (BAA). Users on Basic, Pro, or Business plans cannot obtain a BAA and cannot use Otter for protected health information in a compliant way.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Does Otter.ai sign a Business Associate Agreement (BAA)?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Yes, for Enterprise plan customers only, through its sales and account management process. Without a signed BAA in place, Otter is not acting as a HIPAA business associate.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Can I use Otter's free, Pro, or Business plan for patient conversations?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "No. Per Otter's help center, HIPAA compliance is restricted to the Enterprise plan with a signed BAA. Recording conversations containing PHI on other plans would be an impermissible disclosure to a vendor with no BAA.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Do on-device transcription tools need a BAA?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "No. A BAA is required when a vendor receives, stores, or processes PHI on your behalf. Software that transcribes entirely on your own device — such as open-source tools built on whisper.cpp, like Minutes — never transmits the conversation to a vendor, so there is no business associate relationship to paper over. Your own HIPAA obligations (device encryption, access controls) still apply.",
-      },
-    },
-  ],
-} as const;
+const faqs = [
+  {
+    question: "Is Otter.ai HIPAA compliant?",
+    answer: "Conditionally. Otter.ai announced HIPAA compliance in July 2025, but per its help center it is only available to Enterprise plan customers who sign a Business Associate Agreement (BAA). Users on Basic, Pro, or Business plans cannot obtain a BAA and cannot use Otter for protected health information in a compliant way.",
+  },
+  {
+    question: "Does Otter.ai sign a Business Associate Agreement (BAA)?",
+    answer: "Yes, for Enterprise plan customers only, through its sales and account management process. Without a signed BAA in place, Otter is not acting as a HIPAA business associate.",
+  },
+  {
+    question: "Can I use Otter's free, Pro, or Business plan for patient conversations?",
+    answer: "No. Per Otter's help center, HIPAA compliance is restricted to the Enterprise plan with a signed BAA. Recording conversations containing PHI on other plans would be an impermissible disclosure to a vendor with no BAA.",
+  },
+  {
+    question: "Do on-device transcription tools need a BAA?",
+    answer: "No. A BAA is required when a vendor receives, stores, or processes PHI on your behalf. Software that transcribes entirely on your own device — such as open-source tools built on whisper.cpp, like Minutes — never transmits the conversation to a vendor, so there is no business associate relationship to paper over. Your own HIPAA obligations (device encryption, access controls) still apply.",
+  },
+] as const;
 
 const sources = [
   {
@@ -66,23 +49,18 @@ const sources = [
   { label: "Minutes on GitHub", href: "https://github.com/silverstein/minutes" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-07-11";
 
 export default function IsOtterAiHipaaCompliantPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/is-otter-ai-hipaa-compliant", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -117,7 +95,7 @@ export default function IsOtterAiHipaaCompliantPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-07-11
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Sourced answer
@@ -281,6 +259,8 @@ export default function IsOtterAiHipaaCompliantPage() {
           </a>
         </div>
       </section>
+
+      <FaqSection items={faqs} />
 
       <section className="mt-14">
         <SectionLabel label="Sources" />

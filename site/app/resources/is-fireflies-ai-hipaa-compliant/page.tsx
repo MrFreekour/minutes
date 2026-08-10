@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Is Fireflies.ai HIPAA compliant?",
@@ -10,44 +13,24 @@ export const metadata: Metadata = {
   },
 };
 
-const faqJsonLd = {
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  mainEntity: [
-    {
-      "@type": "Question",
-      name: "Is Fireflies.ai HIPAA compliant?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Conditionally. Per Fireflies' own documentation, HIPAA compliance requires three things simultaneously: an active Enterprise plan, Private Storage enabled, and a signed BAA. If any one lapses, compliance is disabled. Free, Pro, and Business plans cannot be used for PHI in a compliant way.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Does Fireflies sign a BAA?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Yes, via a self-serve BAA page (fireflies.ai/baa) — but the BAA only takes effect with Private Storage enabled, and the HIPAA configuration is Enterprise-only ($39/user/month, billed annually).",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Where does Fireflies process and store meeting audio?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "In Fireflies' cloud in the United States (AWS and GCP) by default, with transcription and AI passing through vendors including OpenAI under zero-retention BAAs. Enterprise Private Storage allows dedicated or bring-your-own storage. Nothing runs on the user's device.",
-      },
-    },
-    {
-      "@type": "Question",
-      name: "Is there a meeting notetaker that doesn't need a BAA at all?",
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: "Yes — on-device tools. A BAA exists to govern a vendor's handling of PHI; software that transcribes and stores entirely on your own machine (like Minutes, open source) never gives a vendor the data, so no business associate relationship is created. Device security and consent obligations remain yours.",
-      },
-    },
-  ],
-} as const;
+const faqs = [
+  {
+    question: "Is Fireflies.ai HIPAA compliant?",
+    answer: "Conditionally. Per Fireflies' own documentation, HIPAA compliance requires three things simultaneously: an active Enterprise plan, Private Storage enabled, and a signed BAA. If any one lapses, compliance is disabled. Free, Pro, and Business plans cannot be used for PHI in a compliant way.",
+  },
+  {
+    question: "Does Fireflies sign a BAA?",
+    answer: "Yes, via a self-serve BAA page (fireflies.ai/baa) — but the BAA only takes effect with Private Storage enabled, and the HIPAA configuration is Enterprise-only ($39/user/month, billed annually).",
+  },
+  {
+    question: "Where does Fireflies process and store meeting audio?",
+    answer: "In Fireflies' cloud in the United States (AWS and GCP) by default, with transcription and AI passing through vendors including OpenAI under zero-retention BAAs. Enterprise Private Storage allows dedicated or bring-your-own storage. Nothing runs on the user's device.",
+  },
+  {
+    question: "Is there a meeting notetaker that doesn't need a BAA at all?",
+    answer: "Yes — on-device tools. A BAA exists to govern a vendor's handling of PHI; software that transcribes and stores entirely on your own machine (like Minutes, open source) never gives a vendor the data, so no business associate relationship is created. Device security and consent obligations remain yours.",
+  },
+] as const;
 
 const sources = [
   { label: "Fireflies security", href: "https://fireflies.ai/security" },
@@ -66,23 +49,18 @@ const sources = [
   { label: "Is Otter.ai HIPAA compliant?", href: "/resources/is-otter-ai-hipaa-compliant" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-07-11";
 
 export default function IsFirefliesHipaaCompliantPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([
+            resourceArticleSchema({ metadata, path: "/resources/is-fireflies-ai-hipaa-compliant", lastReviewed: LAST_REVIEWED, sources }),
+            faqPageSchema(faqs),
+          ]) }}
       />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
@@ -120,7 +98,7 @@ export default function IsFirefliesHipaaCompliantPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-07-11
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Sourced answer
@@ -218,6 +196,8 @@ export default function IsFirefliesHipaaCompliantPage() {
           </a>
         </div>
       </section>
+
+      <FaqSection items={faqs} />
 
       <section className="mt-14">
         <SectionLabel label="Sources" />

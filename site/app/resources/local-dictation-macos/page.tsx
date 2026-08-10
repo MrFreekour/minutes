@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Local dictation on macOS: the complete guide",
@@ -45,20 +47,16 @@ const sources = [
   { label: "Minutes vs superwhisper — full comparison", href: "/compare/superwhisper-vs-minutes" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-07-11";
 
 export default function LocalDictationMacosPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(resourceArticleSchema({ metadata, path: "/resources/local-dictation-macos", lastReviewed: LAST_REVIEWED, sources })) }}
+      />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
           minutes
@@ -92,7 +90,7 @@ export default function LocalDictationMacosPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-07-11
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Fit-based resource
@@ -132,7 +130,7 @@ export default function LocalDictationMacosPage() {
               key={opt.name}
               className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-6 shadow-[var(--shadow-panel)]"
             >
-              <h2 className="font-serif text-[22px] text-[var(--text)]">{opt.name}</h2>
+              <h3 className="font-serif text-[22px] text-[var(--text)]">{opt.name}</h3>
               <p className="mt-2 font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--accent)]">
                 {opt.bestFor}
               </p>

@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
+import { resourceArticleSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
   title: "Open-source alternatives to Granola AI",
@@ -43,20 +45,16 @@ const sources = [
   { label: "Meetily GitHub", href: "https://github.com/Zackriya-Solutions/meeting-minutes" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
+
+const LAST_REVIEWED = "2026-04-09";
 
 export default function OpenSourceAlternativesToGranolaPage() {
   return (
     <div className="mx-auto max-w-[980px] px-6 pb-16 pt-10 sm:px-8 sm:pt-14">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(resourceArticleSchema({ metadata, path: "/resources/open-source-alternatives-to-granola-ai", lastReviewed: LAST_REVIEWED, sources })) }}
+      />
       <div className="mb-10 flex items-center justify-between border-b border-[color:var(--border)] pb-4">
         <a href="/" className="font-mono text-[15px] font-medium text-[var(--text)]">
           minutes
@@ -89,7 +87,7 @@ export default function OpenSourceAlternativesToGranolaPage() {
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-            Last reviewed: 2026-04-09
+            Last reviewed: {LAST_REVIEWED}
           </span>
           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent)]">
             Fit-based resource
@@ -128,7 +126,7 @@ export default function OpenSourceAlternativesToGranolaPage() {
               <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--accent)]">
                 {tool.bestFor}
               </p>
-              <h2 className="mt-3 text-[18px] font-medium text-[var(--text)]">{tool.name}</h2>
+              <h3 className="mt-3 text-[18px] font-medium text-[var(--text)]">{tool.name}</h3>
               <p className="mt-2 text-[15px] leading-8 text-[var(--text-secondary)]">
                 {tool.summary}
               </p>

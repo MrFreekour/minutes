@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 import surfaces from "@/lib/product-surfaces.json";
 
 export const metadata: Metadata = {
@@ -101,16 +102,6 @@ const docsSections = [
   },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 export default function DocsIndexPage() {
   return (
@@ -187,7 +178,7 @@ export default function DocsIndexPage() {
                   <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--accent)]">
                     {section.label}
                   </p>
-                  <h2 className="mt-3 text-[18px] font-medium text-[var(--text)]">{link.title}</h2>
+                  <h3 className="mt-3 text-[18px] font-medium text-[var(--text)]">{link.title}</h3>
                   <p className="mt-2 text-[15px] leading-8 text-[var(--text-secondary)]">
                     {link.blurb}
                   </p>

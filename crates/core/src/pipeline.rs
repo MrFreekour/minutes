@@ -339,6 +339,18 @@ struct SelfAttributionDebug {
     skipped_reason: Option<SelfAttributionSkippedReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fallback_reason: Option<SelfAttributionSkippedReason>,
+    /// Speakers the diarizer attributed speech to inside the voice stem.
+    ///
+    /// Present on every outcome reached after the voice stem was successfully
+    /// diarized, and absent only when it was not diarized at all. A
+    /// source-backed label says which stem speech came from, never how many
+    /// people were in front of that microphone, and issue #169 showed those
+    /// being conflated: two colleagues sharing one room and one mic produced a
+    /// single local label that was then named after the recorder. Establishing
+    /// that from a bug report required reading the source, because no output
+    /// anywhere reported how many people the local stem held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice_stem_speaker_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -388,9 +400,16 @@ impl SelfAttributionOutcome {
                 applied_via: Some(applied_via),
                 skipped_reason: None,
                 fallback_reason,
+                voice_stem_speaker_count: None,
             },
             attribution: Some(attribution),
         }
+    }
+
+    /// Record how many speakers the voice stem held, for the debug record.
+    fn with_voice_stem_speaker_count(mut self, count: usize) -> Self {
+        self.debug.voice_stem_speaker_count = Some(count);
+        self
     }
 
     fn skipped(reason: SelfAttributionSkippedReason) -> Self {
@@ -405,6 +424,7 @@ impl SelfAttributionOutcome {
                 applied_via: None,
                 skipped_reason: Some(reason),
                 fallback_reason: None,
+                voice_stem_speaker_count: None,
             },
         }
     }
@@ -2491,6 +2511,7 @@ fn single_stem_speaker_self_attribution(
     if let Some(stems) = diarize::discover_stems(audio_path) {
         if let Some(source_backed_label) = source_backed_speaker_label.clone() {
             if let Some(voice_stem_result) = diarize::diarize(&stems.voice, config) {
+                let voice_stem_speakers = diarize::attributed_speaker_count(&voice_stem_result);
                 let matched_self =
                     match_speakers_by_voice(config, &voice_stem_result.speaker_embeddings)
                         .attributions
@@ -2517,7 +2538,8 @@ fn single_stem_speaker_self_attribution(
                         SelfAttributionAppliedVia::SourceBackedStem
                     },
                     None,
-                );
+                )
+                .with_voice_stem_speaker_count(voice_stem_speakers);
             }
 
             return SelfAttributionOutcome::applied(
@@ -2533,16 +2555,18 @@ fn single_stem_speaker_self_attribution(
         }
 
         if let Some(voice_stem_result) = diarize::diarize(&stems.voice, config) {
-            let _ = voice_stem_result;
+            let voice_stem_speakers = diarize::attributed_speaker_count(&voice_stem_result);
             if speaker_label == "SPEAKER_1" {
                 return SelfAttributionOutcome::skipped(
                     SelfAttributionSkippedReason::RemoteOnlyLabel,
-                );
+                )
+                .with_voice_stem_speaker_count(voice_stem_speakers);
             }
 
             return SelfAttributionOutcome::skipped(
                 SelfAttributionSkippedReason::VoiceStemNoSelfMatch,
-            );
+            )
+            .with_voice_stem_speaker_count(voice_stem_speakers);
         }
 
         return SelfAttributionOutcome::skipped(

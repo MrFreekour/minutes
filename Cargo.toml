@@ -3,6 +3,7 @@ members = [
     "archive/src-tauri",
     "crates/archive-convert",
     "crates/archive-core",
+    "crates/archive-ocr",
     "crates/archive-semantic",
     "crates/core",
     "crates/cli",
@@ -45,7 +46,7 @@ hound = "3.5"
 whisper-rs = { version = "0.16", features = ["tracing_backend"] }
 
 # File watching
-notify = "7"
+notify = "8"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -60,7 +61,7 @@ anyhow = "1"
 # Filesystem
 dirs = "6"
 walkdir = "2"
-which = "4"
+which = "8"
 cap-std = "4.0.2"
 
 # Logging
