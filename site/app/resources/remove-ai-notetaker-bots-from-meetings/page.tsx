@@ -151,6 +151,22 @@ export default function RemoveNotetakerBotsPage() {
             .
           </p>
           <p>
+            <span className="font-medium text-[var(--text)]">
+              Zoom AI Companion and Teams Copilot are not this.
+            </span>{" "}
+            Inside their own platform they are features rather than participants, so there is
+            nothing in the list to eject and the controls are account and policy settings
+            instead. (Zoom AI Companion brought into a Google Meet or Teams meeting is the
+            exception: there it does join as a participant.) See{" "}
+            <a
+              href="/resources/turn-off-built-in-ai-notetakers"
+              className="text-[var(--accent)] hover:underline"
+            >
+              turning off built-in AI notetakers
+            </a>
+            .
+          </p>
+          <p>
             <span className="font-medium text-[var(--text)]">Anything else.</span> The pattern
             generalizes: find the calendar connection and sever it, find the auto-join rule and
             turn it off. If a bot has no calendar access, it has no way to find your meetings.
