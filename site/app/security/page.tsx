@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 
 export const metadata: Metadata = {
   title: "Security — audio that never leaves your device",
@@ -55,16 +56,6 @@ const sources = [
   { label: "Compare Minutes", href: "/compare" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 export default function SecurityPage() {
   return (
@@ -150,7 +141,7 @@ export default function SecurityPage() {
               key={g.title}
               className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-6 shadow-[var(--shadow-panel)]"
             >
-              <h2 className="font-serif text-[20px] text-[var(--text)]">{g.title}</h2>
+              <h3 className="font-serif text-[20px] text-[var(--text)]">{g.title}</h3>
               <p className="mt-3 text-[15px] leading-8 text-[var(--text-secondary)]">{g.body}</p>
             </div>
           ))}

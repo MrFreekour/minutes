@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 
 export const metadata: Metadata = {
   title: "Local dictation on macOS: the complete guide",
@@ -45,16 +46,6 @@ const sources = [
   { label: "Minutes vs superwhisper — full comparison", href: "/compare/superwhisper-vs-minutes" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 export default function LocalDictationMacosPage() {
   return (
@@ -132,7 +123,7 @@ export default function LocalDictationMacosPage() {
               key={opt.name}
               className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-6 shadow-[var(--shadow-panel)]"
             >
-              <h2 className="font-serif text-[22px] text-[var(--text)]">{opt.name}</h2>
+              <h3 className="font-serif text-[22px] text-[var(--text)]">{opt.name}</h3>
               <p className="mt-2 font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--accent)]">
                 {opt.bestFor}
               </p>

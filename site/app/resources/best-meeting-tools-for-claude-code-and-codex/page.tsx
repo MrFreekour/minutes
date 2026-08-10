@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 
 export const metadata: Metadata = {
   title: "Best meeting tools for Claude Code and Codex",
@@ -81,16 +82,6 @@ const sources = [
   { label: "Fireflies apps", href: "https://fireflies.ai/apps" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 export default function BestMeetingToolsPage() {
   return (
@@ -194,7 +185,7 @@ export default function BestMeetingToolsPage() {
               <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--accent)]">
                 {tool.bestFor}
               </p>
-              <h2 className="mt-3 text-[18px] font-medium text-[var(--text)]">{tool.name}</h2>
+              <h3 className="mt-3 text-[18px] font-medium text-[var(--text)]">{tool.name}</h3>
               <p className="mt-2 text-[15px] leading-8 text-[var(--text-secondary)]">
                 {tool.summary}
               </p>

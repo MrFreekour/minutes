@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema } from "@/lib/schema";
 
 export const metadata: Metadata = {
@@ -99,16 +100,6 @@ const sources = [
   { label: "Minutes security & privacy architecture", href: "/security" },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 export default function HipaaCompliantAiNoteTakerPage() {
   return (
@@ -186,7 +177,7 @@ export default function HipaaCompliantAiNoteTakerPage() {
               className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-6 shadow-[var(--shadow-panel)]"
             >
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="font-serif text-[22px] text-[var(--text)]">{v.name}</h2>
+                <h3 className="font-serif text-[22px] text-[var(--text)]">{v.name}</h3>
                 <span
                   className={`rounded-full px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em] ${
                     v.verdict === "No"

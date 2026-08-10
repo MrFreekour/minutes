@@ -9,6 +9,7 @@ import {
   WINDOWS_SETUP_EXE,
 } from "@/lib/release";
 import { organizationSchema, softwareApplicationSchema } from "@/lib/schema";
+import { NumberedSectionLabel as SectionLabel } from "@/components/section-label";
 
 const featureGrid = [
   {
@@ -131,19 +132,6 @@ const comparisons = [
   ["Agent-agnostic", "No", "No", "Partially", "Yes"],
 ] as const;
 
-function SectionLabel({ n, label }: { n: string; label: string }) {
-  return (
-    <div className="mb-8 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {n}
-      </span>
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--text-secondary)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 function TranscriptCard() {
   return (
@@ -494,7 +482,7 @@ export default function Home() {
       </section>
 
       <section id="dictation" className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="01" label="Dictation" />
+        <SectionLabel n="01" label="Dictation" heading={false} />
         <h2 className="font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           The fastest way in is your voice.
         </h2>
@@ -515,7 +503,7 @@ export default function Home() {
       </section>
 
       <section id="local" className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="02" label="On-device" />
+        <SectionLabel n="02" label="On-device" heading={false} />
         <h2 className="font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           Your conversation never leaves your machine.
         </h2>
@@ -542,7 +530,7 @@ export default function Home() {
       </section>
 
       <section className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="03" label="Proof" />
+        <SectionLabel n="03" label="Proof" heading={false} />
         <h2 className="font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           See it work before you believe it.
         </h2>
@@ -588,7 +576,7 @@ export default function Home() {
       </section>
 
       <section id="pipeline" className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="04" label="Pipeline" />
+        <SectionLabel n="04" label="Pipeline" heading={false} />
         <h2 className="font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           How it works
         </h2>
@@ -609,7 +597,7 @@ export default function Home() {
       </section>
 
       <section className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="05" label="Audience" />
+        <SectionLabel n="05" label="Audience" heading={false} />
         <h2 className="max-w-[620px] font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           Capture it anywhere. Find it everywhere.
         </h2>
@@ -634,7 +622,7 @@ export default function Home() {
       </section>
 
       <section className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="06" label="Features" />
+        <SectionLabel n="06" label="Features" heading={false} />
         <h2 className="font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           What you get
         </h2>
@@ -665,7 +653,7 @@ export default function Home() {
       </section>
 
       <section className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="07" label="Comparison" />
+        <SectionLabel n="07" label="Comparison" heading={false} />
         <h2 className="font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           How it compares
         </h2>
@@ -740,7 +728,7 @@ export default function Home() {
       </section>
 
       <section className="border-t border-[color:var(--border)] py-16">
-        <SectionLabel n="08" label="Governance" />
+        <SectionLabel n="08" label="Governance" heading={false} />
         <h2 className="font-serif text-[30px] leading-tight tracking-[-0.035em] text-[var(--text)] sm:text-[32px]">
           Built in, not retrofitted.
         </h2>

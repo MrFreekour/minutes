@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 
 export const metadata: Metadata = {
   title: "The best local speech-to-text apps (2026)",
@@ -68,16 +69,6 @@ const sources = [
   },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 export default function BestLocalSpeechToTextPage() {
   return (
@@ -155,7 +146,7 @@ export default function BestLocalSpeechToTextPage() {
               className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-6 shadow-[var(--shadow-panel)]"
             >
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="font-serif text-[22px] text-[var(--text)]">{tool.name}</h2>
+                <h3 className="font-serif text-[22px] text-[var(--text)]">{tool.name}</h3>
                 <span className="rounded-full bg-[var(--bg-hover)] px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
                   {tool.license}
                 </span>

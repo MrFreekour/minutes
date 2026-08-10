@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
+import { SectionLabel } from "@/components/section-label";
 
 export const metadata: Metadata = {
   title: "Meeting minutes templates (markdown, copy-paste ready)",
@@ -101,16 +102,6 @@ Respectfully submitted, {secretary}`,
   },
 ] as const;
 
-function SectionLabel({ label }: { label: string }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--accent)]">
-        {label}
-      </span>
-      <div className="h-px flex-1 bg-[var(--border)]" />
-    </div>
-  );
-}
 
 export default function MeetingMinutesTemplatePage() {
   return (
@@ -164,7 +155,7 @@ export default function MeetingMinutesTemplatePage() {
               className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] shadow-[var(--shadow-panel)]"
             >
               <div className="border-b border-[color:var(--border)] px-5 py-3">
-                <h2 className="font-serif text-[19px] text-[var(--text)]">{t.title}</h2>
+                <h3 className="font-serif text-[19px] text-[var(--text)]">{t.title}</h3>
               </div>
               <div className="overflow-x-auto p-5">
                 <pre className="whitespace-pre font-mono text-[12px] leading-6 text-[var(--text-secondary)]">
