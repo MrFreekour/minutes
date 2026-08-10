@@ -631,6 +631,17 @@ a:focus-visible {
   display: block;
 }
 
+.location-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.reveal-location {
+  padding: 5px 10px;
+  font-size: var(--text-xs);
+}
+
 .location-copy strong {
   font-size: var(--text-body);
 }

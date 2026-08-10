@@ -131,13 +131,35 @@ function renderLocations(nextLocations) {
     text.append(title, detail);
     copy.append(icon, text);
 
+    // Finder answers "which folder is this?" better than any label the
+    // interface could carry, and without a path crossing into it.
+    const reveal = document.createElement("button");
+    reveal.className = "button button-quiet reveal-location";
+    reveal.type = "button";
+    reveal.textContent = "Show in Finder";
+    reveal.setAttribute("aria-label", `Show ${location.label} in Finder`);
+    reveal.addEventListener("click", async () => {
+      reveal.disabled = true;
+      try {
+        await invoke("reveal_archive_location", { locationId: location.id });
+      } catch (error) {
+        showError(String(error));
+      } finally {
+        reveal.disabled = false;
+      }
+    });
+
     const remove = document.createElement("button");
     remove.className = "remove-location";
     remove.type = "button";
     remove.setAttribute("aria-label", `Remove ${location.label}`);
     remove.textContent = "×";
     remove.addEventListener("click", () => removeLocation(location.id));
-    item.append(copy, remove);
+
+    const actions = document.createElement("div");
+    actions.className = "location-actions";
+    actions.append(reveal, remove);
+    item.append(copy, actions);
     elements.locationList.append(item);
   }
 
