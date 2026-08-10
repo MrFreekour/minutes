@@ -61,7 +61,7 @@ const categoryLabels = {
   archive: "Compressed archives",
   database: "Databases",
   apple_document: "Apple documents",
-  icloud_placeholder: "iCloud placeholders",
+  icloud_placeholder: "Still in iCloud",
   other: "Other formats",
 };
 
@@ -127,7 +127,15 @@ function renderLocations(nextLocations) {
     const title = document.createElement("strong");
     title.textContent = location.label;
     const detail = document.createElement("span");
-    detail.textContent = "Read-only native authority";
+    // Counts, when a census has produced them, are what tells one opaque row
+    // from another. They name nothing: a folder of exhibits and a matter
+    // archive differ by two orders of magnitude and by nothing identifying.
+    detail.textContent =
+      typeof location.artifacts === "number"
+        ? `${location.artifacts.toLocaleString()} item${
+            location.artifacts === 1 ? "" : "s"
+          } · ${formatBytes(location.regularFileBytes ?? 0)} · read-only`
+        : "Read-only";
     text.append(title, detail);
     copy.append(icon, text);
 
@@ -167,10 +175,10 @@ function renderLocations(nextLocations) {
   elements.skipFolders.disabled = locations.length === 0;
   elements.setupStatus.textContent =
     locations.length === 0
-      ? "Choose at least one location to continue."
-      : `${locations.length.toLocaleString()} location${
+      ? "Choose at least one folder to continue."
+      : `${locations.length.toLocaleString()} folder${
           locations.length === 1 ? "" : "s"
-        } approved. Nothing has been scanned yet.`;
+        } chosen. Nothing has been looked at yet.`;
 }
 
 async function chooseLocations() {
@@ -252,14 +260,14 @@ async function chooseSkippedFolders() {
       notes.push(
         `${choice.outside.toLocaleString()} ${
           choice.outside === 1 ? "folder is" : "folders are"
-        } not inside an approved location, so ${
+        } not inside a folder you chose, so ${
           choice.outside === 1 ? "it was" : "they were"
         } not added.`,
       );
     }
     if (choice.refusedWholeLocation > 0) {
       notes.push(
-        "A whole approved location cannot be skipped — remove the location instead.",
+        "You cannot skip a whole folder you chose — remove it instead.",
       );
     }
     if (notes.length > 0) {
@@ -282,7 +290,7 @@ async function clearSkippedFolders() {
     elements.clearSkipped.hidden = true;
     elements.setupStatus.textContent = `${cleared.toLocaleString()} skipped folder${
       cleared === 1 ? "" : "s"
-    } restored. Every approved location will be read whole.`;
+    } restored. Every folder you chose will be read whole.`;
     lastReport = null;
     vaultReport = null;
   } catch (error) {
@@ -370,10 +378,10 @@ function renderReport(report) {
   elements.resultStatus.dataset.status = report.status;
   elements.resultSummary.textContent =
     report.status === "complete"
-      ? "The approved locations were counted without reading document contents."
+      ? "Your folders were counted without opening a single document."
       : report.status === "cancelled"
-        ? "The census was cancelled. Partial counts were discarded from export."
-        : "The census stopped at a safety boundary. Review the aggregate signals.";
+        ? "Cancelled. The partial counts were thrown away."
+        : "Counting stopped at a safety limit, so these totals are incomplete. See what needs attention.";
 
   renderBuildForecast(report);
   elements.metricArtifacts.textContent = report.summary.artifacts.toLocaleString();
@@ -404,21 +412,21 @@ function renderReport(report) {
   if (categories.length === 0) {
     const empty = document.createElement("p");
     empty.className = "status";
-    empty.textContent = "No file or package artifacts were found.";
+    empty.textContent = "No files were found.";
     elements.categoryList.append(empty);
   }
 
   elements.signalsList.replaceChildren(
     createSignal(
-      "Likely OCR candidates",
+      "Scans that need reading",
       report.categories.find((item) => item.category === "image_or_scan")?.artifacts ?? 0,
     ),
-    createSignal("iCloud placeholders", report.signals.icloud_placeholders),
-    createSignal("Apple packages", report.summary.packages),
-    createSignal("Unreadable by mode", report.signals.permission_mode_unreadable),
-    createSignal("Links skipped", report.signals.symlinks_skipped),
+    createSignal("Not downloaded from iCloud", report.signals.icloud_placeholders),
+    createSignal("Pages, Numbers, Keynote", report.summary.packages),
+    createSignal("Blocked by permissions", report.signals.permission_mode_unreadable),
+    createSignal("Shortcuts skipped", report.signals.symlinks_skipped),
     createSignal(
-      "Metadata errors",
+      "Could not be examined",
       report.signals.metadata_errors + report.signals.directory_errors,
     ),
   );
@@ -439,7 +447,7 @@ async function runCensus() {
     if (report.status === "cancelled") {
       lastReport = null;
       showView("setup");
-      elements.setupStatus.textContent = "Census cancelled. No report was retained.";
+      elements.setupStatus.textContent = "Cancelled. Nothing was kept.";
       return;
     }
     renderReport(report);
@@ -469,7 +477,7 @@ async function exportReport() {
   elements.exportStatus.textContent = "Preparing report…";
   try {
     const saved = await invoke("export_archive_census");
-    elements.exportStatus.textContent = saved ? "Aggregate report saved." : "";
+    elements.exportStatus.textContent = saved ? "Report saved." : "";
   } catch (error) {
     elements.exportStatus.textContent = "";
     showError(error);
@@ -485,9 +493,9 @@ function renderVaultSummary(report) {
   // screen needs to know in one glance what is searchable, and then be able to
   // find the caveat that applies to them. Nothing is dropped, and the warnings
   // that change whether a negative result can be trusted are marked as such.
-  const lead = `${report.indexed_documents.toLocaleString()} supported document${
+  const lead = `${report.indexed_documents.toLocaleString()} document${
     report.indexed_documents === 1 ? "" : "s"
-  } indexed (${formatBytes(report.indexed_bytes)}). All indexes exist only in memory.`;
+  } ready to search (${formatBytes(report.indexed_bytes)}). Held in memory only — nothing was saved to disk.`;
 
   const notes = [];
   const formatBreakdown = [
@@ -496,7 +504,7 @@ function renderVaultSummary(report) {
     // to counsel is how much became searchable, not which container it arrived in.
     `${report.docx_documents.toLocaleString()} Word or OpenDocument`,
   ].join(", ");
-  notes.push({ text: `Searchable formats: ${formatBreakdown}.` });
+  notes.push({ text: `You can search: ${formatBreakdown}.` });
 
   // Its own line. A scan that was read is searchable, but only as a
   // transcription, and folding it into the indexed total would say the archive
@@ -505,16 +513,18 @@ function renderVaultSummary(report) {
     notes.push({
       text: `${report.transcribed_documents.toLocaleString()} scanned page${
         report.transcribed_documents === 1 ? "" : "s"
-      } read by text recognition — searchable as transcriptions, never quoted as source text.`,
+      } read by the text reader — you can search these, but they are a machine reading a picture, so they are never quoted as the document\u0027s own words.`,
     });
   }
   if (report.unsupported_files_skipped > 0 || report.ocr_required_files > 0) {
     notes.push({
-      text: `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
+      text: `${report.unsupported_files_skipped.toLocaleString()} file${
         report.unsupported_files_skipped === 1 ? "" : "s"
+      } this app cannot open ${
+        report.unsupported_files_skipped === 1 ? "was" : "were"
       } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
         report.ocr_required_files === 1 ? "" : "s"
-      } are images of pages and carry no text to read.`,
+      } are pictures of pages with no text to read.`,
     });
   }
   // Folders the owner told the build not to enter. Deliberate, so not a
@@ -533,17 +543,17 @@ function renderVaultSummary(report) {
   const inferredBoundaryDocuments = report.inferred_boundary_documents ?? 0;
   if (inferredBoundaryDocuments > 0) {
     notes.push({
-      text: `${inferredBoundaryDocuments.toLocaleString()} indexed document${
+      text: `${inferredBoundaryDocuments.toLocaleString()} document${
         inferredBoundaryDocuments === 1 ? "" : "s"
-      } cannot answer same-clause questions because the file does not record where a clause ends.`,
+      } cannot answer "in the same clause" questions, because the file does not record where one clause ends and the next begins.`,
     });
   }
   notes.push({
     text: report.semantic_retrieval_enabled
-      ? `${report.semantic_provisions_indexed.toLocaleString()} provision suggestion vector${
+      ? `Suggestions are on: ${report.semantic_provisions_indexed.toLocaleString()} passage${
           report.semantic_provisions_indexed === 1 ? "" : "s"
-        } built with the pinned macOS model inside its network-denied worker.`
-      : "Semantic suggestions are unavailable on this Mac.",
+        } were prepared using the language model built into macOS, on this Mac.`
+      : "Suggestions by meaning are not available on this Mac. Exact search still works.",
   });
   // Partial suggestion coverage is not the same as none. Exact search is
   // complete either way; a reader who assumes the suggestions swept the whole
@@ -551,7 +561,7 @@ function renderVaultSummary(report) {
   if (report.semantic_coverage_partial) {
     notes.push({
       warning: true,
-      text: "The on-device suggestion model stopped partway through this build, so meaning-based suggestions cover only part of the archive. Exact search covers all of it.",
+      text: "The suggestion model stopped partway through, so suggestions cover only part of your documents. Exact search covers all of them.",
     });
   }
   const dropped = describeDroppedSources(report).trim();
@@ -603,46 +613,49 @@ function renderVaultSummary(report) {
 // visible to be acted on.
 function describeDroppedSources(report) {
   const dropped = [
-    [report.conversion_failures, "could not be converted"],
-    [report.malformed_text_files_skipped, "were malformed"],
-    [report.oversized_files_skipped, "exceeded the size budget"],
-    [report.duplicate_files_skipped, "were duplicates"],
+    [report.conversion_failures, "could not be opened by the converter"],
+    [report.malformed_text_files_skipped, "damaged"],
+    [report.oversized_files_skipped, "too large"],
+    [report.duplicate_files_skipped, "duplicates"],
     // Both link counters were tallied and never shown. On de-duplicated or
     // linked storage every file can carry a second name, so the whole archive
     // is refused and counsel is told only that fewer documents were indexed
     // than the folder holds -- a silent, total coverage loss.
-    [report.symlinks_skipped, "were aliases or shortcuts"],
+    [report.symlinks_skipped, "aliases or shortcuts"],
     [report.hard_links_skipped, "have a second name elsewhere on the disk"],
     // Split five ways after a real archive reported 10,429 of ~16,600
     // documents "could not be read" and the number could not be acted on.
     // Permission denied is a thing a reader can fix; a file changing mid-read
     // is not the same problem at all.
-    [report.permission_denied, "were blocked by macOS permissions"],
-    [report.unopenable, "could not be opened for another reason"],
+    [report.permission_denied, "blocked by macOS permissions"],
+    [report.unopenable, "could not be opened for some other reason"],
     [
       report.open_file_limit_reached,
-      "were not reached before the app ran out of open files (restart and index a smaller folder)",
+      "not reached because the app ran out of open files (restart it and try a smaller folder)",
     ],
-    [report.scans_unreadable, "were scans the text recognizer could not read"],
+    [report.scans_unreadable, "scans the text reader could not make out"],
     [report.entries_unstattable, "could not be examined at all"],
-    [report.identity_unavailable, "had no stable identity to pin"],
+    [report.identity_unavailable, "could not be tracked reliably"],
     [report.changed_while_reading, "changed while being read"],
-    [report.directory_errors, "were in unreadable folders"],
+    [report.directory_errors, "inside folders that could not be read"],
   ].filter(([count]) => count > 0);
   if (dropped.length === 0) {
-    return "No supported document was dropped. ";
+    return "Every supported document was read. ";
   }
   const total = dropped.reduce((sum, [count]) => sum + count, 0);
+  // "reason (count)", not "count reason": the reasons are phrases that cannot
+  // agree with every number, and "1 were aliases or shortcuts" is the kind of
+  // sentence that makes a reader distrust the number beside it.
   const detail = dropped
-    .map(([count, reason]) => `${count.toLocaleString()} ${reason}`)
+    .map(([count, reason]) => `${reason} (${count.toLocaleString()})`)
     .join(", ");
   // "items", not "documents": `directory_errors` counts folders, and an alias
   // can point at one, so the aggregate spans more than files. Calling it a
   // document count would overstate how many documents are missing.
   return (
     `${total.toLocaleString()} item${total === 1 ? "" : "s"} ` +
-    `${total === 1 ? "was" : "were"} not indexed and cannot be searched ` +
-    `(${detail}). Review these before relying on a negative result. `
+    `could not be read, so ${total === 1 ? "it is" : "they are"} not searchable: ` +
+    `${detail}. Check these before you trust a "nothing found" result. `
   );
 }
 
@@ -705,7 +718,7 @@ async function buildTextVault() {
     elements.searchStatus.textContent =
       report.indexed_documents === 0
         ? "No searchable PDF, Word, OpenDocument, RTF, TXT, or Markdown documents were found in the approved locations."
-        : "Enter a legal retrieval question. Results are exact source excerpts, not generated answers.";
+        : "Type what you are looking for. You get exact quotes from your own documents, not an answer written by an AI.";
     showView("search");
     if (report.indexed_documents > 0) {
       elements.searchQuery.focus();
@@ -736,25 +749,23 @@ function renderQueryInterpretation(response) {
   const query = response.query;
   elements.queryChips.replaceChildren();
   addQueryChip(
-    query.scope === "same_provision" ? "Same provision" : "Anywhere in one document",
+    query.scope === "same_provision" ? "All in one clause" : "Anywhere in one document",
   );
   for (const concept of query.required_concepts) {
-    addQueryChip(`Must cover: ${humanize(concept)}`);
+    addQueryChip(`Must mention: ${humanize(concept)}`);
   }
   for (const concept of query.excluded_concepts) {
     addQueryChip(`Exclude: ${humanize(concept)}`);
   }
   if (query.exact_phrase) addQueryChip(`Exact: “${query.exact_phrase}”`);
   if (query.max_sentences) addQueryChip(`At most ${query.max_sentences} sentences`);
-  if (response.semantic_query_applied) addQueryChip("On-device meaning suggestions");
+  if (response.semantic_query_applied) addQueryChip("Close matches too");
   elements.candidateCount.textContent =
-    `${response.lexical_candidates_considered.toLocaleString()} lexical candidate${
+    `${response.lexical_candidates_considered.toLocaleString()} passage${
       response.lexical_candidates_considered === 1 ? "" : "s"
-    } checked` +
+    } checked word by word` +
     (response.semantic_query_applied
-      ? ` · ${response.semantic_candidates_considered.toLocaleString()} semantic vector${
-          response.semantic_candidates_considered === 1 ? "" : "s"
-        } ranked`
+      ? ` · ${response.semantic_candidates_considered.toLocaleString()} compared by meaning`
       : "");
   elements.queryInterpretation.hidden = false;
 }
@@ -797,7 +808,7 @@ function evidenceCard(card, compact = false, semantic = false) {
   titleBlock.append(kicker, title);
   const fresh = document.createElement("span");
   fresh.className = "metadata-pill";
-  fresh.textContent = card.index_fresh ? "Source verified" : "Unavailable";
+  fresh.textContent = card.index_fresh ? "Checked against the file" : "Unavailable";
   header.append(titleBlock, fresh);
 
   const excerpt = document.createElement("blockquote");
@@ -855,7 +866,7 @@ function documentCard(card) {
   const titleBlock = document.createElement("div");
   const kicker = document.createElement("span");
   kicker.className = "evidence-kicker";
-  kicker.textContent = "Document-level conjunction";
+  kicker.textContent = "Found across the whole document";
   const title = document.createElement("strong");
   title.className = "evidence-title";
   title.textContent = card.document_title;
@@ -894,7 +905,7 @@ function transcribedCard(card) {
 
   const anchor = document.createElement("p");
   anchor.className = "transcription-anchor";
-  anchor.textContent = `${card.page_anchor} · read by ${card.transcriber}`;
+  anchor.textContent = `${card.page_anchor} · read from a scan`;
   article.append(anchor);
 
   const text = document.createElement("blockquote");
@@ -905,7 +916,7 @@ function transcribedCard(card) {
   const confidence = document.createElement("p");
   confidence.className = "transcription-confidence";
   const percent = Math.round((card.lowest_line_confidence ?? 0) * 100);
-  confidence.textContent = `Lowest line confidence ${percent}%. Check this against the page before relying on it.`;
+  confidence.textContent = `The text reader was least sure here: ${percent}%. Check this against the page before relying on it.`;
   article.append(confidence);
 
   const why = document.createElement("p");
@@ -930,7 +941,7 @@ function renderSearchResponse(response) {
   if (response.semantic_suggestions.length > 0) {
     const heading = document.createElement("p");
     heading.className = "semantic-heading";
-    heading.textContent = "Broader recall · review, not verified legal matches";
+    heading.textContent = "Similar wording — read these yourself; they are not exact matches";
     elements.searchResults.append(heading);
     for (const card of response.semantic_suggestions) {
       elements.searchResults.append(evidenceCard(card, false, true));
@@ -956,31 +967,31 @@ function renderSearchResponse(response) {
     empty.className = "empty-results";
     empty.textContent =
       response.stale_evidence_withdrawn > 0
-        ? "The indexed match is no longer current. It was withdrawn; rebuild the document index before relying on it."
-        : "No current source satisfied every visible constraint. Try removing one constraint or search for a different legal concept.";
+        ? "This match is out of date, so it was withheld. Open your documents again before relying on it."
+        : "Nothing in your documents matched all of that. Try asking for less at once, or use different wording.";
     elements.searchResults.append(empty);
   }
-  const resultKind = response.query.scope === "same_provision" ? "provision" : "document";
+  const resultKind = response.query.scope === "same_provision" ? "clause" : "document";
   const staleNote =
     response.stale_evidence_withdrawn > 0
       ? ` ${response.stale_evidence_withdrawn.toLocaleString()} stale source${
           response.stale_evidence_withdrawn === 1 ? " was" : "s were"
-        } withdrawn.`
+        } withheld because the file changed.`
       : "";
   const boundaryNote =
     (response.inferred_boundary_evidence_withdrawn ?? 0) > 0
-      ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} searchable document${
+      ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} document${
           response.inferred_boundary_evidence_withdrawn === 1 ? " does" : "s do"
         } not record where a clause ends, so ${
           response.inferred_boundary_evidence_withdrawn === 1 ? "it was" : "they were"
         } excluded from same-clause questions.`
       : "";
   elements.searchStatus.textContent =
-    `${verifiedCount.toLocaleString()} current ${resultKind}${
+    `${verifiedCount.toLocaleString()} ${resultKind}${
       verifiedCount === 1 ? "" : "s"
-    } matched every visible constraint; ${suggestionCount.toLocaleString()} separately labeled meaning suggestion${
-      suggestionCount === 1 ? "" : "s"
-    }.${staleNote}${boundaryNote}`;
+    } matched everything you asked for. ${suggestionCount.toLocaleString()} more ${
+      suggestionCount === 1 ? "is" : "are"
+    } close in meaning, listed separately below.${staleNote}${boundaryNote}`;
 }
 
 async function searchVault(event) {
@@ -988,7 +999,7 @@ async function searchVault(event) {
   hideError();
   const query = elements.searchQuery.value.trim();
   if (!query) {
-    elements.searchStatus.textContent = "Enter a legal retrieval question first.";
+    elements.searchStatus.textContent = "Type what you are looking for first.";
     elements.searchQuery.focus();
     return;
   }
@@ -999,19 +1010,31 @@ async function searchVault(event) {
     const response = await invoke("search_archive_text_vault", { query });
     renderSearchResponse(response);
   } catch (error) {
-    elements.searchStatus.textContent = "No evidence was returned.";
+    elements.searchStatus.textContent = "Nothing matched.";
     showError(error);
   } finally {
     elements.searchSubmit.disabled = false;
   }
 }
 
-function startOver() {
+async function startOver() {
   hideError();
   showView("setup");
-  elements.setupStatus.textContent = `${locations.length.toLocaleString()} approved location${
+  // Re-read the rows rather than reusing the ones rendered before the census.
+  // The per-location counts only exist once a census has run, so the state
+  // this view was left in is exactly the state that lacks them, and the rows
+  // would stay unlabelled for the whole session.
+  try {
+    const state = await invoke("archive_bootstrap");
+    renderLocations(state.locations);
+  } catch (error) {
+    // A failed refresh costs the counts, never the view: the operator asked
+    // to change locations and must still land somewhere he can.
+    showError(String(error));
+  }
+  elements.setupStatus.textContent = `${locations.length.toLocaleString()} folder${
     locations.length === 1 ? "" : "s"
-  }. Change locations or run the metadata census again.`;
+  } chosen. Change them, or count what is there again.`;
 }
 
 function backToCensus() {
@@ -1027,7 +1050,7 @@ async function bootstrap() {
     // where a support conversation starts. Two candidates once carried the
     // same version number and only one of them could index anything.
     if (state.buildIdentity) {
-      elements.buildIdentity.textContent = `Private evidence build · ${state.buildIdentity}`;
+      elements.buildIdentity.textContent = `Minutes Archive ${state.buildIdentity}`;
     }
     renderLocations(state.locations);
     lastReport = state.report;

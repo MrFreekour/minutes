@@ -25,12 +25,13 @@
       </header>
 
       <section id="main-content" class="hero">
-        <p class="eyebrow">Private legal work product</p>
+        <p class="eyebrow">Local only · nothing is uploaded</p>
         <h1>Map first. Then find the exact language.</h1>
         <p class="hero-copy">
-          Start with a metadata-only census. If the coverage looks right, build
-          a local, in-memory document index and search exact provisions with
-          source evidence. Nothing is uploaded.
+          First count what is in your folders, without opening anything. If
+          that looks right, open the documents so you can search them and get
+          exact quotes that point back to the file they came from. Nothing
+          leaves this Mac.
         </p>
       </section>
 
@@ -40,29 +41,29 @@
             <li class="step is-active" data-step="1">
               <span class="step-number">1</span>
               <div>
-                <strong>Approve locations</strong>
-                <span>Nothing is scanned implicitly.</span>
+                <strong>Choose folders</strong>
+                <span>Nothing is looked at until you pick it.</span>
               </div>
             </li>
             <li class="step" data-step="2">
               <span class="step-number">2</span>
               <div>
-                <strong>Run private census</strong>
-                <span>Metadata only. No filenames exported.</span>
+                <strong>Count what is there</strong>
+                <span>Counts only. Your files stay closed.</span>
               </div>
             </li>
             <li class="step" data-step="3">
               <span class="step-number">3</span>
               <div>
-                <strong>Review coverage</strong>
-                <span>Decide what the pilot should support.</span>
+                <strong>Check the totals</strong>
+                <span>See what is there before opening anything.</span>
               </div>
             </li>
             <li class="step" data-step="4">
               <span class="step-number">4</span>
               <div>
-                <strong>Search exact evidence</strong>
-                <span>Searchable PDF, Word, OpenDocument, RTF, text, and scans read on-device.</span>
+                <strong>Search your documents</strong>
+                <span>PDFs, Word files, text, and scans — all read on this Mac.</span>
               </div>
             </li>
           </ol>
@@ -73,10 +74,11 @@
               <path d="m9.2 12 1.7 1.8 4-4.3" />
             </svg>
             <div>
-              <strong>The census cannot open documents</strong>
+              <strong>This step cannot open your documents</strong>
               <p>
-                Content access is a later, explicit action. No mode follows
-                links, contacts a model, or uploads anything.
+                Opening documents is a separate step that you choose.
+                Nothing here follows shortcuts, sends anything to an AI
+                service, or uploads.
               </p>
             </div>
           </div>
@@ -87,17 +89,17 @@
             <div class="panel-heading">
               <div>
                 <p class="section-label">Step 1</p>
-                <h2 id="locations-title">Approved archive locations</h2>
+                <h2 id="locations-title">Folders you have approved</h2>
                 <p>
-                  Use the macOS picker to approve Documents, iCloud Drive,
-                  external drives, or any other folder. Each location remains
-                  a separate authorization boundary.
+                  Pick folders the way you would in Finder — Documents,
+                  iCloud Drive, an external drive, anything. Each folder is
+                  approved on its own, and you can remove it at any time.
                 </p>
               </div>
               <div class="location-actions">
                 <button id="add-locations" class="button button-secondary" type="button">
                   <span aria-hidden="true">＋</span>
-                  Choose locations
+                  Choose folders
                 </button>
                 <button id="skip-folders" class="button button-secondary" type="button" disabled>
                   <span aria-hidden="true">−</span>
@@ -113,8 +115,8 @@
               <div class="folder-illustration" aria-hidden="true">
                 <span></span>
               </div>
-              <strong>No locations approved</strong>
-              <p>Your home folder and entire filesystem are intentionally refused.</p>
+              <strong>No folders chosen yet</strong>
+              <p>Your whole home folder and your whole disk are refused on purpose.</p>
             </div>
 
             <ul id="location-list" class="location-list" aria-live="polite"></ul>
@@ -122,20 +124,20 @@
             <div class="privacy-strip">
               <span class="privacy-icon" aria-hidden="true">◎</span>
               <div>
-                <strong>Paths stay behind the native boundary</strong>
+                <strong>Reports you save are safe to share</strong>
                 <p>
-                  The interface receives opaque location numbers, not folder
-                  paths. Exported reports contain no paths, filenames, or text.
+                  A saved report is counts only — no folder names, no file
+                  names, and nothing from inside your documents.
                 </p>
               </div>
             </div>
 
             <div class="action-row">
               <p id="setup-status" class="status" role="status">
-                Choose at least one location to continue.
+                Choose at least one folder to continue.
               </p>
               <button id="run-census" class="button button-primary" type="button" disabled>
-                Run private census
+                Count what is there
                 <span aria-hidden="true">→</span>
               </button>
             </div>
@@ -145,45 +147,45 @@
             <div class="scan-orbit" aria-hidden="true">
               <span></span>
             </div>
-            <p class="section-label">Metadata-only census</p>
-            <h2>Inspecting approved locations…</h2>
+            <p class="section-label">Counting only</p>
+            <h2>Looking through your folders…</h2>
             <p>
-              Counting formats, sizes, age bands, packages, and cloud-only
-              placeholders. Document contents remain unopened.
+              Counting file types, sizes, and dates. Not one document is
+              opened.
             </p>
             <div class="progress-track" aria-hidden="true">
               <span></span>
             </div>
             <button id="cancel-census" class="button button-quiet" type="button">
-              Cancel census
+              Stop counting
             </button>
           </div>
 
           <div id="results-view" hidden>
             <div class="results-heading">
               <div>
-                <p class="section-label">Aggregate result</p>
-                <h2>Archive coverage census</h2>
-                <p id="result-summary">The census completed without reading document contents.</p>
+                <p class="section-label">Totals</p>
+                <h2>What is in your folders</h2>
+                <p id="result-summary">Counted without opening a single document.</p>
               </div>
               <div id="result-status" class="result-status">Complete</div>
             </div>
 
             <div class="metrics" aria-label="Census totals">
               <article class="metric">
-                <span>Artifacts</span>
+                <span>Files</span>
                 <strong id="metric-artifacts">—</strong>
               </article>
               <article class="metric">
-                <span>Approved locations</span>
+                <span>Folders</span>
                 <strong id="metric-locations">—</strong>
               </article>
               <article class="metric">
-                <span>Document bytes</span>
+                <span>Total size</span>
                 <strong id="metric-bytes">—</strong>
               </article>
               <article class="metric">
-                <span>Cloud-only items</span>
+                <span>Still in iCloud</span>
                 <strong id="metric-cloud">—</strong>
               </article>
             </div>
@@ -192,16 +194,16 @@
               <section class="coverage-card" aria-labelledby="coverage-title">
                 <div class="card-title">
                   <div>
-                    <p class="section-label">Format mix</p>
-                    <h3 id="coverage-title">What the archive contains</h3>
+                    <p class="section-label">File types</p>
+                    <h3 id="coverage-title">What kinds of files you have</h3>
                   </div>
-                  <span class="metadata-pill">Aggregate only</span>
+                  <span class="metadata-pill">Counts only</span>
                 </div>
                 <div id="category-list" class="category-list"></div>
               </section>
 
               <section class="signals-card" aria-labelledby="signals-title">
-                <p class="section-label">Coverage signals</p>
+                <p class="section-label">Worth knowing</p>
                 <h3 id="signals-title">What needs attention</h3>
                 <dl id="signals-list" class="signals-list"></dl>
               </section>
@@ -210,37 +212,32 @@
             <div class="verified-strip">
               <span aria-hidden="true">✓</span>
               <div>
-                <strong>No document content was read</strong>
+                <strong>Nothing inside your documents was read</strong>
                 <p>
-                  No filenames or paths were emitted, no hashes were computed,
-                  and no symlinks were followed.
+                  No file names or folder names were recorded, and no
+                  shortcuts were followed.
                 </p>
               </div>
             </div>
 
             <div class="pilot-strip">
               <div>
-                <p class="section-label">Optional next gate</p>
-                <strong>Build a temporary document search index</strong>
+                <p class="section-label">Optional next step</p>
+                <strong>Open your documents so you can search them</strong>
                 <p id="build-forecast" class="build-forecast" hidden></p>
                 <p>
-                  This explicitly opens searchable <code>.pdf</code>,
-                  <code>.docx</code>, <code>.doc</code>, <code>.odt</code>,
-                  <code>.rtf</code>, <code>.txt</code>, <code>.text</code>,
-                  and <code>.md</code> files, and reads scanned images
-                  (<code>.png</code>, <code>.jpg</code>, <code>.tiff</code>,
-                  <code>.heic</code>) with the on-device text recognizer. A
-                  scan's text is a machine's reading and is never quoted as
-                  source language. Every converted byte goes to a
-                  bounded, network-denied converter. Exact search plus the
-                  revision-pinned macOS semantic model run in separate
-                  network-denied workers; source text, FTS rows, and
-                  suggestion vectors stay in memory.
-                  Scans, legacy Word, and email are counted but not searched.
+                  This opens your PDFs, Word, OpenDocument, RTF, text, and
+                  Markdown files, and reads scanned images with the text
+                  reader built into macOS. Text from a scan is a machine
+                  reading a picture, so it is never quoted as the document's
+                  own words. Everything is read on this Mac, by helper
+                  programs that have no network access, and it is all held in
+                  memory — nothing is written to disk. Scans, very old Word
+                  files, and email archives are counted but not searched.
                 </p>
               </div>
               <button id="build-text-vault" class="button button-primary" type="button">
-                Build document pilot
+                Open my documents
                 <span aria-hidden="true">→</span>
               </button>
             </div>
@@ -262,15 +259,14 @@
             <div class="scan-orbit" aria-hidden="true">
               <span></span>
             </div>
-            <p class="section-label">Explicit content step</p>
-            <h2>Building the private document index…</h2>
+            <p class="section-label">You chose this step</p>
+            <h2>Reading your documents…</h2>
             <p>
-              Reading bounded supported files from the approved locations.
-              All document conversion runs in the network-denied worker. The
-              index stays in memory, links remain excluded, and the built-in
-              macOS sentence model creates suggestion vectors in its own
-              network-denied worker. Minutes Archive requests no model download; macOS
-              manages its own on-device assets.
+              Reading the files this app supports from the folders you
+              approved. Everything happens on this Mac, in helper programs
+              with no network access. Shortcuts are skipped, and the result
+              is held in memory only. macOS provides the language model used
+              for suggestions; nothing is downloaded.
             </p>
             <div class="progress-track" aria-hidden="true">
               <span></span>
@@ -286,14 +282,14 @@
           <div id="search-view" hidden>
             <div class="search-heading">
               <div>
-                <p class="section-label">Evidence-first document pilot</p>
-                <h2>Search the approved archive</h2>
+                <p class="section-label">Search</p>
+                <h2>Search your documents</h2>
                 <div id="vault-summary">
-                  <p>The private document index is ready in memory.</p>
+                  <p>Your documents are ready to search. Nothing was saved to disk.</p>
                 </div>
               </div>
               <button id="back-to-census" class="button button-secondary" type="button">
-                Census &amp; locations
+                Folders &amp; totals
               </button>
             </div>
 
@@ -311,34 +307,34 @@
                 </button>
               </div>
               <p class="search-help">
-                Try “Find documents containing assignment, governing law, and a
-                BAA reference” for document-level conjunction, or describe a
-                clause in ordinary language for separately labeled semantic
-                suggestions.
+                You can ask for several things at once — “documents with
+                assignment, governing law, and a BAA reference” — or just
+                describe a clause in your own words. Close matches are listed
+                separately from exact ones.
               </p>
             </form>
 
             <div id="query-interpretation" class="query-interpretation" hidden>
               <div>
-                <p class="section-label">Interpreted constraints</p>
+                <p class="section-label">What was searched for</p>
                 <div id="query-chips" class="query-chips"></div>
               </div>
               <span id="candidate-count" class="metadata-pill"></span>
             </div>
 
             <p id="search-status" class="status search-status" role="status">
-              Enter a legal retrieval question. Results are exact source
-              excerpts, not generated answers.
+              Type what you are looking for. You get exact quotes from your
+              own documents, not an answer written by an AI.
             </p>
             <div id="search-results" class="search-results"></div>
 
             <div class="verified-strip search-verification">
               <span aria-hidden="true">✓</span>
               <div>
-                <strong>Every displayed card passed a live source fence</strong>
+                <strong>Every result below was just checked against the real file</strong>
                 <p>
-                  A moved, replaced, changed, inaccessible, or out-of-scope
-                  source is withdrawn before its indexed excerpt is returned.
+                  If a document has moved, changed, or is no longer
+                  available, its quote is withheld rather than shown.
                 </p>
               </div>
             </div>
@@ -353,11 +349,11 @@
       </div>
 
       <footer>
-        <span id="build-identity">Private evidence build</span>
+        <span id="build-identity">Minutes Archive</span>
         <span aria-hidden="true">•</span>
-        <span>Networking disabled by design</span>
+        <span>Networking is switched off</span>
         <span aria-hidden="true">•</span>
-        <span>Closing the window ends the session and discards the index</span>
+        <span>Closing this window forgets everything</span>
       </footer>
     </main>
   </body>

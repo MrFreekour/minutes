@@ -104,6 +104,18 @@ impl Default for ArchiveState {
 struct LocationSummary {
     id: u64,
     label: String,
+    /// What this location contributed to the last census, or `None` before
+    /// one has run.
+    ///
+    /// The rows are deliberately indistinguishable by name, which leaves an
+    /// owner with several matters approved unable to tell them apart at a
+    /// glance. Counts separate them without naming anything: "4,102 items"
+    /// beside "12 items" is the difference between a matter archive and a
+    /// folder of exhibits, and neither number says whose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifacts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regular_file_bytes: Option<u64>,
 }
 
 /// The result of a folder-picker round.
@@ -187,12 +199,35 @@ fn safe_census_error(error: impl std::fmt::Display) -> String {
 }
 
 fn location_summaries(locations: &[ApprovedLocation]) -> Vec<LocationSummary> {
+    location_summaries_with(locations, None)
+}
+
+/// Location rows, with the last census's per-location totals when there is a
+/// census to draw them from.
+///
+/// Totals are positional against the approved roots, exactly as the census
+/// produced them. A report from a different set of locations -- one taken
+/// before a folder was added or removed -- would misattribute every row, so a
+/// length mismatch drops the numbers rather than showing wrong ones. A row
+/// without a count is a smaller failure than a row with someone else's.
+fn location_summaries_with(
+    locations: &[ApprovedLocation],
+    report: Option<&CensusReport>,
+) -> Vec<LocationSummary> {
+    let totals = report
+        .map(|report| report.per_location.as_slice())
+        .filter(|totals| totals.len() == locations.len());
     locations
         .iter()
         .enumerate()
-        .map(|(index, location)| LocationSummary {
-            id: location.id,
-            label: format!("Approved location {}", index + 1),
+        .map(|(index, location)| {
+            let totals = totals.and_then(|totals| totals.get(index));
+            LocationSummary {
+                id: location.id,
+                label: format!("Approved location {}", index + 1),
+                artifacts: totals.map(|totals| totals.artifacts),
+                regular_file_bytes: totals.map(|totals| totals.regular_file_bytes),
+            }
         })
         .collect()
 }
@@ -311,7 +346,7 @@ fn archive_bootstrap(state: State<'_, ArchiveState>) -> Result<BootstrapState, S
     let session = state.session.lock().map_err(|_| lock_error())?;
     Ok(BootstrapState {
         build_identity: build_identity(),
-        locations: location_summaries(&session.locations),
+        locations: location_summaries_with(&session.locations, session.last_report.as_ref()),
         scan_running: session.scan.running,
         report: session.last_report.clone(),
         text_vault_report: session
@@ -345,7 +380,9 @@ async fn choose_archive_locations(
             folded: 0,
             forgotten_skips: 0,
             unskipped: 0,
-            locations: location_summaries(&session.locations),
+            // Nothing was approved or removed, so the last census still
+            // describes exactly these rows and its counts still belong on them.
+            locations: location_summaries_with(&session.locations, session.last_report.as_ref()),
         });
     };
 
@@ -1614,6 +1651,98 @@ mod tests {
         );
         assert!(!serialized.contains("client-alpha"));
         assert!(!serialized.contains("client-beta"));
+    }
+
+    /// Per-location counts distinguish the rows and never reach the export.
+    ///
+    /// The rows are deliberately unnameable, which left an owner unable to
+    /// tell one approved matter from another. Counts fix that without naming
+    /// anything -- but the exported report has been through a privacy review
+    /// and carries a versioned schema, so the numbers stop at the interface.
+    #[test]
+    fn per_location_counts_reach_the_interface_and_not_the_export() {
+        let temp = TempDir::new().expect("temp");
+        let big = temp.path().join("matter-archive");
+        let small = temp.path().join("exhibits");
+        fs::create_dir(&big).expect("big");
+        fs::create_dir(&small).expect("small");
+        for index in 0..7u32 {
+            fs::write(
+                big.join(format!("agreement-{index:02}.txt")),
+                "x".repeat(100),
+            )
+            .expect("write");
+        }
+        fs::write(small.join("exhibit-a.txt"), "y".repeat(10)).expect("write");
+
+        let approved = approve_roots(&[big, small]).expect("approve");
+        let report =
+            scan_approved_roots(&approved, CensusLimits::default(), &AtomicBool::new(false))
+                .expect("census");
+
+        // Positional against the approved roots, and each artifact counted
+        // once under the location it was actually found in.
+        assert_eq!(report.per_location.len(), 2);
+        assert_eq!(report.per_location[0].artifacts, 7);
+        assert_eq!(report.per_location[0].regular_file_bytes, 700);
+        assert_eq!(report.per_location[1].artifacts, 1);
+        assert_eq!(report.per_location[1].regular_file_bytes, 10);
+        // The per-location totals must reconcile with the aggregate, or one
+        // of the two numbers on screen is lying about the same archive.
+        let summed: u64 = report.per_location.iter().map(|t| t.artifacts).sum();
+        assert_eq!(summed, report.summary.artifacts);
+
+        // The interface receives them on the rows it could not otherwise tell
+        // apart.
+        let mut roots = approved.into_iter();
+        let locations = [
+            ApprovedLocation {
+                id: 1,
+                root: roots.next().expect("first"),
+            },
+            ApprovedLocation {
+                id: 2,
+                root: roots.next().expect("second"),
+            },
+        ];
+        let serialized = serde_json::to_string(&location_summaries_with(&locations, Some(&report)))
+            .expect("serialize");
+        assert!(serialized.contains(r#""artifacts":7"#), "{serialized}");
+        assert!(serialized.contains(r#""artifacts":1"#), "{serialized}");
+        // The interface reads these by name, and the struct renames to
+        // camelCase -- a mismatch here showed every location as "0 B" while
+        // the item count was right, which is the kind of half-correct row
+        // that reads as a real number.
+        assert!(
+            serialized.contains(r#""regularFileBytes":700"#),
+            "{serialized}"
+        );
+        assert!(!serialized.contains("matter-archive"), "{serialized}");
+        assert!(!serialized.contains("exhibits"), "{serialized}");
+
+        // The export does not, and stays exactly the reviewed shape.
+        let exported = serde_json::to_string(&report).expect("export");
+        assert!(
+            !exported.contains("per_location"),
+            "per-location totals must not enter the reviewed export shape: {exported}"
+        );
+
+        // A report taken against a different set of locations misattributes
+        // every row, so its numbers are dropped rather than shown wrong.
+        let one_location = [ApprovedLocation {
+            id: 1,
+            root: approve_roots(std::slice::from_ref(&temp.path().join("matter-archive")))
+                .ok()
+                .and_then(|mut roots| roots.pop())
+                .expect("re-approve"),
+        }];
+        let mismatched =
+            serde_json::to_string(&location_summaries_with(&one_location, Some(&report)))
+                .expect("serialize");
+        assert!(
+            !mismatched.contains("artifacts"),
+            "a report from a different location set must not label these rows: {mismatched}"
+        );
     }
 
     /// Revealing a location resolves its path here and never hands one out.

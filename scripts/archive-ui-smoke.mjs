@@ -370,7 +370,7 @@ try {
         if (!document.querySelector("#setup-status").textContent.includes("3 folders")) {
           throw new Error("The skipped count came from the interface, not the native side");
         }
-        if (!document.querySelector("#setup-status").textContent.includes("not inside an approved location")) {
+        if (!document.querySelector("#setup-status").textContent.includes("not inside a folder you chose")) {
           throw new Error("A folder outside every approved location was dropped silently");
         }
         // The way back must be visible once something is skipped.
@@ -384,7 +384,7 @@ try {
         );
         document.querySelector("#run-census").click();
         await waitFor(() => !document.querySelector("#results-view").hidden, "census result");
-        if (!document.querySelector("#result-summary").textContent.includes("without reading")) {
+        if (!document.querySelector("#result-summary").textContent.includes("without opening")) {
           throw new Error("Census privacy copy is missing");
         }
         document.querySelector("#build-text-vault").click();
@@ -398,9 +398,9 @@ try {
         const body = document.body.innerText;
         if (
           !body.includes("Synthetic Agreement") ||
-          !body.includes("Source verified") ||
-          !body.toLowerCase().includes("review, not verified legal matches") ||
-          !body.includes("Closing the window ends the session and discards the index")
+          !body.includes("Checked against the file") ||
+          !body.toLowerCase().includes("not exact matches") ||
+          !body.includes("Closing this window forgets everything")
         ) {
           throw new Error("Evidence provenance or session-disposal notice did not render");
         }
@@ -448,16 +448,16 @@ try {
 
         const vaultSummary = document.querySelector("#vault-summary").textContent;
         if (
-          !vaultSummary.includes("2 were aliases or shortcuts") ||
-          !vaultSummary.includes("3 have a second name elsewhere on the disk") ||
-          !vaultSummary.includes("9,023 items were not indexed") ||
-          !vaultSummary.includes("4 scanned pages read by text recognition") ||
+          !vaultSummary.includes("aliases or shortcuts (2)") ||
+          !vaultSummary.includes("have a second name elsewhere on the disk (3)") ||
+          !vaultSummary.includes("9,023 items could not be read") ||
+          !vaultSummary.includes("4 scanned pages read by the text reader") ||
           !vaultSummary.includes("This index is PARTIAL") ||
           !vaultSummary.includes("5,000 documents were not read") ||
           !vaultSummary.includes("3 folders were too deep to enter") ||
-          !vaultSummary.includes("9,000 were blocked by macOS permissions") ||
-          !vaultSummary.includes("12 were scans the text recognizer could not read") ||
-          !vaultSummary.includes("2 changed while being read") ||
+          !vaultSummary.includes("blocked by macOS permissions (9,000)") ||
+          !vaultSummary.includes("scans the text reader could not make out (12)") ||
+          !vaultSummary.includes("changed while being read (2)") ||
           !vaultSummary.includes("suggestion model stopped partway") ||
           !vaultSummary.includes("2 folders were skipped at your request")
         ) {
