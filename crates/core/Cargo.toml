@@ -32,11 +32,16 @@ denoise = ["dep:nnnoiseless"]
 # pulled in by `diarize`; cargo unifies them when both features are on.
 vad-ort = ["streaming", "dep:ort", "dep:ndarray"]
 # Opt-in SOTA transcription engine: sherpa-onnx + parakeet-tdt-0.6b-v3 (multilingual,
-# no Python), in-process via sherpa-rs. Off by default; whisper.cpp stays the default.
-# Linkage is per-target (see the [target.*] sherpa-rs deps below): macOS static
-# (self-contained binaries, #369), Linux/Windows dynamic (run from target layout).
-# Coexists with `diarize`/`vad-ort`'s ort either way; no parakeet/ort dep here.
-engine-sherpa = ["dep:sherpa-rs"]
+# no Python). Off by default; whisper.cpp stays the default.
+#
+# This enables the LOADER, not a static link. sherpa lives in a separate
+# cdylib (crates/sherpa-plugin) that is dlopened at runtime, because sherpa and
+# pyannote each vendor their own ONNX Runtime and kaldi-native-fbank, and one
+# executable can only hold one copy of each: whichever wins breaks the other
+# consumer (issue #683). Loading sherpa into its own image removes the conflict
+# instead of arbitrating it (issue #685), so this feature now coexists with
+# `diarize` and `vad-ort` on every platform.
+engine-sherpa = ["dep:libloading"]
 
 [dependencies]
 serde = { workspace = true }
@@ -64,6 +69,7 @@ interprocess = { workspace = true }
 pyannote-rs = { workspace = true, optional = true }
 knf-rs = { version = "0.3.2", optional = true }
 ort = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 whisper-guard = { path = "../whisper-guard", version = "0.3.0" }
 nnnoiseless = { workspace = true, optional = true }
@@ -89,13 +95,11 @@ mach2 = "0.6"
 # Static sherpa-onnx on macOS so opt-in engine-sherpa builds produce apps/CLIs
 # with no dangling @rpath dylib refs (the #369 packaging blocker; verified by
 # real launch + transcription). `default-features = false` drops upstream `tts`.
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "static"], optional = true }
+# sherpa-rs moved to crates/sherpa-plugin (#685); nothing here links it.
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5.14.0"
-# Dynamic on Linux: sherpa-rs-sys's `static` panics in build.rs here unless a
-# global RUSTFLAGS relocation hack is set. CLI-from-source stays the Linux path.
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"], optional = true }
+# sherpa-rs moved to crates/sherpa-plugin (#685).
 
 # Native hotkey (CGEventTap) uses raw FFI — no extra crate deps needed.
 # The macOS frameworks are linked automatically via #[link(name = "...")]
@@ -104,7 +108,7 @@ sherpa-rs = { version = "0.6.8", default-features = false, features = ["download
 windows-sys = { version = "0.59", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 # Dynamic on Windows, as before the macOS static fix (CI builds this gate on
 # all three platforms; static archives are only wired up for macOS).
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"], optional = true }
+# sherpa-rs moved to crates/sherpa-plugin (#685).
 
 [dev-dependencies]
 hound = { workspace = true }

@@ -977,17 +977,19 @@ minutes setup --diarization
 # NOT yet the recommended daily engine: in real-meeting A/B it trails the Parakeet
 # engine on segmentation/casing (see issue #369).
 #
-# macOS: engine-sherpa cannot be combined with the default `diarize` feature in
-# one binary. Both stacks vendor ONNX Runtime and kaldi-native-fbank, and the
-# static link can only keep one copy of each, which breaks voice enrollment or
-# sherpa itself depending on which copy wins (issue #683; the build refuses
-# with a compile error rather than shipping the broken combination). Build the
-# sherpa CLI without diarization:
-#   cargo build --release -p minutes-cli --no-default-features \
-#     --features whisper,engine-sherpa,metal
+# sherpa runs from an isolated plugin, so it now coexists with diarization on
+# every platform. Both stacks vendor their own ONNX Runtime and
+# kaldi-native-fbank, and one executable can only keep one copy of each, which
+# broke voice enrollment or sherpa itself depending on which copy won (#683).
+# Loading sherpa from its own dynamic library removes the conflict (#685).
+# Build the plugin, then the CLI, then copy the plugin where the CLI looks:
+#   (cd crates/sherpa-plugin && cargo build --release)
+#   cargo build --release -p minutes-cli --features engine-sherpa,metal
+#   mkdir -p ~/.minutes/lib && \
+#     cp crates/sherpa-plugin/target/release/libminutes_sherpa.dylib ~/.minutes/lib/
 # Then enable in one command:
 minutes setup --sherpa        # downloads the int8 ONNX model (~670MB) + sets engine = "sherpa"
-# If you select sherpa without the feature/model, transcription auto-falls-back
+# If you select sherpa without the feature, model, or plugin, transcription auto-falls-back
 # to Whisper (the bundled default), so a recording never breaks. See docs/architecture/sherpa-engine.md.
 # macOS sherpa builds are self-contained (static). On Linux/Windows, run from the
 # repo (cargo run) rather than copying the binary out of target/ — details in the doc.

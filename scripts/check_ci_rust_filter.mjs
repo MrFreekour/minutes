@@ -31,6 +31,22 @@ function workspaceMembers() {
   return [...block[1].matchAll(/["']([^"']+)["']/g)].map((m) => m[1]);
 }
 
+/**
+ * Crates deliberately excluded from the workspace.
+ *
+ * Excluding a crate keeps it off `cargo clippy --all`, which is exactly why
+ * `crates/sherpa-plugin` is excluded, but it also means the member list above
+ * cannot see it. Such a crate is real Rust that real jobs build, so it needs
+ * filter coverage like any other; without this it would fall through the gap
+ * between "member" and "not a Rust crate at all".
+ */
+function workspaceExclusions() {
+  const raw = readFileSync(join(repoRoot, "Cargo.toml"), "utf8");
+  const block = raw.match(/^\s*exclude\s*=\s*\[([\s\S]*?)\]/m);
+  if (!block) return [];
+  return [...block[1].matchAll(/["']([^"']+)["']/g)].map((m) => m[1]);
+}
+
 /** Patterns listed under the `rust:` filter in ci.yml. */
 function rustFilterPatterns() {
   const raw = readFileSync(join(repoRoot, ".github/workflows/ci.yml"), "utf8");
@@ -93,8 +109,9 @@ function unclassifiedCrateDirs() {
 }
 
 const members = workspaceMembers();
+const excluded = workspaceExclusions();
 const patterns = rustFilterPatterns();
-const mustCover = [...members, ...unclassifiedCrateDirs()];
+const mustCover = [...members, ...excluded, ...unclassifiedCrateDirs()];
 const missing = mustCover.filter((m) => !coveredBy(m, patterns));
 
 if (missing.length > 0) {
@@ -109,7 +126,8 @@ if (missing.length > 0) {
 }
 
 console.log(
-  `CI rust filter covers all ${members.length} workspace members ` +
-    `and ${mustCover.length - members.length} unclassified crates/ dirs ` +
-    `(${patterns.length} patterns).`
+  `CI rust filter covers all ${members.length} workspace members, ` +
+    `${excluded.length} excluded crates, and ` +
+    `${mustCover.length - members.length - excluded.length} unclassified ` +
+    `crates/ dirs (${patterns.length} patterns).`
 );

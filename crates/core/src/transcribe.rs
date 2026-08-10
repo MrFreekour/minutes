@@ -424,15 +424,25 @@ fn transcribe_dispatch(
             // `sherpa_engine` path helpers are always compiled, so this check
             // works in any build.
             let model_dir = crate::sherpa_engine::model_dir(config);
+            // Since #685 the engine lives in a dlopened plugin, so being
+            // compiled in no longer implies being runnable: the plugin ships
+            // separately and can be absent or ABI-mismatched. Probe it here,
+            // with the other preconditions, so an unloadable plugin falls back
+            // like a missing model instead of failing the transcription. The
+            // probe is a cached one-shot, so this costs nothing after the
+            // first call.
+            let plugin_problem = sherpa_plugin_unavailable_reason(config);
             if cfg!(feature = "engine-sherpa")
                 && crate::sherpa_engine::model_files_present(&model_dir)
+                && plugin_problem.is_none()
             {
                 transcribe_sherpa_dispatch(audio_path, config, hints)
             } else {
                 tracing::warn!(
                     model_dir = %model_dir.display(),
                     compiled = cfg!(feature = "engine-sherpa"),
-                    "engine = \"sherpa\" selected but unavailable (feature/model); falling back to whisper"
+                    plugin = plugin_problem.as_deref().unwrap_or("ok"),
+                    "engine = \"sherpa\" selected but unavailable (feature/model/plugin); falling back to whisper"
                 );
                 transcribe_whisper_dispatch(audio_path, config, hints)
             }
@@ -903,6 +913,20 @@ fn transcribe_parakeet_dispatch(
         tracing::warn!("Parakeet is not compiled into this build; falling back to Whisper");
         transcribe_whisper_dispatch(audio_path, config, hints)
     }
+}
+
+/// Why the sherpa plugin cannot be used, or `None` when it loads.
+///
+/// Always `None` without the engine feature, where the caller's `cfg!` check
+/// already decided the question.
+#[cfg(feature = "engine-sherpa")]
+fn sherpa_plugin_unavailable_reason(config: &Config) -> Option<String> {
+    crate::sherpa_plugin::unavailable_reason(config)
+}
+
+#[cfg(not(feature = "engine-sherpa"))]
+fn sherpa_plugin_unavailable_reason(_config: &Config) -> Option<String> {
+    None
 }
 
 /// Dispatch for the opt-in sherpa-onnx engine (parakeet-tdt-0.6b-v3, multilingual).
