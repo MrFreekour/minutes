@@ -421,7 +421,7 @@ function renderReport(report) {
       "Scans that need reading",
       report.categories.find((item) => item.category === "image_or_scan")?.artifacts ?? 0,
     ),
-    createSignal("iCloud placeholders", report.signals.icloud_placeholders),
+    createSignal("Not downloaded from iCloud", report.signals.icloud_placeholders),
     createSignal("Pages, Numbers, Keynote", report.summary.packages),
     createSignal("Blocked by permissions", report.signals.permission_mode_unreadable),
     createSignal("Shortcuts skipped", report.signals.symlinks_skipped),
@@ -518,8 +518,10 @@ function renderVaultSummary(report) {
   }
   if (report.unsupported_files_skipped > 0 || report.ocr_required_files > 0) {
     notes.push({
-      text: `${report.unsupported_files_skipped.toLocaleString()} unsupported item${
+      text: `${report.unsupported_files_skipped.toLocaleString()} file${
         report.unsupported_files_skipped === 1 ? "" : "s"
+      } this app cannot open ${
+        report.unsupported_files_skipped === 1 ? "was" : "were"
       } skipped; ${report.ocr_required_files.toLocaleString()} PDF${
         report.ocr_required_files === 1 ? "" : "s"
       } are pictures of pages with no text to read.`,
@@ -541,7 +543,7 @@ function renderVaultSummary(report) {
   const inferredBoundaryDocuments = report.inferred_boundary_documents ?? 0;
   if (inferredBoundaryDocuments > 0) {
     notes.push({
-      text: `${inferredBoundaryDocuments.toLocaleString()} indexed document${
+      text: `${inferredBoundaryDocuments.toLocaleString()} document${
         inferredBoundaryDocuments === 1 ? "" : "s"
       } cannot answer "in the same clause" questions, because the file does not record where one clause ends and the next begins.`,
     });
@@ -716,7 +718,7 @@ async function buildTextVault() {
     elements.searchStatus.textContent =
       report.indexed_documents === 0
         ? "No searchable PDF, Word, OpenDocument, RTF, TXT, or Markdown documents were found in the approved locations."
-        : "Enter a legal retrieval question. Results are exact source excerpts, not generated answers.";
+        : "Type what you are looking for. You get exact quotes from your own documents, not an answer written by an AI.";
     showView("search");
     if (report.indexed_documents > 0) {
       elements.searchQuery.focus();
@@ -747,25 +749,23 @@ function renderQueryInterpretation(response) {
   const query = response.query;
   elements.queryChips.replaceChildren();
   addQueryChip(
-    query.scope === "same_provision" ? "Same provision" : "Anywhere in one document",
+    query.scope === "same_provision" ? "All in one clause" : "Anywhere in one document",
   );
   for (const concept of query.required_concepts) {
-    addQueryChip(`Must cover: ${humanize(concept)}`);
+    addQueryChip(`Must mention: ${humanize(concept)}`);
   }
   for (const concept of query.excluded_concepts) {
     addQueryChip(`Exclude: ${humanize(concept)}`);
   }
   if (query.exact_phrase) addQueryChip(`Exact: “${query.exact_phrase}”`);
   if (query.max_sentences) addQueryChip(`At most ${query.max_sentences} sentences`);
-  if (response.semantic_query_applied) addQueryChip("On-device meaning suggestions");
+  if (response.semantic_query_applied) addQueryChip("Close matches too");
   elements.candidateCount.textContent =
-    `${response.lexical_candidates_considered.toLocaleString()} lexical candidate${
+    `${response.lexical_candidates_considered.toLocaleString()} passage${
       response.lexical_candidates_considered === 1 ? "" : "s"
-    } checked` +
+    } checked word by word` +
     (response.semantic_query_applied
-      ? ` · ${response.semantic_candidates_considered.toLocaleString()} semantic vector${
-          response.semantic_candidates_considered === 1 ? "" : "s"
-        } ranked`
+      ? ` · ${response.semantic_candidates_considered.toLocaleString()} compared by meaning`
       : "");
   elements.queryInterpretation.hidden = false;
 }
@@ -968,10 +968,10 @@ function renderSearchResponse(response) {
     empty.textContent =
       response.stale_evidence_withdrawn > 0
         ? "This match is out of date, so it was withheld. Open your documents again before relying on it."
-        : "No current source satisfied every visible constraint. Try removing one constraint or search for a different legal concept.";
+        : "Nothing in your documents matched all of that. Try asking for less at once, or use different wording.";
     elements.searchResults.append(empty);
   }
-  const resultKind = response.query.scope === "same_provision" ? "provision" : "document";
+  const resultKind = response.query.scope === "same_provision" ? "clause" : "document";
   const staleNote =
     response.stale_evidence_withdrawn > 0
       ? ` ${response.stale_evidence_withdrawn.toLocaleString()} stale source${
@@ -980,18 +980,18 @@ function renderSearchResponse(response) {
       : "";
   const boundaryNote =
     (response.inferred_boundary_evidence_withdrawn ?? 0) > 0
-      ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} searchable document${
+      ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} document${
           response.inferred_boundary_evidence_withdrawn === 1 ? " does" : "s do"
         } not record where a clause ends, so ${
           response.inferred_boundary_evidence_withdrawn === 1 ? "it was" : "they were"
         } excluded from same-clause questions.`
       : "";
   elements.searchStatus.textContent =
-    `${verifiedCount.toLocaleString()} current ${resultKind}${
+    `${verifiedCount.toLocaleString()} ${resultKind}${
       verifiedCount === 1 ? "" : "s"
-    } matched every visible constraint; ${suggestionCount.toLocaleString()} separately labeled meaning suggestion${
-      suggestionCount === 1 ? "" : "s"
-    }.${staleNote}${boundaryNote}`;
+    } matched everything you asked for. ${suggestionCount.toLocaleString()} more ${
+      suggestionCount === 1 ? "is" : "are"
+    } close in meaning, listed separately below.${staleNote}${boundaryNote}`;
 }
 
 async function searchVault(event) {
