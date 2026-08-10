@@ -12,6 +12,7 @@ minutes-archive-convert = { path = "../../crates/archive-convert" }
 minutes-archive-core = { path = "../../crates/archive-core" }
 minutes-archive-ocr = { path = "../../crates/archive-ocr" }
 minutes-archive-semantic = { path = "../../crates/archive-semantic" }
+minutes-archive-worker-control = { path = "../../crates/archive-worker-control" }
 serde = { workspace = true }
 sha2 = "0.10"
 serde_json = { workspace = true }

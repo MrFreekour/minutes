@@ -4,6 +4,7 @@
 //! callers must use the worker entry point so PDF and ZIP/XML parsing never
 //! occurs in the Tauri process.
 
+use minutes_archive_worker_control::{RegisteredChild, WorkerProcessControl};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
@@ -205,6 +206,7 @@ pub struct BoundedConverter {
     executable_identity: FileIdentity,
     executable_bytes: u64,
     executable_digest: [u8; 32],
+    process_control: Option<WorkerProcessControl>,
 }
 
 /// Device and inode of the pinned worker.
@@ -239,6 +241,20 @@ impl std::fmt::Debug for BoundedConverter {
 
 impl BoundedConverter {
     pub fn bind(worker_executable: &Path) -> Result<Self, WorkerError> {
+        Self::bind_inner(worker_executable, None)
+    }
+
+    pub fn bind_with_process_control(
+        worker_executable: &Path,
+        process_control: WorkerProcessControl,
+    ) -> Result<Self, WorkerError> {
+        Self::bind_inner(worker_executable, Some(process_control))
+    }
+
+    fn bind_inner(
+        worker_executable: &Path,
+        process_control: Option<WorkerProcessControl>,
+    ) -> Result<Self, WorkerError> {
         let canonical =
             fs::canonicalize(worker_executable).map_err(|_| WorkerError::ExecutableUnavailable)?;
         let lexical =
@@ -294,6 +310,7 @@ impl BoundedConverter {
             executable_identity,
             executable_bytes,
             executable_digest,
+            process_control,
         };
         converter.verify_sandbox()?;
         Ok(converter)
@@ -394,10 +411,23 @@ impl BoundedConverter {
                 });
             }
         }
-        let mut child = command.spawn().map_err(|_| WorkerError::WorkerFailed)?;
-        let mut stdin = child.stdin.take().ok_or(WorkerError::WorkerFailed)?;
-        let stdout = child.stdout.take().ok_or(WorkerError::WorkerFailed)?;
-        let stderr = child.stderr.take().ok_or(WorkerError::WorkerFailed)?;
+        let mut child = RegisteredChild::spawn(&mut command, self.process_control.as_ref())
+            .map_err(|_| WorkerError::WorkerFailed)?;
+        let mut stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or(WorkerError::WorkerFailed)?;
+        let stdout = child
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or(WorkerError::WorkerFailed)?;
+        let stderr = child
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or(WorkerError::WorkerFailed)?;
         let input_writer = thread::spawn(move || {
             let result = stdin.write_all(&input).and_then(|_| stdin.flush());
             drop(stdin);
@@ -420,16 +450,35 @@ impl BoundedConverter {
 
         let deadline = Instant::now() + WORKER_DEADLINE;
         let exit_status = loop {
-            match child.try_wait().map_err(|_| WorkerError::WorkerFailed)? {
+            if self
+                .process_control
+                .as_ref()
+                .is_some_and(WorkerProcessControl::is_cancelled)
+            {
+                child.terminate();
+                let _ = input_writer.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(WorkerError::WorkerBudgetExceeded);
+            }
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    child.terminate();
+                    let _ = input_writer.join();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(WorkerError::WorkerFailed);
+                }
+            };
+            match status {
                 Some(exit_status) => break exit_status,
                 None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 None => {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-                    }
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.terminate();
+                    let _ = input_writer.join();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     return Err(WorkerError::WorkerBudgetExceeded);
                 }
             }
@@ -632,102 +681,141 @@ const SCAN_IMAGE_MIN_PIXELS: i64 = 250_000;
 
 /// Pages examined for the embedded-reading signature.
 ///
-/// Enough that no real agreement outruns it, bounded so a hostile page count
-/// cannot turn the verdict into unbounded work. A document whose signature
-/// pages sit past this many pages keeps its `AuthorWritten` verdict, which is
-/// the known limitation, not a crash.
-const TEXT_ORIGIN_PAGES_EXAMINED: usize = 500;
+/// This is a bound against hostile page counts, not a performance budget. A
+/// document longer than the bound fails closed below rather than letting an
+/// unexamined page turn machine-read text into an exact quotation.
+const TEXT_ORIGIN_PAGES_EXAMINED: usize = 2_000;
 
 /// Whether this PDF's text layer is a machine reading embedded behind images.
 ///
-/// The signature is specific: a page that draws its text in an invisible
-/// rendering mode (`3 Tr` or `7 Tr`) *and* draws a page-sized image. That is
-/// how every scanner and copier that embeds OCR builds its output -- the image
-/// is the page, the hidden text makes it searchable. Both signals are
-/// required: invisible text alone appears in odd but authored PDFs, and a
-/// full-page image alone is a cover sheet or a poster. Demotion loses
-/// quotability, never truth, so a false negative here is worse than a false
-/// positive -- but a verdict that fired on half the archive would teach the
-/// operator to distrust it, so it stays on the two-signal signature.
+/// A page-sized scan plus text that is invisible or painted underneath that
+/// scan is a machine reading, not text the reader can see. Content-stream
+/// order matters: visible text painted after an image can be a caption or
+/// stamp, while text painted first and covered by the image cannot be.
 fn pdf_text_origin(doc: &lopdf::Document) -> TextOrigin {
-    for (index, (_page_number, page_id)) in doc.get_pages().into_iter().enumerate() {
-        if index >= TEXT_ORIGIN_PAGES_EXAMINED {
-            break;
-        }
-        if page_has_invisible_text(doc, page_id) && page_has_scan_sized_image(doc, page_id) {
-            return TextOrigin::MachineReadLayer;
+    let pages = doc.get_pages();
+    for (_page_number, page_id) in pages.iter().take(TEXT_ORIGIN_PAGES_EXAMINED) {
+        match page_has_machine_read_layer(doc, *page_id) {
+            Some(true) | None => return TextOrigin::MachineReadLayer,
+            Some(false) => {}
         }
     }
-    TextOrigin::AuthorWritten
+    if pages.len() > TEXT_ORIGIN_PAGES_EXAMINED {
+        TextOrigin::MachineReadLayer
+    } else {
+        TextOrigin::AuthorWritten
+    }
 }
 
-fn page_has_invisible_text(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool {
-    let Ok(content) = doc.get_page_content(page_id) else {
-        return false;
-    };
-    let Ok(content) = lopdf::content::Content::decode(&content) else {
-        return false;
-    };
-    content.operations.iter().any(|operation| {
-        operation.operator == "Tr"
-            && operation
-                .operands
-                .first()
-                .is_some_and(invisible_render_mode)
-    })
+fn page_has_machine_read_layer(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<bool> {
+    let scan_images = scan_sized_image_names(doc, page_id)?;
+    if scan_images.is_empty() {
+        return Some(false);
+    }
+    let content = doc.get_page_content(page_id).ok()?;
+    let content = lopdf::content::Content::decode(&content).ok()?;
+    Some(
+        page_has_invisible_text(&content)?
+            || page_has_text_beneath_scan_image(&content, &scan_images),
+    )
+}
+
+fn page_has_invisible_text(content: &lopdf::content::Content) -> Option<bool> {
+    let mut invisible = Some(false);
+    for operation in &content.operations {
+        if operation.operator == "Tr" {
+            invisible = operation.operands.first().and_then(invisible_render_mode);
+        } else if text_showing_operator(&operation.operator) {
+            match invisible {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => return None,
+            }
+        }
+    }
+    Some(false)
+}
+
+fn page_has_text_beneath_scan_image(
+    content: &lopdf::content::Content,
+    scan_images: &[Vec<u8>],
+) -> bool {
+    let mut text_seen = false;
+    for operation in &content.operations {
+        if text_showing_operator(&operation.operator) {
+            text_seen = true;
+            continue;
+        }
+        if operation.operator != "Do" || !text_seen {
+            continue;
+        }
+        let Some(name) = operation
+            .operands
+            .first()
+            .and_then(|operand| operand.as_name().ok())
+        else {
+            continue;
+        };
+        if scan_images.iter().any(|candidate| candidate == name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn text_showing_operator(operator: &str) -> bool {
+    matches!(operator, "Tj" | "TJ" | "'" | "\"")
 }
 
 /// Text rendering modes that paint no glyphs: 3 fills and strokes nothing;
 /// 7 clips and paints nothing. OCR layers use these to sit behind the image.
-fn invisible_render_mode(operand: &lopdf::Object) -> bool {
-    match operand {
-        lopdf::Object::Integer(mode) => *mode == 3 || *mode == 7,
-        lopdf::Object::Real(mode) => *mode == 3.0 || *mode == 7.0,
-        _ => false,
-    }
+fn invisible_render_mode(operand: &lopdf::Object) -> Option<bool> {
+    let mode = match operand {
+        lopdf::Object::Integer(mode) => *mode,
+        lopdf::Object::Real(mode) if mode.fract() == 0.0 => *mode as i64,
+        _ => return None,
+    };
+    (0..=7).contains(&mode).then_some(mode == 3 || mode == 7)
 }
 
-fn page_has_scan_sized_image(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool {
+fn scan_sized_image_names(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<Vec<Vec<u8>>> {
     let Ok((direct, inherited)) = doc.get_page_resources(page_id) else {
-        return false;
+        return None;
     };
     let mut resource_dictionaries = Vec::new();
     if let Some(direct) = direct {
         resource_dictionaries.push(direct);
     }
     for object_id in inherited {
-        if let Ok(dictionary) = doc.get_dictionary(object_id) {
-            resource_dictionaries.push(dictionary);
-        }
+        resource_dictionaries.push(doc.get_dictionary(object_id).ok()?);
     }
-    resource_dictionaries.iter().any(|resources| {
-        let Some(xobjects) =
-            resolved(doc, resources.get(b"XObject").ok()).and_then(|object| object.as_dict().ok())
-        else {
-            return false;
+    let mut names = Vec::new();
+    for resources in resource_dictionaries {
+        let Ok(xobject_resource) = resources.get(b"XObject") else {
+            continue;
         };
-        xobjects.iter().any(|(_name, object)| {
-            let Some(stream) = resolved(doc, Some(object)).and_then(|o| o.as_stream().ok()) else {
-                return false;
-            };
-            let is_image = resolved(doc, stream.dict.get(b"Subtype").ok())
-                .and_then(|object| object.as_name().ok())
-                .is_some_and(|name| name == b"Image");
-            if !is_image {
-                return false;
+        let xobjects = resolved(doc, Some(xobject_resource))?.as_dict().ok()?;
+        for (name, object) in xobjects {
+            let stream = resolved(doc, Some(object))?.as_stream().ok()?;
+            let subtype = resolved(doc, stream.dict.get(b"Subtype").ok())?
+                .as_name()
+                .ok()?;
+            if subtype != b"Image" {
+                continue;
             }
             let width = resolved(doc, stream.dict.get(b"Width").ok())
                 .and_then(|object| object.as_i64().ok());
             let height = resolved(doc, stream.dict.get(b"Height").ok())
                 .and_then(|object| object.as_i64().ok());
-            match (width, height) {
-                (Some(width), Some(height)) => {
-                    width.saturating_mul(height) >= SCAN_IMAGE_MIN_PIXELS
-                }
-                _ => false,
+            let (Some(width), Some(height)) = (width, height) else {
+                return None;
+            };
+            if width.saturating_mul(height) >= SCAN_IMAGE_MIN_PIXELS {
+                names.push(name.clone());
             }
-        })
-    })
+        }
+    }
+    Some(names)
 }
 
 /// Follow at most one reference, which is how these dictionaries are written
@@ -1615,22 +1703,34 @@ mod tests {
         assemble_pdf(&objects)
     }
 
-    /// A page built the way a scanner that embeds OCR builds one: a page-sized
-    /// image drawn over text in the requested rendering mode. `render_mode`
-    /// is spliced into the content stream (`"3 Tr "` for the copier
-    /// signature, `""` for ordinarily visible text); `with_image` controls
-    /// whether the page-sized raster is present at all.
-    fn synthetic_copier_pdf(render_mode: &str, with_image: bool) -> Vec<u8> {
-        let image_draw = if with_image {
+    /// Build a page with optional text and a page-sized image. `Some(true)`
+    /// paints the image before the text; `Some(false)` paints it afterward;
+    /// `None` omits it. That order is the distinction between a visible stamp
+    /// or caption and extracted text hidden underneath the scan.
+    fn synthetic_copier_pdf(
+        render_mode: &str,
+        image_before_text: Option<bool>,
+        with_text: bool,
+    ) -> Vec<u8> {
+        let image_draw = if image_before_text.is_some() {
             "q 612 0 0 792 0 0 cm /Im1 Do Q "
         } else {
             ""
         };
-        let stream = format!(
-            "{image_draw}BT /F1 12 Tf {render_mode}72 720 Td (7. CONFIDENTIALITY) Tj 0 -20 Td (Confidential Information includes affiliate data.) Tj ET"
-        )
+        let text_draw = if with_text {
+            format!(
+                "BT /F1 12 Tf {render_mode}72 720 Td (7. CONFIDENTIALITY) Tj 0 -20 Td (Confidential Information includes affiliate data.) Tj ET "
+            )
+        } else {
+            String::new()
+        };
+        let stream = if image_before_text == Some(true) {
+            format!("{image_draw}{text_draw}")
+        } else {
+            format!("{text_draw}{image_draw}")
+        }
         .into_bytes();
-        let resources = if with_image {
+        let resources = if image_before_text.is_some() {
             "/Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >>"
         } else {
             "/Resources << /Font << /F1 4 0 R >> >>"
@@ -1650,7 +1750,7 @@ mod tests {
             ]
             .concat(),
         ];
-        if with_image {
+        if image_before_text.is_some() {
             // A 150dpi letter-size scan by its declared dimensions. The pixel
             // data is a stub: the verdict reads /Width and /Height, and the
             // extractor does not decode image bytes.
@@ -1984,8 +2084,11 @@ mod tests {
     /// of the source.
     #[test]
     fn a_scanners_embedded_ocr_layer_is_reported_as_machine_read() {
-        let document = convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("3 Tr ", true))
-            .expect("convert");
+        let document = convert_bytes(
+            SourceFormat::Pdf,
+            &synthetic_copier_pdf("3 Tr ", Some(false), true),
+        )
+        .expect("convert");
         assert!(
             document.blocks.iter().any(|block| block.text.contains("CONFIDENTIALITY")),
             "the reading is still extracted -- demotion changes what it may claim, not whether it is seen"
@@ -1993,33 +2096,129 @@ mod tests {
         assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
     }
 
-    /// Both signals are required, in both directions: visible text over a
-    /// page image is a cover sheet or an exhibit reference, and invisible
-    /// text with no image is odd but authored. Firing on either alone would
-    /// demote born-digital documents and teach the operator to distrust the
-    /// verdict.
     #[test]
-    fn the_machine_read_verdict_requires_both_signals() {
-        let visible_over_image =
-            convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("", true)).expect("convert");
-        assert_eq!(visible_over_image.text_origin, TextOrigin::AuthorWritten);
+    fn text_under_an_opaque_page_image_is_machine_read() {
+        let document = convert_bytes(
+            SourceFormat::Pdf,
+            &synthetic_copier_pdf("", Some(false), true),
+        )
+        .expect("convert");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
 
-        let invisible_without_image =
-            convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("3 Tr ", false))
-                .expect("convert");
-        assert_eq!(
-            invisible_without_image.text_origin,
-            TextOrigin::AuthorWritten
-        );
+    #[test]
+    fn text_drawn_over_a_page_image_is_author_written() {
+        let document = convert_bytes(
+            SourceFormat::Pdf,
+            &synthetic_copier_pdf("", Some(true), true),
+        )
+        .expect("convert");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+    }
+
+    #[test]
+    fn a_scan_sized_image_alone_does_not_demote_a_document() {
+        let bytes = synthetic_copier_pdf("", Some(true), false);
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
+        assert_eq!(pdf_text_origin(&document), TextOrigin::AuthorWritten);
+    }
+
+    #[test]
+    fn invisible_text_without_a_scan_image_is_author_written() {
+        let document = convert_bytes(
+            SourceFormat::Pdf,
+            &synthetic_copier_pdf("3 Tr ", None, true),
+        )
+        .expect("convert");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
     }
 
     /// Clipping mode 7 paints nothing either; a copier that uses it instead
     /// of 3 is the same side door.
     #[test]
     fn clip_mode_invisible_text_is_also_machine_read() {
-        let document = convert_bytes(SourceFormat::Pdf, &synthetic_copier_pdf("7 Tr ", true))
-            .expect("convert");
+        let document = convert_bytes(
+            SourceFormat::Pdf,
+            &synthetic_copier_pdf("7 Tr ", Some(false), true),
+        )
+        .expect("convert");
         assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_document_longer_than_the_examined_pages_fails_closed() {
+        let page_count = TEXT_ORIGIN_PAGES_EXAMINED + 1;
+        let kids = (0..page_count)
+            .map(|index| format!("{} 0 R", index + 3))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {page_count} >>").into_bytes(),
+        ];
+        objects.extend(
+            (0..page_count)
+                .map(|_| b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec()),
+        );
+        let bytes = assemble_pdf(&objects);
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
+        assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn six_real_born_digital_pdf_fixtures_remain_author_written() {
+        let fixtures: [(&str, &[u8]); 6] = [
+            (
+                "double-spaced-signature.pdf",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/archive-real-pdf/double-spaced-signature.pdf"
+                )),
+            ),
+            (
+                "labelled-clauses-at-uniform-spacing.pdf",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/archive-real-pdf/labelled-clauses-at-uniform-spacing.pdf"
+                )),
+            ),
+            (
+                "liability-wrap.pdf",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/archive-real-pdf/liability-wrap.pdf"
+                )),
+            ),
+            (
+                "list-tail-merge.pdf",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/archive-real-pdf/list-tail-merge.pdf"
+                )),
+            ),
+            (
+                "unheaded-clauses-under-one-notice.pdf",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/archive-real-pdf/unheaded-clauses-under-one-notice.pdf"
+                )),
+            ),
+            (
+                "uniform-spacing-captions.pdf",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/archive-real-pdf/uniform-spacing-captions.pdf"
+                )),
+            ),
+        ];
+        for (name, bytes) in fixtures {
+            let document = convert_bytes(SourceFormat::Pdf, bytes).expect(name);
+            assert_eq!(
+                document.text_origin,
+                TextOrigin::AuthorWritten,
+                "{name} must remain quotable"
+            );
+        }
     }
 
     /// A text layer damaged past reading must not be quoted; it converts as

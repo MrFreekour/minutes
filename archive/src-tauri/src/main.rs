@@ -11,14 +11,16 @@ use minutes_archive_core::vault::{
     DocumentVaultLimits, ExcludedFolder,
 };
 use minutes_archive_core::{
-    authorize_roots, reduce_approved_roots, relative_path_within, scan_approved_roots,
-    validate_approved_roots, ApprovedRoot, CensusLimits, CensusReport, CensusStatus,
+    authorize_roots, portable_identity_for, reduce_approved_roots, relative_path_within,
+    scan_approved_roots, validate_approved_roots, ApprovedRoot, CensusLimits, CensusReport,
+    CensusStatus, FileIdentity,
 };
 use minutes_archive_ocr::{BoundedTranscriber, WORKER_MARKER as OCR_WORKER_MARKER};
 use minutes_archive_semantic::{
     run_worker_process as run_semantic_worker, BoundedSemanticEngine,
     WORKER_MARKER as SEMANTIC_WORKER_MARKER,
 };
+use minutes_archive_worker_control::LiveWorkerProcesses;
 use serde::Serialize;
 use std::fs;
 use std::io::Write;
@@ -72,6 +74,9 @@ struct SessionState {
 struct ArchiveState {
     session: Mutex<SessionState>,
     next_location_id: AtomicU64,
+    /// Every converter, recogniser, and semantic worker alive in this process.
+    /// Purge kills their process groups before the desktop process exits.
+    live_workers: LiveWorkerProcesses,
     /// Snapshot directories of workers that are currently alive.
     ///
     /// During a vault build the converter and engine live inside a blocking
@@ -93,6 +98,7 @@ impl Default for ArchiveState {
         Self {
             session: Mutex::new(SessionState::default()),
             next_location_id: AtomicU64::new(1),
+            live_workers: LiveWorkerProcesses::default(),
             live_snapshots: Arc::new(Mutex::new(Vec::new())),
             build_progress: Mutex::new(Arc::new(BuildProgress::default())),
         }
@@ -272,11 +278,14 @@ fn reveal_archive_document(
         .text_vault
         .as_ref()
         .ok_or_else(|| "There is no open index.".to_string())?;
-    // Refuses if the file moved, changed identity, or is no longer a regular
-    // file inside its approved root -- the same check a quotation gets.
+    // Refuses if the file moved or its bytes no longer match the revision the
+    // quotation was checked against.
     let path = vault
         .source_path_for_reveal(&document_id)
-        .ok_or_else(|| "That source is no longer where it was indexed.".to_string())?;
+        .ok_or_else(|| {
+            "That document changed since it was searched, so Minutes Archive will not show it. Run the search again first."
+                .to_string()
+        })?;
     std::process::Command::new("/usr/bin/open")
         .arg("-R")
         .arg(&path)
@@ -487,6 +496,7 @@ async fn choose_archive_locations(
 struct SessionExclusion {
     location_id: u64,
     relative_path: std::path::PathBuf,
+    identity: FileIdentity,
 }
 
 /// Cancels every skip the owner's newest folder choices contradict, and says
@@ -541,6 +551,7 @@ fn exclusions_for_build(session: &SessionState) -> Vec<ExcludedFolder> {
             Some(ExcludedFolder {
                 root_index,
                 relative_path: exclusion.relative_path.clone(),
+                identity: exclusion.identity,
             })
         })
         .collect()
@@ -659,9 +670,17 @@ async fn choose_archive_exclusions(
             continue;
         }
 
+        let Some(identity) = fs::metadata(&canonical)
+            .ok()
+            .and_then(|metadata| portable_identity_for(&metadata))
+        else {
+            choice.outside += 1;
+            continue;
+        };
         let exclusion = SessionExclusion {
             location_id,
             relative_path: relative,
+            identity,
         };
         if !session.exclusions.contains(&exclusion) {
             session.exclusions.push(exclusion);
@@ -900,6 +919,7 @@ async fn build_archive_text_vault(
 
     let worker_executable = std::env::current_exe()
         .map_err(|_| "Minutes Archive could not bind its document converter.".to_string())?;
+    let worker_process_control = state.live_workers.control(Arc::clone(&cancelled));
     // Kept live: `purge_session` drains it, and a worker that needs scratch
     // space again should register here. Nothing populates it today.
     let _snapshot_registry = Arc::clone(&state.live_snapshots);
@@ -912,17 +932,28 @@ async fn build_archive_text_vault(
     let build_result = tauri::async_runtime::spawn_blocking(move || {
         let vault_id = VaultId::parse("local-private-vault")
             .map_err(|_| "Minutes Archive could not establish the private vault.".to_string())?;
-        let converter =
-            BoundedConverter::bind(&worker_executable).map_err(|error| error.to_string())?;
+        let converter = BoundedConverter::bind_with_process_control(
+            &worker_executable,
+            worker_process_control.clone(),
+        )
+        .map_err(|error| error.to_string())?;
         // Binding the on-device model must not be able to deny the operator an
         // index. Exact evidence is the product; semantic suggestions are an
         // optional aid the interface already labels review-not-verified. A Mac
         // without Apple's linguistic asset previously got NO search at all.
-        let semantic_engine = BoundedSemanticEngine::bind(&worker_executable).ok();
+        let semantic_engine = BoundedSemanticEngine::bind_with_process_control(
+            &worker_executable,
+            worker_process_control.clone(),
+        )
+        .ok();
         // Same reasoning for the recogniser: a Mac where Vision cannot start
         // must still index everything that is not a scan. Scans then stay
         // counted as needing OCR, which is what they were before this existed.
-        let transcriber = BoundedTranscriber::bind(&worker_executable).ok();
+        let transcriber = BoundedTranscriber::bind_with_process_control(
+            &worker_executable,
+            worker_process_control,
+        )
+        .ok();
         // Neither worker copies itself any more -- both execute in place from
         // the bundle -- so there is no snapshot directory left to reclaim. The
         // registry stays because it is what `purge_session` drains, and a
@@ -1053,7 +1084,10 @@ impl From<&minutes_archive_core::retrieval::TranscribedCard> for UiTranscribedCa
 #[derive(serde::Serialize)]
 struct UiDocumentCard {
     document_title: String,
+    matched_concepts: Vec<minutes_archive_core::retrieval::LegalConcept>,
     criterion_evidence: Vec<UiEvidenceCard>,
+    criterion_evidence_truncated: bool,
+    why_matched: String,
     index_fresh: bool,
 }
 
@@ -1081,11 +1115,14 @@ impl From<LegalSearchResponse> for UiSearchResponse {
                 .iter()
                 .map(|document| UiDocumentCard {
                     document_title: document.document_title.clone(),
+                    matched_concepts: document.matched_concepts.clone(),
                     criterion_evidence: document
                         .criterion_evidence
                         .iter()
                         .map(UiEvidenceCard::from)
                         .collect(),
+                    criterion_evidence_truncated: document.criterion_evidence_truncated,
+                    why_matched: document.why_matched.clone(),
                     index_fresh: document.index_fresh,
                 })
                 .collect(),
@@ -1474,6 +1511,10 @@ fn purge_session(app_handle: &tauri::AppHandle) {
     let Some(state) = app_handle.try_state::<ArchiveState>() else {
         return;
     };
+    purge_archive_state(&state);
+}
+
+fn purge_archive_state(state: &ArchiveState) {
     // Recover from poisoning rather than skipping the purge. A panic anywhere
     // under this lock would otherwise leave the session permanently
     // un-purgeable, and a poisoned app is precisely the app a user closes.
@@ -1481,8 +1522,16 @@ fn purge_session(app_handle: &tauri::AppHandle) {
         .session
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cancelled) = session.scan.cancelled.take() {
+        cancelled.store(true, Ordering::Release);
+    }
     *session = SessionState::default();
     drop(session);
+
+    // Child processes survive their parent on POSIX. Kill every registered
+    // process group while the desktop process is still alive; each launcher
+    // then reaps and deregisters its child as cancellation unwinds the build.
+    state.live_workers.terminate_all();
 
     let mut snapshots = state
         .live_snapshots
@@ -1499,6 +1548,68 @@ fn purge_session(app_handle: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use minutes_archive_core::approve_roots;
+
+    #[test]
+    #[cfg(unix)]
+    fn purge_terminates_a_registered_worker_process() {
+        use minutes_archive_worker_control::RegisteredChild;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let state = ArchiveState::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut session = state.session.lock().expect("session");
+            session.scan.running = true;
+            session.scan.cancelled = Some(Arc::clone(&cancelled));
+        }
+        let control = state.live_workers.control(Arc::clone(&cancelled));
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut worker =
+            RegisteredChild::spawn(&mut command, Some(&control)).expect("spawn real worker");
+        assert_eq!(state.live_workers.live_count(), 1);
+
+        purge_archive_state(&state);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match worker.try_wait().expect("check worker") {
+                Some(status) => break status,
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                None => panic!("the worker survived purge"),
+            }
+        };
+        assert!(!status.success(), "the purge let the worker exit normally");
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            state.live_workers.live_count(),
+            0,
+            "the reaped worker remained registered"
+        );
+
+        let mut late_command = Command::new("/bin/sleep");
+        late_command.arg("60");
+        let late_spawn = RegisteredChild::spawn(&mut late_command, Some(&control));
+        assert_eq!(
+            late_spawn
+                .expect_err("purge allowed a late worker to start")
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
 
     /// Exporting the census must never overwrite a hard-linked document.
     ///
@@ -1608,6 +1719,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn document_card_truncation_and_reason_survive_the_ui_projection() {
+        use minutes_archive_core::retrieval::{
+            normalize_text_document, CurrentRevisionSet, DocumentId, LegalConcept, LegalIndex,
+            LegalQuery, MatchScope, VaultId,
+        };
+
+        let mut clauses = (0..64)
+            .map(|ordinal| {
+                format!(
+                    "{}. CONFIDENTIALITY\nEach party shall protect Confidential Information.",
+                    ordinal + 1
+                )
+            })
+            .collect::<Vec<_>>();
+        clauses.push(
+            "65. ASSIGNMENT\nNeither party may assign this Agreement without consent.".to_string(),
+        );
+        let document = normalize_text_document(
+            DocumentId::parse("dto-sixty-four-plus-one").expect("id"),
+            "Sixty Four Plus One",
+            clauses.join("\n\n").as_bytes(),
+        )
+        .expect("normalize");
+        let vault = VaultId::parse("dto-document-card").expect("vault");
+        let mut index = LegalIndex::new(vault.clone()).expect("index");
+        index.replace_document(&document).expect("replace");
+        let revisions = CurrentRevisionSet::from_documents([&document]);
+        let query = LegalQuery {
+            raw: "Find documents containing confidentiality and assignment.".to_string(),
+            scope: MatchScope::AnywhereInDocument,
+            required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
+            excluded_concepts: Vec::new(),
+            exact_phrase: None,
+            max_sentences: None,
+            limit: 20,
+        };
+        let response = index.search(&vault, query, &revisions).expect("search");
+        let projected = serde_json::to_value(UiSearchResponse::from(response)).expect("serialize");
+        let card = &projected["documents"][0];
+
+        assert_eq!(card["criterion_evidence_truncated"], true);
+        assert!(card["why_matched"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("assignment")));
+        assert_eq!(
+            card["matched_concepts"],
+            serde_json::json!(["confidentiality", "assignment"])
+        );
+        let assignment_is_shown = card["criterion_evidence"]
+            .as_array()
+            .is_some_and(|evidence| {
+                evidence.iter().any(|passage| {
+                    passage["exact_excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains("assign"))
+                })
+            });
+        assert!(
+            assignment_is_shown || card["criterion_evidence_truncated"] == true,
+            "the late assignment match was neither shown nor disclosed"
+        );
+    }
+
     use super::*;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -1622,6 +1797,11 @@ mod tests {
         .expect("synthetic document");
         minutes_archive_core::scan_roots(&[root], CensusLimits::default(), &AtomicBool::new(false))
             .expect("synthetic report")
+    }
+
+    fn directory_identity(path: &std::path::Path) -> FileIdentity {
+        portable_identity_for(&fs::metadata(path).expect("directory metadata"))
+            .expect("portable directory identity")
     }
 
     #[test]
@@ -1817,21 +1997,25 @@ mod tests {
             SessionExclusion {
                 location_id: 7,
                 relative_path: std::path::PathBuf::from("attachments"),
+                identity: directory_identity(&attachments),
             },
             // Inside the chosen folder: does not contradict the choice.
             SessionExclusion {
                 location_id: 7,
                 relative_path: std::path::PathBuf::from("attachments/movs"),
+                identity: directory_identity(&deeper),
             },
             // Unrelated: must survive untouched.
             SessionExclusion {
                 location_id: 7,
                 relative_path: std::path::PathBuf::from("matters"),
+                identity: directory_identity(&other),
             },
         ];
 
         // The owner picks the skipped folder itself.
-        let chosen = approve_roots(&[attachments]).expect("approve attachments");
+        let chosen =
+            approve_roots(std::slice::from_ref(&attachments)).expect("approve attachments");
         let unskipped = cancel_contradicted_skips(&locations, &mut exclusions, &chosen);
 
         assert_eq!(unskipped, 1, "exactly the suppressing skip is cancelled");
@@ -1859,6 +2043,7 @@ mod tests {
         let mut exclusions = vec![SessionExclusion {
             location_id: 7,
             relative_path: std::path::PathBuf::from("attachments"),
+            identity: directory_identity(&attachments),
         }];
         let chosen = approve_roots(&[deeper]).expect("approve deeper");
         assert_eq!(
@@ -1883,7 +2068,8 @@ mod tests {
         let second = temp.path().join("second");
         fs::create_dir(&first).expect("first");
         fs::create_dir(&second).expect("second");
-        let mut roots = approve_roots(&[first, second]).expect("approve synthetic roots");
+        fs::create_dir(second.join("attachments")).expect("attachments");
+        let mut roots = approve_roots(&[first, second.clone()]).expect("approve synthetic roots");
         let mut session = SessionState {
             locations: vec![
                 ApprovedLocation {
@@ -1898,6 +2084,7 @@ mod tests {
             exclusions: vec![SessionExclusion {
                 location_id: 8,
                 relative_path: std::path::PathBuf::from("attachments"),
+                identity: directory_identity(&second.join("attachments")),
             }],
             ..SessionState::default()
         };

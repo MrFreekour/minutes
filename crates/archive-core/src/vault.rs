@@ -94,6 +94,8 @@ pub struct ExcludedFolder {
     pub root_index: usize,
     /// Path of the folder relative to that root.
     pub relative_path: PathBuf,
+    /// Identity of the directory the owner chose, retained across renames.
+    pub identity: FileIdentity,
 }
 
 // No longer `Copy`: the exclusion list owns its paths.
@@ -237,6 +239,10 @@ pub struct TextVaultBuildReport {
     pub directories_left_unread: u64,
     /// Folders the operator chose not to index.
     pub excluded_directories: u64,
+    /// Skipped-folder choices whose directory moved or whose old pathname now
+    /// names a different directory. The original identity remains excluded;
+    /// the replacement does not inherit that choice.
+    pub excluded_folder_changes: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
     pub transcribed_documents: u64,
     pub directory_errors: u64,
@@ -331,20 +337,16 @@ impl AuthorizedTextVault {
     /// it against the roots the vault already holds, and only the Rust side
     /// ever sees the path. Nothing about it reaches the webview.
     ///
-    /// Refuses unless the file is still the one that was indexed, checked the
-    /// same way a quotation is: same device and inode, still a regular file,
-    /// still inside its approved root. Revealing a path that now names
-    /// something else would point counsel at the wrong document.
+    /// Refuses unless the file is still the exact revision that was indexed,
+    /// checked the same way a quotation is: same authority, identity, link
+    /// status, byte length and SHA-256. Revealing a changed file beside a stale
+    /// quotation would invite counsel to attribute the quote to the wrong
+    /// source revision.
     pub fn source_path_for_reveal(&self, document_id: &DocumentId) -> Option<PathBuf> {
         let source = self.sources.get(document_id)?;
         let root = self.roots.get(source.root_index)?;
         let path = root.approval.canonical_path().join(&source.relative_path);
-        let metadata = std::fs::symlink_metadata(&path).ok()?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return None;
-        }
-        let current = crate::portable_identity_for(&metadata)?;
-        if current != source.identity {
+        if !self.source_is_current(source) {
             return None;
         }
         Some(path)
@@ -625,6 +627,7 @@ struct BuildCounters {
     changed_while_reading: u64,
     directories_left_unread: u64,
     excluded_directories: u64,
+    excluded_folder_changes: u64,
     transcribed_documents: u64,
     indexed_bytes: u64,
     unsupported_files_skipped: u64,
@@ -644,6 +647,11 @@ struct BuildCounters {
     semantic_provisions_skipped: u64,
     semantic_unavailable: bool,
     semantic_coverage_partial: bool,
+}
+
+fn note_semantic_capacity_skip(counters: &mut BuildCounters) {
+    counters.semantic_coverage_partial = true;
+    counters.semantic_provisions_skipped = counters.semantic_provisions_skipped.saturating_add(1);
 }
 
 /// Live counts for a build in flight.
@@ -770,6 +778,7 @@ fn build_authorized_vault(
     let mut index = LegalIndex::new(vault_id.clone()).map_err(VaultError::from)?;
     let mut sources = BTreeMap::new();
     let mut identities = HashSet::new();
+    let mut disclosed_exclusion_changes = HashSet::new();
     let mut counters = BuildCounters::default();
     let batch_size = extraction_batch_size();
     let mut pending_documents: Vec<PendingDocument> = Vec::with_capacity(batch_size);
@@ -863,20 +872,35 @@ fn build_authorized_vault(
                         counters.unsupported_files_skipped.saturating_add(1);
                     continue;
                 }
-                // Folders the operator excluded are not entered at all.
-                //
-                // The only unit of choice used to be a whole approved folder,
-                // so a notes vault with 2,873 screenshots and recordings under
-                // one subfolder had to be indexed whole or not at all. An
-                // exclusion names one folder inside one root: it covers that
-                // folder and everything beneath it, and a folder of the same
-                // name in another approved root is untouched.
+                // Folders the operator excluded are bound to directory
+                // identity, not to the name they had when chosen. A rename
+                // must keep the original directory out, while a new directory
+                // created at the old name must not inherit the skip.
                 let relative = current.relative_path.join(&name);
-                if limits.excluded_paths.iter().any(|excluded| {
-                    excluded.root_index == current.root_index
-                        && (relative == excluded.relative_path
-                            || relative.starts_with(&excluded.relative_path))
-                }) {
+                let directory_identity = cap_metadata_identity_portable(&metadata);
+                let mut excluded_by_identity = false;
+                for (exclusion_index, excluded) in limits.excluded_paths.iter().enumerate() {
+                    if excluded.root_index != current.root_index {
+                        continue;
+                    }
+                    if directory_identity == Some(excluded.identity) {
+                        excluded_by_identity = true;
+                        if relative != excluded.relative_path
+                            && disclosed_exclusion_changes.insert(exclusion_index)
+                        {
+                            counters.excluded_folder_changes =
+                                counters.excluded_folder_changes.saturating_add(1);
+                        }
+                        break;
+                    }
+                    if relative == excluded.relative_path
+                        && disclosed_exclusion_changes.insert(exclusion_index)
+                    {
+                        counters.excluded_folder_changes =
+                            counters.excluded_folder_changes.saturating_add(1);
+                    }
+                }
+                if excluded_by_identity {
                     counters.excluded_directories = counters.excluded_directories.saturating_add(1);
                     continue;
                 }
@@ -1149,6 +1173,7 @@ fn build_authorized_vault(
         changed_while_reading: counters.changed_while_reading,
         directories_left_unread: counters.directories_left_unread,
         excluded_directories: counters.excluded_directories,
+        excluded_folder_changes: counters.excluded_folder_changes,
         transcribed_documents: counters.transcribed_documents,
         directory_errors: counters.directory_errors,
         source_content_persisted: false,
@@ -1452,8 +1477,7 @@ fn index_extracted_batch(
             let mut embeddings = Vec::with_capacity(normalized.provisions.len());
             for (position, provision) in normalized.provisions.iter().enumerate() {
                 if position >= remaining {
-                    counters.semantic_provisions_skipped =
-                        counters.semantic_provisions_skipped.saturating_add(1);
+                    note_semantic_capacity_skip(counters);
                     embeddings.push(None);
                     continue;
                 }
@@ -1729,8 +1753,8 @@ fn relative_source_identity_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approve_roots;
     use crate::retrieval::MatchScope;
+    use crate::{approve_roots, portable_identity_for};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1914,6 +1938,37 @@ mod tests {
             .expect("search");
         assert!(response.evidence.is_empty());
         assert_eq!(response.stale_evidence_withdrawn, 1);
+    }
+
+    #[test]
+    fn reveal_refuses_a_source_mutated_in_place() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, source) = build(&temp);
+        let response = vault
+            .interpret_and_search(
+                "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.",
+            )
+            .expect("search");
+        let document_id = response.evidence[0].document_id.clone();
+        assert!(
+            vault.source_path_for_reveal(&document_id).is_some(),
+            "the unchanged source should still be revealable"
+        );
+        let identity_before = portable_identity_for(&fs::metadata(&source).expect("before"));
+        fs::write(
+            &source,
+            "7. PUBLICITY\nPress releases require approval. This replacement is deliberately a different length.",
+        )
+        .expect("mutate in place");
+        let identity_after = portable_identity_for(&fs::metadata(&source).expect("after"));
+        assert_eq!(
+            identity_before, identity_after,
+            "the fixture replaced the inode instead of exercising in-place mutation"
+        );
+        assert!(
+            vault.source_path_for_reveal(&document_id).is_none(),
+            "Finder reveal accepted bytes that no longer match the indexed revision"
+        );
     }
 
     #[test]
@@ -2140,6 +2195,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reaching_semantic_capacity_marks_coverage_partial_and_counts_the_gap() {
+        let mut counters = BuildCounters::default();
+        note_semantic_capacity_skip(&mut counters);
+        assert!(
+            counters.semantic_coverage_partial,
+            "capacity exhaustion would read as complete suggestion coverage"
+        );
+        assert_eq!(counters.semantic_provisions_skipped, 1);
+    }
+
     /// An excluded folder is not entered, and every namesake is kept.
     ///
     /// The only unit of choice was a whole approved root, so a notes vault
@@ -2177,6 +2243,10 @@ mod tests {
         )
         .expect("second-root namesake file");
 
+        let excluded_identity = portable_identity_for(
+            &fs::metadata(root.join("attachments")).expect("excluded folder metadata"),
+        )
+        .expect("excluded folder identity");
         let approved = approve_roots(&[root, other]).expect("approve");
         let vault = build_authorized_text_vault(
             VaultId::parse("excluding").expect("vault"),
@@ -2185,6 +2255,7 @@ mod tests {
                 excluded_paths: vec![ExcludedFolder {
                     root_index: 0,
                     relative_path: PathBuf::from("attachments"),
+                    identity: excluded_identity,
                 }],
                 ..TextVaultLimits::default()
             },
@@ -2200,6 +2271,72 @@ mod tests {
         assert_eq!(
             report.indexed_documents, 3,
             "the excluded folder was entered, or a namesake was wrongly skipped"
+        );
+    }
+
+    #[test]
+    fn a_renamed_excluded_folder_stays_excluded_and_its_replacement_is_disclosed() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("approved");
+        let skipped = root.join("attachments");
+        let renamed = root.join("renamed-attachments");
+        fs::create_dir_all(&skipped).expect("skipped folder");
+        fs::write(
+            skipped.join("privileged.txt"),
+            "CONFIDENTIALITY\nThe original skipped folder contains Confidential Information.",
+        )
+        .expect("skipped document");
+        let skipped_identity =
+            portable_identity_for(&fs::metadata(&skipped).expect("skipped folder metadata"))
+                .expect("skipped folder identity");
+
+        let approved = approve_roots(std::slice::from_ref(&root)).expect("approve root");
+        fs::rename(&skipped, &renamed).expect("rename skipped folder");
+        fs::create_dir(&skipped).expect("replacement at old name");
+        fs::write(
+            skipped.join("replacement.txt"),
+            "ASSIGNMENT\nNeither party may assign this Agreement.",
+        )
+        .expect("replacement document");
+
+        let vault = build_authorized_text_vault(
+            VaultId::parse("renamed-exclusion").expect("vault"),
+            &approved,
+            TextVaultLimits {
+                excluded_paths: vec![ExcludedFolder {
+                    root_index: 0,
+                    relative_path: PathBuf::from("attachments"),
+                    identity: skipped_identity,
+                }],
+                ..TextVaultLimits::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("build");
+
+        let report = vault.build_report();
+        assert_eq!(report.excluded_directories, 1);
+        assert_eq!(
+            report.excluded_folder_changes, 1,
+            "the path substitution was not disclosed"
+        );
+        assert_eq!(
+            report.indexed_documents, 1,
+            "the renamed original was read or the replacement inherited its skip"
+        );
+        let original = vault
+            .interpret_and_search("Find documents containing confidentiality.")
+            .expect("search excluded content");
+        assert!(
+            original.evidence.is_empty() && original.documents.is_empty(),
+            "documents in the renamed excluded folder became searchable"
+        );
+        let replacement = vault
+            .interpret_and_search("Find documents containing assignment.")
+            .expect("search replacement content");
+        assert!(
+            !replacement.evidence.is_empty() || !replacement.documents.is_empty(),
+            "the new directory at the old name wrongly inherited the skip"
         );
     }
 

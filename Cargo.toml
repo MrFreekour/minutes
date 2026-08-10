@@ -5,6 +5,7 @@ members = [
     "crates/archive-core",
     "crates/archive-ocr",
     "crates/archive-semantic",
+    "crates/archive-worker-control",
     "crates/core",
     "crates/cli",
     "crates/reader",

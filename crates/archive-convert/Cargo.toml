@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Bounded, network-denied document conversion worker for Minutes Archive"
 
 [dependencies]
+minutes-archive-worker-control = { path = "../archive-worker-control" }
 # Pinned exactly. The crate is days old and shipped four releases on the day
 # it was adopted, so a range would silently take a parser this project has
 # not exercised. Its PDF path is never called -- see convert_via_anydoc.

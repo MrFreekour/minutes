@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{OcrError, RecognizedPage, MAX_IMAGE_BYTES, MAX_TEXT_BYTES};
+use minutes_archive_worker_control::{RegisteredChild, WorkerProcessControl};
 
 /// A dense page genuinely takes seconds; beyond this something is wrong.
 const PAGE_DEADLINE: Duration = Duration::from_secs(90);
@@ -49,6 +50,7 @@ pub struct BoundedTranscriber {
     executable_path: PathBuf,
     executable: fs::File,
     executable_identity: FileIdentity,
+    process_control: Option<WorkerProcessControl>,
 }
 
 impl std::fmt::Debug for BoundedTranscriber {
@@ -59,6 +61,20 @@ impl std::fmt::Debug for BoundedTranscriber {
 
 impl BoundedTranscriber {
     pub fn bind(worker_executable: &Path) -> Result<Self, OcrError> {
+        Self::bind_inner(worker_executable, None)
+    }
+
+    pub fn bind_with_process_control(
+        worker_executable: &Path,
+        process_control: WorkerProcessControl,
+    ) -> Result<Self, OcrError> {
+        Self::bind_inner(worker_executable, Some(process_control))
+    }
+
+    fn bind_inner(
+        worker_executable: &Path,
+        process_control: Option<WorkerProcessControl>,
+    ) -> Result<Self, OcrError> {
         let canonical =
             fs::canonicalize(worker_executable).map_err(|_| OcrError::RecognizerUnavailable)?;
         let lexical =
@@ -86,6 +102,7 @@ impl BoundedTranscriber {
             executable_identity: file_identity(&metadata),
             executable_path: canonical,
             executable,
+            process_control,
         };
         transcriber.verify_sandbox()?;
         Ok(transcriber)
@@ -158,11 +175,18 @@ impl BoundedTranscriber {
                 });
             }
         }
-        let mut child = command
-            .spawn()
+        let mut child = RegisteredChild::spawn(&mut command, self.process_control.as_ref())
             .map_err(|_| OcrError::RecognizerUnavailable)?;
-        let mut stdin = child.stdin.take().ok_or(OcrError::RecognizerUnavailable)?;
-        let stdout = child.stdout.take().ok_or(OcrError::RecognizerUnavailable)?;
+        let mut stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or(OcrError::RecognizerUnavailable)?;
+        let stdout = child
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or(OcrError::RecognizerUnavailable)?;
         let image = input.to_vec();
         let writer = thread::spawn(move || {
             let result = stdin.write_all(&image).and_then(|_| stdin.flush());
@@ -179,16 +203,32 @@ impl BoundedTranscriber {
 
         let deadline = Instant::now() + PAGE_DEADLINE;
         let status = loop {
-            match child.try_wait().map_err(|_| OcrError::MalformedImage)? {
+            if self
+                .process_control
+                .as_ref()
+                .is_some_and(WorkerProcessControl::is_cancelled)
+            {
+                child.terminate();
+                let _ = writer.join();
+                let _ = reader.join();
+                return Err(OcrError::OutputBudgetExceeded);
+            }
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    child.terminate();
+                    let _ = writer.join();
+                    let _ = reader.join();
+                    return Err(OcrError::MalformedImage);
+                }
+            };
+            match status {
                 Some(status) => break status,
                 None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
                 None => {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-                    }
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.terminate();
+                    let _ = writer.join();
+                    let _ = reader.join();
                     return Err(OcrError::OutputBudgetExceeded);
                 }
             }

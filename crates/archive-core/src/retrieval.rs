@@ -39,7 +39,6 @@ pub const MAX_EVIDENCE_RESULTS: usize = 100;
 const MAX_FTS_CANDIDATES: usize = 25_000;
 const MAX_DOCUMENT_EVIDENCE_PROVISIONS: usize = 64;
 pub const MAX_SEMANTIC_PROVISIONS: usize = 100_000;
-const MAX_SEMANTIC_CANDIDATES: usize = 400;
 /// Ceiling on a quoted excerpt, in characters.
 ///
 /// `exact_excerpt` was the whole provision body with no bound. A provision is
@@ -1760,8 +1759,6 @@ impl LegalIndex {
                 .then_with(|| left.1.cmp(&right.1))
                 .then_with(|| left.2.cmp(&right.2))
         });
-        ranked.truncate(MAX_SEMANTIC_CANDIDATES.min(ranked.len()));
-
         let mut suggestions = Vec::new();
         let mut stale_documents = BTreeSet::new();
         for (similarity, document_id, ordinal) in ranked {
@@ -2085,6 +2082,38 @@ impl LegalIndex {
                     ));
                 } else {
                     entry.criterion_evidence_truncated = true;
+                    // Do not let sixty-four repetitions of one criterion hide
+                    // the only passage supporting another. If this is the
+                    // first retained evidence for a newly matched concept,
+                    // replace a passage whose concepts are already supported
+                    // elsewhere. The card still discloses truncation because a
+                    // matching passage was omitted.
+                    let represented = entry
+                        .criterion_evidence
+                        .iter()
+                        .flat_map(|evidence| evidence.matched_concepts.iter().copied())
+                        .collect::<BTreeSet<_>>();
+                    let carries_new_concept =
+                        matched.iter().any(|concept| !represented.contains(concept));
+                    if carries_new_concept {
+                        let replacement = entry.criterion_evidence.iter().position(|evidence| {
+                            evidence.matched_concepts.is_empty()
+                                || evidence.matched_concepts.iter().all(|concept| {
+                                    entry
+                                        .criterion_evidence
+                                        .iter()
+                                        .filter(|candidate| {
+                                            candidate.matched_concepts.contains(concept)
+                                        })
+                                        .count()
+                                        > 1
+                                })
+                        });
+                        if let Some(replacement) = replacement {
+                            entry.criterion_evidence[replacement] =
+                                extracted.evidence_card(&self.vault_id, matched, None);
+                        }
+                    }
                 }
             }
         }
@@ -4303,6 +4332,77 @@ mod tests {
     }
 
     #[test]
+    fn semantic_search_refills_after_stale_and_transcribed_candidates_are_filtered() {
+        const PREVIOUS_PRE_FILTER_CUTOFF: usize = 400;
+        let model = SemanticModelMetadata::apple_english_sentence_revision_one();
+        let mut index = LegalIndex::new(vault()).expect("index");
+        let mut current = CurrentRevisionSet::default();
+
+        for ordinal in 0..(PREVIOUS_PRE_FILTER_CUTOFF / 2) {
+            let stale = document(
+                &format!("stale-{ordinal:03}"),
+                "Stale",
+                "CONFIDENTIALITY\nThe recipient shall protect private material.",
+            );
+            index
+                .replace_document_with_semantics(&stale, model.clone(), &[Some(semantic_axis(0))])
+                .expect("stale semantic document");
+            // Deliberately not inserted into `current`: every one is stale.
+        }
+        for ordinal in 0..(PREVIOUS_PRE_FILTER_CUTOFF / 2) {
+            let transcribed = normalize_transcribed_document(
+                DocumentId::parse(format!("transcribed-{ordinal:03}")).expect("id"),
+                "Transcribed",
+                format!("scan-{ordinal}").as_bytes(),
+                "test-reader",
+                &[(
+                    1,
+                    "The recipient shall protect private material.".to_string(),
+                    Some(0.9),
+                )],
+            )
+            .expect("transcribed document");
+            index
+                .replace_document_with_semantics(
+                    &transcribed,
+                    model.clone(),
+                    &[Some(semantic_axis(0))],
+                )
+                .expect("transcribed semantic document");
+            current.insert(
+                transcribed.document_id.clone(),
+                transcribed.revision.clone(),
+            );
+        }
+
+        // Lower similarity places the one eligible passage at rank 401. The
+        // old pre-filter truncation returned no suggestion at all.
+        let eligible = document(
+            "eligible-below-old-cutoff",
+            "Eligible",
+            "CONFIDENTIALITY\nThe recipient shall protect private material.",
+        );
+        index
+            .replace_document_with_semantics(&eligible, model, &[Some(semantic_axis(1))])
+            .expect("eligible semantic document");
+        current.insert(eligible.document_id.clone(), eligible.revision.clone());
+
+        let response = index
+            .semantic_search(&vault(), &semantic_axis(0), &current, 1)
+            .expect("semantic search");
+        assert_eq!(
+            response.candidates_considered,
+            PREVIOUS_PRE_FILTER_CUTOFF + 1
+        );
+        assert_eq!(response.suggestions.len(), 1);
+        assert_eq!(response.suggestions[0].document_id, eligible.document_id);
+        assert_eq!(
+            response.stale_evidence_withdrawn,
+            (PREVIOUS_PRE_FILTER_CUTOFF / 2) as u64
+        );
+    }
+
+    #[test]
     fn a_struck_clause_shows_the_reader_that_it_was_struck() {
         // Deleting a clause but leaving its heading is routine in negotiated
         // contracts. Matching spans heading and body so the clause is still
@@ -4519,6 +4619,53 @@ mod tests {
                 LegalConcept::Assignment,
                 LegalConcept::GoverningLaw,
             ]
+        );
+    }
+
+    #[test]
+    fn a_late_first_criterion_displaces_repeated_evidence_at_the_document_cap() {
+        let mut clauses = (0..MAX_DOCUMENT_EVIDENCE_PROVISIONS)
+            .map(|ordinal| {
+                format!(
+                    "{}. CONFIDENTIALITY\nEach party shall protect Confidential Information.",
+                    ordinal + 1
+                )
+            })
+            .collect::<Vec<_>>();
+        clauses.push(
+            "65. ASSIGNMENT\nNeither party may assign this Agreement without consent.".to_string(),
+        );
+        let source = document(
+            "sixty-four-plus-one",
+            "Sixty Four Plus One",
+            &clauses.join("\n\n"),
+        );
+        let mut index = LegalIndex::new(vault()).expect("index");
+        index.replace_document(&source).expect("ingest");
+        let revisions = CurrentRevisionSet::from_documents([&source]);
+        let query = LegalQuery {
+            raw: "Find documents containing confidentiality and assignment.".to_string(),
+            scope: MatchScope::AnywhereInDocument,
+            required_concepts: vec![LegalConcept::Confidentiality, LegalConcept::Assignment],
+            excluded_concepts: Vec::new(),
+            exact_phrase: None,
+            max_sentences: None,
+            limit: 20,
+        };
+
+        let response = index.search(&vault(), query, &revisions).expect("search");
+        assert_eq!(response.documents.len(), 1);
+        let card = &response.documents[0];
+        assert_eq!(
+            card.criterion_evidence.len(),
+            MAX_DOCUMENT_EVIDENCE_PROVISIONS
+        );
+        assert!(card.criterion_evidence_truncated);
+        assert!(
+            card.criterion_evidence.iter().any(|evidence| evidence
+                .matched_concepts
+                .contains(&LegalConcept::Assignment)),
+            "the only assignment passage was dropped behind repeated confidentiality evidence"
         );
     }
 

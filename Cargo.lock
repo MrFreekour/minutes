@@ -3898,6 +3898,7 @@ dependencies = [
  "minutes-archive-core",
  "minutes-archive-ocr",
  "minutes-archive-semantic",
+ "minutes-archive-worker-control",
  "serde",
  "serde_json",
  "sha2",
@@ -3915,6 +3916,7 @@ dependencies = [
  "libc",
  "lopdf 0.42.0",
  "mach2 0.6.0",
+ "minutes-archive-worker-control",
  "pdf-extract",
  "quick-xml 0.41.0",
  "serde",
@@ -3951,6 +3953,7 @@ version = "0.24.0"
 dependencies = [
  "libc",
  "mach2 0.6.0",
+ "minutes-archive-worker-control",
  "objc2",
  "objc2-foundation",
  "objc2-vision",
@@ -3966,6 +3969,7 @@ version = "0.24.0"
 dependencies = [
  "libc",
  "mach2 0.6.0",
+ "minutes-archive-worker-control",
  "objc2",
  "objc2-foundation",
  "objc2-natural-language",
@@ -3974,6 +3978,13 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "minutes-archive-worker-control"
+version = "0.24.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

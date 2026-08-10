@@ -539,6 +539,14 @@ function renderVaultSummary(report) {
       } is in this index.`,
     });
   }
+  if ((report.excluded_folder_changes ?? 0) > 0) {
+    notes.push({
+      warning: true,
+      text: `${report.excluded_folder_changes.toLocaleString()} skipped folder${
+        report.excluded_folder_changes === 1 ? " was" : "s were"
+      } moved or replaced. Minutes did not transfer your choice to a different folder with the old name, and kept the original folder out when it could identify it. Review your folders before relying on what search does not find.`,
+    });
+  }
   // Defaulted, not asserted: a missing count must never blank the search view.
   const inferredBoundaryDocuments = report.inferred_boundary_documents ?? 0;
   if (inferredBoundaryDocuments > 0) {
@@ -559,9 +567,12 @@ function renderVaultSummary(report) {
   // complete either way; a reader who assumes the suggestions swept the whole
   // archive would be wrong.
   if (report.semantic_coverage_partial) {
+    const skippedSuggestions = report.semantic_provisions_skipped ?? 0;
     notes.push({
       warning: true,
-      text: "The suggestion model stopped partway through, so suggestions cover only part of your documents. Exact search covers all of them.",
+      text: `Suggestions cover only part of your documents. ${skippedSuggestions.toLocaleString()} passage${
+        skippedSuggestions === 1 ? " was" : "s were"
+      } not prepared for suggestions. Exact search covers all of your documents.`,
     });
   }
   const dropped = describeDroppedSources(report).trim();
@@ -808,7 +819,7 @@ function evidenceCard(card, compact = false, semantic = false) {
   titleBlock.append(kicker, title);
   const fresh = document.createElement("span");
   fresh.className = "metadata-pill";
-  fresh.textContent = card.index_fresh ? "Checked against the file" : "Unavailable";
+  fresh.textContent = card.index_fresh ? "Checked for this search" : "Unavailable";
   header.append(titleBlock, fresh);
 
   const excerpt = document.createElement("blockquote");
@@ -885,7 +896,15 @@ function documentCard(card) {
   for (const evidence of card.criterion_evidence) {
     criteria.append(evidenceCard(evidence, true));
   }
-  article.append(header, why, criteria);
+  article.append(header, why);
+  if (card.criterion_evidence_truncated) {
+    const warning = document.createElement("p");
+    warning.className = "document-evidence-warning";
+    warning.textContent =
+      "Some matching passages are not shown. Something you asked for may be supported by a passage that was left off this card.";
+    article.append(warning);
+  }
+  article.append(criteria);
   return article;
 }
 
