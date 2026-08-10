@@ -116,7 +116,13 @@ function renderLocations(nextLocations) {
     const icon = document.createElement("span");
     icon.className = "location-icon";
     icon.setAttribute("aria-hidden", "true");
-    icon.textContent = "⌂";
+    // An inline folder glyph rather than a text character: the shipped fonts
+    // carry no U+2302 HOUSE, so the webview substituted a fallback font and
+    // drew a misaligned sliver in the icon box.
+    icon.innerHTML =
+      '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M1.75 4a1 1 0 0 1 1-1h3.3l1.5 1.8h5.7a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1z" ' +
+      'stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
     const text = document.createElement("div");
     const title = document.createElement("strong");
     title.textContent = location.label;
@@ -942,8 +948,10 @@ function renderSearchResponse(response) {
   const boundaryNote =
     (response.inferred_boundary_evidence_withdrawn ?? 0) > 0
       ? ` ${(response.inferred_boundary_evidence_withdrawn ?? 0).toLocaleString()} searchable document${
-          response.inferred_boundary_evidence_withdrawn === 1 ? "" : "s"
-        } do not record where a clause ends, so they were excluded from same-clause questions.`
+          response.inferred_boundary_evidence_withdrawn === 1 ? " does" : "s do"
+        } not record where a clause ends, so ${
+          response.inferred_boundary_evidence_withdrawn === 1 ? "it was" : "they were"
+        } excluded from same-clause questions.`
       : "";
   elements.searchStatus.textContent =
     `${verifiedCount.toLocaleString()} current ${resultKind}${
