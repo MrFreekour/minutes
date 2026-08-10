@@ -528,6 +528,17 @@ pub struct CensusSignals {
     pub max_depth: u32,
 }
 
+/// What one approved location contributed, in the order the roots were given.
+///
+/// Exists so an owner with several matters approved can tell one opaque
+/// "Approved location" row from another. Counts only -- no name, no path, no
+/// per-format breakdown that could fingerprint a matter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocationTotals {
+    pub artifacts: u64,
+    pub regular_file_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CensusReport {
     pub schema: &'static str,
@@ -539,6 +550,15 @@ pub struct CensusReport {
     pub age_buckets: BTreeMap<String, u64>,
     pub size_buckets: BTreeMap<String, u64>,
     pub signals: CensusSignals,
+    /// Per-location totals, positional against the approved roots.
+    ///
+    /// Deliberately `serde(skip)`: the interface needs these to distinguish
+    /// its own rows, and the exported report -- which has been through a
+    /// privacy review and carries a versioned schema -- does not. A number
+    /// that nothing asked the export to carry does not get added to it, so
+    /// `minutes.archive-census.v1` stays byte-identical to what was reviewed.
+    #[serde(skip)]
+    pub per_location: Vec<LocationTotals>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -562,6 +582,9 @@ struct CensusAccumulator {
     age_buckets: BTreeMap<String, u64>,
     size_buckets: BTreeMap<String, u64>,
     signals: CensusSignals,
+    /// Positional against the approved roots, so a total can be attributed
+    /// without the walk carrying anything that names a folder.
+    per_location: Vec<LocationTotals>,
 }
 
 impl CensusAccumulator {
@@ -579,6 +602,20 @@ impl CensusAccumulator {
             age_buckets: BTreeMap::new(),
             size_buckets: BTreeMap::new(),
             signals: CensusSignals::default(),
+            per_location: vec![LocationTotals::default(); approved_locations],
+        }
+    }
+
+    /// Attribute one artifact to the root it was found under.
+    ///
+    /// A root index past the end is dropped rather than panicking: the walk
+    /// is the only producer and always passes a real index, but a census
+    /// that aborted on an accounting slip would lose a whole archive read to
+    /// a cosmetic number.
+    fn credit_location(&mut self, root_index: usize, bytes: u64) {
+        if let Some(totals) = self.per_location.get_mut(root_index) {
+            totals.artifacts = totals.artifacts.saturating_add(1);
+            totals.regular_file_bytes = totals.regular_file_bytes.saturating_add(bytes);
         }
     }
 
@@ -592,11 +629,12 @@ impl CensusAccumulator {
         }
     }
 
-    fn record_file(&mut self, name: &OsStr, metadata: &CapMetadata) {
+    fn record_file(&mut self, name: &OsStr, metadata: &CapMetadata, root_index: usize) {
         let extension = extension_for_name(name);
         let category = category_for_extension(&extension).to_string();
         let size = metadata.len();
 
+        self.credit_location(root_index, size);
         self.regular_files += 1;
         self.regular_file_bytes = self.regular_file_bytes.saturating_add(size);
         let format = self.formats.entry(extension.clone()).or_default();
@@ -628,7 +666,8 @@ impl CensusAccumulator {
         }
     }
 
-    fn record_package(&mut self, name: &OsStr, extension: &str, category: &str) {
+    fn record_package(&mut self, name: &OsStr, extension: &str, category: &str, root_index: usize) {
+        self.credit_location(root_index, 0);
         self.packages += 1;
         self.formats
             .entry(extension.to_string())
@@ -691,6 +730,7 @@ impl CensusAccumulator {
             age_buckets: self.age_buckets,
             size_buckets: self.size_buckets,
             signals: self.signals,
+            per_location: self.per_location,
         }
     }
 }
@@ -699,6 +739,10 @@ impl CensusAccumulator {
 struct PendingDirectory {
     directory: Dir,
     depth: u32,
+    /// Which approved root this directory descends from. Inherited by every
+    /// child, so an artifact found ten levels down is still attributed to the
+    /// location the owner actually approved.
+    root_index: usize,
 }
 
 /// Scans approved roots without opening a regular file.
@@ -726,11 +770,12 @@ pub fn scan_approved_roots(
     validate_approved_roots(roots)?;
     let mut stack = Vec::with_capacity(roots.len());
 
-    for root in roots {
+    for (root_index, root) in roots.iter().enumerate() {
         let directory = open_approved_root(root)?;
         stack.push(PendingDirectory {
             directory,
             depth: 0,
+            root_index,
         });
     }
 
@@ -797,7 +842,7 @@ pub fn scan_approved_roots(
             if metadata.is_dir() {
                 let extension = extension_for_name(&name);
                 if let Some(category) = package_category(&extension) {
-                    census.record_package(&name, &extension, category);
+                    census.record_package(&name, &extension, category, current.root_index);
                     continue;
                 }
                 if current.depth >= limits.max_depth {
@@ -834,9 +879,10 @@ pub fn scan_approved_roots(
                 stack.push(PendingDirectory {
                     directory: child,
                     depth: current.depth + 1,
+                    root_index: current.root_index,
                 });
             } else if metadata.is_file() {
-                census.record_file(&name, &metadata);
+                census.record_file(&name, &metadata, current.root_index);
             } else {
                 census.signals.special_files_skipped += 1;
             }

@@ -127,7 +127,15 @@ function renderLocations(nextLocations) {
     const title = document.createElement("strong");
     title.textContent = location.label;
     const detail = document.createElement("span");
-    detail.textContent = "Read-only native authority";
+    // Counts, when a census has produced them, are what tells one opaque row
+    // from another. They name nothing: a folder of exhibits and a matter
+    // archive differ by two orders of magnitude and by nothing identifying.
+    detail.textContent =
+      typeof location.artifacts === "number"
+        ? `${location.artifacts.toLocaleString()} item${
+            location.artifacts === 1 ? "" : "s"
+          } · ${formatBytes(location.regularFileBytes ?? 0)} · read-only native authority`
+        : "Read-only native authority";
     text.append(title, detail);
     copy.append(icon, text);
 
@@ -1006,9 +1014,21 @@ async function searchVault(event) {
   }
 }
 
-function startOver() {
+async function startOver() {
   hideError();
   showView("setup");
+  // Re-read the rows rather than reusing the ones rendered before the census.
+  // The per-location counts only exist once a census has run, so the state
+  // this view was left in is exactly the state that lacks them, and the rows
+  // would stay unlabelled for the whole session.
+  try {
+    const state = await invoke("archive_bootstrap");
+    renderLocations(state.locations);
+  } catch (error) {
+    // A failed refresh costs the counts, never the view: the operator asked
+    // to change locations and must still land somewhere he can.
+    showError(String(error));
+  }
   elements.setupStatus.textContent = `${locations.length.toLocaleString()} approved location${
     locations.length === 1 ? "" : "s"
   }. Change locations or run the metadata census again.`;
