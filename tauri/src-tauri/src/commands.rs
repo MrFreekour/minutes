@@ -10217,7 +10217,24 @@ fn spawn_tracked_recall_chat_child(
     })
 }
 
-fn reap_recall_chat_child(current_turn: &Arc<Mutex<Option<RecallChatTurn>>>, turn_id: u64) {
+/// How long to keep trying to reap a provider that survived termination before
+/// abandoning it. The turn is already known broken, so this only bounds cleanup.
+const CORPUS_STALLED_PROVIDER_REAP_BUDGET: Duration = Duration::from_secs(2);
+
+/// Terminate the tracked child after we have stopped reading its stdout.
+///
+/// Breaking out of the read loop early leaves the child writing into a pipe
+/// nobody drains. Once that pipe fills, the child blocks, so stderr never
+/// reaches EOF, the stderr join never returns, and the turn hangs instead of
+/// reporting the failure. Killing it first is what makes the early exits safe.
+///
+/// Deliberately narrower than `cancel_recall_chat_turn`: it must not set the
+/// cancelled flag or clear the turn, because this is a provider failure the
+/// user still needs reported, not a cancellation.
+fn terminate_tracked_recall_chat_child(
+    current_turn: &Arc<Mutex<Option<RecallChatTurn>>>,
+    turn_id: u64,
+) {
     let child = {
         let mut current = current_turn.lock().unwrap();
         current
@@ -10226,8 +10243,65 @@ fn reap_recall_chat_child(current_turn: &Arc<Mutex<Option<RecallChatTurn>>>, tur
             .and_then(|turn| turn.child.take())
     };
     if let Some(mut child) = child {
-        let _ = child.wait();
+        if let Err(error) = terminate_recall_chat_process_tree(&mut child) {
+            tracing::warn!(error = %error, "failed to terminate stalled Recall chat provider");
+        }
+        // Bounded, and deliberately not authoritative. Closing stdout unblocks
+        // a child that was stuck writing, but one that stalls without writing
+        // again would never deliver EPIPE, so an unbounded wait here could hang
+        // the turn on exactly the path where termination already failed.
+        //
+        // Giving up costs only a lingering process. The turn is already known
+        // broken by this point, so nothing downstream needs this exit status.
+        let deadline = Instant::now() + CORPUS_STALLED_PROVIDER_REAP_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        tracing::warn!(
+                            "Recall chat provider survived termination; abandoning the reap"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
     }
+}
+
+/// Decide whether a finished Recall chat turn may be stored.
+///
+/// Split out so the rule is testable on its own. `None` is not evidence of a
+/// clean run: it covers a child already taken by cancellation and a `wait()`
+/// that itself failed, so only an observed successful status counts.
+fn recall_chat_stream_completed(
+    read_broke: bool,
+    exit_status: Option<std::process::ExitStatus>,
+) -> bool {
+    !read_broke && matches!(exit_status, Some(status) if status.success())
+}
+
+/// Reap the child and report how it exited.
+///
+/// The status used to be discarded. For a subprocess it is better evidence of
+/// completion than any in-band marker: a provider that crashed, was killed, or
+/// exited non-zero produced an answer that stopped early, however well-formed
+/// the lines before it looked. `None` means there was no child left to wait on,
+/// which is the cancellation path rather than a failure.
+fn reap_recall_chat_child(
+    current_turn: &Arc<Mutex<Option<RecallChatTurn>>>,
+    turn_id: u64,
+) -> Option<std::process::ExitStatus> {
+    let child = {
+        let mut current = current_turn.lock().unwrap();
+        current
+            .as_mut()
+            .filter(|turn| turn.id == turn_id)
+            .and_then(|turn| turn.child.take())
+    };
+    child.and_then(|mut child| child.wait().ok())
 }
 
 /// Cancel the current turn and return whether the caller owns its one-and-only
@@ -10925,14 +10999,28 @@ pub async fn cmd_recall_chat_send(
                 }
             });
 
-            let reader = BufReader::new(stdout);
+            // Bounded for the same reason as the HTTP providers: `lines()`
+            // allocates a whole line before yielding it, so a provider stuck in
+            // a loop can grow this without limit. A local CLI is far less
+            // adversarial than a network peer, but the failure mode is the same.
+            let mut limited = stdout.take(RECALL_CHAT_MAX_RESPONSE_BYTES + 1);
+            let reader = BufReader::new(&mut limited);
             let mut full_response = String::new();
+            let mut stream_failed = false;
             for line_result in reader.lines() {
                 if cancelled.load(Ordering::Relaxed) {
                     break;
                 }
                 match line_result {
                     Ok(line) if !line.trim().is_empty() => {
+                        // stream-json is NDJSON: every non-empty line is meant
+                        // to be a frame, so one that will not parse is truncated
+                        // or corrupt output, not noise to skip past.
+                        if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                            eprintln!("[recall-chat] malformed stream-json frame");
+                            stream_failed = true;
+                            break;
+                        }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                             if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
                                 if let Some(arr) = json
@@ -10957,13 +11045,60 @@ pub async fn cmd_recall_chat_send(
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("[recall-chat] stdout read error: {}", e);
+                        stream_failed = true;
                         break;
                     }
                 }
             }
-            let _ = stderr_thread.join();
+            let truncated = limited.limit() == 0;
+            let read_broke = stream_failed || truncated;
 
-            if !cancelled.load(Ordering::Relaxed) && !full_response.is_empty() {
+            // Stopping early leaves the child writing into a pipe nobody
+            // drains, where it blocks and the stderr join below never returns.
+            //
+            // Order matters: release our end of stdout *first*. That is what
+            // unblocks the child unconditionally, via EPIPE, and it still holds
+            // if termination fails and leaves the process alive. Terminating
+            // first and closing after would keep the hang on exactly that path.
+            drop(limited);
+            if read_broke {
+                terminate_tracked_recall_chat_child(&worker_turn, turn_id);
+            }
+
+            if read_broke {
+                // Detached rather than joined. Nothing is needed from a
+                // discarded turn's stderr, and a provider that survived
+                // termination still holds that pipe open, so joining here would
+                // reintroduce the hang the termination above exists to prevent.
+                // The thread ends on its own once the pipe closes.
+                drop(stderr_thread);
+            } else {
+                let _ = stderr_thread.join();
+            }
+
+            // Reaped before the persistence decision, not after, because the
+            // exit status is part of that decision.
+            let exit_status = reap_recall_chat_child(&worker_turn, turn_id);
+            let stream_broke = !recall_chat_stream_completed(read_broke, exit_status);
+
+            if !cancelled.load(Ordering::Relaxed) && stream_broke {
+                emit_recall_chat_stream_failure(
+                    &app,
+                    if truncated {
+                        "The provider sent more than Recall will buffer, so the answer was cut \
+                         off. Nothing was saved to this conversation."
+                    } else if stream_failed {
+                        "The provider's output ended unexpectedly, so the answer is incomplete. \
+                         Nothing was saved to this conversation."
+                    } else {
+                        "The provider exited before finishing, so the answer is incomplete. \
+                         Nothing was saved to this conversation."
+                    },
+                );
+            }
+
+            // Only a turn whose provider ran to a clean exit becomes history.
+            if !cancelled.load(Ordering::Relaxed) && !stream_broke && !full_response.is_empty() {
                 store_recall_history_if_still_authorized(
                     &history_arc,
                     RecallChatHistoryTurn {
@@ -10974,7 +11109,6 @@ pub async fn cmd_recall_chat_send(
                 );
             }
 
-            reap_recall_chat_child(&worker_turn, turn_id);
             finish_recall_chat_turn(&app, &worker_turn, turn_id);
         })
         .await
@@ -12537,6 +12671,136 @@ mod tests {
         }
         assert!(stream_failed);
         assert!(!saw_terminator);
+    }
+
+    /// The storage rule, exercised through the function the worker actually
+    /// calls. `None` is the case that matters: it covers both a child already
+    /// taken by cancellation and a `wait()` that failed, so treating it as a
+    /// clean run would certify a turn nobody observed finishing.
+    #[test]
+    fn only_an_observed_successful_exit_completes_a_turn() {
+        use std::process::Command;
+
+        let ok = Command::new("sh").arg("-c").arg("exit 0").status().unwrap();
+        let failed = Command::new("sh").arg("-c").arg("exit 1").status().unwrap();
+
+        assert!(recall_chat_stream_completed(false, Some(ok)));
+        assert!(!recall_chat_stream_completed(false, Some(failed)));
+        assert!(!recall_chat_stream_completed(false, None));
+        // A broken read is disqualifying even when the provider exits 0, which
+        // is what a truncated-but-tidy provider looks like.
+        assert!(!recall_chat_stream_completed(true, Some(ok)));
+    }
+
+    /// A provider killed by a signal exits with no code at all; without an
+    /// explicit success check that falls through as completion.
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_provider_does_not_complete_a_turn() {
+        use std::process::Command;
+
+        let killed = Command::new("sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .unwrap();
+
+        assert!(
+            killed.code().is_none(),
+            "expected a signal, not an exit code"
+        );
+        assert!(!recall_chat_stream_completed(false, Some(killed)));
+    }
+
+    /// The shape that made stopping early dangerous, with the escape hatch the
+    /// production path relies on. stdout is closed while the provider is still
+    /// writing and still holding the pipe; the child must then become reapable
+    /// even though nothing terminated it. That is what makes the helper's
+    /// `wait()` safe on the path where termination itself fails.
+    #[cfg(unix)]
+    #[test]
+    fn closing_stdout_lets_a_still_writing_provider_be_reaped() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::{Command, Stdio};
+
+        // Writes far more than any pipe buffer holds and never exits on its own.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do printf 'x%.0s' $(seq 1 1000); echo; done")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn writer");
+
+        let stdout = child.stdout.take().expect("stdout");
+        let mut limited = stdout.take(4096);
+        {
+            let reader = BufReader::new(&mut limited);
+            let mut lines = 0;
+            for line in reader.lines() {
+                if line.is_err() {
+                    break;
+                }
+                lines += 1;
+            }
+            assert!(lines > 0, "should have read a bounded prefix");
+        }
+        assert_eq!(limited.limit(), 0, "budget should be exhausted");
+
+        // No kill. Closing the read end alone must be enough to unblock it.
+        drop(limited);
+
+        let status = child
+            .wait()
+            .expect("closing stdout must make the child reapable");
+        assert!(
+            !recall_chat_stream_completed(true, Some(status)),
+            "a provider that died on EPIPE never completed the turn"
+        );
+    }
+
+    /// The reap must give up rather than hang when a provider survives
+    /// termination and then simply sits there. A process that never writes
+    /// again never receives EPIPE, so closing stdout cannot rescue an
+    /// unbounded wait; only the deadline can.
+    #[cfg(unix)]
+    #[test]
+    fn reaping_a_surviving_provider_gives_up_instead_of_hanging() {
+        use std::process::{Command, Stdio};
+
+        // Alive, silent, and far outliving the budget. Never terminated here,
+        // which is exactly the termination-failed path.
+        let mut child = Command::new("sleep")
+            .arg("120")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn sleeper");
+
+        let started = Instant::now();
+        let deadline = started + CORPUS_STALLED_PROVIDER_REAP_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < CORPUS_STALLED_PROVIDER_REAP_BUDGET + Duration::from_secs(3),
+            "reap must be bounded, took {elapsed:?}"
+        );
+        assert!(
+            child.try_wait().expect("still queryable").is_none(),
+            "the sleeper should still be running, proving we gave up rather than waited it out"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     fn test_guard() -> MutexGuard<'static, ()> {
