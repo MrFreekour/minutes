@@ -64,8 +64,12 @@ fn write_error(err: *mut c_char, err_len: usize, message: &str) {
     let bytes = message.as_bytes();
     // Leave room for the terminator, and never split a UTF-8 sequence: the
     // host reads this with CStr and then from_utf8_lossy.
+    //
+    // `take < bytes.len()` is load-bearing. Without it, a message that fits
+    // (the common case) indexes bytes[bytes.len()] and panics, and this runs
+    // outside catch_unwind, so that panic would cross the FFI boundary.
     let mut take = bytes.len().min(err_len - 1);
-    while take > 0 && (bytes[take] & 0b1100_0000) == 0b1000_0000 {
+    while take > 0 && take < bytes.len() && (bytes[take] & 0b1100_0000) == 0b1000_0000 {
         take -= 1;
     }
     unsafe {
@@ -117,16 +121,82 @@ pub unsafe extern "C" fn minutes_sherpa_create(
             .map_err(|e| format!("failed to load sherpa model: {e}"))
     }));
 
+    // Reporting the failure is itself wrapped: write_error is panic-free by
+    // construction, but "by construction" is exactly what the bounds bug above
+    // disproved once, and a panic escaping here is undefined behavior rather
+    // than a bad error message.
+    let report = |message: &str| {
+        let _ = catch_unwind(AssertUnwindSafe(|| write_error(err, err_len, message)));
+    };
     match result {
         Ok(Ok(recognizer)) => Box::into_raw(recognizer) as *mut std::ffi::c_void,
         Ok(Err(message)) => {
-            write_error(err, err_len, &message);
+            report(&message);
             std::ptr::null_mut()
         }
         Err(_) => {
-            write_error(err, err_len, "sherpa plugin panicked while loading the model");
+            report("sherpa plugin panicked while loading the model");
             std::ptr::null_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run write_error against a fixed buffer and read back what the host would.
+    fn write_and_read(message: &str, buffer_len: usize) -> String {
+        let mut buffer = vec![0 as c_char; buffer_len];
+        write_error(buffer.as_mut_ptr(), buffer.len(), message);
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn a_message_that_fits_is_written_whole() {
+        // The case that panicked: take == bytes.len(), so the truncation loop
+        // indexed one past the end. This is the COMMON path, reached by every
+        // ordinary model-load failure.
+        assert_eq!(
+            write_and_read("failed to load sherpa model: bad tokens", 512),
+            "failed to load sherpa model: bad tokens"
+        );
+    }
+
+    #[test]
+    fn an_oversized_message_is_truncated_and_terminated() {
+        let long = "x".repeat(100);
+        let out = write_and_read(&long, 16);
+        assert_eq!(out.len(), 15, "must leave room for the terminator");
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        // Three-byte characters against a buffer whose cut lands mid-sequence.
+        // A split would make the host's CStr read produce replacement
+        // characters instead of a shorter but correct message.
+        for buffer_len in 2..12 {
+            let out = write_and_read("日本語テキスト", buffer_len);
+            assert!(
+                !out.contains('\u{FFFD}'),
+                "buffer {buffer_len} produced a split character: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_buffers_and_messages_are_safe() {
+        assert_eq!(write_and_read("", 8), "");
+        assert_eq!(write_and_read("anything", 1), "");
+        // A null buffer must be ignored rather than dereferenced.
+        write_error(std::ptr::null_mut(), 32, "ignored");
+        // A zero length must be ignored even with a real pointer.
+        let mut buffer = vec![7 as c_char; 4];
+        write_error(buffer.as_mut_ptr(), 0, "ignored");
+        assert_eq!(buffer[0], 7, "nothing may be written when err_len is 0");
     }
 }
 
