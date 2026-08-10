@@ -67,4 +67,27 @@ describe("stable corpus lease refusal contract", () => {
       expect(projections).toBe(0);
     });
   });
+
+  // Shares this file's isolation for the same reason as the test above: it
+  // drives the worker-termination path, which touches process-global state.
+  it("keeps working after an unconfirmed kill of a worker that never learned the corpus", async () => {
+    await withCorpus(async (root) => {
+      writeFileSync(join(root, "meeting.md"), "never fed canary");
+      // A one-millisecond budget expires while the worker is still starting,
+      // so `begin` is never written and the child cannot hold corpus bytes.
+      await expect(
+        withStableCorpusLease(root, () => "unreachable", {
+          timeoutMs: 1,
+          forceUnconfirmedTerminationForTest: true,
+        })
+      ).rejects.toThrow("stable meeting corpus authorization failed");
+
+      // Issue #689: this used to refuse with "requires a process restart"
+      // until the host process was restarted, and to keep the killed lease's
+      // memory reservation charged forever.
+      await expect(withStableCorpusLease(root, () => "recovered")).resolves.toBe(
+        "recovered"
+      );
+    });
+  });
 });
