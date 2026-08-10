@@ -13,7 +13,7 @@
         "label": "main",
         "title": "Minutes Archive",
         "width": 1240,
-        "height": 820,
+        "height": 960,
         "minWidth": 840,
         "minHeight": 640,
         "center": true,

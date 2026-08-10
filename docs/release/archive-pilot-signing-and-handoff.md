@@ -115,6 +115,15 @@ Generate the synthetic review folder on the test Mac:
   "/path/to/empty/Minutes Archive QA Fixtures"
 ```
 
+Do not place the fixture folder anywhere iCloud Drive syncs -- Desktop and
+Documents are synced by default on a Mac with Desktop & Documents enabled. A
+QA run that put fixtures on the Desktop found the canary string in
+`~/Library/Caches/CloudKit/com.apple.bird/`, which is iCloud's own upload
+cache and not the application: the app holds no network sockets and never
+wrote outside its own space. The leak sweep still has to distinguish the two
+every time, so keep the fixtures off synced volumes and the question does not
+arise.
+
 The release operator completes the Finder interaction once with networking
 disabled and once with networking enabled under observation. The independent
 reviewer follows `docs/security/archive-pilot-independent-review.md` and owns
