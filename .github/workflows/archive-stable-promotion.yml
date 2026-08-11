@@ -1,0 +1,252 @@
+name: Promote Reviewed Archive Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Reviewed draft tag in archive-vX.Y.Z form
+        required: true
+        type: string
+      candidate_sha:
+        description: Full commit SHA resolved by the protected release tag
+        required: true
+        type: string
+      release_sums_sha256:
+        description: Independently recorded SHA-256 of archive-release-SHA256SUMS.txt
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-stable-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote-reviewed-release:
+    name: Publish exact reviewed bytes and advance Archive stable
+    if: >-
+      github.actor == 'silverstein' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: archive-stable-release
+    permissions:
+      contents: write
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      EXPECTED_SUMS_SHA256: ${{ inputs.release_sums_sha256 }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Bind promotion to the exact protected tag and private draft
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^archive-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release_tag must be archive-vX.Y.Z" >&2
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SUMS_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "release_sums_sha256 must be a lowercase SHA-256" >&2
+            exit 1
+          fi
+
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          refs="$(
+            git ls-remote --tags "$remote" \
+              "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" || true
+          )"
+          exact="$(
+            printf '%s\n' "$refs" |
+              awk -v t="refs/tags/$RELEASE_TAG" '$2 == t {print $1}'
+          )"
+          peeled="$(
+            printf '%s\n' "$refs" |
+              awk -v t="refs/tags/$RELEASE_TAG^{}" '$2 == t {print $1}'
+          )"
+          if [ "$(printf '%s\n' "$exact" | grep -c .)" -ne 1 ] ||
+             [ "$(printf '%s\n' "$peeled" | grep -c .)" -gt 1 ]; then
+            echo "Protected tag $RELEASE_TAG does not resolve unambiguously" >&2
+            exit 1
+          fi
+          resolved="${peeled:-$exact}"
+          if [ "$resolved" != "$CANDIDATE_SHA" ]; then
+            echo "Protected tag $RELEASE_TAG does not resolve exactly to $CANDIDATE_SHA" >&2
+            exit 1
+          fi
+
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          RELEASE_JSON="$release_json" python3 <<'PY'
+          import json
+          import os
+
+          release = json.loads(os.environ["RELEASE_JSON"])
+          if not release.get("draft"):
+              raise SystemExit("Versioned release is not a private draft")
+          if release.get("tag_name") != os.environ["RELEASE_TAG"]:
+              raise SystemExit("Draft release tag does not match the requested tag")
+          PY
+
+      - name: Download and verify the exact independently reviewed asset set
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#archive-v}"
+          dmg="Minutes_Archive_${version}_aarch64.dmg"
+          updater="Minutes.Archive_${version}_aarch64.app.tar.gz"
+          mkdir payload
+          gh release download "$RELEASE_TAG" --dir payload
+
+          printf '%s\n' \
+            "$dmg" \
+            "$updater" \
+            "${updater}.sig" \
+            archive-release-SHA256SUMS.txt \
+            latest-archive.json \
+            signed-archive-provenance.txt | sort > expected-assets.txt
+          find payload -maxdepth 1 -type f -printf '%f\n' | sort > actual-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+
+          actual_sums_sha256="$(sha256sum payload/archive-release-SHA256SUMS.txt | awk '{print $1}')"
+          if [ "$actual_sums_sha256" != "$EXPECTED_SUMS_SHA256" ]; then
+            echo "Draft asset checksum record is not the independently reviewed record" >&2
+            exit 1
+          fi
+          printf '%s\n' \
+            "$dmg" \
+            "$updater" \
+            "${updater}.sig" \
+            latest-archive.json \
+            signed-archive-provenance.txt | sort > expected-checksums.txt
+          awk '{name=$2; sub(/^\*/, "", name); print name}' \
+            payload/archive-release-SHA256SUMS.txt | sort > actual-checksums.txt
+          diff -u expected-checksums.txt actual-checksums.txt
+          (cd payload && sha256sum -c archive-release-SHA256SUMS.txt)
+
+          CANDIDATE_SHA="$CANDIDATE_SHA" \
+          RELEASE_TAG="$RELEASE_TAG" \
+          REPOSITORY="$GITHUB_REPOSITORY" \
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tag.removeprefix("archive-v")
+          updater = f"Minutes.Archive_{version}_aarch64.app.tar.gz"
+          manifest = json.loads(Path("payload/latest-archive.json").read_text())
+          platform = manifest.get("platforms", {}).get("darwin-aarch64", {})
+          expected_url = (
+              f"https://github.com/{os.environ['REPOSITORY']}/releases/"
+              f"download/{tag}/{updater}"
+          )
+          if manifest.get("version") != version:
+              raise SystemExit("Manifest version does not match release tag")
+          if platform.get("url") != expected_url:
+              raise SystemExit("Manifest updater URL does not match the versioned asset")
+          signature = Path(f"payload/{updater}.sig").read_text().strip()
+          if not signature or platform.get("signature") != signature:
+              raise SystemExit("Manifest signature does not match the reviewed signature asset")
+
+          provenance = dict(
+              line.split("=", 1)
+              for line in Path("payload/signed-archive-provenance.txt").read_text().splitlines()
+              if "=" in line
+          )
+          required = {
+              "candidate": os.environ["CANDIDATE_SHA"],
+              "team_id": "63TMLKT8HN",
+              "identifier": "com.useminutes.archive",
+              "notarized": "true",
+              "stapled": "true",
+          }
+          if any(provenance.get(key) != value for key, value in required.items()):
+              raise SystemExit("Signed provenance does not match the reviewed candidate")
+          PY
+
+      - name: Refuse an accidental downgrade or same-version byte replacement
+        run: |
+          set -euo pipefail
+          if ! gh release view archive-stable >/dev/null 2>&1; then
+            exit 0
+          fi
+          mkdir current-stable
+          gh release download archive-stable \
+            --pattern latest-archive.json \
+            --dir current-stable
+          NEW_MANIFEST=payload/latest-archive.json \
+          OLD_MANIFEST=current-stable/latest-archive.json \
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          old_path = Path(os.environ["OLD_MANIFEST"])
+          new_path = Path(os.environ["NEW_MANIFEST"])
+          old = json.loads(old_path.read_text())
+          new = json.loads(new_path.read_text())
+
+          def version_tuple(value):
+              parts = value.split(".")
+              if len(parts) != 3 or not all(part.isdigit() for part in parts):
+                  raise SystemExit(f"Invalid Archive version: {value}")
+              return tuple(int(part) for part in parts)
+
+          old_version = version_tuple(old.get("version", ""))
+          new_version = version_tuple(new.get("version", ""))
+          if new_version < old_version:
+              raise SystemExit("Refusing to move Archive stable to an older version")
+          if new_version == old_version:
+              old_hash = hashlib.sha256(old_path.read_bytes()).hexdigest()
+              new_hash = hashlib.sha256(new_path.read_bytes()).hexdigest()
+              if old_hash != new_hash:
+                  raise SystemExit("Refusing to replace an existing version with different bytes")
+          PY
+
+      - name: Publish draft, verify public bytes, then advance stable manifest last
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" --draft=false
+
+          mkdir public
+          while IFS= read -r asset; do
+            curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+              --output "public/$asset" \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${asset}"
+          done < actual-assets.txt
+          diff -u \
+            <(cd payload && while IFS= read -r asset; do sha256sum "$asset"; done < ../actual-assets.txt) \
+            <(cd public && while IFS= read -r asset; do sha256sum "$asset"; done < ../actual-assets.txt)
+
+          if ! gh release view archive-stable >/dev/null 2>&1; then
+            gh release create archive-stable \
+              --latest=false \
+              --target "$CANDIDATE_SHA" \
+              --title "Minutes Archive stable update channel" \
+              --notes "Machine-readable stable channel for signed Minutes Archive updates."
+          fi
+          gh release upload archive-stable payload/latest-archive.json --clobber
+
+          expected_manifest_sha="$(sha256sum payload/latest-archive.json | awk '{print $1}')"
+          verified=false
+          for _ in 1 2 3 4 5; do
+            if curl --proto '=https' --tlsv1.2 --fail --location \
+              --output stable-manifest.json \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/archive-stable/latest-archive.json"; then
+              actual_manifest_sha="$(sha256sum stable-manifest.json | awk '{print $1}')"
+              if [ "$actual_manifest_sha" = "$expected_manifest_sha" ]; then
+                verified=true
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$verified" != "true" ]; then
+            echo "Stable manifest URL did not return the exact reviewed manifest" >&2
+            exit 1
+          fi

@@ -474,7 +474,12 @@ jobs:
           }
           Path("latest-archive.json").write_text(json.dumps(manifest, indent=2) + "\n")
           PY
-          shasum -a 256 "$dmg" "$updater" "${updater}.sig" latest-archive.json \
+          shasum -a 256 \
+            "$dmg" \
+            "$updater" \
+            "${updater}.sig" \
+            latest-archive.json \
+            signed-archive-provenance.txt \
             > archive-release-SHA256SUMS.txt
           {
             echo "ARCHIVE_VERSION=$version"
@@ -483,7 +488,7 @@ jobs:
             echo "ARCHIVE_UPDATER=$updater"
           } >> "$GITHUB_ENV"
 
-      - name: Publish versioned release and advance stable updater manifest
+      - name: Stage exact versioned assets in a private draft release
         if: needs.authorize-candidate.outputs.release_tag != ''
         env:
           CANDIDATE_SHA: ${{ needs.authorize-candidate.outputs.candidate_sha }}
@@ -492,9 +497,18 @@ jobs:
         run: |
           set -euo pipefail
           notes="docs/release/notes/${RELEASE_TAG}.md"
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
+            if [ "$is_draft" != "true" ]; then
+              echo "Release $RELEASE_TAG is already public; refusing to replace reviewed assets" >&2
+              exit 1
+            fi
+          else
             gh release create "$RELEASE_TAG" \
               --verify-tag \
+              --draft \
+              --latest=false \
+              --target "$CANDIDATE_SHA" \
               --title "Minutes Archive ${ARCHIVE_VERSION}" \
               --notes-file "$notes"
           fi
@@ -506,18 +520,6 @@ jobs:
             archive-release-SHA256SUMS.txt \
             signed-archive-provenance.txt \
             --clobber
-
-          # The app reads one stable URL. Versioned payloads are uploaded
-          # first; replacing this tiny manifest last makes publication atomic
-          # from the client's point of view and lets an operator stop offering
-          # a bad release without removing prior signed artifacts.
-          if ! gh release view archive-stable >/dev/null 2>&1; then
-            gh release create archive-stable \
-              --target "$CANDIDATE_SHA" \
-              --title "Minutes Archive stable update channel" \
-              --notes "Machine-readable stable channel for signed Minutes Archive updates."
-          fi
-          gh release upload archive-stable latest-archive.json --clobber
 
       - name: Remove ephemeral signing material
         if: always()

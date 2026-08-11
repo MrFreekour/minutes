@@ -138,10 +138,13 @@ authority" row above is unchanged. Both workers still run under
 
 **Release and recovery path.** Archive uses its own fixed `archive-stable`
 manifest, never the normal Minutes `latest.json`. An `archive-vX.Y.Z` tag runs
-the protected signing workflow, uploads a versioned signed updater archive and
-notarized DMG, and replaces the stable manifest only after those versioned
-assets exist. The reviewer must confirm the stable manifest returns 200 and
-names the exact reviewed version before delivery. If a release must be stopped,
+the protected signing workflow and stages the signed updater archive and
+notarized DMG in a private draft release. It does not advance the updater feed.
+The reviewer records the checksum-record hash for those exact bytes. A separate
+protected promotion checks that hash, makes the same assets public, verifies
+their public hashes, and replaces the stable manifest last. The reviewer must
+confirm the stable manifest returns 200 and names the exact reviewed version
+before delivery. If a release must be stopped,
 the stable manifest can be replaced or removed so older clients no longer see
 it; clients that already installed it require a higher patch release or a
 manual DMG. The UI states that the installed app stays unchanged after a failed
