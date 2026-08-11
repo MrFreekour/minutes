@@ -209,32 +209,70 @@ jobs:
       # engine and its shared libraries, as a tarball. The bare binary above is
       # unchanged, so existing installs and the Homebrew formula are unaffected.
       #
-      # sherpa-onnx links dynamically on Linux, so the binary needs
-      # libsherpa-onnx-c-api.so and libonnxruntime.so beside it. `$ORIGIN`
-      # runpath makes the loader look next to the executable rather than in the
-      # build tree. Static linkage is deliberately not used here: sherpa-rs-sys
-      # demands a global `-C relocation-model=dynamic-no-pic`, which produces a
-      # non-PIE binary and loses ASLR for every Linux user (#645).
+      # sherpa-onnx links dynamically on Linux, so its shared libraries ship
+      # beside the plugin. `$ORIGIN` runpath makes the loader look next to the
+      # loading image rather than in the build tree. Static linkage is
+      # deliberately not used here: sherpa-rs-sys demands a global
+      # `-C relocation-model=dynamic-no-pic`, which produces a non-PIE binary
+      # and loses ASLR for every Linux user (#645).
+      #
+      # Since #685 sherpa lives in a dlopened cdylib outside the workspace, so
+      # `-p minutes-cli --features engine-sherpa` builds only the loader and
+      # emits no sherpa libraries at all. This step used to copy `*.so` out of
+      # the CLI's target dir, which now finds nothing; the archive has to build
+      # crates/sherpa-plugin and take its artifacts instead. Only a tag runs
+      # this workflow, so the break was invisible until release time, which is
+      # what scripts/check_sherpa_packaging.mjs now prevents.
       - name: Build sherpa-enabled Linux archive
+        # Keyed on by scripts/check_sherpa_packaging.py, so that renaming this
+        # step is a rename rather than a silent loss of its packaging gate.
+        id: sherpa-archive
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
-        env:
-          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN"
+        # No RUSTFLAGS rpath here any more. The executable no longer links
+        # sherpa at all, and the plugin sets its own `$ORIGIN` runpath from
+        # crates/sherpa-plugin/build.rs, so it locates its libraries whether it
+        # is packaged here or installed by hand. A global RUSTFLAGS would also
+        # invalidate the shared build cache for every other step.
         run: |
           set -euo pipefail
           cargo build --release -p minutes-cli \
             --features ${{ matrix.features }},engine-sherpa \
             --target ${{ matrix.target }}
+          # Excluded from the workspace, so it needs its own build invocation.
+          ( cd crates/sherpa-plugin && cargo build --release --locked )
+          plugin_dir="crates/sherpa-plugin/target/release"
           out="minutes-linux-x64-sherpa"
-          rm -rf "$out" && mkdir -p "$out"
+          # Separate statements: a failure on the left of `&&` does not trip
+          # errexit, so a half-removed stale directory could have survived into
+          # the archive.
+          rm -rf "$out"
+          mkdir -p "$out"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$out/minutes"
-          # sherpa-rs-sys drops its shared libraries into the target profile dir.
-          find "target/${{ matrix.target }}/release" -maxdepth 1 -name '*.so' -exec cp {} "$out/" \;
-          test -f "$out/libsherpa-onnx-c-api.so" \
-            || { echo "sherpa shared library missing from the archive"; exit 1; }
-          # Prove it loads outside the build tree, which a build-only check
-          # cannot catch: the failure mode is loader search paths.
+          cp "$plugin_dir/libminutes_sherpa.so" "$out/"
+          # sherpa-rs-sys drops its shared libraries into the plugin's profile
+          # dir; the plugin resolves them through its own $ORIGIN.
+          #
+          # `-exec ... +` rather than `\;`: with `\;` find exits 0 even when
+          # every cp failed, which would have produced an archive missing its
+          # libraries with no error anywhere.
+          find "$plugin_dir" -maxdepth 1 -name '*.so' ! -name 'libminutes_sherpa.so' \
+            -exec cp -t "$out/" {} +
+          # libonnxruntime.so is asserted too. Leaving it out meant the dlopen
+          # below could still pass by finding a system copy, since only
+          # LD_LIBRARY_PATH is cleared and the default loader paths remain.
+          for lib in libminutes_sherpa.so libsherpa-onnx-c-api.so libonnxruntime.so; do
+            test -f "$out/$lib" \
+              || { echo "::error::$lib missing from the sherpa archive"; exit 1; }
+          done
+          # Prove both images load outside the build tree, which a build-only
+          # check cannot catch: the failure mode is loader search paths. The
+          # binary running proves nothing about the plugin, because the plugin
+          # is dlopened lazily and only when sherpa is actually selected.
           ( cd /tmp && env -u LD_LIBRARY_PATH "$GITHUB_WORKSPACE/$out/minutes" --version )
+          ( cd /tmp && env -u LD_LIBRARY_PATH python3 \
+              "$GITHUB_WORKSPACE/scripts/verify_sherpa_plugin_loads.py" \
+              "$GITHUB_WORKSPACE/$out/libminutes_sherpa.so" )
           tar czf "$out.tar.gz" "$out"
 
       - name: Upload sherpa archive artifact

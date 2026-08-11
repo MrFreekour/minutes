@@ -42,6 +42,14 @@ jobs:
           node scripts/check_apple_speech_worker_packaging.mjs --self-test
           python3 scripts/seal_apple_speech_worker_hash.py --self-test
 
+      - name: Check sherpa archive packaging
+        # Release CLI Binaries only runs on tags, so nothing else on a pull
+        # request notices when the sherpa archive stops shipping a working
+        # engine (#685 broke it and every gate stayed green).
+        run: |
+          python3 scripts/check_sherpa_packaging.py
+          python3 scripts/check_sherpa_packaging.py --self-test
+
       - name: Verify broken workflow is rejected
         run: |
           if docker run --rm \
