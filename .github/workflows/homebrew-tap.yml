@@ -1,0 +1,143 @@
+name: Update Homebrew Tap
+
+# The tap's cask sat at 0.18.2 while releases reached 0.24.0, because bumping
+# it was a step someone had to remember (#736). This removes the memory.
+#
+# `release: published` rather than a tag push: the release procedure creates
+# the release as a draft, waits for the release workflows to attach assets,
+# then un-drafts it. Publishing is therefore the first moment the DMG this
+# needs is guaranteed to exist. A tag push fires while the assets are still
+# building.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to point the tap at, for example 0.24.0"
+        required: true
+        type: string
+      dry_run:
+        description: "Report what would change without writing"
+        type: boolean
+        default: true
+
+# This job holds a token that can write to another repository, so it takes
+# nothing it does not need: no checkout credentials, no third-party actions,
+# and a read-only default token.
+permissions:
+  contents: read
+
+# Two runs must not interleave. Each writes a single commit, but run A can
+# still read the tap, run B commit, and run A then commit over a base it never
+# saw. The non-forced ref update in the script makes that fail rather than
+# silently win, and this keeps it from arising at all.
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Point the tap at the release
+    runs-on: ubuntu-latest
+    # Creating a release or dispatching a workflow needs only write access, so
+    # without a gate the trust boundary for a cross-repository token is every
+    # write collaborator rather than the maintainer. Adding required reviewers
+    # to this environment in repository settings closes that; the environment
+    # exists either way, so this is safe before it is configured.
+    environment: homebrew-tap
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # The default branch, never the event ref. A release is published
+          # from a tag, and `workflow_dispatch` can select any ref, so taking
+          # the event ref would run whatever version of the bump script that
+          # ref happens to contain while the tap token is in the environment.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Verify the bump logic before using it
+        # First, so broken logic cannot reach the token.
+        run: python3 scripts/bump_homebrew_tap.py --self-test
+
+      - name: Resolve version
+        id: version
+        env:
+          # Through env, never interpolated into the shell, so a crafted
+          # release name cannot become code here.
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-${EVENT_TAG#v}}"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip prereleases
+        id: gate
+        env:
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          # The tap has no way to express a prerelease, so pointing it at one
+          # would ship it to every `brew upgrade`. The script refuses suffixed
+          # versions too; this stops the run earlier and more legibly.
+          if [ "${PRERELEASE:-false}" = "true" ]; then
+            echo "::notice::prerelease, leaving the tap alone"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump the formula and the cask
+        id: bump
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          # A fine-grained PAT scoped to silverstein/homebrew-tap with
+          # contents: write. The default GITHUB_TOKEN cannot reach another
+          # repository, which is the whole reason this needs a secret.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run && 'yes' || '' }}
+        run: |
+          set -euo pipefail
+          echo "wrote=false" >> "$GITHUB_OUTPUT"
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            # Deliberately not a failure. Until the secret exists this
+            # workflow must not turn a good release red; it just says what it
+            # would have done, loudly enough to be seen.
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set, so the tap was not updated."
+            echo "Create a fine-grained PAT scoped to silverstein/homebrew-tap"
+            echo "(contents: write) and add it as the HOMEBREW_TAP_TOKEN secret."
+            echo "Until then, bump the tap by hand: docs/release/procedure.md step 16."
+            exit 0
+          fi
+          # Branch rather than splat an empty variable into the argv, which is
+          # unquoted expansion and shellcheck rightly rejects it.
+          if [ -n "${DRY_RUN:-}" ]; then
+            python3 scripts/bump_homebrew_tap.py --version "$VERSION" --dry-run
+          else
+            python3 scripts/bump_homebrew_tap.py --version "$VERSION"
+            echo "wrote=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only when something was actually written. An earlier version gated
+      # this on a token variable it never declared, so the check was always
+      # skipped: a verification step that cannot fail verifies nothing.
+      - name: Confirm the tap now serves the release
+        if: steps.bump.outputs.wrote == 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Re-running the bump in dry-run mode is the strongest postcondition
+          # available: it re-reads the published tap and re-derives the
+          # expected hash from the release, so it catches a wrong sha256 as
+          # well as a wrong version. Comparing version strings alone would
+          # call a cask with a corrupt hash correct.
+          output=$(python3 scripts/bump_homebrew_tap.py --version "$VERSION" --dry-run)
+          echo "$output"
+          case "$output" in
+            *"nothing to do"*) echo "tap verified at $VERSION" ;;
+            *) echo "::error::the tap does not match release $VERSION after the write"; exit 1 ;;
+          esac

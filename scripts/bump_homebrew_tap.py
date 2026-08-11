@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Point the Homebrew tap at a released version.
+
+The tap holds two independent files, and they drift independently. The CLI
+formula was bumped faithfully every release while the desktop cask sat at
+0.18.2 through six of them, until a user reported that `brew upgrade --cask`
+had been a no-op for months (#736). Nothing was broken; the step simply
+depended on someone remembering, and release-time steps rot invisibly between
+releases. So this does both, from the release event, with no memory involved.
+
+The governing risk is a *wrong* hash rather than a stale one. A stale cask
+installs an old version; a wrong one fails every install with a checksum
+mismatch. Everything below follows from that:
+
+- Nothing is written until every read, download and check has succeeded, and
+  then both files land in one commit through the Git Data API. Writing the
+  formula first meant a later failure left the tap half-updated.
+- The DMG is validated three ways: GitHub must call the asset `uploaded`, the
+  downloaded byte count must equal the declared size, and the computed hash
+  must equal the digest GitHub recorded. A sized read on a connection that
+  closes early does not necessarily raise, so hashing until the stream ends
+  can silently digest a truncated file.
+- A cask already at the right version is still checked against the expected
+  hash, and repaired if it disagrees. Treating the version as proof of
+  currency made a wrong hash permanently unfixable by this tool.
+- Edits must match exactly once, so a restructured tap file makes this refuse
+  rather than guess.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TAP_REPO = "silverstein/homebrew-tap"
+TAP_BRANCH = "main"
+SOURCE_REPO = "silverstein/minutes"
+CASK_PATH = "Casks/minutes.rb"
+FORMULA_PATH = "Formula/minutes.rb"
+API = "https://api.github.com"
+
+
+class BumpError(RuntimeError):
+    """A condition that must stop the bump rather than be guessed around."""
+
+
+class HostChangeStripsAuth(urllib.request.HTTPRedirectHandler):
+    """Drop Authorization when a redirect crosses to another host.
+
+    Release asset downloads answer with a 302 to object storage, and the
+    stdlib redirect handler copies every header onto the redirected request,
+    Authorization included. Confirmed against the installed runtime rather
+    than assumed. Without this, a token that can write to the tap repository
+    is handed to a storage host with no business seeing it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        same_host = (
+            urllib.parse.urlsplit(newurl).netloc
+            == urllib.parse.urlsplit(req.full_url).netloc
+        )
+        if not same_host:
+            for header in list(new.headers):
+                if header.lower() == "authorization":
+                    del new.headers[header]
+            new.unredirected_hdrs.pop("Authorization", None)
+        return new
+
+
+# ---------------------------------------------------------------------------
+# Pure transforms
+# ---------------------------------------------------------------------------
+
+
+def substitute_once(pattern: str, replacement, text: str, what: str) -> str:
+    """Replace exactly one match, or refuse.
+
+    Zero matches means the file moved on and this script no longer understands
+    it. More than one means the file is ambiguous. Either way, writing would be
+    a guess.
+    """
+    # MULTILINE so `^` anchors per line: these directives sit indented inside a
+    # cask or formula block, never at the start of the file.
+    new_text, count = re.subn(pattern, replacement, text, count=2, flags=re.MULTILINE)
+    if count != 1:
+        raise BumpError(
+            f"expected exactly one {what} in the tap file, found {count}. "
+            "Refusing to write a guess; update this script alongside the tap."
+        )
+    return new_text
+
+
+def bump_cask(content: str, version: str, sha256: str) -> str:
+    content = substitute_once(
+        r'^(\s*version\s+)"[^"]+"',
+        lambda m: f'{m.group(1)}"{version}"',
+        content,
+        "version line",
+    )
+    return substitute_once(
+        r'^(\s*sha256\s+)"[0-9a-f]{64}"',
+        lambda m: f'{m.group(1)}"{sha256}"',
+        content,
+        "sha256 line",
+    )
+
+
+def bump_formula(content: str, version: str) -> str:
+    return substitute_once(
+        r'(tag:\s*)"v[^"]+"',
+        lambda m: f'{m.group(1)}"v{version}"',
+        content,
+        "git tag reference",
+    )
+
+
+def cask_version(content: str) -> str | None:
+    match = re.search(r'^\s*version\s+"([^"]+)"', content, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def cask_sha256(content: str) -> str | None:
+    match = re.search(r'^\s*sha256\s+"([0-9a-f]{64})"', content, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def formula_version(content: str) -> str | None:
+    match = re.search(r'tag:\s*"v([^"]+)"', content)
+    return match.group(1) if match else None
+
+
+# ---------------------------------------------------------------------------
+# GitHub plumbing
+# ---------------------------------------------------------------------------
+
+
+def request(
+    url: str, token: str, method: str = "GET", payload: dict | None = None
+) -> dict:
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        body = error.read().decode(errors="replace")[:400]
+        # Never interpolate the token into an error.
+        raise BumpError(f"{method} {url} failed with {error.code}: {body}") from None
+
+
+def read_tap_file(path: str, token: str) -> str:
+    payload = request(f"{API}/repos/{TAP_REPO}/contents/{path}?ref={TAP_BRANCH}", token)
+    return base64.b64decode(payload["content"]).decode()
+
+
+def commit_tap_files(files: dict[str, str], message: str, token: str) -> str:
+    """Write every changed file in one commit.
+
+    Two Contents API calls are two commits, so a failure between them leaves
+    the tap half-updated, and two concurrent runs can interleave into a formula
+    and cask from different versions. A tree plus a commit plus a non-forced
+    ref update is atomic and rejects a stale base outright.
+    """
+    ref = request(f"{API}/repos/{TAP_REPO}/git/ref/heads/{TAP_BRANCH}", token)
+    base_sha = ref["object"]["sha"]
+    base_commit = request(f"{API}/repos/{TAP_REPO}/git/commits/{base_sha}", token)
+
+    tree = request(
+        f"{API}/repos/{TAP_REPO}/git/trees",
+        token,
+        method="POST",
+        payload={
+            "base_tree": base_commit["tree"]["sha"],
+            "tree": [
+                {"path": path, "mode": "100644", "type": "blob", "content": content}
+                for path, content in sorted(files.items())
+            ],
+        },
+    )
+    commit = request(
+        f"{API}/repos/{TAP_REPO}/git/commits",
+        token,
+        method="POST",
+        payload={"message": message, "tree": tree["sha"], "parents": [base_sha]},
+    )
+    # force defaults to false: a concurrent run that moved the branch makes
+    # this fail rather than silently discard its commit.
+    request(
+        f"{API}/repos/{TAP_REPO}/git/refs/heads/{TAP_BRANCH}",
+        token,
+        method="PATCH",
+        payload={"sha": commit["sha"], "force": False},
+    )
+    return commit["sha"][:8]
+
+
+def dmg_digest(version: str, token: str) -> str | None:
+    """SHA-256 of the released DMG, or None when the release has no DMG."""
+    asset_name = f"Minutes_{version}_aarch64.dmg"
+    release = request(f"{API}/repos/{SOURCE_REPO}/releases/tags/v{version}", token)
+    asset = next((a for a in release.get("assets", []) if a["name"] == asset_name), None)
+    if asset is None:
+        return None
+
+    if asset.get("state") != "uploaded":
+        raise BumpError(
+            f"{asset_name} is in state {asset.get('state')!r}, not 'uploaded'; "
+            "refusing to hash an asset GitHub has not finished storing"
+        )
+
+    opener = urllib.request.build_opener(HostChangeStripsAuth)
+    req = urllib.request.Request(asset["url"])
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/octet-stream")
+    digest = hashlib.sha256()
+    read = 0
+    with opener.open(req) as response:
+        for chunk in iter(lambda: response.read(1024 * 1024), b""):
+            digest.update(chunk)
+            read += len(chunk)
+    computed = digest.hexdigest()
+
+    declared = asset.get("size")
+    if declared is not None and read != declared:
+        raise BumpError(
+            f"downloaded {read} bytes of {asset_name} but GitHub declares "
+            f"{declared}; refusing to write the hash of a partial file"
+        )
+
+    recorded = asset.get("digest") or ""
+    if recorded.startswith("sha256:") and recorded.split(":", 1)[1] != computed:
+        raise BumpError(
+            f"{asset_name} hashed to {computed} but GitHub records {recorded}; "
+            "refusing to write a hash the two disagree on"
+        )
+
+    return computed
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+
+def run(version: str, token: str, dry_run: bool) -> int:
+    version = version.lstrip("v")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise BumpError(
+            f"refusing to bump to a non-release version {version!r}; "
+            "prereleases and suffixed tags do not belong in the tap"
+        )
+
+    # Everything is read, downloaded and checked before anything is written.
+    formula = read_tap_file(FORMULA_PATH, token)
+    cask = read_tap_file(CASK_PATH, token)
+    pending: dict[str, str] = {}
+
+    if formula_version(formula) == version:
+        print(f"formula already at {version}")
+    else:
+        pending[FORMULA_PATH] = bump_formula(formula, version)
+        print(f"formula {formula_version(formula)} -> {version}")
+
+    expected = dmg_digest(version, token)
+    if expected is None:
+        # Not a failure, but it must be visible: silence is how the cask froze.
+        print(
+            f"::warning::release v{version} has no Minutes_{version}_aarch64.dmg; "
+            "cask left as is"
+        )
+    elif cask_version(cask) == version and cask_sha256(cask) == expected:
+        print(f"cask already at {version} with a matching hash")
+    else:
+        if cask_version(cask) == version:
+            # The version alone is not proof of currency. An earlier draft
+            # returned here, which made a wrong hash unfixable by this tool.
+            print(
+                f"::warning::cask says {version} but its hash is "
+                f"{cask_sha256(cask)}, expected {expected}; repairing"
+            )
+        pending[CASK_PATH] = bump_cask(cask, version, expected)
+        print(f"cask {cask_version(cask)} -> {version} (sha256 {expected[:12]}...)")
+
+    if not pending:
+        print("tap already current; nothing to do")
+        return 0
+    if dry_run:
+        print(f"dry run: would commit {', '.join(sorted(pending))}")
+        return 0
+
+    commit = commit_tap_files(pending, f"minutes {version}", token)
+    print(f"committed {commit}: {', '.join(sorted(pending))}")
+    return 0
+
+
+FIXTURE_CASK = """cask "minutes" do
+  version "0.18.2"
+  sha256 "71b267b411ce77c15e19b97a3cd38ad3c8d7c82e080f1ff1702ce7e39c06fbf9"
+
+  url "https://github.com/silverstein/minutes/releases/download/v#{version}/Minutes_#{version}_aarch64.dmg"
+  app "Minutes.app"
+end
+"""
+
+FIXTURE_FORMULA = """class Minutes < Formula
+  url "https://github.com/silverstein/minutes.git", tag: "v0.24.0"
+  license "MIT"
+end
+"""
+
+
+def self_test() -> int:
+    failures = 0
+
+    def check(condition: bool, message: str) -> None:
+        nonlocal failures
+        if condition:
+            print(f"self-test ok: {message}")
+        else:
+            print(f"self-test FAILED: {message}", file=sys.stderr)
+            failures += 1
+
+    new_sha = "d" * 64
+    updated = bump_cask(FIXTURE_CASK, "0.24.0", new_sha)
+    check(
+        cask_version(updated) == "0.24.0" and cask_sha256(updated) == new_sha,
+        "cask bump rewrites both version and hash",
+    )
+    # The url line interpolates #{version} and must survive, or the cask would
+    # point at a literal path and every install would 404.
+    check(
+        "#{version}" in updated and updated.count("sha256") == 1,
+        "cask bump leaves surrounding content intact",
+    )
+    check(
+        formula_version(bump_formula(FIXTURE_FORMULA, "0.25.0")) == "0.25.0",
+        "formula bump rewrites the tag",
+    )
+    check(
+        bump_cask(updated, "0.24.0", new_sha) == updated,
+        "cask bump is idempotent",
+    )
+
+    for label, content, fn in [
+        ("a cask with no version line", 'cask "minutes" do\nend\n',
+         lambda c: bump_cask(c, "1.0.0", new_sha)),
+        ("a cask with two version lines",
+         'version "1.0.0"\nversion "2.0.0"\nsha256 "%s"\n' % ("a" * 64),
+         lambda c: bump_cask(c, "1.0.0", new_sha)),
+        ("a formula with no tag", "class Minutes < Formula\nend\n",
+         lambda c: bump_formula(c, "1.0.0")),
+    ]:
+        try:
+            fn(content)
+        except BumpError:
+            check(True, f"refused {label}")
+        else:
+            check(False, f"accepted {label}")
+
+    # Version parsing must reject anything that is not a plain release, since
+    # the tap has no way to express a prerelease.
+    for bad in ["1.2.3-rc1", "1.2", "latest", "", "1.2.3.4"]:
+        try:
+            run(bad, "unused-token", dry_run=True)
+        except BumpError:
+            check(True, f"refused version {bad!r}")
+        except Exception as error:  # network attempted means the guard passed it
+            check(False, f"refused version {bad!r} (got {type(error).__name__})")
+        else:
+            check(False, f"refused version {bad!r}")
+
+    # The redirect handler is the only thing standing between the tap token and
+    # a storage host, so it is exercised rather than trusted.
+    handler = HostChangeStripsAuth()
+    original = urllib.request.Request("https://api.github.com/x")
+    original.add_header("Authorization", "Bearer secret")
+    same = handler.redirect_request(
+        original, None, 302, "Found", {}, "https://api.github.com/y"
+    )
+    cross = handler.redirect_request(
+        original, None, 302, "Found", {}, "https://objects.example.com/y"
+    )
+    check(
+        any(k.lower() == "authorization" for k in (same.headers if same else {})),
+        "redirect within the same host keeps Authorization",
+    )
+    check(
+        not any(k.lower() == "authorization" for k in (cross.headers if cross else {})),
+        "redirect to another host drops Authorization",
+    )
+
+    if failures == 0:
+        print("self-test ok: all checks passed")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", help="release version, with or without a leading v")
+    parser.add_argument("--dry-run", action="store_true", help="report without writing")
+    parser.add_argument("--self-test", action="store_true", help="exercise the logic")
+    args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
+    if not args.version:
+        parser.error("--version is required unless --self-test is given")
+
+    token = os.environ.get("HOMEBREW_TAP_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+    if not token:
+        raise BumpError(
+            "no token in HOMEBREW_TAP_TOKEN or GITHUB_TOKEN; the default "
+            "workflow token cannot write to another repository"
+        )
+    return run(args.version, token, args.dry_run)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BumpError as error:
+        print(f"::error::{error}", file=sys.stderr)
+        raise SystemExit(1)
