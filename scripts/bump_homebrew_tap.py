@@ -145,6 +145,14 @@ def formula_version(content: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class HttpFailure(BumpError):
+    """A failed request, carrying its status so callers can discriminate."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 def request(
     url: str, token: str, method: str = "GET", payload: dict | None = None
 ) -> dict:
@@ -161,7 +169,9 @@ def request(
     except urllib.error.HTTPError as error:
         body = error.read().decode(errors="replace")[:400]
         # Never interpolate the token into an error.
-        raise BumpError(f"{method} {url} failed with {error.code}: {body}") from None
+        raise HttpFailure(
+            error.code, f"{method} {url} failed with {error.code}: {body}"
+        ) from None
 
 
 def read_tap_file(path: str, token: str) -> str:
@@ -208,6 +218,51 @@ def commit_tap_files(files: dict[str, str], message: str, token: str) -> str:
         payload={"sha": commit["sha"], "force": False},
     )
     return commit["sha"][:8]
+
+
+def check_write_access(token: str) -> int:
+    """Prove the token may write to the tap, without writing anything.
+
+    Reading the tap needs no more than public access, so a successful bump
+    dry-run says nothing about whether the token can actually commit. A
+    permission set to read-only therefore stays invisible until a release, and
+    a release is the worst moment to discover it.
+
+    Updating a ref to the commit it already points at is the probe: it creates
+    no commit and moves nothing, but the API still refuses it without write
+    access.
+    """
+    ref = request(f"{API}/repos/{TAP_REPO}/git/ref/heads/{TAP_BRANCH}", token)
+    sha = ref["object"]["sha"]
+    try:
+        request(
+            f"{API}/repos/{TAP_REPO}/git/refs/heads/{TAP_BRANCH}",
+            token,
+            method="PATCH",
+            payload={"sha": sha, "force": False},
+        )
+    except HttpFailure as failure:
+        if failure.status in (401, 403, 404):
+            # 404 as well as 403: GitHub hides repositories a token cannot
+            # reach rather than admitting they exist.
+            raise BumpError(
+                "the token cannot write to "
+                f"{TAP_REPO} (HTTP {failure.status}). Check that the "
+                "fine-grained token grants Contents: Read and write on that "
+                "repository, and that the repository is in its scope."
+            ) from None
+        if failure.status == 422:
+            # Some deployments decline a no-op ref update outright. That is
+            # not evidence either way, and claiming otherwise would be the
+            # kind of check that reassures without verifying.
+            print(
+                "::warning::write access could not be determined: the no-op "
+                f"ref update returned 422. This is inconclusive, not a failure."
+            )
+            return 0
+        raise
+    print(f"token can write to {TAP_REPO} (no commit was created)")
+    return 0
 
 
 def dmg_digest(version: str, token: str) -> str | None:
@@ -385,6 +440,45 @@ def self_test() -> int:
         else:
             check(False, f"refused version {bad!r}")
 
+    # A token that can read the tap but not write to it is the realistic
+    # misconfiguration: picking Read-only for Contents. It cannot be produced
+    # here, so the branch is driven directly rather than left unexercised.
+    import types
+
+    real_request = globals()["request"]
+    for status in (403, 404):
+        def refuse(url, token, method="GET", payload=None, _status=status):
+            if method == "GET":
+                return {"object": {"sha": "0" * 40}}
+            raise HttpFailure(_status, "refused")
+
+        globals()["request"] = refuse
+        try:
+            check_write_access("token")
+        except BumpError as error:
+            check(
+                "Contents: Read and write" in str(error),
+                f"a {status} on the ref update reports the permission to fix",
+            )
+        else:
+            check(False, f"a {status} on the ref update was treated as success")
+        finally:
+            globals()["request"] = real_request
+
+    def inconclusive(url, token, method="GET", payload=None):
+        if method == "GET":
+            return {"object": {"sha": "0" * 40}}
+        raise HttpFailure(422, "no-op declined")
+
+    globals()["request"] = inconclusive
+    try:
+        check(
+            check_write_access("token") == 0,
+            "a 422 is reported as inconclusive rather than as proof either way",
+        )
+    finally:
+        globals()["request"] = real_request
+
     # The redirect handler is the only thing standing between the tap token and
     # a storage host, so it is exercised rather than trusted.
     handler = HostChangeStripsAuth()
@@ -415,10 +509,20 @@ def main() -> int:
     parser.add_argument("--version", help="release version, with or without a leading v")
     parser.add_argument("--dry-run", action="store_true", help="report without writing")
     parser.add_argument("--self-test", action="store_true", help="exercise the logic")
+    parser.add_argument(
+        "--check-access",
+        action="store_true",
+        help="prove the token can write to the tap, without writing",
+    )
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
+    if args.check_access:
+        token = os.environ.get("HOMEBREW_TAP_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+        if not token:
+            raise BumpError("no token in HOMEBREW_TAP_TOKEN or GITHUB_TOKEN")
+        return check_write_access(token)
     if not args.version:
         parser.error("--version is required unless --self-test is given")
 
