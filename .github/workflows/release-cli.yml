@@ -224,6 +224,9 @@ jobs:
       # this workflow, so the break was invisible until release time, which is
       # what scripts/check_sherpa_packaging.mjs now prevents.
       - name: Build sherpa-enabled Linux archive
+        # Keyed on by scripts/check_sherpa_packaging.py, so that renaming this
+        # step is a rename rather than a silent loss of its packaging gate.
+        id: sherpa-archive
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         # No RUSTFLAGS rpath here any more. The executable no longer links
@@ -240,14 +243,25 @@ jobs:
           ( cd crates/sherpa-plugin && cargo build --release --locked )
           plugin_dir="crates/sherpa-plugin/target/release"
           out="minutes-linux-x64-sherpa"
-          rm -rf "$out" && mkdir -p "$out"
+          # Separate statements: a failure on the left of `&&` does not trip
+          # errexit, so a half-removed stale directory could have survived into
+          # the archive.
+          rm -rf "$out"
+          mkdir -p "$out"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$out/minutes"
           cp "$plugin_dir/libminutes_sherpa.so" "$out/"
           # sherpa-rs-sys drops its shared libraries into the plugin's profile
           # dir; the plugin resolves them through its own $ORIGIN.
+          #
+          # `-exec ... +` rather than `\;`: with `\;` find exits 0 even when
+          # every cp failed, which would have produced an archive missing its
+          # libraries with no error anywhere.
           find "$plugin_dir" -maxdepth 1 -name '*.so' ! -name 'libminutes_sherpa.so' \
-            -exec cp {} "$out/" \;
-          for lib in libminutes_sherpa.so libsherpa-onnx-c-api.so; do
+            -exec cp -t "$out/" {} +
+          # libonnxruntime.so is asserted too. Leaving it out meant the dlopen
+          # below could still pass by finding a system copy, since only
+          # LD_LIBRARY_PATH is cleared and the default loader paths remain.
+          for lib in libminutes_sherpa.so libsherpa-onnx-c-api.so libonnxruntime.so; do
             test -f "$out/$lib" \
               || { echo "::error::$lib missing from the sherpa archive"; exit 1; }
           done

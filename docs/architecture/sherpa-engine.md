@@ -21,8 +21,23 @@ falls back to Whisper (with a warning) so a recording never breaks.
 (cd crates/sherpa-plugin && cargo build --release)
 cargo build --release -p minutes-cli --features engine-sherpa
 rm -f ~/.local/bin/minutes && cp target/release/minutes ~/.local/bin/minutes
-mkdir -p ~/.minutes/lib && cp crates/sherpa-plugin/target/release/libminutes_sherpa.dylib ~/.minutes/lib/
+mkdir -p ~/.minutes/lib
+```
 
+Installing the plugin differs by platform, because only macOS links sherpa-onnx
+statically into it:
+
+```bash
+# macOS: the plugin is self-contained.
+cp crates/sherpa-plugin/target/release/libminutes_sherpa.dylib ~/.minutes/lib/
+
+# Linux: the sherpa libraries must travel with it, since the plugin resolves
+# them through its own $ORIGIN. Copying the plugin alone installs one that
+# cannot load.
+cp crates/sherpa-plugin/target/release/*.so ~/.minutes/lib/
+```
+
+```bash
 minutes setup --sherpa     # downloads the int8 ONNX model + sets engine = "sherpa"
 ```
 
@@ -207,15 +222,21 @@ The `engine-sherpa` Cargo feature must be enabled at build time:
 # Core library check
 cargo check -p minutes-core --no-default-features --features engine-sherpa
 
-# CLI build (macOS: --no-default-features is required, see the constraint above)
-cargo build --release -p minutes-cli --no-default-features --features whisper,engine-sherpa,metal
+# CLI build, keeping the default features. The plugin has to be built too:
+# `engine-sherpa` compiles only the loader.
+cargo build --release -p minutes-cli --features engine-sherpa,metal
+(cd crates/sherpa-plugin && cargo build --release)
 ```
 
-The feature is opt-in and not included in the default build. The CLI's default
-features are `whisper` and `diarize`, so a plain `--features engine-sherpa`
-build would include Whisper, Sherpa, and diarization; on macOS that
-combination refuses to compile (issue #683), which is why the commands above
-drop the defaults and re-add `whisper` explicitly.
+The feature is opt-in and not included in the default build.
+
+`engine-sherpa` and `diarize` coexist on every platform since #685, so there is
+no longer any reason to drop the default features. Before that, both stacks
+were statically linked into one macOS image and their two ONNX Runtime copies
+collided, so this document told you to build with `--no-default-features` and
+give up diarization. Now sherpa lives in its own dlopened image with its own
+runtime, and CI compiles `diarize,engine-sherpa` together on purpose to keep it
+that way.
 
 `sherpa-rs-sys` builds sherpa-onnx through CMake, so a working CMake toolchain
 must be available during the build.

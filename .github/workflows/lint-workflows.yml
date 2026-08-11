@@ -47,8 +47,8 @@ jobs:
         # request notices when the sherpa archive stops shipping a working
         # engine (#685 broke it and every gate stayed green).
         run: |
-          node scripts/check_sherpa_packaging.mjs
-          node scripts/check_sherpa_packaging.mjs --self-test
+          python3 scripts/check_sherpa_packaging.py
+          python3 scripts/check_sherpa_packaging.py --self-test
 
       - name: Verify broken workflow is rejected
         run: |
