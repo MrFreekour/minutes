@@ -31,10 +31,11 @@ pub enum ShadowOutcome {
 
 /// A fixed failure category for a shadow attempt.
 ///
-/// The raw error string is deliberately discarded: it can embed recognized
-/// speech (names, account details) that must never reach a shadow log, and
-/// truncation is not redaction. Classification reads the message but stores only
-/// this closed set, so no transcript content survives.
+/// `compare` takes this category directly rather than a raw error string. The
+/// caller has the typed failure context (worker exit, XPC status, Speech error),
+/// so it can categorize accurately; and a closed enum makes it *impossible* for a
+/// raw message — which can embed recognized speech — to reach a shadow log. That
+/// is a stronger guarantee than trying to redact free text after the fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShadowError {
     /// The worker process died (crash / abort).
@@ -58,24 +59,6 @@ impl ShadowError {
             Self::AssetsUnavailable => "assets_unavailable",
             Self::SpeechError => "speech_error",
             Self::Unknown => "unknown",
-        }
-    }
-
-    /// Classify a raw error into a fixed category, discarding the message so no
-    /// transcript content it might embed is ever stored or logged. Matching is
-    /// on the worker's own code-controlled status wording, not on user speech.
-    fn classify(msg: &str) -> Self {
-        let m = msg.to_lowercase();
-        if m.contains("interrupt") || m.contains("invalidat") {
-            Self::XpcInterrupted
-        } else if m.contains("crash") || m.contains("abort") || m.contains("signal") {
-            Self::WorkerCrashed
-        } else if m.contains("not subscribed") || m.contains("asset") || m.contains("locale") {
-            Self::AssetsUnavailable
-        } else if m.contains("speech") || m.contains("analyzer") || m.contains("recogni") {
-            Self::SpeechError
-        } else {
-            Self::Unknown
         }
     }
 }
@@ -122,11 +105,13 @@ const SIMILARITY_WORD_CAP: usize = 3000;
 /// Speech attempt result for the same audio.
 ///
 /// `apple` is `Ok(Some(text))` for a usable transcript, `Ok(None)` for an empty
-/// result, or `Err(msg)` when the attempt failed. Whisper is always present
-/// because it is the shipped output. A `Some` value that normalizes to zero
-/// words (e.g. the native bridge's empty-segment `""`) is classified `Empty`,
-/// not `Usable`, so capability-success rates are not inflated.
-pub fn compare(whisper: &str, apple: Result<Option<&str>, &str>) -> ShadowComparison {
+/// result, or `Err(category)` when the attempt failed, where the caller supplies
+/// the typed [`ShadowError`] category (no raw message crosses this boundary).
+/// Whisper is always present because it is the shipped output. A `Some` value
+/// that normalizes to zero words (e.g. the native bridge's empty-segment `""`)
+/// is classified `Empty`, not `Usable`, so capability-success rates are not
+/// inflated.
+pub fn compare(whisper: &str, apple: Result<Option<&str>, ShadowError>) -> ShadowComparison {
     let whisper_words_vec = normalized_words(whisper);
     let whisper_chars = normalized_char_count(whisper);
     let whisper_words = whisper_words_vec.len();
@@ -171,7 +156,7 @@ pub fn compare(whisper: &str, apple: Result<Option<&str>, &str>) -> ShadowCompar
             }
         }
         Ok(None) => non_usable(ShadowOutcome::Empty, None),
-        Err(msg) => non_usable(ShadowOutcome::Failed, Some(ShadowError::classify(msg))),
+        Err(category) => non_usable(ShadowOutcome::Failed, Some(category)),
     }
 }
 
@@ -194,6 +179,10 @@ pub fn log_comparison(source: &str, cmp: &ShadowComparison) -> std::io::Result<(
     };
     let entry = serde_json::json!({
         "event": "apple_speech_shadow",
+        // Each caller injects its own timestamp; append_log does not. Without it
+        // measurements can't be correlated with the OS/app/worker change being
+        // evaluated across sessions (daily rotation gives at most a file date).
+        "ts": chrono::Utc::now().to_rfc3339(),
         "source": source,
         "outcome": outcome,
         "whisper_words": cmp.whisper_words,
@@ -367,25 +356,15 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_attempt_stores_a_fixed_category_not_the_message() {
-        let cmp = compare("whisper had text", Err("worker crashed (XPC interrupted)"));
+    fn a_failed_attempt_records_the_caller_supplied_category() {
+        // The caller passes a typed category; no raw message can cross the API,
+        // so transcript content can never reach the record by construction.
+        let cmp = compare("whisper had text", Err(ShadowError::XpcInterrupted));
         assert_eq!(cmp.outcome, ShadowOutcome::Failed);
         assert_eq!(cmp.apple_words, 0);
         assert_eq!(cmp.similarity, None);
         assert_eq!(cmp.apple_error, Some(ShadowError::XpcInterrupted));
         assert_eq!(cmp.whisper_words, 3);
-    }
-
-    #[test]
-    fn error_classification_discards_any_embedded_text() {
-        // Even if an error embedded recognized speech, only a fixed category is
-        // stored — the raw words never survive. The stored value is a token from
-        // ShadowError's closed set regardless of which category is chosen.
-        let cmp = compare("hi", Err("boom: the secret launch code is hunter2"));
-        let category = cmp.apple_error.expect("failed attempt has a category");
-        assert!(!category.as_str().contains("hunter2"));
-        assert!(!category.as_str().contains("secret"));
-        assert!(!category.as_str().contains("launch"));
     }
 
     #[test]
