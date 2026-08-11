@@ -239,20 +239,29 @@ pub fn shadow_enabled(config: &Config) -> bool {
 /// and punctuates (`Hello, world!`) where Apple Speech emits plain `hello world`.
 /// Shadow mode measures word content, not typography, so each line is first run
 /// through `pipeline::clean_transcript_line` (stripping `[...]` prefixes, exactly
-/// as the offline evaluator does) and then non-alphanumeric, non-whitespace
-/// characters are mapped to spaces. This keeps the shadow metric and the offline
-/// evaluator (`apple_speech::eval_text_for_compare_punct_insensitive`) in
-/// agreement on what "same words" means.
+/// as the offline evaluator does) and then punctuation is folded:
+///
+/// - word-internal apostrophes and periods are *deleted*, so contractions and
+///   abbreviations survive as one token (`can't` == `cant`, `U.S.` == `us`),
+/// - every other non-alphanumeric character becomes a space (a word boundary).
+///
+/// This follows `apple_speech::eval_text_for_compare_punct_insensitive` but folds
+/// contractions the base evaluator would split. Residual heuristic limits remain
+/// (e.g. hyphenated compounds still split); a shadow similarity is a proxy, not a
+/// ground-truth WER.
 fn normalized_words(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(crate::pipeline::clean_transcript_line)
         .flat_map(|line| {
             line.chars()
-                .map(|c| {
+                .filter_map(|c| {
                     if c.is_alphanumeric() || c.is_whitespace() {
-                        c
+                        Some(c)
+                    } else if c == '\'' || c == '.' {
+                        // Fold word-internal punctuation: can't -> cant, U.S. -> us.
+                        None
                     } else {
-                        ' '
+                        Some(' ')
                     }
                 })
                 .collect::<String>()
@@ -338,6 +347,16 @@ mod tests {
         assert!(cmp.exact_match, "timestamp prefix must be stripped");
         assert_eq!(cmp.similarity, Some(1.0));
         assert_eq!(cmp.whisper_words, 2, "the 0 and 05 must not count as words");
+    }
+
+    #[test]
+    fn contractions_and_abbreviations_fold_to_a_match() {
+        // Engines format contractions/abbreviations differently; word-internal
+        // apostrophes and periods must not create spurious word boundaries.
+        let cmp = compare("I can't visit the U.S.", Ok(Some("i cant visit the us")));
+        assert_eq!(cmp.outcome, ShadowOutcome::Usable);
+        assert!(cmp.exact_match, "can't==cant and U.S.==us");
+        assert_eq!(cmp.similarity, Some(1.0));
     }
 
     #[test]
