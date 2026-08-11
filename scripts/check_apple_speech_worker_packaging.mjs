@@ -42,10 +42,11 @@ const files = {
     "tauri/src-tauri/minutes-apple-speech-worker.entitlements",
     "utf8",
   ),
-  // Structural-only (deliberately not golden-hashed): build.rs changes for
+  // Structural-only (deliberately not golden-hashed): build.rs files change for
   // unrelated reasons and should not force a reseal, but the Swift Concurrency
-  // rpath is load-bearing and must not silently regress.
+  // rpaths are load-bearing and must not silently regress.
   coreBuild: readFileSync("crates/core/build.rs", "utf8"),
+  cliBuild: readFileSync("crates/cli/build.rs", "utf8"),
 };
 
 
@@ -177,11 +178,19 @@ function validate(candidate, checkGoldens = true) {
   // Without this runtime rpath the weak libswift_Concurrency load resolves to
   // null and the worker aborts in swift_getTypeByMangledName as soon as it
   // constructs a Speech (async) type. Proven on hardware; the analyzer cannot
-  // run without it.
+  // run without it. The shipping worker binary gets its rpath from
+  // crates/cli/build.rs (a cargo:rustc-link-arg in minutes-core does not reach
+  // a downstream bin); crates/core covers minutes-core's own test/example
+  // targets. Both are load-bearing.
+  requireText(
+    candidate.cliBuild,
+    "cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift",
+    "the Apple Speech worker bin must add the Swift Concurrency runtime rpath",
+  );
   requireText(
     candidate.coreBuild,
     "cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift",
-    "the worker build must add the Swift Concurrency runtime rpath (/usr/lib/swift)",
+    "minutes-core's own targets must add the Swift Concurrency runtime rpath",
   );
 
   for (const value of [
