@@ -242,9 +242,9 @@ pub fn normalize_text_document(
 /// Turn a page reading into an indexable document.
 ///
 /// The OCR entry point marks every resulting provision `Transcribed`.
-/// Converted PDFs can also mark individual provisions transcribed when their
-/// page carries a scan-sized raster; unlike this path, they may be mixed with
-/// extracted provisions from readable pages in the same document.
+/// Converted documents also carry per-anchor provenance so independently read
+/// pages remain distinguishable. The PDF converter currently marks every page
+/// when its document-wide sweep finds a scan.
 ///
 /// One provision per page, anchored to the page. A transcription has no
 /// section structure to cite -- the recogniser reports lines and confidences,
@@ -2524,6 +2524,63 @@ fn document_why_matched(
 mod tests {
     use super::*;
 
+    fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn pdf_stream(dictionary_entries: &str, content: Vec<u8>) -> Vec<u8> {
+        [
+            format!(
+                "<< {dictionary_entries} /Length {} >>\nstream\n",
+                content.len()
+            )
+            .into_bytes(),
+            content,
+            b"\nendstream".to_vec(),
+        ]
+        .concat()
+    }
+
+    fn two_page_pdf_with_a_scan_on_page_two() -> Vec<u8> {
+        let first_page = b"BT /F1 12 Tf 72 720 Td (1. CONFIDENTIALITY) Tj 0 -20 Td (Recipient shall protect Confidential Information.) Tj ET";
+        let second_page = b"BT /F1 12 Tf 72 720 Td (2. GOVERNING LAW) Tj 0 -20 Td (This Agreement is governed by Arizona law.) Tj ET /Im1 Do";
+        let pixels = vec![0x80; 1275 * 1650];
+        assemble_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 8 0 R >> >> /Contents 7 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            pdf_stream("", first_page.to_vec()),
+            pdf_stream("", second_page.to_vec()),
+            pdf_stream(
+                "/Type /XObject /Subtype /Image /Width 1275 /Height 1650 /ColorSpace /DeviceGray /BitsPerComponent 8",
+                pixels,
+            ),
+        ])
+    }
+
     fn vault() -> VaultId {
         VaultId::parse("peter-pilot").expect("vault")
     }
@@ -2962,12 +3019,11 @@ mod tests {
         );
     }
 
-    /// The document summary is deliberately extracted for a mixed document.
-    /// If either candidate query reads that summary instead of the provision
-    /// row, page two becomes quotable and this test fails on both retrieval
-    /// paths.
+    /// This deliberately hand-marks one provision, so it tests retrieval's
+    /// provision-level gate rather than PDF image detection.
     #[test]
-    fn a_scanned_page_inside_a_readable_document_is_never_quoted() {
+    fn a_transcribed_provision_is_never_quoted_when_marked_transcribed() {
+        // Fails if either candidate query reads the document summary instead of the provision row.
         let mut document = normalize_text_document(
             DocumentId::parse("mixed-pages").expect("id"),
             "Mixed Pages",
@@ -3040,6 +3096,72 @@ mod tests {
             assert!(response.transcriptions[0]
                 .transcribed_text
                 .contains("scanned page"));
+        }
+    }
+
+    #[test]
+    fn a_pdf_with_a_page_scan_is_never_quoted_after_real_conversion() {
+        // Fails if conversion does not propagate one scan to every PDF provision's provenance.
+        let bytes = two_page_pdf_with_a_scan_on_page_two();
+        let converted = minutes_archive_convert::convert_bytes(SourceFormat::Pdf, &bytes)
+            .expect("convert scan-bearing PDF");
+        assert_eq!(
+            converted.text_origin,
+            minutes_archive_convert::TextOrigin::MachineReadLayer
+        );
+        assert_eq!(
+            converted.machine_read_anchors,
+            BTreeSet::from(["page:0001".to_string(), "page:0002".to_string()])
+        );
+
+        let normalized = normalize_converted_document(
+            DocumentId::parse("converter-scan").expect("id"),
+            "Converter Scan",
+            &bytes,
+            &converted,
+        )
+        .expect("normalize converted PDF");
+        assert_eq!(normalized.text_provenance, TextProvenance::Transcribed);
+        assert!(
+            normalized
+                .provisions
+                .iter()
+                .all(|provision| provision.text_provenance == TextProvenance::Transcribed),
+            "every provision in the scan-bearing PDF must be transcription-only"
+        );
+        assert!(normalized
+            .provisions
+            .iter()
+            .any(|provision| provision.text.contains("Confidential Information")));
+
+        let revisions = CurrentRevisionSet::from_documents([&normalized]);
+        let mut index =
+            LegalIndex::new(VaultId::parse("converter-scan-vault").expect("vault")).expect("index");
+        index.replace_document(&normalized).expect("ingest");
+        for scope in [MatchScope::SameProvision, MatchScope::AnywhereInDocument] {
+            let response = index
+                .search(
+                    index.vault_id(),
+                    LegalQuery {
+                        raw: "confidentiality".to_string(),
+                        scope,
+                        required_concepts: vec![LegalConcept::Confidentiality],
+                        excluded_concepts: Vec::new(),
+                        exact_phrase: None,
+                        max_sentences: None,
+                        limit: 10,
+                    },
+                    &revisions,
+                )
+                .expect("search");
+            assert!(response.evidence.is_empty(), "{scope:?} returned a quote");
+            assert!(
+                response
+                    .documents
+                    .iter()
+                    .all(|document| document.criterion_evidence.is_empty()),
+                "{scope:?} returned document-level quoted evidence"
+            );
         }
     }
 

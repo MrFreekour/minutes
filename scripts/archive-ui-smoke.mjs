@@ -479,12 +479,13 @@ try {
         }
 
         const vaultSummary = document.querySelector("#vault-summary").textContent;
+        // Fails if the UI again implies that any provision in a scan-bearing PDF is quotable.
         if (
           !vaultSummary.includes("aliases or shortcuts (2)") ||
           !vaultSummary.includes("have a second name elsewhere on the disk (3)") ||
           !vaultSummary.includes("9,023 items could not be read") ||
-          !vaultSummary.includes("4 scanned pages read by the text reader") ||
-          !vaultSummary.includes("2 documents have both readable text and pages containing a page-sized picture") ||
+          !vaultSummary.includes("4 documents contain text read from scans") ||
+          !vaultSummary.includes("an imported PDF containing any page scan is not quotable at all") ||
           !vaultSummary.includes("This index is PARTIAL") ||
           !vaultSummary.includes("5,000 documents were not read") ||
           !vaultSummary.includes("3 folders were too deep to enter") ||

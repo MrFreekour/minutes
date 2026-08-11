@@ -9,7 +9,8 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -103,9 +104,9 @@ pub struct ConvertedBlock {
 /// purpose -- a payload that does not state its origin fails to parse instead
 /// of quietly parsing as quotable.
 ///
-/// `MachineReadLayer` summarizes a document whose pages are all machine-read.
-/// Page anchors carry the actual quoting decision, because a single scanned
-/// exhibit must not demote the readable pages around it.
+/// `MachineReadLayer` summarizes a document whose characters may be a machine
+/// reading of a page scan. For PDF conversion the verdict is document-wide: a
+/// scan anywhere makes every provision transcribed rather than quotable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextOrigin {
@@ -122,10 +123,12 @@ pub struct ConvertedDocument {
     pub warnings: Vec<String>,
     /// See [`TextOrigin`]. Required in the worker payload: no default.
     pub text_origin: TextOrigin,
-    /// Page anchors whose text came from a page carrying a scan-sized raster.
+    /// Page anchors whose text must be treated as machine-read.
     ///
     /// Required in the worker payload: page provenance is a quoting boundary,
-    /// not optional metadata that an older producer may silently omit.
+    /// not optional metadata that an older producer may silently omit. The PDF
+    /// converter records every page when its flat document sweep finds a scan;
+    /// the OCR path can still record individual pages.
     pub machine_read_anchors: BTreeSet<String>,
 }
 
@@ -686,338 +689,237 @@ fn inline_text(inlines: &[anydoc::model::Inline]) -> String {
     out
 }
 
-/// The pixel count below which an image cannot be a legible page scan.
-///
-/// A letterhead logo or signature image runs well under a tenth of this; the
-/// lowest-resolution readable page -- a standard fax at 1728x1100 -- is seven
-/// times it. A full-page chart, figure, letterhead or watermark can exceed the
-/// threshold too, and deliberately makes only that page unquotable.
-const SCAN_IMAGE_MIN_PIXELS: i64 = 250_000;
+/// A page scan is large in both directions. A 150dpi letter page is 1275x1650
+/// and a fax is 1728x1100; signatures, logos, stamps, and headshots are large
+/// in at most one direction.
+const SCAN_MIN_EDGE: i64 = 1_000;
 
-/// Pages examined for the embedded-reading signature.
+/// Maximum total decoded stream bytes inspected by the provenance sweep.
 ///
-/// This is a bound against hostile page counts, not a performance budget. A
-/// document longer than the bound fails closed below rather than letting an
-/// unexamined page turn machine-read text into an exact quotation.
-const TEXT_ORIGIN_PAGES_EXAMINED: usize = 2_000;
+/// PDF conversion already runs in a memory- and time-bounded worker, while
+/// this lower format-specific ceiling prevents a document with many compressed
+/// streams from consuming the worker's entire allowance. Crossing the limit is
+/// an unknown provenance result and therefore fails closed.
+const MAX_PDF_SWEEP_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 
-/// Document-level summary of page provenance.
+type PdfScanCheck = Result<bool, ()>;
+
+#[derive(Debug)]
+struct PdfStreamBudget {
+    used: usize,
+    limit: usize,
+}
+
+impl PdfStreamBudget {
+    fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.used)
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), ()> {
+        self.used = self.used.checked_add(bytes).ok_or(())?;
+        (self.used <= self.limit).then_some(()).ok_or(())
+    }
+}
+
+/// Classify the complete PDF, without following resource references.
 ///
-/// The page anchors carry the quoting decision. This summary is
-/// `MachineReadLayer` only when every page is machine-read, so one scanned
-/// exhibit does not demote the rest of a born-digital agreement.
-#[cfg(test)]
+/// Pass one enumerates every parsed object for image XObjects. Pass two
+/// enumerates every stream for inline images. A malformed object-table entry,
+/// an undecodable stream, or an exhausted byte budget is an unknown result and
+/// fails closed at the caller. Reference shape, depth, and cycles are irrelevant.
+fn pdf_has_scan_sized_image(doc: &lopdf::Document) -> PdfScanCheck {
+    pdf_has_scan_sized_image_with_budget(doc, MAX_PDF_SWEEP_DECOMPRESSED_BYTES)
+}
+
+fn pdf_has_scan_sized_image_with_budget(
+    doc: &lopdf::Document,
+    decompressed_byte_limit: usize,
+) -> PdfScanCheck {
+    object_table_is_complete(doc)?;
+
+    for object in doc.objects.values() {
+        let lopdf::Object::Stream(stream) = object else {
+            continue;
+        };
+        if stream_is_image_xobject(doc, stream)?
+            && image_dimensions_are_scan_sized(doc, &stream.dict, b"Width", b"Height")?
+        {
+            return Ok(true);
+        }
+    }
+
+    let mut budget = PdfStreamBudget::new(decompressed_byte_limit);
+    for object in doc.objects.values() {
+        let lopdf::Object::Stream(stream) = object else {
+            continue;
+        };
+        let bytes = decode_stream_for_sweep(stream, &mut budget)?;
+        if stream_bytes_have_scan_sized_inline_image(doc, &bytes)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// lopdf deliberately skips malformed indirect objects while loading the rest
+/// of a PDF. Compare the parsed map to every live xref entry so a skipped object
+/// cannot disappear from an allegedly complete flat sweep.
+fn object_table_is_complete(doc: &lopdf::Document) -> Result<(), ()> {
+    for (&object_number, entry) in &doc.reference_table.entries {
+        let expected_id = match entry {
+            lopdf::xref::XrefEntry::Normal { generation, .. } => Some((object_number, *generation)),
+            lopdf::xref::XrefEntry::Compressed { .. } => Some((object_number, 0)),
+            lopdf::xref::XrefEntry::Free | lopdf::xref::XrefEntry::UnusableFree => None,
+        };
+        if expected_id.is_some_and(|object_id| !doc.objects.contains_key(&object_id)) {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn stream_is_image_xobject(doc: &lopdf::Document, stream: &lopdf::Stream) -> PdfScanCheck {
+    let subtype = match stream.dict.get(b"Subtype") {
+        Ok(subtype) => doc.dereference(subtype).map_err(|_| ())?.1,
+        Err(_) => return Ok(false),
+    };
+    Ok(subtype.as_name().map_err(|_| ())? == b"Image")
+}
+
+fn decode_stream_for_sweep<'a>(
+    stream: &'a lopdf::Stream,
+    budget: &mut PdfStreamBudget,
+) -> Result<Cow<'a, [u8]>, ()> {
+    let remaining = budget.remaining();
+    if stream.content.len() > remaining {
+        return Err(());
+    }
+    let filters = match stream.dict.get(b"Filter") {
+        Ok(_) => stream.filters().map_err(|_| ())?,
+        Err(_) => Vec::new(),
+    };
+    if stream.dict.get(b"DecodeParms").is_ok() {
+        // Predictor transforms need their own bounded implementation. Until
+        // then an encoded stream that requests one has unknown provenance.
+        return Err(());
+    }
+
+    let mut bytes = Cow::Borrowed(stream.content.as_slice());
+    for filter in filters {
+        bytes = Cow::Owned(match filter {
+            b"FlateDecode" | b"Fl" => bounded_zlib_decode(&bytes, remaining)?,
+            b"ASCII85Decode" | b"A85" => bounded_ascii85_decode(&bytes, remaining)?,
+            // Do not fall back to lopdf's unbounded allocation for uncommon or
+            // image-specific codecs. Unknown decoding is a fail-closed verdict.
+            _ => return Err(()),
+        });
+    }
+    budget.charge(bytes.len())?;
+    Ok(bytes)
+}
+
+fn bounded_zlib_decode(input: &[u8], limit: usize) -> Result<Vec<u8>, ()> {
+    use flate2::read::ZlibDecoder;
+
+    let maximum = u64::try_from(limit)
+        .map_err(|_| ())?
+        .checked_add(1)
+        .ok_or(())?;
+    let mut decoder = ZlibDecoder::new(input).take(maximum);
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).map_err(|_| ())?;
+    (output.len() <= limit).then_some(output).ok_or(())
+}
+
+fn bounded_ascii85_decode(input: &[u8], limit: usize) -> Result<Vec<u8>, ()> {
+    let input = input.strip_suffix(b"~>").unwrap_or(input);
+    let mut output = Vec::with_capacity(input.len().min(limit));
+    let mut buffer = 0u32;
+    let mut count = 0usize;
+
+    for &byte in input {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'z' {
+            if count != 0 || output.len().checked_add(4).is_none_or(|size| size > limit) {
+                return Err(());
+            }
+            output.extend_from_slice(&[0; 4]);
+            continue;
+        }
+        if !(b'!'..=b'u').contains(&byte) {
+            return Err(());
+        }
+        buffer = buffer.checked_mul(85).ok_or(())?;
+        buffer = buffer.checked_add(u32::from(byte - b'!')).ok_or(())?;
+        count += 1;
+        if count == 5 {
+            if output.len().checked_add(4).is_none_or(|size| size > limit) {
+                return Err(());
+            }
+            output.extend_from_slice(&buffer.to_be_bytes());
+            buffer = 0;
+            count = 0;
+        }
+    }
+
+    if count == 1 {
+        return Err(());
+    }
+    if count > 1 {
+        for _ in count..5 {
+            buffer = buffer.checked_mul(85).ok_or(())?;
+            buffer = buffer.checked_add(84).ok_or(())?;
+        }
+        let bytes = buffer.to_be_bytes();
+        let final_bytes = count - 1;
+        if output
+            .len()
+            .checked_add(final_bytes)
+            .is_none_or(|size| size > limit)
+        {
+            return Err(());
+        }
+        output.extend_from_slice(&bytes[..final_bytes]);
+    }
+    Ok(output)
+}
+
+fn stream_bytes_have_scan_sized_inline_image(doc: &lopdf::Document, bytes: &[u8]) -> PdfScanCheck {
+    // Most streams are fonts, image samples, metadata, or other non-content.
+    // Only invoke the strict content parser when the bytes contain a standalone
+    // `BI` operator candidate; this still sweeps every stream without treating
+    // arbitrary binary bytes as malformed page-description syntax.
+    if !bytes.windows(2).enumerate().any(|(index, pair)| {
+        pair == b"BI"
+            && (index == 0 || pdf_token_boundary(bytes[index - 1]))
+            && (index + 2 == bytes.len() || pdf_token_boundary(bytes[index + 2]))
+    }) {
+        return Ok(false);
+    }
+    let content = lopdf::content::Content::decode_strict(bytes).map_err(|_| ())?;
+    content_has_scan_sized_inline_image(doc, &content)
+}
+
+fn pdf_token_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+}
+
 fn pdf_text_origin(doc: &lopdf::Document) -> TextOrigin {
-    let pages = doc.get_pages();
-    let machine_read_anchors = pdf_machine_read_anchors(doc);
-    if !pages.is_empty() && machine_read_anchors.len() == pages.len() {
+    if pdf_has_scan_sized_image(doc).unwrap_or(true) {
         TextOrigin::MachineReadLayer
     } else {
         TextOrigin::AuthorWritten
     }
-}
-
-const PDF_RESOURCE_RECURSION_DEPTH: usize = 64;
-type PdfScanCheck = Result<bool, ()>;
-
-/// A page is machine-read when a scan-sized raster is reachable anywhere on
-/// it. No drawing order, text mode, opacity, transform or overlap is
-/// interpreted. Resource reachability is the whole rule.
-fn pdf_machine_read_anchors(doc: &lopdf::Document) -> BTreeSet<String> {
-    doc.get_pages()
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (page_number, page_id))| {
-            let machine_read = index >= TEXT_ORIGIN_PAGES_EXAMINED
-                || page_has_scan_sized_image(doc, page_id).unwrap_or(true);
-            machine_read.then(|| format!("page:{page_number:04}"))
-        })
-        .collect()
-}
-
-fn page_has_scan_sized_image(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> PdfScanCheck {
-    let page = doc.get_dictionary(page_id).map_err(|_| ())?;
-    let mut visiting = HashSet::new();
-    visiting.insert(page_id);
-
-    if let Ok(contents) = page.get(b"Contents") {
-        let mut bytes = Vec::new();
-        append_content_bytes(doc, contents, 0, &mut visiting, &mut bytes)?;
-        let content = lopdf::content::Content::decode_strict(&bytes).map_err(|_| ())?;
-        if content_has_scan_sized_inline_image(doc, &content)? {
-            return Ok(true);
-        }
-    }
-    if page_resources_have_scan_sized_image(doc, page_id, &mut visiting)? {
-        return Ok(true);
-    }
-    page_annotations_have_scan_sized_image(doc, page, &mut visiting)
-}
-
-fn page_resources_have_scan_sized_image(
-    doc: &lopdf::Document,
-    page_id: lopdf::ObjectId,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-) -> PdfScanCheck {
-    let mut current_id = page_id;
-    let mut ancestors = HashSet::new();
-    loop {
-        if !ancestors.insert(current_id) {
-            return Err(());
-        }
-        let node = doc.get_dictionary(current_id).map_err(|_| ())?;
-        if let Ok(resources) = node.get(b"Resources") {
-            return resources_have_scan_sized_image(doc, resources, 0, visiting);
-        }
-        let Ok(parent) = node.get(b"Parent") else {
-            return Ok(false);
-        };
-        current_id = parent.as_reference().map_err(|_| ())?;
-    }
-}
-
-fn resources_have_scan_sized_image(
-    doc: &lopdf::Document,
-    object: &lopdf::Object,
-    depth: usize,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-) -> PdfScanCheck {
-    if depth >= PDF_RESOURCE_RECURSION_DEPTH {
-        return Err(());
-    }
-    let (object_id, object) = enter_resolved(doc, object, visiting)?;
-    let result = (|| {
-        let resources = object.as_dict().map_err(|_| ())?;
-        if let Ok(xobjects) = resources.get(b"XObject") {
-            let (xobject_id, xobjects) = enter_resolved(doc, xobjects, visiting)?;
-            let xobject_result = (|| {
-                for (_, xobject) in xobjects.as_dict().map_err(|_| ())? {
-                    if xobject_has_scan_sized_image(doc, xobject, depth + 1, visiting)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            })();
-            leave_resolved(xobject_id, visiting);
-            if xobject_result? {
-                return Ok(true);
-            }
-        }
-        if let Ok(patterns) = resources.get(b"Pattern") {
-            let (pattern_id, patterns) = enter_resolved(doc, patterns, visiting)?;
-            let pattern_result = (|| {
-                for (_, pattern) in patterns.as_dict().map_err(|_| ())? {
-                    if pattern_has_scan_sized_image(doc, pattern, depth + 1, visiting)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            })();
-            leave_resolved(pattern_id, visiting);
-            if pattern_result? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    })();
-    leave_resolved(object_id, visiting);
-    result
-}
-
-fn xobject_has_scan_sized_image(
-    doc: &lopdf::Document,
-    object: &lopdf::Object,
-    depth: usize,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-) -> PdfScanCheck {
-    if depth >= PDF_RESOURCE_RECURSION_DEPTH {
-        return Err(());
-    }
-    let (object_id, object) = enter_resolved(doc, object, visiting)?;
-    let result = (|| {
-        let stream = object.as_stream().map_err(|_| ())?;
-        let subtype = resolved_dict_value(doc, &stream.dict, b"Subtype")?
-            .as_name()
-            .map_err(|_| ())?;
-        match subtype {
-            b"Image" => image_dimensions_are_scan_sized(doc, &stream.dict, b"Width", b"Height"),
-            b"Form" => {
-                if stream_has_scan_sized_inline_image(doc, stream)? {
-                    return Ok(true);
-                }
-                match stream.dict.get(b"Resources") {
-                    Ok(resources) => {
-                        resources_have_scan_sized_image(doc, resources, depth + 1, visiting)
-                    }
-                    Err(_) => Ok(false),
-                }
-            }
-            _ => Ok(false),
-        }
-    })();
-    leave_resolved(object_id, visiting);
-    result
-}
-
-fn pattern_has_scan_sized_image(
-    doc: &lopdf::Document,
-    object: &lopdf::Object,
-    depth: usize,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-) -> PdfScanCheck {
-    if depth >= PDF_RESOURCE_RECURSION_DEPTH {
-        return Err(());
-    }
-    let (object_id, object) = enter_resolved(doc, object, visiting)?;
-    let result = (|| {
-        let dictionary = match object {
-            lopdf::Object::Stream(stream) => &stream.dict,
-            lopdf::Object::Dictionary(dictionary) => dictionary,
-            _ => return Err(()),
-        };
-        let pattern_type = resolved_dict_value(doc, dictionary, b"PatternType")?
-            .as_i64()
-            .map_err(|_| ())?;
-        match pattern_type {
-            1 => {
-                let stream = object.as_stream().map_err(|_| ())?;
-                if stream_has_scan_sized_inline_image(doc, stream)? {
-                    return Ok(true);
-                }
-                match dictionary.get(b"Resources") {
-                    Ok(resources) => {
-                        resources_have_scan_sized_image(doc, resources, depth + 1, visiting)
-                    }
-                    Err(_) => Ok(false),
-                }
-            }
-            2 => Ok(false),
-            _ => Err(()),
-        }
-    })();
-    leave_resolved(object_id, visiting);
-    result
-}
-
-fn page_annotations_have_scan_sized_image(
-    doc: &lopdf::Document,
-    page: &lopdf::Dictionary,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-) -> PdfScanCheck {
-    let Ok(annotations) = page.get(b"Annots") else {
-        return Ok(false);
-    };
-    let (annotations_id, annotations) = enter_resolved(doc, annotations, visiting)?;
-    let result = (|| {
-        for annotation in annotations.as_array().map_err(|_| ())? {
-            let (annotation_id, annotation) = enter_resolved(doc, annotation, visiting)?;
-            let annotation_result = (|| {
-                let annotation = annotation.as_dict().map_err(|_| ())?;
-                let Ok(appearances) = annotation.get(b"AP") else {
-                    return Ok(false);
-                };
-                let (appearances_id, appearances) = enter_resolved(doc, appearances, visiting)?;
-                let appearance_result = (|| {
-                    let appearances = appearances.as_dict().map_err(|_| ())?;
-                    for key in [b"N".as_slice(), b"R".as_slice(), b"D".as_slice()] {
-                        if let Ok(appearance) = appearances.get(key) {
-                            if appearance_has_scan_sized_image(doc, appearance, 0, visiting)? {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Ok(false)
-                })();
-                leave_resolved(appearances_id, visiting);
-                appearance_result
-            })();
-            leave_resolved(annotation_id, visiting);
-            if annotation_result? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    })();
-    leave_resolved(annotations_id, visiting);
-    result
-}
-
-fn appearance_has_scan_sized_image(
-    doc: &lopdf::Document,
-    object: &lopdf::Object,
-    depth: usize,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-) -> PdfScanCheck {
-    if depth >= PDF_RESOURCE_RECURSION_DEPTH {
-        return Err(());
-    }
-    let (object_id, object) = enter_resolved(doc, object, visiting)?;
-    let result = match object {
-        lopdf::Object::Stream(stream) => {
-            if stream_has_scan_sized_inline_image(doc, stream)? {
-                Ok(true)
-            } else {
-                match stream.dict.get(b"Resources") {
-                    Ok(resources) => {
-                        resources_have_scan_sized_image(doc, resources, depth + 1, visiting)
-                    }
-                    Err(_) => Ok(false),
-                }
-            }
-        }
-        lopdf::Object::Dictionary(states) => {
-            let mut found = false;
-            for (_, appearance) in states {
-                if appearance_has_scan_sized_image(doc, appearance, depth + 1, visiting)? {
-                    found = true;
-                    break;
-                }
-            }
-            Ok(found)
-        }
-        _ => Err(()),
-    };
-    leave_resolved(object_id, visiting);
-    result
-}
-
-fn append_content_bytes(
-    doc: &lopdf::Document,
-    object: &lopdf::Object,
-    depth: usize,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-    bytes: &mut Vec<u8>,
-) -> Result<(), ()> {
-    if depth >= PDF_RESOURCE_RECURSION_DEPTH {
-        return Err(());
-    }
-    let (object_id, object) = enter_resolved(doc, object, visiting)?;
-    let result = match object {
-        lopdf::Object::Stream(stream) => {
-            bytes.extend(stream.decompressed_content().map_err(|_| ())?);
-            bytes.push(b'\n');
-            Ok(())
-        }
-        lopdf::Object::Array(streams) => {
-            for stream in streams {
-                append_content_bytes(doc, stream, depth + 1, visiting, bytes)?;
-            }
-            Ok(())
-        }
-        lopdf::Object::Null => Ok(()),
-        _ => Err(()),
-    };
-    leave_resolved(object_id, visiting);
-    result
-}
-
-fn stream_has_scan_sized_inline_image(
-    doc: &lopdf::Document,
-    stream: &lopdf::Stream,
-) -> PdfScanCheck {
-    let bytes = stream.decompressed_content().map_err(|_| ())?;
-    let content = lopdf::content::Content::decode_strict(&bytes).map_err(|_| ())?;
-    content_has_scan_sized_inline_image(doc, &content)
 }
 
 fn content_has_scan_sized_inline_image(
@@ -1034,7 +936,17 @@ fn content_has_scan_sized_inline_image(
             // for this provenance gate, which must fail closed.
             return Err(());
         };
-        if image_dimensions_are_scan_sized(doc, &image.dict, b"W", b"H")? {
+        let width_key = if image.dict.get(b"W").is_ok() {
+            b"W".as_slice()
+        } else {
+            b"Width".as_slice()
+        };
+        let height_key = if image.dict.get(b"H").is_ok() {
+            b"H".as_slice()
+        } else {
+            b"Height".as_slice()
+        };
+        if image_dimensions_are_scan_sized(doc, &image.dict, width_key, height_key)? {
             return Ok(true);
         }
     }
@@ -1056,7 +968,7 @@ fn image_dimensions_are_scan_sized(
     if width <= 0 || height <= 0 {
         return Err(());
     }
-    Ok(width.saturating_mul(height) >= SCAN_IMAGE_MIN_PIXELS)
+    Ok(width >= SCAN_MIN_EDGE && height >= SCAN_MIN_EDGE)
 }
 
 fn resolved_dict_value<'a>(
@@ -1068,24 +980,6 @@ fn resolved_dict_value<'a>(
     doc.dereference(value)
         .map(|(_, value)| value)
         .map_err(|_| ())
-}
-
-fn enter_resolved<'a>(
-    doc: &'a lopdf::Document,
-    object: &'a lopdf::Object,
-    visiting: &mut HashSet<lopdf::ObjectId>,
-) -> Result<(Option<lopdf::ObjectId>, &'a lopdf::Object), ()> {
-    let (object_id, object) = doc.dereference(object).map_err(|_| ())?;
-    if object_id.is_some_and(|object_id| !visiting.insert(object_id)) {
-        return Err(());
-    }
-    Ok((object_id, object))
-}
-
-fn leave_resolved(object_id: Option<lopdf::ObjectId>, visiting: &mut HashSet<lopdf::ObjectId>) {
-    if let Some(object_id) = object_id {
-        visiting.remove(&object_id);
-    }
 }
 
 /// The share of characters a readable text layer can lose to encoding damage.
@@ -1151,13 +1045,15 @@ fn convert_pdf(bytes: &[u8]) -> Result<ConvertedDocument, ConversionError> {
             });
         }
     }
-    let machine_read_anchors = pdf_machine_read_anchors(&doc);
-    let text_origin =
-        if !doc.get_pages().is_empty() && machine_read_anchors.len() == doc.get_pages().len() {
-            TextOrigin::MachineReadLayer
-        } else {
-            TextOrigin::AuthorWritten
-        };
+    let text_origin = pdf_text_origin(&doc);
+    let machine_read_anchors = if text_origin == TextOrigin::MachineReadLayer {
+        doc.get_pages()
+            .into_keys()
+            .map(|page_number| format!("page:{page_number:04}"))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     // A text layer damaged past reading is not a text layer. Handing the
     // blocks over anyway would quote mojibake as the exact language of the
     // source; reporting the file as needing OCR is true -- the pages are
@@ -1949,6 +1845,30 @@ mod tests {
         pdf
     }
 
+    fn pdf_stream(dictionary_entries: &str, content: Vec<u8>) -> Vec<u8> {
+        [
+            format!(
+                "<< {dictionary_entries} /Length {} >>\nstream\n",
+                content.len()
+            )
+            .into_bytes(),
+            content,
+            b"\nendstream".to_vec(),
+        ]
+        .concat()
+    }
+
+    fn grayscale_image_xobject(width: usize, height: usize) -> Vec<u8> {
+        let pixels = vec![0x80; width.checked_mul(height).expect("fixture dimensions")];
+        pdf_stream(
+            &format!(
+                "/Type /XObject /Subtype /Image /Width {width} /Height {height} \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8"
+            ),
+            pixels,
+        )
+    }
+
     fn synthetic_pdf() -> Vec<u8> {
         let stream = b"BT /F1 12 Tf 72 720 Td (7. CONFIDENTIALITY) Tj 0 -20 Td (Confidential Information includes affiliate data.) Tj ET";
         let objects = [
@@ -2013,13 +1933,8 @@ mod tests {
             .concat(),
         ];
         if image_before_text.is_some() {
-            // A 150dpi letter-size scan by its declared dimensions. The pixel
-            // data is a stub: the verdict reads /Width and /Height, and the
-            // extractor does not decode image bytes.
-            objects.push(
-                b"<< /Type /XObject /Subtype /Image /Width 1275 /Height 1650 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 3 >>\nstream\nIMG\nendstream"
-                    .to_vec(),
-            );
+            // A real, raw 8-bit grayscale raster at 150dpi letter dimensions.
+            objects.push(grayscale_image_xobject(1275, 1650));
         }
         assemble_pdf(&objects)
     }
@@ -2037,62 +1952,64 @@ mod tests {
                 b"\nendstream".to_vec(),
             ]
             .concat(),
-            format!(
-                "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 3 >>\nstream\nIMG\nendstream"
-            )
-            .into_bytes(),
+            grayscale_image_xobject(
+                usize::try_from(width).expect("positive fixture width"),
+                usize::try_from(height).expect("positive fixture height"),
+            ),
         ];
         assemble_pdf(&objects)
     }
 
-    fn synthetic_nested_form_pdf() -> Vec<u8> {
-        let page_stream = b"/Fm1 Do";
-        let form_stream = b"BT /F1 12 Tf 72 720 Td (Readable form text.) Tj ET /Im1 Do";
+    fn synthetic_two_page_raster_pdf(width: usize, height: usize) -> Vec<u8> {
+        let first_page = b"BT /F1 12 Tf 72 720 Td (Readable first page text.) Tj ET";
+        let second_page = b"BT /F1 12 Tf 72 720 Td (Readable second page text.) Tj ET /Im1 Do";
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Fm1 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 8 0 R >> >> /Contents 7 0 R >>".to_vec(),
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-            [
-                format!("<< /Length {} >>\nstream\n", page_stream.len()).into_bytes(),
-                page_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-            [
-                format!("<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 7 0 R >> >> /Length {} >>\nstream\n", form_stream.len()).into_bytes(),
-                form_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-            b"<< /Type /XObject /Subtype /Image /Width 1275 /Height 1650 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 3 >>\nstream\nIMG\nendstream".to_vec(),
+            pdf_stream("", first_page.to_vec()),
+            pdf_stream("", second_page.to_vec()),
+            grayscale_image_xobject(width, height),
         ];
         assemble_pdf(&objects)
     }
 
-    fn synthetic_annotation_appearance_pdf() -> Vec<u8> {
-        let page_stream = b"BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET";
-        let appearance_stream = b"/Im1 Do";
+    fn synthetic_extgstate_soft_mask_pdf() -> Vec<u8> {
+        let page_stream = b"BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET /GS1 gs";
+        let mask_stream = b"/Im1 Do";
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /ExtGState << /GS1 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-            [
-                format!("<< /Length {} >>\nstream\n", page_stream.len()).into_bytes(),
-                page_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-            b"<< /Type /Annot /Subtype /Stamp /Rect [0 0 612 792] /AP << /N 7 0 R >> >>"
-                .to_vec(),
-            [
-                format!("<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /XObject << /Im1 8 0 R >> >> /Length {} >>\nstream\n", appearance_stream.len()).into_bytes(),
-                appearance_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-            b"<< /Type /XObject /Subtype /Image /Width 1275 /Height 1650 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 3 >>\nstream\nIMG\nendstream".to_vec(),
+            pdf_stream("", page_stream.to_vec()),
+            b"<< /Type /ExtGState /SMask << /S /Luminosity /G 7 0 R >> >>".to_vec(),
+            pdf_stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Group << /S /Transparency /CS /DeviceGray >> /Resources << /XObject << /Im1 8 0 R >> >>",
+                mask_stream.to_vec(),
+            ),
+            grayscale_image_xobject(1275, 1650),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    fn synthetic_inline_image_in_form_pdf() -> Vec<u8> {
+        let page_stream = b"BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET /Fm1 Do";
+        let mut form_stream = b"BI /W 1275 /H 1650 /CS /Gray /BPC 8 ID\n".to_vec();
+        form_stream.extend(std::iter::repeat_n(0x80, 1275 * 1650));
+        form_stream.extend_from_slice(b"\nEI\n");
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            pdf_stream("", page_stream.to_vec()),
+            pdf_stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << >>",
+                form_stream,
+            ),
         ];
         assemble_pdf(&objects)
     }
@@ -2400,6 +2317,7 @@ mod tests {
 
     #[test]
     fn pdf_conversion_preserves_page_anchors() {
+        // Fails if ordinary PDF extraction or the no-raster classifier path stops working.
         let document = convert_bytes(SourceFormat::Pdf, &synthetic_pdf()).expect("convert");
         assert_eq!(document.blocks.len(), 2);
         assert_eq!(document.blocks[0].source_anchor, "page:0001");
@@ -2411,6 +2329,7 @@ mod tests {
 
     #[test]
     fn a_scanners_embedded_ocr_layer_is_reported_as_machine_read() {
+        // Fails if a real raster plus an extracted OCR text layer is not detected.
         let document = convert_bytes(
             SourceFormat::Pdf,
             &synthetic_copier_pdf("3 Tr ", Some(false), true),
@@ -2429,6 +2348,7 @@ mod tests {
 
     #[test]
     fn drawing_order_does_not_change_scan_image_provenance() {
+        // Fails if classification starts depending on page drawing order again.
         for image_before_text in [true, false] {
             let document = convert_bytes(
                 SourceFormat::Pdf,
@@ -2438,25 +2358,15 @@ mod tests {
             assert_eq!(
                 document.text_origin,
                 TextOrigin::MachineReadLayer,
-                "a reachable scan must demote its page in either drawing order"
+                "an enumerated scan must demote its document in either drawing order"
             );
             assert!(document.machine_read_anchors.contains("page:0001"));
         }
     }
 
     #[test]
-    fn a_scan_sized_image_alone_demotes_its_page() {
-        let bytes = synthetic_copier_pdf("", Some(true), false);
-        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
-        assert_eq!(
-            pdf_machine_read_anchors(&document),
-            BTreeSet::from(["page:0001".to_string()])
-        );
-    }
-
-    #[test]
     fn invisible_text_without_a_scan_image_is_author_written() {
+        // Fails if text rendering mode is mistaken for raster provenance.
         let document = convert_bytes(
             SourceFormat::Pdf,
             &synthetic_copier_pdf("3 Tr ", None, true),
@@ -2467,239 +2377,171 @@ mod tests {
 
     #[test]
     fn text_render_mode_does_not_change_scan_image_provenance() {
+        // Fails if any visible, invisible, or clipping text mode bypasses the object sweep.
         for render_mode in ["", "3 Tr ", "7 Tr "] {
             let document = convert_bytes(
                 SourceFormat::Pdf,
                 &synthetic_copier_pdf(render_mode, Some(false), true),
             )
             .expect("convert");
-            assert!(document.machine_read_anchors.contains("page:0001"));
+            assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
         }
     }
 
     #[test]
-    fn an_image_nested_in_a_form_xobject_is_machine_read() {
-        let bytes = synthetic_nested_form_pdf();
-        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        let page_id = document.get_pages()[&1];
-        assert_eq!(page_has_scan_sized_image(&document, page_id), Ok(true));
+    fn a_signature_sized_image_does_not_demote_a_page() {
+        // Fails if the old area rule returns or either edge threshold drops to 600.
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(600, 600))
+            .expect("convert signature PDF");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+        assert!(document.machine_read_anchors.is_empty());
+    }
+
+    #[test]
+    fn a_high_resolution_logo_does_not_demote_a_page() {
+        // Fails if one long edge is enough to classify a banner as a page scan.
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(1200, 300))
+            .expect("convert banner PDF");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+        assert!(document.machine_read_anchors.is_empty());
+    }
+
+    #[test]
+    fn a_page_scan_sized_image_demotes_the_document() {
+        // Fails if a scan on page two does not mark every page anchor machine-read.
+        let bytes = synthetic_two_page_raster_pdf(1275, 1650);
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert scan PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+        assert_eq!(
+            document.machine_read_anchors,
+            BTreeSet::from(["page:0001".to_string(), "page:0002".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_image_behind_an_extgstate_soft_mask_is_found() {
+        // Fails if detection follows page resources instead of enumerating the image object table.
+        let bytes = synthetic_extgstate_soft_mask_pdf();
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert soft-mask PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+        assert_eq!(
+            document.machine_read_anchors,
+            BTreeSet::from(["page:0001".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_inline_image_in_a_form_xobject_is_found() {
+        // Fails if the stream sweep misses inline BI/ID/EI data outside page content streams.
+        let bytes = synthetic_inline_image_in_form_pdf();
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load inline-image PDF");
+        assert_eq!(pdf_has_scan_sized_image(&document), Ok(true));
         assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
+        let converted = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert inline-image PDF");
+        assert_eq!(converted.text_origin, TextOrigin::MachineReadLayer);
     }
 
     #[test]
-    fn an_image_in_an_annotation_appearance_is_machine_read() {
-        let bytes = synthetic_annotation_appearance_pdf();
-        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        let page_id = document.get_pages()[&1];
-        assert_eq!(page_has_scan_sized_image(&document, page_id), Ok(true));
-        assert!(pdf_machine_read_anchors(&document).contains("page:0001"));
-    }
-
-    #[test]
-    fn an_image_in_a_tiling_pattern_is_machine_read() {
-        let page_stream = b"/Pattern cs /P1 scn 0 0 612 792 re f";
-        let pattern_stream = b"/Im1 Do";
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
-            [
-                format!("<< /Length {} >>\nstream\n", page_stream.len()).into_bytes(),
-                page_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-            [
-                format!("<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 612 792] /XStep 612 /YStep 792 /Resources << /XObject << /Im1 6 0 R >> >> /Length {} >>\nstream\n", pattern_stream.len()).into_bytes(),
-                pattern_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-            b"<< /Type /XObject /Subtype /Image /Width 1275 /Height 1650 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 3 >>\nstream\nIMG\nendstream".to_vec(),
-        ];
-        let bytes = assemble_pdf(&objects);
-        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        let page_id = document.get_pages()[&1];
-        assert_eq!(page_has_scan_sized_image(&document, page_id), Ok(true));
-        assert!(pdf_machine_read_anchors(&document).contains("page:0001"));
-    }
-
-    #[test]
-    fn a_page_whose_resources_cannot_be_parsed_fails_closed() {
+    fn a_document_with_an_unparseable_object_table_fails_closed() {
+        // Fails if lopdf's skipped malformed xref entry is mistaken for a complete object sweep.
         let stream = b"BT (Readable text.) Tj ET";
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 99 0 R /Contents 4 0 R >>".to_vec(),
-            [
-                format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(),
-                stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            pdf_stream("", stream.to_vec()),
+            b"<< /ThisObjectNeverCloses".to_vec(),
         ];
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        let page_id = document.get_pages()[&1];
-        assert_eq!(
-            page_has_scan_sized_image(&document, page_id),
-            Err(()),
-            "an unresolved resource dictionary must reach the fail-closed path"
-        );
-        assert!(pdf_machine_read_anchors(&document).contains("page:0001"));
+        assert!(!document.objects.contains_key(&(5, 0)));
+        assert_eq!(pdf_has_scan_sized_image(&document), Err(()));
+        assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
     }
 
     #[test]
-    fn a_page_whose_content_stream_cannot_be_parsed_fails_closed() {
-        let stream = b"BT [(unterminated) Tj";
+    fn an_undecodable_stream_fails_closed() {
+        // Fails if stream decode errors are ignored during the flat sweep.
+        let page_stream = b"BT (Readable text.) Tj ET";
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>".to_vec(),
-            [
-                format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(),
-                stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            pdf_stream("", page_stream.to_vec()),
+            pdf_stream("/Filter /UnsupportedDecode", b"not decodable".to_vec()),
         ];
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        let page_id = document.get_pages()[&1];
-        assert_eq!(page_has_scan_sized_image(&document, page_id), Err(()));
-        assert!(pdf_machine_read_anchors(&document).contains("page:0001"));
+        assert_eq!(pdf_has_scan_sized_image(&document), Err(()));
+        assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
     }
 
     #[test]
-    fn a_recursive_form_xobject_cycle_terminates_and_fails_closed() {
+    fn the_stream_sweep_enforces_a_cumulative_decompressed_byte_budget() {
+        // Fails if decoded bytes are not accumulated across every stream in the document.
+        let first = b"q 1 0 0 1 0 0 cm Q";
+        let second = b"BT (Readable text.) Tj ET";
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] >>"
+                .to_vec(),
+            pdf_stream("", first.to_vec()),
+            pdf_stream("", second.to_vec()),
+        ];
+        let bytes = assemble_pdf(&objects);
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
+        assert_eq!(
+            pdf_has_scan_sized_image_with_budget(
+                &document,
+                first.len().checked_add(second.len()).expect("fixture size") - 1
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn a_compressed_stream_cannot_expand_past_the_sweep_budget() {
+        // Fails if one Flate stream can allocate or return more than the remaining byte budget.
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&vec![b'A'; 4_096]).expect("compress");
+        let compressed = encoder.finish().expect("finish compressed stream");
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            pdf_stream("/Filter /FlateDecode", compressed),
+        ];
+        let bytes = assemble_pdf(&objects);
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
+        assert_eq!(
+            pdf_has_scan_sized_image_with_budget(&document, 128),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn a_recursive_reference_cycle_is_irrelevant_to_the_flat_sweep() {
+        // Fails if resource recursion or its cycle guard is reintroduced.
         let page_stream = b"/Fm1 Do";
         let form_stream = b"/Fm1 Do";
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
-            [
-                format!("<< /Length {} >>\nstream\n", page_stream.len()).into_bytes(),
-                page_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
-            [
-                format!("<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /XObject << /Fm1 5 0 R >> >> /Length {} >>\nstream\n", form_stream.len()).into_bytes(),
+            pdf_stream("", page_stream.to_vec()),
+            pdf_stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /XObject << /Fm1 5 0 R >> >>",
                 form_stream.to_vec(),
-                b"\nendstream".to_vec(),
-            ]
-            .concat(),
+            ),
         ];
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        let page_id = document.get_pages()[&1];
-        assert_eq!(
-            page_has_scan_sized_image(&document, page_id),
-            Err(()),
-            "the recursive resource must hit the cycle guard"
-        );
-        assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
-    }
-
-    #[test]
-    fn a_small_logo_does_not_demote_a_page() {
-        let small = pdf_extract::Document::load_mem(&synthetic_raster_pdf(100, 100))
-            .expect("small-logo PDF");
-        assert_eq!(pdf_text_origin(&small), TextOrigin::AuthorWritten);
-        assert!(pdf_machine_read_anchors(&small).is_empty());
-
-        let scan = pdf_extract::Document::load_mem(&synthetic_raster_pdf(1275, 1650))
-            .expect("scan-sized PDF");
-        assert_eq!(pdf_text_origin(&scan), TextOrigin::MachineReadLayer);
-        assert!(pdf_machine_read_anchors(&scan).contains("page:0001"));
-    }
-
-    #[test]
-    fn a_document_longer_than_the_examined_pages_fails_closed() {
-        let page_count = TEXT_ORIGIN_PAGES_EXAMINED + 1;
-        let kids = (0..page_count)
-            .map(|index| format!("{} 0 R", index + 3))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut objects = vec![
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            format!("<< /Type /Pages /Kids [{kids}] /Count {page_count} >>").into_bytes(),
-        ];
-        objects.extend(
-            (0..page_count)
-                .map(|_| b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec()),
-        );
-        let bytes = assemble_pdf(&objects);
-        let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        let machine_read_anchors = pdf_machine_read_anchors(&document);
-        assert_eq!(machine_read_anchors.len(), 1);
-        assert!(machine_read_anchors.contains(&format!("page:{page_count:04}")));
-        assert_eq!(
-            pdf_text_origin(&document),
-            TextOrigin::AuthorWritten,
-            "only the unexamined page is machine-read; the document summary stays mixed"
-        );
-    }
-
-    #[test]
-    fn six_real_born_digital_pdf_fixtures_remain_author_written() {
-        let fixtures: [(&str, &[u8]); 6] = [
-            (
-                "double-spaced-signature.pdf",
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../tests/fixtures/archive-real-pdf/double-spaced-signature.pdf"
-                )),
-            ),
-            (
-                "labelled-clauses-at-uniform-spacing.pdf",
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../tests/fixtures/archive-real-pdf/labelled-clauses-at-uniform-spacing.pdf"
-                )),
-            ),
-            (
-                "liability-wrap.pdf",
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../tests/fixtures/archive-real-pdf/liability-wrap.pdf"
-                )),
-            ),
-            (
-                "list-tail-merge.pdf",
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../tests/fixtures/archive-real-pdf/list-tail-merge.pdf"
-                )),
-            ),
-            (
-                "unheaded-clauses-under-one-notice.pdf",
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../tests/fixtures/archive-real-pdf/unheaded-clauses-under-one-notice.pdf"
-                )),
-            ),
-            (
-                "uniform-spacing-captions.pdf",
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../tests/fixtures/archive-real-pdf/uniform-spacing-captions.pdf"
-                )),
-            ),
-        ];
-        for (name, bytes) in fixtures {
-            let document = convert_bytes(SourceFormat::Pdf, bytes).expect(name);
-            assert_eq!(
-                document.text_origin,
-                TextOrigin::AuthorWritten,
-                "{name} must remain quotable"
-            );
-            assert!(
-                document.machine_read_anchors.is_empty(),
-                "{name} acquired a machine-read page"
-            );
-        }
+        assert_eq!(pdf_has_scan_sized_image(&document), Ok(false));
+        assert_eq!(pdf_text_origin(&document), TextOrigin::AuthorWritten);
     }
 
     /// A text layer damaged past reading must not be quoted; it converts as

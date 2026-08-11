@@ -506,14 +506,14 @@ function renderVaultSummary(report) {
   ].join(", ");
   notes.push({ text: `You can search: ${formatBreakdown}.` });
 
-  // Its own line. A scan that was read is searchable, but only as a
-  // transcription, and folding it into the indexed total would say the archive
-  // can quote more of itself than it can.
+  // Its own line. A document with machine-read text is searchable, but only as
+  // a transcription, and folding it into the indexed total would say the
+  // archive can quote more of itself than it can.
   if ((report.transcribed_documents ?? 0) > 0) {
     notes.push({
-      text: `${report.transcribed_documents.toLocaleString()} scanned page${
+      text: `${report.transcribed_documents.toLocaleString()} document${
         report.transcribed_documents === 1 ? "" : "s"
-      } read by the text reader — you can search these, but they are a machine reading a picture, so they are never quoted as the document\u0027s own words.`,
+      } contain text read from scans — you can search the machine reading, but none of those documents is quotable as the document\u0027s own words.`,
     });
   }
   const mixedProvenanceDocuments = report.mixed_provenance_documents ?? 0;
@@ -521,7 +521,7 @@ function renderVaultSummary(report) {
     notes.push({
       text: `${mixedProvenanceDocuments.toLocaleString()} document${
         mixedProvenanceDocuments === 1 ? " has" : "s have"
-      } both readable text and pages containing a page-sized picture. Readable pages can be quoted; picture-based pages are shown only as a machine reading and must be checked against the source.`,
+      } both extracted and transcribed provisions. Only separately extracted provisions can be quoted; an imported PDF containing any page scan is not quotable at all.`,
     });
   }
   if (report.unsupported_files_skipped > 0 || report.ocr_required_files > 0) {

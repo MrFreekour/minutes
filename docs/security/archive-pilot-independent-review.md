@@ -158,14 +158,17 @@ ordinary rename defeated it; inspection and identity capture now happen
 together, but closing the inode-reuse gap would require holding an open
 directory capability across the build, which is a separate design.
 
-**A page-sized image makes its page unquotable.** A born-digital chart, figure,
-full-page letterhead or watermark can therefore turn that page into a
-machine-read card rather than an exact quotation. Other readable pages in the
-same document remain quotable. Two visibility rules based on text rendering
-mode and drawing order were tried; nested PDF objects defeated them, and they
-also demoted ordinary documents based on facts that did not establish what a
-reader could see. The broader page rule is the deliberate price of provenance
-that does not depend on analysing the rendered page.
+**A PDF containing a page scan is not quotable at all.** A scan means a raster
+that is at least 1,000 pixels wide and at least 1,000 pixels tall, whether it is
+an image object or an inline image in any PDF stream. Signatures, logos, stamps,
+and headshots that are large in only one direction do not meet that rule. The
+converter enumerates the whole object table and every stream instead of trying
+to follow every possible resource path; if it finds one scan, every provision
+in that PDF is shown only as a machine reading and must be checked against the
+source. A born-digital page-sized chart, figure, letterhead, or watermark can
+therefore make the whole PDF unquotable. This conservative document-wide rule
+is the price of provenance that does not depend on incomplete path traversal or
+analysing the rendered page.
 
 ## Stop-ship criteria
 

@@ -1252,9 +1252,9 @@ enum ExtractionOutcome {
 /// Normalize conversion output with the page provenance carried by the
 /// converter.
 ///
-/// `text_origin` is a document summary only. Routing on it here would demote
-/// every readable page beside one scanned exhibit; the normalizer instead
-/// marks each provision from its page anchor.
+/// `text_origin` is a document summary only. The normalizer still reads each
+/// provision's page anchor so independently produced OCR provenance is not
+/// flattened. The PDF converter now records every page when it finds a scan.
 fn normalize_conversion_by_origin(
     document_id: DocumentId,
     title: &str,
@@ -2469,9 +2469,10 @@ mod tests {
         assert_eq!(report.documents_left_unread, 35);
     }
 
-    /// The converter summary never replaces page provenance.
+    /// Per-anchor provenance survives independently of the document summary.
     #[test]
-    fn a_machine_read_page_is_demoted_without_demoting_its_readable_neighbour() {
+    fn per_anchor_provenance_survives_normalization_independently_of_the_summary() {
+        // Fails if normalization replaces anchor provenance with the document summary.
         let block = |page: &str, text: &str| minutes_archive_convert::ConvertedBlock {
             is_heading: None,
             source_anchor: page.to_string(),
