@@ -457,15 +457,17 @@ impl LiveTranscriptWriter {
             TranscriptSource::Standalone => "standalone",
             TranscriptSource::RecordingSidecar => "recording-sidecar",
         };
-        // The worker is only reachable from inside a trusted installed app
-        // bundle, so a CLI-run session would fail its first attempt and latch
-        // off, logging a failure that says nothing about device capability.
-        // Decline up front with the actionable reason instead — persisted, so a
-        // run with zero shadow rows is never confused with "no eligible audio".
-        if !crate::apple_speech_worker::worker_authority_available() {
+        // The worker is only reachable from a trusted installed app bundle, so a
+        // CLI-run session would fail its first attempt and latch off, logging a
+        // failure that says nothing about device capability. Decline up front,
+        // carrying the authority layer's own reason (not-an-app-bundle, cdhash
+        // mismatch, missing manifest, unavailable peer API — they are different
+        // diagnoses) and persist it, so a run with zero shadow rows is never
+        // confused with "no eligible audio".
+        if let Some(reason) = crate::apple_speech_worker::worker_authority_error() {
             crate::apple_speech_shadow::log_shadow_disabled(
                 source,
-                "worker unreachable: the Apple Speech worker is only addressable from an installed Minutes app",
+                &format!("worker unreachable: {reason}"),
             );
             return;
         }

@@ -303,16 +303,19 @@ fn acceptance_canary_samples() -> Vec<f32> {
         .collect()
 }
 
-/// Whether this process can reach the Apple Speech worker at all.
+/// Why this process cannot reach the Apple Speech worker, or `None` if it can.
 ///
-/// The worker is only addressable from inside a trusted, installed Minutes app
-/// bundle (`Contents/MacOS/...` beside `Contents/XPCServices`), so a plain CLI
-/// binary or a test harness can never reach it. Optional consumers (shadow
-/// measurement) check this up front so they can decline with a clear reason
-/// instead of arming themselves and failing on the first utterance.
+/// Authority can fail for several distinct reasons — not running from a trusted
+/// installed app bundle (`Contents/MacOS/...` beside `Contents/XPCServices`, which
+/// a plain CLI binary or test harness never satisfies), an unavailable
+/// peer-requirement API, a missing worker executable or manifest, or a cdhash
+/// mismatch. Optional consumers (shadow measurement) check this up front so they
+/// can decline with the *actual* reason instead of arming themselves and failing
+/// on the first utterance. The returned string is code-controlled (constants and
+/// bundle paths); it never carries recognized speech.
 #[cfg(target_os = "macos")]
-pub(crate) fn worker_authority_available() -> bool {
-    authority().is_ok()
+pub(crate) fn worker_authority_error() -> Option<String> {
+    authority().err()
 }
 
 #[cfg(target_os = "macos")]
