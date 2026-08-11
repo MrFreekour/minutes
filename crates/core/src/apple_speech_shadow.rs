@@ -10,9 +10,10 @@
 //!
 //! This module is the measurement primitive: the pure comparison record and
 //! its logging. It deliberately carries only measurements (counts, a
-//! similarity score, an outcome), never the transcript text, so a shadow log
-//! can never leak sensitive content. Wiring a shadow attempt into a capture
-//! path is a separate step, paired with the on-hardware data run.
+//! similarity score, an outcome) and a fixed error *category*, never the
+//! transcript text or a raw error message, so a shadow log can never leak
+//! sensitive content. Wiring a shadow attempt into a capture path is a separate
+//! step, paired with the on-hardware data run.
 
 use crate::config::Config;
 
@@ -28,11 +29,63 @@ pub enum ShadowOutcome {
     Failed,
 }
 
+/// A fixed failure category for a shadow attempt.
+///
+/// The raw error string is deliberately discarded: it can embed recognized
+/// speech (names, account details) that must never reach a shadow log, and
+/// truncation is not redaction. Classification reads the message but stores only
+/// this closed set, so no transcript content survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowError {
+    /// The worker process died (crash / abort).
+    WorkerCrashed,
+    /// The XPC connection was interrupted or invalidated.
+    XpcInterrupted,
+    /// Speech assets are not installed for the locale.
+    AssetsUnavailable,
+    /// A Speech-framework or analyzer error.
+    SpeechError,
+    /// Anything else; the raw message is not retained.
+    Unknown,
+}
+
+impl ShadowError {
+    /// Stable log token for this category.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerCrashed => "worker_crashed",
+            Self::XpcInterrupted => "xpc_interrupted",
+            Self::AssetsUnavailable => "assets_unavailable",
+            Self::SpeechError => "speech_error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Classify a raw error into a fixed category, discarding the message so no
+    /// transcript content it might embed is ever stored or logged. Matching is
+    /// on the worker's own code-controlled status wording, not on user speech.
+    fn classify(msg: &str) -> Self {
+        let m = msg.to_lowercase();
+        if m.contains("interrupt") || m.contains("invalidat") {
+            Self::XpcInterrupted
+        } else if m.contains("crash") || m.contains("abort") || m.contains("signal") {
+            Self::WorkerCrashed
+        } else if m.contains("not subscribed") || m.contains("asset") || m.contains("locale") {
+            Self::AssetsUnavailable
+        } else if m.contains("speech") || m.contains("analyzer") || m.contains("recogni") {
+            Self::SpeechError
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
 /// One shadow-mode comparison of Whisper (the shipped transcript) against an
 /// Apple Speech attempt for the same audio.
 ///
-/// Carries only measurements, never the transcript text, so it is safe to log
-/// to disk under the same privacy rules as the rest of the pipeline.
+/// Carries only measurements and a fixed error category, never the transcript
+/// text, so it is safe to log to disk under the same privacy rules as the rest
+/// of the pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShadowComparison {
     /// Whether Apple Speech produced a usable transcript, an empty one, or failed.
@@ -46,27 +99,24 @@ pub struct ShadowComparison {
     /// Word count of the Apple Speech transcript; 0 unless `Usable`.
     pub apple_words: usize,
     /// Word-level similarity in `[0.0, 1.0]`, `1.0` meaning identical word
-    /// sequences (a normalized inverse word-error-rate). Only meaningful when
-    /// `outcome == Usable`; `0.0` otherwise.
-    pub similarity: f32,
+    /// sequences (a normalized inverse word-error-rate). `None` when there is
+    /// nothing to score (`outcome != Usable`) or when the transcripts differ and
+    /// exceed [`SIMILARITY_WORD_CAP`] words, where an exact score is skipped
+    /// rather than faked. Never a placeholder number.
+    pub similarity: Option<f32>,
     /// True when both engines produced the same normalized text.
     pub exact_match: bool,
-    /// Failure detail when `outcome == Failed`; `None` otherwise. A bounded,
-    /// single-line error category, never transcript content.
-    pub apple_error: Option<String>,
+    /// Failure category when `outcome == Failed`; `None` otherwise. A fixed
+    /// category, never transcript content or a raw message.
+    pub apple_error: Option<ShadowError>,
 }
 
-/// Above this normalized word count, `similarity` uses a cheap length-ratio
-/// proxy instead of an O(n*m) word edit distance, so a full-meeting batch
-/// transcript can never make shadow logging quadratic. Per-utterance shadow
-/// runs are far below this, so the exact metric is what actually gets used.
+/// Above this normalized word count, and only when the two transcripts are not
+/// already known-equal, `similarity` is reported as `None` instead of running an
+/// O(n*m) word edit distance, so a pathologically long transcript can never make
+/// shadow logging quadratic. Shadow runs per utterance, far below this cap, so
+/// the exact metric is what actually gets used.
 const SIMILARITY_WORD_CAP: usize = 3000;
-
-/// Cap on the stored `apple_error` length. Worker errors are structured status
-/// strings, but `compare` accepts an arbitrary `&str`, so the message is
-/// collapsed to one line and truncated to defend the "no transcript content in
-/// shadow logs" guarantee against a caller whose error embeds recognized text.
-const MAX_ERROR_CHARS: usize = 160;
 
 /// Build a shadow comparison from the shipped Whisper transcript and the Apple
 /// Speech attempt result for the same audio.
@@ -81,13 +131,13 @@ pub fn compare(whisper: &str, apple: Result<Option<&str>, &str>) -> ShadowCompar
     let whisper_chars = normalized_char_count(whisper);
     let whisper_words = whisper_words_vec.len();
 
-    let empty = |outcome, apple_error| ShadowComparison {
+    let non_usable = |outcome, apple_error| ShadowComparison {
         outcome,
         whisper_chars,
         whisper_words,
         apple_chars: 0,
         apple_words: 0,
-        similarity: 0.0,
+        similarity: None,
         exact_match: false,
         apple_error,
     };
@@ -99,33 +149,44 @@ pub fn compare(whisper: &str, apple: Result<Option<&str>, &str>) -> ShadowCompar
                 // A Some("") / whitespace / punctuation-only result is not a
                 // usable transcript — the native bridge returns "" when there
                 // are no segments. Record it as Empty.
-                return empty(ShadowOutcome::Empty, None);
+                return non_usable(ShadowOutcome::Empty, None);
             }
+            let exact_match = whisper_words_vec == apple_words_vec;
+            // Equality is cheap and definitive, so identical transcripts always
+            // score 1.0 regardless of length; only differing, over-cap ones go None.
+            let similarity = if exact_match {
+                Some(1.0)
+            } else {
+                word_similarity(&whisper_words_vec, &apple_words_vec)
+            };
             ShadowComparison {
                 outcome: ShadowOutcome::Usable,
                 whisper_chars,
                 whisper_words,
                 apple_chars: normalized_char_count(apple_text),
                 apple_words: apple_words_vec.len(),
-                similarity: word_similarity(&whisper_words_vec, &apple_words_vec),
-                exact_match: whisper_words_vec == apple_words_vec,
+                similarity,
+                exact_match,
                 apple_error: None,
             }
         }
-        Ok(None) => empty(ShadowOutcome::Empty, None),
-        Err(msg) => empty(ShadowOutcome::Failed, Some(bounded_error(msg))),
+        Ok(None) => non_usable(ShadowOutcome::Empty, None),
+        Err(msg) => non_usable(ShadowOutcome::Failed, Some(ShadowError::classify(msg))),
     }
 }
 
-/// Persist a shadow comparison to the structured JSONL log.
+/// Persist a shadow comparison to the structured JSONL log, returning the write
+/// result.
 ///
 /// Writes through [`crate::logging::append_log`] so the measurement is durable:
 /// the CLI's tracing subscriber only reaches stderr and the Tauri entry point
 /// installs no subscriber at all, so tracing-only events would be dropped on
-/// exactly the desktop path shadow mode most needs to measure. The write is
-/// failure-isolated — a logging error is swallowed so it can never affect
-/// capture — and a `debug` trace is emitted alongside for live tailing.
-pub fn log_comparison(source: &str, cmp: &ShadowComparison) {
+/// exactly the desktop path shadow mode most needs to measure. A write failure
+/// (unwritable log dir, full disk) is surfaced two ways — a `warn` trace and the
+/// returned `Err` — instead of being silently swallowed behind a success-looking
+/// event. It stays failure-isolated from capture: the caller logs or ignores the
+/// error and keeps recording; this function never panics.
+pub fn log_comparison(source: &str, cmp: &ShadowComparison) -> std::io::Result<()> {
     let outcome = match cmp.outcome {
         ShadowOutcome::Usable => "usable",
         ShadowOutcome::Empty => "empty",
@@ -141,11 +202,25 @@ pub fn log_comparison(source: &str, cmp: &ShadowComparison) {
         "apple_chars": cmp.apple_chars,
         "similarity": cmp.similarity,
         "exact_match": cmp.exact_match,
-        "apple_error": cmp.apple_error,
+        "apple_error": cmp.apple_error.map(ShadowError::as_str),
     });
-    // Failure-isolated: a logging failure must never affect capture.
-    let _ = crate::logging::append_log(&entry);
-    tracing::debug!(target: "apple_speech_shadow", source, outcome, "apple-speech shadow comparison");
+    let result = crate::logging::append_log(&entry);
+    match &result {
+        Ok(()) => tracing::debug!(
+            target: "apple_speech_shadow",
+            source,
+            outcome,
+            "apple-speech shadow comparison persisted"
+        ),
+        Err(error) => tracing::warn!(
+            target: "apple_speech_shadow",
+            source,
+            outcome,
+            %error,
+            "failed to persist apple-speech shadow comparison"
+        ),
+    }
+    result
 }
 
 /// Whether shadow mode is switched on in config.
@@ -188,24 +263,24 @@ fn normalized_char_count(text: &str) -> usize {
 }
 
 /// Word-level similarity in `[0.0, 1.0]`: `1.0 - editdistance / max(len)`, a
-/// normalized inverse of the word error rate. Two empty transcripts are treated
-/// as identical (`1.0`); one empty and one not is `0.0`.
-fn word_similarity(a: &[String], b: &[String]) -> f32 {
+/// normalized inverse of the word error rate. `None` when the inputs differ and
+/// exceed [`SIMILARITY_WORD_CAP`] words, so a pathological input is reported as
+/// unscored rather than approximated with a misleading number. Callers handle
+/// the known-equal case before calling, so this never sees two identical inputs.
+fn word_similarity(a: &[String], b: &[String]) -> Option<f32> {
     let max_len = a.len().max(b.len());
     if max_len == 0 {
-        return 1.0;
+        return Some(1.0);
     }
-    // Guard against a quadratic blow-up on very long (batch) transcripts.
     if max_len > SIMILARITY_WORD_CAP {
-        let min_len = a.len().min(b.len());
-        return min_len as f32 / max_len as f32;
+        return None;
     }
     let distance = word_edit_distance(a, b);
-    1.0 - (distance as f32 / max_len as f32)
+    Some(1.0 - (distance as f32 / max_len as f32))
 }
 
 /// Levenshtein edit distance over word tokens, two-row DP (O(n*m) time,
-/// O(min(n,m)) space). Inputs are per-utterance word lists, so this is cheap.
+/// O(min(n,m)) space). Bounded by [`SIMILARITY_WORD_CAP`] at the call site.
 fn word_edit_distance(a: &[String], b: &[String]) -> usize {
     // Iterate over the longer sequence in the outer loop so the row we allocate
     // is the shorter of the two.
@@ -228,17 +303,6 @@ fn word_edit_distance(a: &[String], b: &[String]) -> usize {
     prev[short.len()]
 }
 
-/// Collapse an error to a bounded, single-line diagnostic (see `MAX_ERROR_CHARS`).
-fn bounded_error(msg: &str) -> String {
-    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() > MAX_ERROR_CHARS {
-        let truncated: String = one_line.chars().take(MAX_ERROR_CHARS).collect();
-        format!("{truncated}…")
-    } else {
-        one_line
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,7 +316,7 @@ mod tests {
             cmp.exact_match,
             "punctuation/casing/spacing must normalize away"
         );
-        assert_eq!(cmp.similarity, 1.0);
+        assert_eq!(cmp.similarity, Some(1.0));
         assert_eq!(cmp.whisper_words, 2);
         assert_eq!(cmp.apple_words, 2);
         assert!(cmp.apple_error.is_none());
@@ -264,18 +328,15 @@ mod tests {
         assert_eq!(cmp.outcome, ShadowOutcome::Usable);
         assert!(!cmp.exact_match);
         // One substitution out of four words: 1 - 1/4 = 0.75.
-        assert!(
-            (cmp.similarity - 0.75).abs() < 1e-6,
-            "got {}",
-            cmp.similarity
-        );
+        let s = cmp.similarity.expect("scored");
+        assert!((s - 0.75).abs() < 1e-6, "got {s}");
     }
 
     #[test]
-    fn completely_different_text_has_low_similarity() {
+    fn completely_different_text_scores_zero() {
         let cmp = compare("alpha beta gamma", Ok(Some("one two three")));
         assert_eq!(cmp.outcome, ShadowOutcome::Usable);
-        assert_eq!(cmp.similarity, 0.0);
+        assert_eq!(cmp.similarity, Some(0.0));
         assert!(!cmp.exact_match);
     }
 
@@ -285,6 +346,7 @@ mod tests {
         assert_eq!(cmp.outcome, ShadowOutcome::Empty);
         assert_eq!(cmp.apple_words, 0);
         assert_eq!(cmp.whisper_words, 3);
+        assert_eq!(cmp.similarity, None);
         assert!(cmp.apple_error.is_none());
     }
 
@@ -300,45 +362,72 @@ mod tests {
                 "{blank:?} should classify as Empty"
             );
             assert_eq!(cmp.apple_words, 0);
-            assert_eq!(cmp.similarity, 0.0);
+            assert_eq!(cmp.similarity, None);
         }
     }
 
     #[test]
-    fn a_failed_apple_attempt_carries_a_bounded_error_not_the_transcript() {
+    fn a_failed_attempt_stores_a_fixed_category_not_the_message() {
         let cmp = compare("whisper had text", Err("worker crashed (XPC interrupted)"));
         assert_eq!(cmp.outcome, ShadowOutcome::Failed);
         assert_eq!(cmp.apple_words, 0);
-        assert_eq!(
-            cmp.apple_error.as_deref(),
-            Some("worker crashed (XPC interrupted)")
-        );
-        // The Whisper side is still measured so the log shows what shipped.
+        assert_eq!(cmp.similarity, None);
+        assert_eq!(cmp.apple_error, Some(ShadowError::XpcInterrupted));
         assert_eq!(cmp.whisper_words, 3);
     }
 
     #[test]
-    fn a_long_multiline_error_is_bounded_to_one_line() {
-        let huge = format!("failure: {}", "context ".repeat(80));
-        let cmp = compare("hi", Err(&huge));
-        let stored = cmp.apple_error.expect("failed attempt records an error");
-        assert!(!stored.contains('\n'));
-        assert!(
-            stored.chars().count() <= MAX_ERROR_CHARS + 1,
-            "bounded to {} chars, got {}",
-            MAX_ERROR_CHARS,
-            stored.chars().count()
-        );
-        assert!(stored.ends_with('…'), "truncation marker present");
+    fn error_classification_discards_any_embedded_text() {
+        // Even if an error embedded recognized speech, only a fixed category is
+        // stored — the raw words never survive. The stored value is a token from
+        // ShadowError's closed set regardless of which category is chosen.
+        let cmp = compare("hi", Err("boom: the secret launch code is hunter2"));
+        let category = cmp.apple_error.expect("failed attempt has a category");
+        assert!(!category.as_str().contains("hunter2"));
+        assert!(!category.as_str().contains("secret"));
+        assert!(!category.as_str().contains("launch"));
     }
 
     #[test]
     fn similarity_is_symmetric_in_edit_distance() {
         let a = compare("one two three four", Ok(Some("one two three")));
         let b = compare("one two three", Ok(Some("one two three four")));
-        assert!((a.similarity - b.similarity).abs() < 1e-6);
+        assert_eq!(a.similarity, b.similarity);
         // One deletion out of four: 0.75.
-        assert!((a.similarity - 0.75).abs() < 1e-6, "got {}", a.similarity);
+        let s = a.similarity.expect("scored");
+        assert!((s - 0.75).abs() < 1e-6, "got {s}");
+    }
+
+    #[test]
+    fn differing_transcripts_over_the_cap_are_unscored_not_faked() {
+        let big_a = (0..=SIMILARITY_WORD_CAP)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let big_b = (0..=SIMILARITY_WORD_CAP)
+            .map(|i| format!("b{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cmp = compare(&big_a, Ok(Some(&big_b)));
+        assert_eq!(cmp.outcome, ShadowOutcome::Usable);
+        assert!(!cmp.exact_match);
+        // The old length-ratio proxy would have reported 1.0 here; honest is None.
+        assert_eq!(cmp.similarity, None);
+    }
+
+    #[test]
+    fn identical_over_the_cap_still_scores_one() {
+        let big = (0..=SIMILARITY_WORD_CAP)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cmp = compare(&big, Ok(Some(&big)));
+        assert!(cmp.exact_match);
+        assert_eq!(
+            cmp.similarity,
+            Some(1.0),
+            "equality is cheap and definitive"
+        );
     }
 
     #[test]
