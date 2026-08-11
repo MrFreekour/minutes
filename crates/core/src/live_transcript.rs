@@ -451,22 +451,24 @@ impl LiveTranscriptWriter {
         if !crate::apple_speech_shadow::shadow_enabled(config) {
             return;
         }
-        // The worker is only reachable from inside a trusted installed app
-        // bundle, so a CLI-run session would fail its first attempt and latch
-        // off, logging a failure that says nothing about device capability.
-        // Decline up front with the actionable reason instead.
-        if !crate::apple_speech_worker::worker_authority_available() {
-            tracing::warn!(
-                "apple-speech shadow requested but this process cannot reach the Apple Speech worker (it is only addressable from an installed Minutes app); shadow stays off for this session"
-            );
-            return;
-        }
         // Attribute the evidence to the surface that produced it, using the
         // canonical transcript-source vocabulary.
         let source = match self.source {
             TranscriptSource::Standalone => "standalone",
             TranscriptSource::RecordingSidecar => "recording-sidecar",
         };
+        // The worker is only reachable from inside a trusted installed app
+        // bundle, so a CLI-run session would fail its first attempt and latch
+        // off, logging a failure that says nothing about device capability.
+        // Decline up front with the actionable reason instead — persisted, so a
+        // run with zero shadow rows is never confused with "no eligible audio".
+        if !crate::apple_speech_worker::worker_authority_available() {
+            crate::apple_speech_shadow::log_shadow_disabled(
+                source,
+                "worker unreachable: the Apple Speech worker is only addressable from an installed Minutes app",
+            );
+            return;
+        }
         match crate::apple_speech_shadow::spawn_live_shadow_runner(config, source) {
             Some(runner) => {
                 tracing::info!("apple-speech shadow measurement armed for this live session");
@@ -476,8 +478,9 @@ impl LiveTranscriptWriter {
                     overflowed: false,
                 });
             }
-            None => tracing::warn!(
-                "apple-speech shadow requested but its worker thread could not start; continuing without shadow"
+            None => crate::apple_speech_shadow::log_shadow_disabled(
+                source,
+                "worker thread could not be spawned",
             ),
         }
     }
@@ -2328,9 +2331,15 @@ fn finalize_live_utterance(
         Ok(whisper_ctx) => {
             let ok = if let Some(sr) = streaming.finalize(whisper_ctx) {
                 // Whisper is the shipped engine here, so this is the one place a
-                // shadow comparison is valid. No-op unless shadow is armed.
-                writer.submit_whisper_shadow(&sr.text);
-                writer.write_utterance(&sr.text, sr.duration_secs)
+                // shadow comparison is valid. Submit only after the line is
+                // actually written: a failed JSONL write means the user never
+                // received this transcript, so it must not appear as evidence.
+                // No-op unless shadow is armed.
+                let written = writer.write_utterance(&sr.text, sr.duration_secs);
+                if written {
+                    writer.submit_whisper_shadow(&sr.text);
+                }
+                written
             } else {
                 true
             };
@@ -2456,9 +2465,15 @@ fn finalize_live_utterance(
         Ok(whisper_ctx) => {
             if let Some(sr) = streaming.finalize(whisper_ctx) {
                 // Whisper is the shipped engine here, so this is the one place a
-                // shadow comparison is valid. No-op unless shadow is armed.
-                writer.submit_whisper_shadow(&sr.text);
-                writer.write_utterance(&sr.text, sr.duration_secs)
+                // shadow comparison is valid. Submit only after the line is
+                // actually written: a failed JSONL write means the user never
+                // received this transcript, so it must not appear as evidence.
+                // No-op unless shadow is armed.
+                let written = writer.write_utterance(&sr.text, sr.duration_secs);
+                if written {
+                    writer.submit_whisper_shadow(&sr.text);
+                }
+                written
             } else {
                 true
             }

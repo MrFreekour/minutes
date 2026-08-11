@@ -227,6 +227,24 @@ pub fn log_comparison(source: &str, cmp: &ShadowComparison) -> std::io::Result<(
     result
 }
 
+/// Persist the reason shadow measurement is off for a session that asked for it.
+///
+/// Without this a rollout run with zero shadow rows is indistinguishable from one
+/// where every utterance was ineligible: the desktop app installs no tracing
+/// subscriber, so a `warn!` alone disappears exactly where shadow data is meant to
+/// be collected. Same durable JSONL sink as [`log_comparison`], and equally
+/// failure-isolated.
+pub fn log_shadow_disabled(source: &str, reason: &str) {
+    let entry = serde_json::json!({
+        "event": "apple_speech_shadow_disabled",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "source": source,
+        "reason": reason,
+    });
+    let _ = crate::logging::append_log(&entry);
+    tracing::warn!(target: "apple_speech_shadow", source, reason, "apple-speech shadow disabled for this session");
+}
+
 /// Whether shadow mode is switched on in config.
 ///
 /// This is only the config intent. An actual shadow attempt additionally
