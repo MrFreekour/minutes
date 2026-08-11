@@ -197,12 +197,21 @@ jobs:
         # because an ordinary failure message once panicked across the FFI
         # boundary and no gate caught it.
         working-directory: crates/sherpa-plugin
-        run: cargo test --release --locked
+        shell: bash
+        run: |
+          # Both: `cargo test` compiles the lib as a test harness and never
+          # emits the cdylib, so the export check below would find nothing.
+          cargo build --release --locked
+          cargo test --release --locked
 
       - name: The host image must not link sherpa (#683, #685)
         # The isolation property this whole design rests on, asserted rather
         # than assumed: `cargo check` type-checks a feature combination, it
         # does not prove the two native stacks stayed apart.
+        #
+        # Explicit bash: this job has no `defaults.shell`, so a `run:` block on
+        # windows-latest is pwsh and this script is a parse error there.
+        shell: bash
         run: |
           if cargo tree -p minutes-core --no-default-features \
               --features diarize,engine-sherpa 2>/dev/null | grep -q 'sherpa-rs'; then
@@ -215,6 +224,7 @@ jobs:
         if: runner.os == 'macOS'
         # What actually keeps the two runtimes apart: if the cdylib exported
         # OrtGetApiBase it could interpose on the host's copy.
+        shell: bash
         run: |
           PLUGIN=crates/sherpa-plugin/target/release/libminutes_sherpa.dylib
           test -f "$PLUGIN" || { echo "::error::plugin not built"; exit 1; }
