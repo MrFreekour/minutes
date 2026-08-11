@@ -65,7 +65,6 @@ The reviewer should independently attempt at least these cases:
 | Ask for three required concepts in one clause | only one-provision conjunctions qualify |
 | Ask for criteria anywhere in one document | each criterion is tied to exact evidence in that same document |
 | Exceed the candidate budget | search fails closed rather than claiming completeness |
-| Disable networking for the entire installed-app session | census, indexing, exact search, and supported semantic suggestions still work |
 | Approve a folder, then remove it, then try to make the app check for updates | the check is refused; removing the location does not reopen the window |
 | Rebuild with the endpoint pointed at a host you control, and serve a manifest signed with your own minisign key | the download is refused and the installed application is unchanged |
 | Same, with a signature that is valid but was made over different bytes | the download is refused |
@@ -293,9 +292,12 @@ that can:
 - return evidence after its source is no longer current and authorized;
 - persist source text or vectors across application exit;
 - execute document text or candidate-controlled code as instructions;
-- use the network at any moment other than the single announced launch check,
-  send anything in that request, repeat it, or make it after a folder has been
-  approved;
+- use the network at any moment other than the single announced launch check
+  and at most one explicitly consented update download, repeat either
+  operation, or start either operation after a folder has been approved;
+- add an application, user, or archive identifier, query string, or request
+  body to the launch check, or disclose archive-derived data in either network
+  operation;
 - install an update whose minisign signature does not verify against the key in
   `tauri.conf.json`, or install one without the operator asking;
 - silently use a network or downloaded model;

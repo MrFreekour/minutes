@@ -3016,6 +3016,44 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn updater_rejects_an_ad_hoc_signature_without_developer_id_trust() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp");
+        let app = temp.path().join("Minutes Archive.app");
+        let contents = app.join("Contents");
+        let executable = contents.join("MacOS/minutes-archive-app");
+        fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("create synthetic app");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("write executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        fs::write(
+            contents.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>minutes-archive-app</string>
+<key>CFBundleIdentifier</key><string>com.useminutes.archive</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+"#,
+        )
+        .expect("write plist");
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--deep", "--sign", "-"])
+            .arg(&app)
+            .status()
+            .expect("run ad hoc signing");
+        assert!(signed.success(), "construct the negative-control bundle");
+        assert!(
+            verify_staged_archive_app(&app).is_err(),
+            "an internally valid ad hoc signature crossed the Developer ID boundary"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn updater_replacement_is_one_atomic_exchange() {
         let temp = TempDir::new().expect("temp");
         let current = temp.path().join("Minutes Archive.app");

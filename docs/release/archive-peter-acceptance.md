@@ -142,7 +142,8 @@ force-quit or crashes.
 
 What could remain is the folder's FULL PATH -- its name, the names of every
 folder above it, and the name and identifier of the disk it is on. It is not any
-document, not any text from a document, and nothing is ever sent anywhere. It
+document, not any text from a document, and that saved path is never sent
+anywhere. It
 sits in the app's own settings file on your Mac. In a law practice those folder
 names are often client names, which is why this is stated rather than left
 unsaid. Opening Minutes Archive again clears it.
