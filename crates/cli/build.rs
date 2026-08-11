@@ -40,7 +40,5 @@ fn main() {
     // the minutes-core build script does NOT reach this downstream binary, so
     // the rpath must be set here, on the worker bin itself. Proven on Apple
     // Silicon: without this the real worker aborts; with it it transcribes.
-    println!(
-        "cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift"
-    );
+    println!("cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift");
 }
