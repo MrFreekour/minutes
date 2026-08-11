@@ -56,6 +56,12 @@ pub enum ShadowError {
     XpcInterrupted,
     /// The device/runtime cannot run Apple Speech (`runtime_supported == false`).
     RuntimeUnsupported,
+    /// This process cannot address the worker at all: the worker is only
+    /// reachable from a trusted installed app bundle, so a CLI binary or test
+    /// harness always lands here, as does an installed app whose signing or
+    /// packaging authority fails. Says nothing about the device's Speech
+    /// capability, and must not be counted as a capability failure.
+    WorkerUnavailable,
     /// Speech assets are not installed for the locale.
     AssetsUnavailable,
     /// A Speech-framework or analyzer error.
@@ -71,6 +77,7 @@ impl ShadowError {
             Self::WorkerCrashed => "worker_crashed",
             Self::XpcInterrupted => "xpc_interrupted",
             Self::RuntimeUnsupported => "runtime_unsupported",
+            Self::WorkerUnavailable => "worker_unavailable",
             Self::AssetsUnavailable => "assets_unavailable",
             Self::SpeechError => "speech_error",
             Self::Unknown => "unknown",
@@ -227,6 +234,24 @@ pub fn log_comparison(source: &str, cmp: &ShadowComparison) -> std::io::Result<(
     result
 }
 
+/// Persist the reason shadow measurement is off for a session that asked for it.
+///
+/// Without this a rollout run with zero shadow rows is indistinguishable from one
+/// where every utterance was ineligible: the desktop app installs no tracing
+/// subscriber, so a `warn!` alone disappears exactly where shadow data is meant to
+/// be collected. Same durable JSONL sink as [`log_comparison`], and equally
+/// failure-isolated.
+pub fn log_shadow_disabled(source: &str, reason: &str) {
+    let entry = serde_json::json!({
+        "event": "apple_speech_shadow_disabled",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "source": source,
+        "reason": reason,
+    });
+    let _ = crate::logging::append_log(&entry);
+    tracing::warn!(target: "apple_speech_shadow", source, reason, "apple-speech shadow disabled for this session");
+}
+
 /// Whether shadow mode is switched on in config.
 ///
 /// This is only the config intent. An actual shadow attempt additionally
@@ -273,12 +298,16 @@ pub fn worker_ok_to_shadow(
 
 /// Map a worker-call transport failure (the `Err` arm of `transcribe_samples`)
 /// into the shadow taxonomy by its `io::ErrorKind`, without reading the message.
-/// `Other` is the XPC/worker layer failing (crash, interruption, or the 180s
-/// budget); the rest are environment or our-side faults (missing worker
-/// authority, over-budget or malformed input/response) with no Speech-capability
-/// signal, recorded as `Unknown`.
+///
+/// `PermissionDenied` is how a failed worker *authority* surfaces — this process
+/// cannot address the worker at all, which is the normal outcome outside an
+/// installed trusted app bundle and says nothing about the device, so it is kept
+/// distinct from a capability failure. `Other` is the XPC/worker layer failing
+/// (crash, interruption, or the 180s budget). The rest are our-side faults
+/// (over-budget or malformed input/response) with no capability signal.
 pub fn transport_error_category(kind: std::io::ErrorKind) -> ShadowError {
     match kind {
+        std::io::ErrorKind::PermissionDenied => ShadowError::WorkerUnavailable,
         std::io::ErrorKind::Other => ShadowError::XpcInterrupted,
         _ => ShadowError::Unknown,
     }
@@ -426,18 +455,21 @@ impl Drop for ShadowRunner {
     }
 }
 
-/// Build a live-sidecar shadow runner that drives the real Apple Speech worker.
+/// Build a live shadow runner that drives the real Apple Speech worker.
 ///
-/// macOS only, because it calls the XPC worker. The sidecar constructs this once
+/// macOS only, because it calls the XPC worker. The caller constructs this once
 /// per session when [`shadow_enabled`] is true, then feeds it finalized Whisper
-/// utterances via [`ShadowRunner::try_submit`]. A successful call is decoded by
+/// utterances via [`ShadowRunner::try_submit`]. `source` labels the surface in
+/// the log and must use the repository's canonical transcript-source vocabulary
+/// (`"standalone"` / `"recording-sidecar"`) so rollout evidence is attributed to
+/// the surface that actually produced it. A successful call is decoded by
 /// [`worker_ok_to_shadow`]; a transport `Err` is categorized by its
 /// `io::ErrorKind` via [`transport_error_category`]. Returns `None` if the worker
 /// thread cannot be spawned, disabling shadow rather than affecting capture.
 #[cfg(target_os = "macos")]
-pub fn spawn_live_shadow_runner(config: &Config) -> Option<ShadowRunner> {
+pub fn spawn_live_shadow_runner(config: &Config, source: &'static str) -> Option<ShadowRunner> {
     let language = config.transcription.language.clone();
-    ShadowRunner::spawn("live-sidecar", move |samples| {
+    ShadowRunner::spawn(source, move |samples| {
         let locale = crate::apple_speech::live_locale_hint(language.as_deref());
         match crate::apple_speech_worker::transcribe_samples(
             samples,
@@ -721,10 +753,11 @@ mod tests {
             transport_error_category(ErrorKind::Other),
             ShadowError::XpcInterrupted
         );
-        // Environment / our-side faults carry no Speech-capability signal.
+        // A failed worker authority: cannot address the worker at all. Distinct
+        // from a capability failure, and the normal outcome outside an app bundle.
         assert_eq!(
             transport_error_category(ErrorKind::PermissionDenied),
-            ShadowError::Unknown
+            ShadowError::WorkerUnavailable
         );
         assert_eq!(
             transport_error_category(ErrorKind::InvalidData),
