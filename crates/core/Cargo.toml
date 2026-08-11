@@ -41,7 +41,11 @@ vad-ort = ["streaming", "dep:ort", "dep:ndarray"]
 # consumer (issue #683). Loading sherpa into its own image removes the conflict
 # instead of arbitrating it (issue #685), so this feature now coexists with
 # `diarize` and `vad-ort` on every platform.
-engine-sherpa = ["dep:libloading"]
+# Implies `whisper` because the sherpa path promises a whisper fallback: when
+# the plugin or model is unavailable, or sherpa fails after loading, whisper
+# answers. Without it that fallback returns a diagnostic placeholder as if it
+# were a transcript, which is worse than either engine failing honestly.
+engine-sherpa = ["dep:libloading", "whisper"]
 
 [dependencies]
 serde = { workspace = true }

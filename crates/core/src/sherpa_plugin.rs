@@ -52,7 +52,15 @@ struct PluginApi {
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
 
-static PLUGIN: OnceLock<Result<PluginApi, String>> = OnceLock::new();
+/// Successfully loaded plugin, cached for the life of the process.
+///
+/// Only success is cached. An earlier version cached the failure too, with a
+/// comment claiming the answer could not change without a restart; that is
+/// plainly false for a filesystem probe, and it meant a long-lived process
+/// (an MCP server, the desktop app) could never pick up a plugin installed
+/// after it started. Re-probing while unloaded costs a few `exists` calls,
+/// since `dlopen` is only attempted for a path that is actually there.
+static PLUGIN: OnceLock<&'static PluginApi> = OnceLock::new();
 
 /// Platform-specific plugin file name.
 fn plugin_file_name() -> &'static str {
@@ -75,8 +83,9 @@ fn plugin_file_name() -> &'static str {
 /// `MINUTES_SHERPA_PLUGIN` wins so a developer can point at a freshly built
 /// dylib in `target/` without installing it. Otherwise it is looked for beside
 /// the running executable, which is how a packaged app carries it, and then in
-/// the Minutes install root, which is where `minutes setup --sherpa` puts it
-/// next to the model it already downloads.
+/// the Minutes install root, which is the intended install location once the
+/// plugin ships as a release asset. Nothing installs it there automatically
+/// yet, so a source build copies it or points the variable at `target/`.
 pub fn candidate_paths(config: &Config) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(explicit) = std::env::var("MINUTES_SHERPA_PLUGIN") {
@@ -117,7 +126,7 @@ fn load_from(path: &Path) -> Result<PluginApi, String> {
         if found != EXPECTED_ABI_VERSION {
             return Err(format!(
                 "{} reports plugin ABI {found}, but this build speaks {EXPECTED_ABI_VERSION}. \
-                 Reinstall the matching plugin with `minutes setup --sherpa`.",
+                 Rebuild the plugin from the same checkout as this binary.",
                 path.display()
             ));
         }
@@ -160,32 +169,51 @@ fn load_from(path: &Path) -> Result<PluginApi, String> {
 /// Retrying a failed dlopen on every recording would repeat the same slow
 /// failure and log noise; the answer cannot change without a restart.
 fn plugin(config: &Config) -> Result<&'static PluginApi, String> {
-    PLUGIN
-        .get_or_init(|| {
-            let candidates = candidate_paths(config);
-            let mut reasons = Vec::new();
-            for candidate in &candidates {
-                if !candidate.exists() {
-                    reasons.push(format!("{}: not found", candidate.display()));
-                    continue;
-                }
-                match load_from(candidate) {
-                    Ok(api) => {
-                        tracing::info!(plugin = %candidate.display(), "loaded sherpa plugin");
-                        return Ok(api);
-                    }
-                    Err(reason) => reasons.push(reason),
-                }
+    if let Some(api) = PLUGIN.get() {
+        return Ok(api);
+    }
+    match try_load(config) {
+        Ok(api) => {
+            // Leaked rather than dropped: if two threads race here the loser's
+            // library would otherwise unload while its ONNX Runtime globals are
+            // initialized. Leaking one copy in a rare race is cheaper than
+            // reasoning about that teardown.
+            let leaked: &'static PluginApi = Box::leak(Box::new(api));
+            Ok(PLUGIN.get_or_init(|| leaked))
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
+/// Try every candidate path once, reporting why each was rejected.
+fn try_load(config: &Config) -> Result<PluginApi, String> {
+    {
+        let candidates = candidate_paths(config);
+        let mut reasons = Vec::new();
+        for candidate in &candidates {
+            if !candidate.exists() {
+                reasons.push(format!("{}: not found", candidate.display()));
+                continue;
             }
-            Err(format!(
-                "the sherpa transcription plugin could not be loaded. Run \
-                 `minutes setup --sherpa` to install it, or set MINUTES_SHERPA_PLUGIN. \
-                 Tried: {}",
-                reasons.join("; ")
-            ))
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+            match load_from(candidate) {
+                Ok(api) => {
+                    tracing::info!(plugin = %candidate.display(), "loaded sherpa plugin");
+                    return Ok(api);
+                }
+                Err(reason) => reasons.push(reason),
+            }
+        }
+        // Deliberately does not name `minutes setup --sherpa`: that
+        // command installs the model, not the plugin. Pointing at it would
+        // send someone round a loop that cannot fix this.
+        Err(format!(
+            "the sherpa transcription plugin could not be loaded. Build it with \
+                 `(cd crates/sherpa-plugin && cargo build --release)` and copy the library \
+                 beside the executable or into the Minutes lib directory, or point \
+                 MINUTES_SHERPA_PLUGIN at it. Tried: {}",
+            reasons.join("; ")
+        ))
+    }
 }
 
 /// A loaded recognizer. Releases the plugin handle on drop.

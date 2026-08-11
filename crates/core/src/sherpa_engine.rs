@@ -433,6 +433,11 @@ fn transcription_ranges(samples: &[f32], config: &Config) -> Vec<SherpaTranscrip
 /// regions with padding, tiny-gap merge, and long-region splitting. If VAD is
 /// unavailable or fails, this falls back to the legacy 15 s fixed windows. If
 /// VAD runs successfully and finds no speech, this returns no segments.
+///
+/// This is the raw engine, with no whisper fallback: a missing plugin, an
+/// unloadable one, or a decode failure returns `Err`. Callers that must not
+/// lose a recording should go through `transcribe::transcribe_dispatch`, which
+/// answers with whisper whenever sherpa cannot.
 #[cfg(feature = "engine-sherpa")]
 pub fn transcribe_segments(samples: &[f32], config: &Config) -> Result<Vec<(u64, String)>, String> {
     let mut recognizer = build_recognizer(config)?;

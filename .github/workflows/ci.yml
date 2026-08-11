@@ -188,11 +188,41 @@ jobs:
           cargo check -p minutes-core --no-default-features --features diarize,engine-sherpa
           cargo check -p minutes-core --no-default-features --features vad-ort,engine-sherpa
 
-      - name: Build the isolated sherpa plugin
-        if: runner.os == 'macOS'
-        # Excluded from the workspace, so nothing else in CI compiles it.
+      - name: Build and test the isolated sherpa plugin
+        # Every platform, not just macOS: the plugin declares per-target sherpa
+        # dependencies, and the README claims the engine coexists with
+        # diarization everywhere, so Linux and Windows need a real compile.
+        # Excluded from the workspace, so nothing else in CI reaches it, which
+        # also means its FFI error-path tests only run here. Those exist
+        # because an ordinary failure message once panicked across the FFI
+        # boundary and no gate caught it.
         working-directory: crates/sherpa-plugin
-        run: cargo build --release
+        run: cargo test --release --locked
+
+      - name: The host image must not link sherpa (#683, #685)
+        # The isolation property this whole design rests on, asserted rather
+        # than assumed: `cargo check` type-checks a feature combination, it
+        # does not prove the two native stacks stayed apart.
+        run: |
+          if cargo tree -p minutes-core --no-default-features \
+              --features diarize,engine-sherpa 2>/dev/null | grep -q 'sherpa-rs'; then
+            echo "::error::minutes-core links sherpa-rs again; the #683 collision is back"
+            exit 1
+          fi
+          echo "host graph is free of sherpa-rs"
+
+      - name: The plugin must not export ONNX Runtime symbols
+        if: runner.os == 'macOS'
+        # What actually keeps the two runtimes apart: if the cdylib exported
+        # OrtGetApiBase it could interpose on the host's copy.
+        run: |
+          PLUGIN=crates/sherpa-plugin/target/release/libminutes_sherpa.dylib
+          test -f "$PLUGIN" || { echo "::error::plugin not built"; exit 1; }
+          if nm -gU "$PLUGIN" | grep -q OrtGetApiBase; then
+            echo "::error::the plugin exports OrtGetApiBase and can interpose on the host"
+            exit 1
+          fi
+          echo "plugin exports no ONNX Runtime entry points"
 
       - name: Build full workspace (macOS only)
         if: runner.os == 'macOS'
