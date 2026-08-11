@@ -8,13 +8,17 @@
 //! transport gate (`apple_speech_private_audio_transport_supported`). Shadow
 //! measures; it never exposes.
 //!
-//! This module is the measurement primitive: the pure comparison record and
-//! its logging. It deliberately carries only measurements (counts, a
-//! similarity score, an outcome) and a fixed error *category*, never the
-//! transcript text or a raw error message, so a shadow log can never leak
-//! sensitive content. Wiring a shadow attempt into a capture path is a separate
-//! step, paired with the on-hardware data run.
+//! This module holds the measurement primitive (the pure comparison record and
+//! its logging) plus the non-blocking executor that drives it: [`ShadowRunner`]
+//! runs each attempt on a dedicated thread with a bounded, drop-when-busy queue,
+//! so a slow or crashing shadow attempt can never stall capture. Records carry
+//! only measurements (counts, a similarity score, an outcome) and a fixed error
+//! *category*, never the transcript text or a raw error message, so a shadow log
+//! can never leak sensitive content. What remains is hooking
+//! [`ShadowRunner::try_submit`] into a capture path (the live sidecar first),
+//! paired with the on-hardware data run.
 
+use crate::apple_speech_session::AppleSpeechSession;
 use crate::config::Config;
 
 /// What Apple Speech produced for a shadow utterance, relative to Whisper.
@@ -232,6 +236,220 @@ pub fn log_comparison(source: &str, cmp: &ShadowComparison) -> std::io::Result<(
 /// of the product transport gate: shadow measures, it never exposes.
 pub fn shadow_enabled(config: &Config) -> bool {
     config.transcription.apple_speech_shadow
+}
+
+/// Minimum utterance length before a shadow attempt is worth making: 1 second at
+/// 16 kHz, matching the live/dictation Apple Speech thresholds. Sub-second blips
+/// are dropped rather than spawning a worker for noise.
+const SHADOW_MIN_SAMPLES: usize = 16_000;
+
+/// Decode a *successful* Apple Speech worker response into the `compare` apple
+/// argument, following the real bridge contract:
+///
+/// - `runtime_supported == false` is how the bridge's `failureResponse` encodes
+///   *any* thrown error — analyzer, asset, or genuinely-unsupported alike, each
+///   with a message. The bridge does not distinguish them, so this is a coarse
+///   [`ShadowError::SpeechError`]. Finer categories (`RuntimeUnsupported`,
+///   `AssetsUnavailable`) need a typed error kind from the bridge, tracked as the
+///   follow-up on [`ShadowError`].
+/// - Otherwise the runtime ran. A non-empty transcript is `Ok(Some(_))`. An empty
+///   one is the "analyzer completed without results" case (`runtime_supported ==
+///   true` with an advisory message) and is `Ok(None)` — an `Empty` outcome, not
+///   a failure, so the session keeps attempting.
+///
+/// No raw error string is read or carried, so no transcript content can leak.
+pub fn worker_ok_to_shadow(
+    runtime_supported: bool,
+    transcript: &str,
+) -> Result<Option<String>, ShadowError> {
+    if !runtime_supported {
+        Err(ShadowError::SpeechError)
+    } else if transcript.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(transcript.to_string()))
+    }
+}
+
+/// Map a worker-call transport failure (the `Err` arm of `transcribe_samples`)
+/// into the shadow taxonomy by its `io::ErrorKind`, without reading the message.
+/// `Other` is the XPC/worker layer failing (crash, interruption, or the 180s
+/// budget); the rest are environment or our-side faults (missing worker
+/// authority, over-budget or malformed input/response) with no Speech-capability
+/// signal, recorded as `Unknown`.
+pub fn transport_error_category(kind: std::io::ErrorKind) -> ShadowError {
+    match kind {
+        std::io::ErrorKind::Other => ShadowError::XpcInterrupted,
+        _ => ShadowError::Unknown,
+    }
+}
+
+/// One utterance queued for shadow comparison.
+struct ShadowJob {
+    samples: Vec<f32>,
+    whisper_text: String,
+}
+
+/// Process-wide admission: at most one shadow attempt runs at a time across every
+/// `ShadowRunner` (and therefore every recording session) in the process. A
+/// per-runner flag would let rapid stop/start cycles leave several detached 180s
+/// worker jobs overlapping a new recording; a single global gate bounds that to
+/// one, keeping shadow's CPU/memory/asset-download load off active capture.
+static SHADOW_ADMISSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A non-blocking, failure-isolated executor for shadow comparisons.
+///
+/// The shadow attempt runs on a dedicated *detached* thread. A process-wide
+/// admission gate ([`SHADOW_ADMISSION`]) admits exactly one attempt at a time
+/// across all sessions; any utterance arriving while one is running is dropped,
+/// never queued. `try_submit` never blocks and never copies audio (it takes
+/// ownership). This upholds the standing "recording must never be degraded by an
+/// optional consumer" decision (RFC 0004): the sidecar cannot be stalled or
+/// back-pressured, and — critically — shutdown does not join the worker thread,
+/// so a shadow attempt still inside the worker's 180s budget cannot delay Stop or
+/// WAV preservation. Dropping the runner sets a cancel flag and closes the
+/// channel: a queued-but-not-started job is skipped, and a call already inside the
+/// worker finishes in the background. The last in-flight comparison is therefore
+/// best-effort (it may be lost at process exit) — an acceptable trade for never
+/// delaying capture. A per-session [`AppleSpeechSession`] latch stops attempts
+/// after the first failure, so an incapable device is not re-probed every
+/// utterance.
+pub struct ShadowRunner {
+    tx: std::sync::mpsc::SyncSender<ShadowJob>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    session: std::sync::Arc<AppleSpeechSession>,
+}
+
+impl ShadowRunner {
+    /// Spawn a runner whose `attempt` performs one Apple Speech attempt for a set
+    /// of samples and maps it into the shadow taxonomy. `source` labels the
+    /// surface in the log. Comparisons are persisted via [`log_comparison`].
+    ///
+    /// Returns `None` if the OS refuses the worker thread (resource limits): an
+    /// optional consumer disables itself rather than panicking the caller.
+    pub fn spawn<F>(source: &'static str, attempt: F) -> Option<Self>
+    where
+        F: FnMut(&[f32]) -> Result<Option<String>, ShadowError> + Send + 'static,
+    {
+        Self::spawn_with_sink(source, attempt, |src, cmp| {
+            let _ = log_comparison(src, cmp);
+        })
+    }
+
+    /// As [`ShadowRunner::spawn`], with an injectable comparison sink for tests.
+    fn spawn_with_sink<F, S>(source: &'static str, mut attempt: F, mut sink: S) -> Option<Self>
+    where
+        F: FnMut(&[f32]) -> Result<Option<String>, ShadowError> + Send + 'static,
+        S: FnMut(&'static str, &ShadowComparison) + Send + 'static,
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ShadowJob>(1);
+        let session = std::sync::Arc::new(AppleSpeechSession::new());
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let thread_session = std::sync::Arc::clone(&session);
+        let thread_cancelled = std::sync::Arc::clone(&cancelled);
+        // `.ok()?` discards the JoinHandle, detaching the thread: nothing ever
+        // joins it, so shutdown cannot block on an in-flight worker attempt.
+        std::thread::Builder::new()
+            .name("apple-speech-shadow".to_string())
+            .spawn(move || {
+                for job in rx {
+                    // Skip a queued job if the runner was dropped (cancelled) or
+                    // the session latched off, but still release admission below.
+                    if !thread_cancelled.load(Ordering::Acquire) && thread_session.should_attempt()
+                    {
+                        let apple = attempt(&job.samples);
+                        let cmp = compare(
+                            &job.whisper_text,
+                            apple.as_ref().map(|opt| opt.as_deref()).map_err(|e| *e),
+                        );
+                        match cmp.outcome {
+                            ShadowOutcome::Usable => thread_session.record_success(),
+                            ShadowOutcome::Failed => thread_session.record_failure(),
+                            // Worker ran fine but produced no speech: not a
+                            // capability failure, so the session keeps attempting.
+                            ShadowOutcome::Empty => {}
+                        }
+                        sink(source, &cmp);
+                    }
+                    // Release the process-wide slot only after the attempt fully
+                    // settles, whether it ran or was skipped, so a new submission
+                    // (this or another session) cannot start a second worker.
+                    SHADOW_ADMISSION.store(false, Ordering::Release);
+                }
+            })
+            .ok()?;
+        Some(Self {
+            tx,
+            cancelled,
+            session,
+        })
+    }
+
+    /// Submit an utterance for shadow comparison without ever blocking the caller
+    /// and without copying audio: ownership of `samples` moves into the runner, so
+    /// there is no infallible allocation on the capture path. Returns `false`
+    /// (skips) when the utterance is too short, when the session has latched off
+    /// after a failure, or when a shadow attempt is already in flight anywhere in
+    /// the process. A dropped sample is acceptable for measurement.
+    pub fn try_submit(&self, samples: Vec<f32>, whisper_text: String) -> bool {
+        use std::sync::atomic::Ordering;
+        if samples.len() < SHADOW_MIN_SAMPLES || !self.session.should_attempt() {
+            return false;
+        }
+        // Claim the process-wide slot; if an attempt is already in flight, drop.
+        if SHADOW_ADMISSION.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        match self.tx.try_send(ShadowJob {
+            samples,
+            whisper_text,
+        }) {
+            Ok(()) => true,
+            Err(_) => {
+                // Receiver gone (thread ended): release the slot we claimed.
+                SHADOW_ADMISSION.store(false, Ordering::Release);
+                false
+            }
+        }
+    }
+}
+
+impl Drop for ShadowRunner {
+    fn drop(&mut self) {
+        // Cancel a queued-but-not-started job so it can't run the worker during a
+        // later session, then let `tx` drop to close the channel. We never join:
+        // a call already inside the worker finishes in the background, so Stop and
+        // WAV preservation are never delayed.
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Build a live-sidecar shadow runner that drives the real Apple Speech worker.
+///
+/// macOS only, because it calls the XPC worker. The sidecar constructs this once
+/// per session when [`shadow_enabled`] is true, then feeds it finalized Whisper
+/// utterances via [`ShadowRunner::try_submit`]. A successful call is decoded by
+/// [`worker_ok_to_shadow`]; a transport `Err` is categorized by its
+/// `io::ErrorKind` via [`transport_error_category`]. Returns `None` if the worker
+/// thread cannot be spawned, disabling shadow rather than affecting capture.
+#[cfg(target_os = "macos")]
+pub fn spawn_live_shadow_runner(config: &Config) -> Option<ShadowRunner> {
+    let language = config.transcription.language.clone();
+    ShadowRunner::spawn("live-sidecar", move |samples| {
+        let locale = crate::apple_speech::live_locale_hint(language.as_deref());
+        match crate::apple_speech_worker::transcribe_samples(
+            samples,
+            locale.as_deref(),
+            crate::apple_speech::AppleSpeechMode::Speech,
+            true,
+        ) {
+            Ok(result) => worker_ok_to_shadow(result.runtime_supported, &result.transcript),
+            Err(crate::error::MinutesError::Io(io)) => Err(transport_error_category(io.kind())),
+            Err(_) => Err(ShadowError::Unknown),
+        }
+    })
 }
 
 /// Lowercased, timestamp- and punctuation-insensitive words. The two engines
@@ -476,5 +694,118 @@ mod tests {
             ..Default::default()
         };
         assert!(shadow_enabled(&config));
+    }
+
+    #[test]
+    fn worker_ok_maps_the_real_bridge_contract() {
+        // runtime_supported=false is how the bridge encodes ANY thrown error.
+        assert_eq!(
+            worker_ok_to_shadow(false, "ignored"),
+            Err(ShadowError::SpeechError)
+        );
+        // runtime_supported=true + empty transcript is the "no results" case.
+        assert_eq!(worker_ok_to_shadow(true, ""), Ok(None));
+        assert_eq!(worker_ok_to_shadow(true, "   "), Ok(None));
+        // A real transcript flows through.
+        assert_eq!(
+            worker_ok_to_shadow(true, "hello world"),
+            Ok(Some("hello world".to_string()))
+        );
+    }
+
+    #[test]
+    fn transport_errors_are_categorized_by_kind() {
+        use std::io::ErrorKind;
+        // The XPC/worker layer failing (crash, interruption, 180s budget).
+        assert_eq!(
+            transport_error_category(ErrorKind::Other),
+            ShadowError::XpcInterrupted
+        );
+        // Environment / our-side faults carry no Speech-capability signal.
+        assert_eq!(
+            transport_error_category(ErrorKind::PermissionDenied),
+            ShadowError::Unknown
+        );
+        assert_eq!(
+            transport_error_category(ErrorKind::InvalidData),
+            ShadowError::Unknown
+        );
+    }
+
+    fn long_samples() -> Vec<f32> {
+        vec![0.1_f32; SHADOW_MIN_SAMPLES]
+    }
+
+    /// Serialize the runner tests and reset the process-wide admission gate, so a
+    /// prior test's detached thread cannot leave `SHADOW_ADMISSION` set and make a
+    /// later test's submission spuriously drop.
+    fn runner_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        SHADOW_ADMISSION.store(false, std::sync::atomic::Ordering::Release);
+        guard
+    }
+
+    #[test]
+    fn runner_skips_utterances_shorter_than_the_threshold() {
+        let _guard = runner_test_guard();
+        let runner =
+            ShadowRunner::spawn_with_sink("test", |_| Ok(Some("apple".to_string())), |_, _| {})
+                .expect("spawn shadow runner");
+        assert!(
+            !runner.try_submit(vec![0.1; 10], "whisper".to_string()),
+            "sub-threshold utterance must be dropped without a worker spawn"
+        );
+    }
+
+    #[test]
+    fn runner_compares_a_submitted_utterance_and_persists_via_the_sink() {
+        use std::sync::mpsc;
+        let _guard = runner_test_guard();
+        let (done_tx, done_rx) = mpsc::channel();
+        let runner = ShadowRunner::spawn_with_sink(
+            "test",
+            |_| Ok(Some("the quick brown fox".to_string())),
+            move |_, cmp| done_tx.send(cmp.clone()).unwrap(),
+        )
+        .expect("spawn shadow runner");
+        assert!(runner.try_submit(long_samples(), "the quick brown fox".to_string()));
+        let cmp = done_rx.recv().unwrap();
+        assert_eq!(cmp.outcome, ShadowOutcome::Usable);
+        assert!(cmp.exact_match);
+        assert_eq!(cmp.similarity, Some(1.0));
+    }
+
+    #[test]
+    fn runner_latches_off_after_a_failure_and_stops_attempting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc};
+        let _guard = runner_test_guard();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let thread_calls = Arc::clone(&calls);
+        let (done_tx, done_rx) = mpsc::channel();
+        let runner = ShadowRunner::spawn_with_sink(
+            "test",
+            move |_| {
+                thread_calls.fetch_add(1, Ordering::SeqCst);
+                Err(ShadowError::XpcInterrupted)
+            },
+            move |_, cmp| done_tx.send(cmp.outcome).unwrap(),
+        )
+        .expect("spawn shadow runner");
+
+        assert!(runner.try_submit(long_samples(), "whisper text".to_string()));
+        // Wait for the first attempt to be processed so the session has latched.
+        assert_eq!(done_rx.recv().unwrap(), ShadowOutcome::Failed);
+
+        // The session is now latched off: further submits are skipped and the
+        // attempt closure is never called again.
+        assert!(!runner.try_submit(long_samples(), "whisper text".to_string()));
+        drop(runner);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not re-attempt after a failure"
+        );
     }
 }
