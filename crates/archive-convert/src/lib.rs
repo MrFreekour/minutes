@@ -689,10 +689,12 @@ fn inline_text(inlines: &[anydoc::model::Inline]) -> String {
     out
 }
 
-/// A page scan is large in both directions. A 150dpi letter page is 1275x1650
-/// and a fax is 1728x1100; signatures, logos, stamps, and headshots are large
-/// in at most one direction.
-const SCAN_MIN_EDGE: i64 = 1_000;
+/// A page scan is a picture *of a page*, so it has a document page's shape; a
+/// signature, logo, stamp, or headshot does not. Size alone is arbitrary and
+/// has now failed in both directions: it missed ordinary 96-100dpi scans and
+/// previously mistook a 600x600 signature for a scan.
+const SCAN_MIN_EDGE: i64 = 500;
+const PAGE_SHAPE_EDGE_TOLERANCE: f64 = 0.05;
 
 /// Maximum total decoded stream bytes inspected by the provenance sweep.
 ///
@@ -731,22 +733,29 @@ impl PdfStreamBudget {
 /// enumerates every stream for inline images. A malformed object-table entry,
 /// an undecodable stream, or an exhausted byte budget is an unknown result and
 /// fails closed at the caller. Reference shape, depth, and cycles are irrelevant.
-fn pdf_has_scan_sized_image(doc: &lopdf::Document) -> PdfScanCheck {
-    pdf_has_scan_sized_image_with_budget(doc, MAX_PDF_SWEEP_DECOMPRESSED_BYTES)
+fn pdf_has_page_scan_image(doc: &lopdf::Document) -> PdfScanCheck {
+    pdf_has_page_scan_image_with_budget(doc, MAX_PDF_SWEEP_DECOMPRESSED_BYTES)
 }
 
-fn pdf_has_scan_sized_image_with_budget(
+fn pdf_has_page_scan_image_with_budget(
     doc: &lopdf::Document,
     decompressed_byte_limit: usize,
 ) -> PdfScanCheck {
     object_table_is_complete(doc)?;
+    let page_aspect_ratios = collect_page_aspect_ratios(doc)?;
 
     for object in doc.objects.values() {
         let lopdf::Object::Stream(stream) = object else {
             continue;
         };
         if stream_is_image_xobject(doc, stream)?
-            && image_dimensions_are_scan_sized(doc, &stream.dict, b"Width", b"Height")?
+            && image_dimensions_match_page_shape(
+                doc,
+                &stream.dict,
+                b"Width",
+                b"Height",
+                &page_aspect_ratios,
+            )?
         {
             return Ok(true);
         }
@@ -758,11 +767,60 @@ fn pdf_has_scan_sized_image_with_budget(
             continue;
         };
         let bytes = decode_stream_for_sweep(stream, &mut budget)?;
-        if stream_bytes_have_scan_sized_inline_image(doc, &bytes)? {
+        if stream_bytes_have_page_scan_inline_image(doc, &bytes, &page_aspect_ratios)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Collect page shapes without walking page resources or following content.
+///
+/// `MediaBox` is inheritable, so both `/Page` leaves and `/Pages` nodes may
+/// declare the shape. Enumerating those dictionaries keeps provenance a flat,
+/// document-wide sweep while covering ordinary inherited page boxes.
+fn collect_page_aspect_ratios(doc: &lopdf::Document) -> Result<Vec<f64>, ()> {
+    let mut ratios = Vec::new();
+    for object in doc.objects.values() {
+        let lopdf::Object::Dictionary(dictionary) = object else {
+            continue;
+        };
+        let object_type = match dictionary.get(b"Type") {
+            Ok(object_type) => doc.dereference(object_type).map_err(|_| ())?.1,
+            Err(_) => continue,
+        };
+        let object_type = object_type.as_name().map_err(|_| ())?;
+        if object_type != b"Page" && object_type != b"Pages" {
+            continue;
+        }
+        let media_box = match dictionary.get(b"MediaBox") {
+            Ok(media_box) => doc.dereference(media_box).map_err(|_| ())?.1,
+            Err(_) => continue,
+        };
+        let coordinates = media_box.as_array().map_err(|_| ())?;
+        let [x_min, y_min, x_max, y_max] = coordinates.as_slice() else {
+            return Err(());
+        };
+        let width = (resolved_number(doc, x_max)? - resolved_number(doc, x_min)?).abs();
+        let height = (resolved_number(doc, y_max)? - resolved_number(doc, y_min)?).abs();
+        ratios.push(normalized_aspect_ratio(width, height)?);
+    }
+    (!ratios.is_empty()).then_some(ratios).ok_or(())
+}
+
+fn resolved_number(doc: &lopdf::Document, object: &lopdf::Object) -> Result<f64, ()> {
+    match doc.dereference(object).map_err(|_| ())?.1 {
+        lopdf::Object::Integer(value) => Ok(*value as f64),
+        lopdf::Object::Real(value) => Ok(f64::from(*value)),
+        _ => Err(()),
+    }
+}
+
+fn normalized_aspect_ratio(width: f64, height: f64) -> Result<f64, ()> {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err(());
+    }
+    Ok(width.max(height) / width.min(height))
 }
 
 /// lopdf deliberately skips malformed indirect objects while loading the rest
@@ -890,7 +948,11 @@ fn bounded_ascii85_decode(input: &[u8], limit: usize) -> Result<Vec<u8>, ()> {
     Ok(output)
 }
 
-fn stream_bytes_have_scan_sized_inline_image(doc: &lopdf::Document, bytes: &[u8]) -> PdfScanCheck {
+fn stream_bytes_have_page_scan_inline_image(
+    doc: &lopdf::Document,
+    bytes: &[u8],
+    page_aspect_ratios: &[f64],
+) -> PdfScanCheck {
     // Most streams are fonts, image samples, metadata, or other non-content.
     // Only invoke the strict content parser when the bytes contain a standalone
     // `BI` operator candidate; this still sweeps every stream without treating
@@ -903,7 +965,7 @@ fn stream_bytes_have_scan_sized_inline_image(doc: &lopdf::Document, bytes: &[u8]
         return Ok(false);
     }
     let content = lopdf::content::Content::decode_strict(bytes).map_err(|_| ())?;
-    content_has_scan_sized_inline_image(doc, &content)
+    content_has_page_scan_inline_image(doc, &content, page_aspect_ratios)
 }
 
 fn pdf_token_boundary(byte: u8) -> bool {
@@ -915,16 +977,17 @@ fn pdf_token_boundary(byte: u8) -> bool {
 }
 
 fn pdf_text_origin(doc: &lopdf::Document) -> TextOrigin {
-    if pdf_has_scan_sized_image(doc).unwrap_or(true) {
+    if pdf_has_page_scan_image(doc).unwrap_or(true) {
         TextOrigin::MachineReadLayer
     } else {
         TextOrigin::AuthorWritten
     }
 }
 
-fn content_has_scan_sized_inline_image(
+fn content_has_page_scan_inline_image(
     doc: &lopdf::Document,
     content: &lopdf::content::Content,
+    page_aspect_ratios: &[f64],
 ) -> PdfScanCheck {
     for operation in &content.operations {
         if operation.operator != "BI" {
@@ -946,18 +1009,25 @@ fn content_has_scan_sized_inline_image(
         } else {
             b"Height".as_slice()
         };
-        if image_dimensions_are_scan_sized(doc, &image.dict, width_key, height_key)? {
+        if image_dimensions_match_page_shape(
+            doc,
+            &image.dict,
+            width_key,
+            height_key,
+            page_aspect_ratios,
+        )? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn image_dimensions_are_scan_sized(
+fn image_dimensions_match_page_shape(
     doc: &lopdf::Document,
     dictionary: &lopdf::Dictionary,
     width_key: &[u8],
     height_key: &[u8],
+    page_aspect_ratios: &[f64],
 ) -> PdfScanCheck {
     let width = resolved_dict_value(doc, dictionary, width_key)?
         .as_i64()
@@ -968,7 +1038,19 @@ fn image_dimensions_are_scan_sized(
     if width <= 0 || height <= 0 {
         return Err(());
     }
-    Ok(width >= SCAN_MIN_EDGE && height >= SCAN_MIN_EDGE)
+    if width.min(height) < SCAN_MIN_EDGE {
+        return Ok(false);
+    }
+    let image_ratio = normalized_aspect_ratio(width as f64, height as f64)?;
+    Ok(page_aspect_ratios.iter().any(|page_ratio| {
+        // Compare the two shapes after scaling them to equal area. A five
+        // percent allowance on either edge admits ordinary Letter/A4 scanner
+        // rounding without making orientation significant.
+        (image_ratio / page_ratio)
+            .max(page_ratio / image_ratio)
+            .sqrt()
+            <= 1.0 + PAGE_SHAPE_EDGE_TOLERANCE
+    }))
 }
 
 fn resolved_dict_value<'a>(
@@ -1939,12 +2021,22 @@ mod tests {
         assemble_pdf(&objects)
     }
 
-    fn synthetic_raster_pdf(width: i64, height: i64) -> Vec<u8> {
+    fn synthetic_raster_pdf_on_page(
+        page_width: i64,
+        page_height: i64,
+        image_width: i64,
+        image_height: i64,
+    ) -> Vec<u8> {
         let stream = b"BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET /Im1 Do";
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] \
+                 /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> \
+                 /Contents 5 0 R >>"
+            )
+            .into_bytes(),
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
             [
                 format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(),
@@ -1953,11 +2045,15 @@ mod tests {
             ]
             .concat(),
             grayscale_image_xobject(
-                usize::try_from(width).expect("positive fixture width"),
-                usize::try_from(height).expect("positive fixture height"),
+                usize::try_from(image_width).expect("positive fixture width"),
+                usize::try_from(image_height).expect("positive fixture height"),
             ),
         ];
         assemble_pdf(&objects)
+    }
+
+    fn synthetic_raster_pdf(width: i64, height: i64) -> Vec<u8> {
+        synthetic_raster_pdf_on_page(612, 792, width, height)
     }
 
     fn synthetic_two_page_raster_pdf(width: usize, height: usize) -> Vec<u8> {
@@ -2390,7 +2486,7 @@ mod tests {
 
     #[test]
     fn a_signature_sized_image_does_not_demote_a_page() {
-        // Fails if the old area rule returns or either edge threshold drops to 600.
+        // Fails if size alone overrides the square signature's page-shape mismatch.
         let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(600, 600))
             .expect("convert signature PDF");
         assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
@@ -2399,7 +2495,7 @@ mod tests {
 
     #[test]
     fn a_high_resolution_logo_does_not_demote_a_page() {
-        // Fails if one long edge is enough to classify a banner as a page scan.
+        // Fails if one long edge overrides the wide banner's page-shape mismatch.
         let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(1200, 300))
             .expect("convert banner PDF");
         assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
@@ -2407,7 +2503,56 @@ mod tests {
     }
 
     #[test]
-    fn a_page_scan_sized_image_demotes_the_document() {
+    fn a_96_dpi_letter_scan_demotes_the_document() {
+        // Fails if the classifier again requires a Letter scan's 816px short edge to reach 1000.
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(816, 1056))
+            .expect("convert 96dpi Letter scan PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_100_dpi_letter_scan_demotes_the_document() {
+        // Fails if the classifier again requires a Letter scan's 850px short edge to reach 1000.
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(850, 1100))
+            .expect("convert 100dpi Letter scan PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_96_dpi_a4_scan_on_a_letter_page_demotes_the_document() {
+        // Fails if the page-shape tolerance cannot absorb ordinary Letter/A4 scanner variance.
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(794, 1123))
+            .expect("convert 96dpi A4 scan PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_72_dpi_letter_scan_demotes_the_document() {
+        // Fails if matching page shape is not enough at the 500px minimum-edge boundary.
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(612, 792))
+            .expect("convert 72dpi Letter scan PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_150_dpi_letter_scan_still_demotes_the_document() {
+        // Fails if replacing the size rule loses the already-correct 1275x1650 scan verdict.
+        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(1275, 1650))
+            .expect("convert 150dpi Letter scan PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_landscape_page_scan_demotes_the_document() {
+        // Fails if page-shape matching depends on portrait rather than normalized orientation.
+        let bytes = synthetic_raster_pdf_on_page(792, 612, 1056, 816);
+        let document =
+            convert_bytes(SourceFormat::Pdf, &bytes).expect("convert landscape Letter scan PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_page_shaped_scan_image_demotes_the_document() {
         // Fails if a scan on page two does not mark every page anchor machine-read.
         let bytes = synthetic_two_page_raster_pdf(1275, 1650);
         let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert scan PDF");
@@ -2435,7 +2580,7 @@ mod tests {
         // Fails if the stream sweep misses inline BI/ID/EI data outside page content streams.
         let bytes = synthetic_inline_image_in_form_pdf();
         let document = pdf_extract::Document::load_mem(&bytes).expect("load inline-image PDF");
-        assert_eq!(pdf_has_scan_sized_image(&document), Ok(true));
+        assert_eq!(pdf_has_page_scan_image(&document), Ok(true));
         assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
         let converted = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert inline-image PDF");
         assert_eq!(converted.text_origin, TextOrigin::MachineReadLayer);
@@ -2455,7 +2600,7 @@ mod tests {
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
         assert!(!document.objects.contains_key(&(5, 0)));
-        assert_eq!(pdf_has_scan_sized_image(&document), Err(()));
+        assert_eq!(pdf_has_page_scan_image(&document), Err(()));
         assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
     }
 
@@ -2472,7 +2617,7 @@ mod tests {
         ];
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        assert_eq!(pdf_has_scan_sized_image(&document), Err(()));
+        assert_eq!(pdf_has_page_scan_image(&document), Err(()));
         assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
     }
 
@@ -2492,7 +2637,7 @@ mod tests {
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
         assert_eq!(
-            pdf_has_scan_sized_image_with_budget(
+            pdf_has_page_scan_image_with_budget(
                 &document,
                 first.len().checked_add(second.len()).expect("fixture size") - 1
             ),
@@ -2517,10 +2662,7 @@ mod tests {
         ];
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        assert_eq!(
-            pdf_has_scan_sized_image_with_budget(&document, 128),
-            Err(())
-        );
+        assert_eq!(pdf_has_page_scan_image_with_budget(&document, 128), Err(()));
     }
 
     #[test]
@@ -2540,7 +2682,7 @@ mod tests {
         ];
         let bytes = assemble_pdf(&objects);
         let document = pdf_extract::Document::load_mem(&bytes).expect("load PDF");
-        assert_eq!(pdf_has_scan_sized_image(&document), Ok(false));
+        assert_eq!(pdf_has_page_scan_image(&document), Ok(false));
         assert_eq!(pdf_text_origin(&document), TextOrigin::AuthorWritten);
     }
 
