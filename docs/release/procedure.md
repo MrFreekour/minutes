@@ -262,12 +262,31 @@ Vercel project that `307`-redirected to www. The site looked fine, and the entir
 40-route content build stayed effectively unindexed: 496 referring domains, one
 ranking keyword.
 
-### 16. Update Homebrew tap formula if CLI changed
-The formula lives at `silverstein/homebrew-tap` → `Formula/minutes.rb`. Update the `tag:` to the new version:
+### 16. Update the Homebrew tap: formula AND cask, every release
+Two files in `silverstein/homebrew-tap`, and they drift independently. The
+formula (`Formula/minutes.rb`, CLI) was faithfully bumped while the cask
+(`Casks/minutes.rb`, desktop app) sat at 0.18.2 through six releases until a
+user reported it (#736). The step that "only applies if the CLI changed" was
+the one that kept happening; the unconditional one was the one forgotten.
+Treat both as unconditional.
+
+**Formula** — update the `tag:` to the new version:
 ```bash
-# Fetch current SHA, update via GitHub API
 SHA=$(gh api repos/silverstein/homebrew-tap/contents/Formula/minutes.rb --jq '.sha')
 # Edit Formula/minutes.rb: change tag: "vX.Y.Z" → new version
 # Push via API or clone+commit+push
 ```
-Verify: `brew update && brew info silverstein/tap/minutes` should show the new version.
+
+**Cask** — update `version` and `sha256`. Compute the hash from the released
+DMG itself, not from SHA256SUMS.txt, which does not list the DMG:
+```bash
+gh release download vX.Y.Z --pattern 'Minutes_X.Y.Z_aarch64.dmg'
+sha256sum Minutes_X.Y.Z_aarch64.dmg
+SHA=$(gh api repos/silverstein/homebrew-tap/contents/Casks/minutes.rb --jq '.sha')
+# Edit Casks/minutes.rb: bump version + sha256, push via API
+```
+
+Verify both: `brew update && brew info silverstein/tap/minutes && brew info --cask silverstein/tap/minutes`.
+
+Automating the bump from the release pipeline is tracked in #736; it needs a
+cross-repository token, so until that lands this manual step is the mechanism.
