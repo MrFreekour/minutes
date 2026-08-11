@@ -182,13 +182,15 @@ function validate(candidate, checkGoldens = true) {
   // crates/cli/build.rs (a cargo:rustc-link-arg in minutes-core does not reach
   // a downstream bin); crates/core covers minutes-core's own test/example
   // targets. Both are load-bearing.
+  // activeCode strips comments first, so a commented-out or dead-code println!
+  // does not satisfy the check (raw source.includes would pass it).
   requireText(
-    candidate.cliBuild,
+    activeCode(candidate.cliBuild),
     "cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift",
     "the Apple Speech worker bin must add the Swift Concurrency runtime rpath",
   );
   requireText(
-    candidate.coreBuild,
+    activeCode(candidate.coreBuild),
     "cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift",
     "minutes-core's own targets must add the Swift Concurrency runtime rpath",
   );
@@ -440,6 +442,21 @@ function validate(candidate, checkGoldens = true) {
 
 if (process.argv.includes("--self-test")) {
   const mutations = [
+    ["worker Concurrency rpath commented out", "cliBuild", (value) =>
+      value.replace(
+        '"cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift"',
+        '// "cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift"',
+      ), false],
+    ["worker Concurrency rpath removed", "cliBuild", (value) =>
+      value.replace(
+        '"cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift"',
+        '"cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-sectcreate,__TEXT,__foo,/dev/null"',
+      ), false],
+    ["core Concurrency rpath commented out", "coreBuild", (value) =>
+      value.replace(
+        '"cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift"',
+        '// "cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift"',
+      ), false],
     ["xpc_main aliased to a block declaration", "xpc", (value) =>
       value.replace(
         "fn xpc_main(handler: XpcConnectionHandler) -> !;",
