@@ -451,6 +451,16 @@ impl LiveTranscriptWriter {
         if !crate::apple_speech_shadow::shadow_enabled(config) {
             return;
         }
+        // The worker is only reachable from inside a trusted installed app
+        // bundle, so a CLI-run session would fail its first attempt and latch
+        // off, logging a failure that says nothing about device capability.
+        // Decline up front with the actionable reason instead.
+        if !crate::apple_speech_worker::worker_authority_available() {
+            tracing::warn!(
+                "apple-speech shadow requested but this process cannot reach the Apple Speech worker (it is only addressable from an installed Minutes app); shadow stays off for this session"
+            );
+            return;
+        }
         match crate::apple_speech_shadow::spawn_live_shadow_runner(config) {
             Some(runner) => {
                 tracing::info!("apple-speech shadow measurement armed for this live session");

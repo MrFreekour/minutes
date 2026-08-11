@@ -303,6 +303,18 @@ fn acceptance_canary_samples() -> Vec<f32> {
         .collect()
 }
 
+/// Whether this process can reach the Apple Speech worker at all.
+///
+/// The worker is only addressable from inside a trusted, installed Minutes app
+/// bundle (`Contents/MacOS/...` beside `Contents/XPCServices`), so a plain CLI
+/// binary or a test harness can never reach it. Optional consumers (shadow
+/// measurement) check this up front so they can decline with a clear reason
+/// instead of arming themselves and failing on the first utterance.
+#[cfg(target_os = "macos")]
+pub(crate) fn worker_authority_available() -> bool {
+    authority().is_ok()
+}
+
 #[cfg(target_os = "macos")]
 fn authority() -> Result<MacAppleSpeechWorkerAuthority, String> {
     if let Some(authority) = APPLE_SPEECH_WORKER_AUTHORITY.get() {
