@@ -11,6 +11,10 @@ members = [
     "crates/whisper-guard",
     "tauri/src-tauri",
 ]
+# Deliberately not a member: building it downloads the whole sherpa-onnx
+# bundle, which would land on every `cargo clippy --all`, and it ships
+# separately from the binaries by design (issue #685).
+exclude = ["crates/sherpa-plugin"]
 resolver = "2"
 
 [workspace.package]
@@ -107,6 +111,8 @@ pyannote-rs = "0.3.4"
 # ONNX Runtime + ndarray (used directly for segmentation model — pyannote-rs
 # has a normalisation bug so we bypass get_segments for the segmentation step)
 ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
+# Runtime loader for the isolated sherpa plugin (#685).
+libloading = "0.8"
 ndarray = "0.16"
 
 # SQLite (relationship graph index)

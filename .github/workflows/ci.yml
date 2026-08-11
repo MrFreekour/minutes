@@ -53,6 +53,10 @@ jobs:
               - 'crates/cli/**'
               - 'crates/reader/**'
               - 'crates/whisper-guard/**'
+              # Excluded from the workspace (it downloads the sherpa bundle),
+              # so `cargo clippy --all` never reaches it and only the filter
+              # keeps it covered.
+              - 'crates/sherpa-plugin/**'
               - 'crates/archive-convert/**'
               - 'crates/archive-core/**'
               - 'crates/archive-ocr/**'
@@ -176,36 +180,59 @@ jobs:
         # otherwise only surfaces at release, and exercises Linux beyond no-default-features.
         run: cargo build -p minutes-core --no-default-features --features engine-sherpa
 
-      - name: Sherpa + diarize refuse to link on macOS (#683 guard)
-        if: runner.os == 'macOS'
-        # The combination vendors two conflicting copies of ONNX Runtime and
-        # kaldi-native-fbank; the compile guard in crates/core/src/lib.rs is
-        # what keeps it out of release builds. Assert it actually fires, so a
-        # refactor cannot silently drop the cfg and re-open #683.
-        # The oracle greps for the guard's own message. Merely asserting a
-        # nonzero exit would pass on any unrelated failure (network error in a
-        # build script, toolchain breakage) while proving nothing about the
-        # guard.
+      - name: Sherpa and diarize share one binary (#685)
+        # The inverse of the guard this replaces. #683 proved the two stacks
+        # cannot be statically linked together; the plugin moved sherpa behind
+        # dlopen, so the combination must now COMPILE rather than refuse.
         run: |
-          check_guard() {
-            # bash -e: a failing command substitution in a plain assignment
-            # would abort the step before the oracle runs, so capture the
-            # status in the same statement.
-            status=0
-            out=$(cargo check -p minutes-core --no-default-features --features "$1" 2>&1) || status=$?
-            if [ $status -eq 0 ]; then
-              echo "::error::the #683 compile guard did not fire for $1 on macOS"
-              return 1
-            fi
-            if ! printf '%s' "$out" | grep -q "cannot share a macOS binary"; then
-              echo "::error::$1 failed for a reason other than the #683 guard:"
-              printf '%s\n' "$out" | tail -20
-              return 1
-            fi
-            echo "guard fired for $1"
-          }
-          check_guard diarize,engine-sherpa
-          check_guard vad-ort,engine-sherpa
+          cargo check -p minutes-core --no-default-features --features diarize,engine-sherpa
+          cargo check -p minutes-core --no-default-features --features vad-ort,engine-sherpa
+
+      - name: Build and test the isolated sherpa plugin
+        # Every platform, not just macOS: the plugin declares per-target sherpa
+        # dependencies, and the README claims the engine coexists with
+        # diarization everywhere, so Linux and Windows need a real compile.
+        # Excluded from the workspace, so nothing else in CI reaches it, which
+        # also means its FFI error-path tests only run here. Those exist
+        # because an ordinary failure message once panicked across the FFI
+        # boundary and no gate caught it.
+        working-directory: crates/sherpa-plugin
+        shell: bash
+        run: |
+          # Both: `cargo test` compiles the lib as a test harness and never
+          # emits the cdylib, so the export check below would find nothing.
+          cargo build --release --locked
+          cargo test --release --locked
+
+      - name: The host image must not link sherpa (#683, #685)
+        # The isolation property this whole design rests on, asserted rather
+        # than assumed: `cargo check` type-checks a feature combination, it
+        # does not prove the two native stacks stayed apart.
+        #
+        # Explicit bash: this job has no `defaults.shell`, so a `run:` block on
+        # windows-latest is pwsh and this script is a parse error there.
+        shell: bash
+        run: |
+          if cargo tree -p minutes-core --no-default-features \
+              --features diarize,engine-sherpa 2>/dev/null | grep -q 'sherpa-rs'; then
+            echo "::error::minutes-core links sherpa-rs again; the #683 collision is back"
+            exit 1
+          fi
+          echo "host graph is free of sherpa-rs"
+
+      - name: The plugin must not export ONNX Runtime symbols
+        if: runner.os == 'macOS'
+        # What actually keeps the two runtimes apart: if the cdylib exported
+        # OrtGetApiBase it could interpose on the host's copy.
+        shell: bash
+        run: |
+          PLUGIN=crates/sherpa-plugin/target/release/libminutes_sherpa.dylib
+          test -f "$PLUGIN" || { echo "::error::plugin not built"; exit 1; }
+          if nm -gU "$PLUGIN" | grep -q OrtGetApiBase; then
+            echo "::error::the plugin exports OrtGetApiBase and can interpose on the host"
+            exit 1
+          fi
+          echo "plugin exports no ONNX Runtime entry points"
 
       - name: Build full workspace (macOS only)
         if: runner.os == 'macOS'

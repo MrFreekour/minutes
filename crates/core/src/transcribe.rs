@@ -424,17 +424,31 @@ fn transcribe_dispatch(
             // `sherpa_engine` path helpers are always compiled, so this check
             // works in any build.
             let model_dir = crate::sherpa_engine::model_dir(config);
-            if cfg!(feature = "engine-sherpa")
-                && crate::sherpa_engine::model_files_present(&model_dir)
-            {
-                transcribe_sherpa_dispatch(audio_path, config, hints)
-            } else {
+            if !sherpa_selectable(config) {
                 tracing::warn!(
                     model_dir = %model_dir.display(),
                     compiled = cfg!(feature = "engine-sherpa"),
-                    "engine = \"sherpa\" selected but unavailable (feature/model); falling back to whisper"
+                    reason = sherpa_unavailable_reason(config),
+                    "engine = \"sherpa\" selected but unavailable; falling back to whisper"
                 );
-                transcribe_whisper_dispatch(audio_path, config, hints)
+                return transcribe_whisper_dispatch(audio_path, config, hints);
+            }
+            // Passing the preflight is not the same as succeeding. The model
+            // files clear a size floor rather than a hash, so a corrupt or
+            // incompatible model loads the plugin fine and then fails inside
+            // it, and an individual decode window can fail too. Those used to
+            // surface as a failed transcription, which loses a recording; the
+            // rule here is that whisper answers whenever sherpa cannot.
+            match transcribe_sherpa_dispatch(audio_path, config, hints) {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    tracing::warn!(
+                        model_dir = %model_dir.display(),
+                        %error,
+                        "sherpa transcription failed after loading; falling back to whisper"
+                    );
+                    transcribe_whisper_dispatch(audio_path, config, hints)
+                }
             }
         }
         "apple-speech" => {
@@ -462,6 +476,11 @@ pub(crate) fn effective_batch_engine(config: &Config) -> &str {
     if (requested.eq_ignore_ascii_case("parakeet")
         && !crate::pipeline::parakeet_capability(cfg!(feature = "parakeet")).selectable)
         || requested.eq_ignore_ascii_case("apple-speech")
+        // Sherpa was missing from this list, so a sherpa-to-whisper
+        // substitution stayed invisible in the desktop artifact: the detector
+        // in pipeline.rs compares the requested engine against this function,
+        // and sherpa always answered "sherpa" no matter what actually ran.
+        || (requested.eq_ignore_ascii_case("sherpa") && !sherpa_selectable(config))
     {
         "whisper"
     } else {
@@ -903,6 +922,44 @@ fn transcribe_parakeet_dispatch(
         tracing::warn!("Parakeet is not compiled into this build; falling back to Whisper");
         transcribe_whisper_dispatch(audio_path, config, hints)
     }
+}
+
+/// Whether sherpa can actually run: compiled in, model installed, plugin
+/// loadable.
+///
+/// Since #685 the engine lives in a dlopened plugin, so being compiled in no
+/// longer implies being runnable. This is the single predicate behind both the
+/// dispatch and `effective_batch_engine`, so planning, the transcript, and the
+/// artifact warning cannot disagree about which engine ran.
+pub(crate) fn sherpa_selectable(config: &Config) -> bool {
+    cfg!(feature = "engine-sherpa")
+        && crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config))
+        && sherpa_plugin_unavailable_reason(config).is_none()
+}
+
+/// Why sherpa is unavailable, phrased for the processing artifact.
+pub(crate) fn sherpa_unavailable_reason(config: &Config) -> &'static str {
+    if !cfg!(feature = "engine-sherpa") {
+        "this build was compiled without the sherpa engine"
+    } else if !crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config)) {
+        "the sherpa model is not installed"
+    } else {
+        "the sherpa plugin could not be loaded"
+    }
+}
+
+/// Why the sherpa plugin cannot be used, or `None` when it loads.
+///
+/// Always `None` without the engine feature, where the caller's `cfg!` check
+/// already decided the question.
+#[cfg(feature = "engine-sherpa")]
+fn sherpa_plugin_unavailable_reason(config: &Config) -> Option<String> {
+    crate::sherpa_plugin::unavailable_reason(config)
+}
+
+#[cfg(not(feature = "engine-sherpa"))]
+fn sherpa_plugin_unavailable_reason(_config: &Config) -> Option<String> {
+    None
 }
 
 /// Dispatch for the opt-in sherpa-onnx engine (parakeet-tdt-0.6b-v3, multilingual).

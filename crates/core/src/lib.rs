@@ -1,56 +1,5 @@
 #![warn(clippy::disallowed_methods)]
 
-// `engine-sherpa` and `diarize` cannot share one macOS binary (issue #683).
-//
-// sherpa-onnx's static bundle and pyannote's dependencies each vendor two of
-// the same native libraries: ONNX Runtime (sherpa 1.17.1 vs ort-sys 1.22.0)
-// and kaldi-native-fbank (both literally named libkaldi-native-fbank-core.a).
-// A Mach-O image has one definition per symbol, so whichever copy wins the
-// link serves both consumers. Measured on macOS arm64, every resolution is
-// broken in one direction or the other:
-//
-//   ORT winner   kaldi winner   pyannote            sherpa
-//   1.17.1       sherpa's       API 17/22 error     works
-//   1.22.0       sherpa's       SIGABRT in fbank    works
-//   1.22.0       knf-rs's       works               SIGABRT
-//
-// ORT could be unified upward because its C API is version-stable, but
-// kaldi-native-fbank has no ABI contract, and identical mangled names with
-// divergent layouts are undefined behavior, not a clean failure. Refusing to
-// link is the only honest option until the sherpa stack is isolated behind
-// its own namespace (dlopen plugin or worker process; see the tracking issue
-// referenced from #683).
-//
-// Linux is verified unaffected: with both stacks linked into one binary
-// (sherpa via libsherpa-onnx-c-api.so, pyannote via static ort 1.22.0),
-// enrollment saves a voice profile and sherpa transcribes, in one process
-// (x86_64, 2026-08-09). The dynamic sherpa library resolves ONNX Runtime from
-// its own DT_NEEDED libonnxruntime.so rather than the executable, which does
-// not export the colliding symbols. Windows is expected safe by the same
-// dynamic-linking structure (per-DLL imports), but has not been executed in
-// this combination; if sherpa ever links statically off macOS, this guard's
-// scope must widen.
-//
-// `vad-ort` is included because it also pulls `dep:ort`: the same two static
-// ONNX Runtimes collide even without pyannote in the picture, and which copy
-// wins is a link-order coin flip. The measured 1.17.1-wins outcome hard-fails
-// every ort-rs consumer at init with the API 17/22 error.
-//
-// For a sherpa CLI build without diarization:
-//   cargo build --release -p minutes-cli --no-default-features \
-//     --features whisper,engine-sherpa,metal
-#[cfg(all(
-    target_os = "macos",
-    feature = "engine-sherpa",
-    any(feature = "diarize", feature = "vad-ort")
-))]
-compile_error!(
-    "engine-sherpa cannot share a macOS binary with diarize or vad-ort: sherpa-onnx's static \
-     bundle vendors its own ONNX Runtime (and kaldi-native-fbank), and whichever copy wins \
-     the link breaks the other consumer (issue #683). Build sherpa without them: \
-     cargo build -p minutes-cli --no-default-features --features whisper,engine-sherpa,metal"
-);
-
 pub mod apple_fm;
 pub mod apple_speech;
 pub mod apple_speech_worker;
@@ -139,6 +88,10 @@ pub mod sensitive;
 // Always compiled: the path/resolution helpers are pure std/Config so `setup`
 // can install models without the engine. Only `transcribe_samples` is gated.
 pub mod sherpa_engine;
+/// Runtime loader for the isolated sherpa plugin (#685). Gated with the engine
+/// so default builds carry no loader at all.
+#[cfg(feature = "engine-sherpa")]
+pub mod sherpa_plugin;
 pub(crate) mod stem_probe;
 /// Incremental reader for stems that are still being written (#576).
 pub mod stem_tail;

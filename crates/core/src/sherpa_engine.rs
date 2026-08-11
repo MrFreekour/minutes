@@ -17,14 +17,14 @@ use std::path::PathBuf;
 // Path/resolution helpers below are always compiled (pure std/Config) so the
 // CLI `setup` command can install + locate models without enabling the engine.
 // Only the sherpa-rs transcription path requires the `engine-sherpa` feature.
+#[cfg(feature = "engine-sherpa")]
+use crate::sherpa_plugin::PluginRecognizer;
 #[cfg(all(
     feature = "engine-sherpa",
     feature = "vad-ort",
     not(feature = "whisper")
 ))]
 use crate::vad::VadEngine;
-#[cfg(feature = "engine-sherpa")]
-use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 
 /// The default sherpa parakeet-v3 model variant directory name (under the
 /// models base). `minutes setup` installs the int8 export here.
@@ -116,7 +116,7 @@ impl SherpaTranscriptionRange {
 }
 
 #[cfg(feature = "engine-sherpa")]
-fn build_recognizer(config: &Config) -> Result<TransducerRecognizer, String> {
+fn build_recognizer(config: &Config) -> Result<PluginRecognizer, String> {
     let dir = model_dir(config);
     if !model_files_present(&dir) {
         return Err(format!(
@@ -125,26 +125,13 @@ fn build_recognizer(config: &Config) -> Result<TransducerRecognizer, String> {
             dir.display()
         ));
     }
-    let path = |file: &str| dir.join(file).to_string_lossy().into_owned();
-    let cfg = TransducerConfig {
-        encoder: path("encoder.int8.onnx"),
-        decoder: path("decoder.int8.onnx"),
-        joiner: path("joiner.int8.onnx"),
-        tokens: path("tokens.txt"),
-        num_threads: 4,
-        decoding_method: "greedy_search".into(),
-        // Empty model_type -> sherpa auto-detects the NeMo parakeet-TDT loader.
-        // The default "transducer" forces the generic loader, which fails with
-        // "vocab_size does not exist in the metadata".
-        model_type: String::new(),
-        debug: false,
-        ..Default::default()
-    };
+    // The model layout and the parakeet-TDT loader quirks now live in the
+    // plugin, which is the only thing that links sherpa (#685).
     tracing::info!(
         model_dir = %dir.display(),
-        "loading sherpa-onnx transducer recognizer"
+        "loading sherpa-onnx transducer recognizer through the isolated plugin"
     );
-    TransducerRecognizer::new(cfg).map_err(|e| format!("failed to load sherpa model: {e}"))
+    PluginRecognizer::new(&dir, config)
 }
 
 #[cfg(feature = "engine-sherpa")]
@@ -446,6 +433,11 @@ fn transcription_ranges(samples: &[f32], config: &Config) -> Vec<SherpaTranscrip
 /// regions with padding, tiny-gap merge, and long-region splitting. If VAD is
 /// unavailable or fails, this falls back to the legacy 15 s fixed windows. If
 /// VAD runs successfully and finds no speech, this returns no segments.
+///
+/// This is the raw engine, with no whisper fallback: a missing plugin, an
+/// unloadable one, or a decode failure returns `Err`. Callers that must not
+/// lose a recording should go through `transcribe::transcribe_dispatch`, which
+/// answers with whisper whenever sherpa cannot.
 #[cfg(feature = "engine-sherpa")]
 pub fn transcribe_segments(samples: &[f32], config: &Config) -> Result<Vec<(u64, String)>, String> {
     let mut recognizer = build_recognizer(config)?;
@@ -453,7 +445,7 @@ pub fn transcribe_segments(samples: &[f32], config: &Config) -> Result<Vec<(u64,
     for range in transcription_ranges(samples, config) {
         let window = &samples[range.decode_start..range.decode_end];
         let start_ms = range.speech_start as u64 * 1000 / SAMPLE_RATE as u64;
-        let text = recognizer.transcribe(16_000, window).trim().to_string();
+        let text = recognizer.transcribe(16_000, window)?.trim().to_string();
         if !text.is_empty() {
             segments.push((start_ms, text));
         }

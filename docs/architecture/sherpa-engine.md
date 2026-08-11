@@ -15,28 +15,36 @@ falls back to Whisper (with a warning) so a recording never breaks.
 ## Quick Start (recommended)
 
 ```bash
-# Build with the sherpa engine, then download + enable the model in one step.
-# On macOS, engine-sherpa cannot coexist with the default `diarize` feature in
-# one binary (issue #683; the build refuses with a compile error), so drop the
-# defaults and re-add whisper:
-cargo build --release -p minutes-cli --no-default-features --features whisper,engine-sherpa,metal
+# Build the isolated sherpa plugin, then the CLI, then install the model.
+# The plugin is a separate dynamic library on purpose (see below); the CLI
+# dlopens it at runtime.
+(cd crates/sherpa-plugin && cargo build --release)
+cargo build --release -p minutes-cli --features engine-sherpa
 rm -f ~/.local/bin/minutes && cp target/release/minutes ~/.local/bin/minutes
+mkdir -p ~/.minutes/lib && cp crates/sherpa-plugin/target/release/libminutes_sherpa.dylib ~/.minutes/lib/
 
 minutes setup --sherpa     # downloads the int8 ONNX model + sets engine = "sherpa"
 ```
 
-> **macOS single-binary constraint (issue #683).** sherpa-onnx's static bundle
-> and pyannote's dependencies each vendor their own ONNX Runtime (1.17.1 vs
-> ort-sys 1.22.0) and their own kaldi-native-fbank. A Mach-O image keeps one
-> definition per symbol, so whichever copy wins the link serves both stacks:
-> measured on arm64, every resolution breaks either voice enrollment (ORT API
-> 17/22 mismatch, or SIGABRT in feature extraction) or sherpa itself (SIGABRT).
-> ONNX Runtime could be unified upward because its C API is backward
-> compatible, but kaldi-native-fbank has no ABI contract, and colliding mangled
-> names with divergent layouts are undefined behavior. `crates/core/src/lib.rs`
-> therefore refuses the combination at compile time until the sherpa stack is
-> isolated behind its own namespace. Linux and Windows are unaffected (dynamic
-> sherpa resolves against its own bundled libraries).
+> **Why sherpa is a plugin (issues #683, #685).** sherpa-onnx bundles its own
+> ONNX Runtime (1.17.1) and its own kaldi-native-fbank; pyannote, used for
+> diarization, brings ONNX Runtime 1.22.0 and a different kaldi-native-fbank
+> under the same archive names. One executable holds one definition per symbol,
+> so statically linking both breaks whichever consumer loses: voice enrollment
+> fails with an ORT API 17/22 mismatch, or aborts inside feature extraction, or
+> sherpa itself aborts. There is no link order that works.
+>
+> Loading sherpa from its own dynamic library removes the conflict instead of
+> arbitrating it. A Rust cdylib exports only its own `#[no_mangle]` surface, so
+> the embedded runtime stays internal and macOS two-level namespaces bind each
+> image's calls to its own copy. Verified on arm64: one binary enrolls a voice
+> through ORT 1.22 and transcribes through the plugin's ORT 1.17, in one
+> process.
+>
+> The plugin is found via `MINUTES_SHERPA_PLUGIN`, then beside the executable,
+> then in `~/.minutes/lib/`. If it is missing or reports a different ABI
+> version, transcription falls back to Whisper with a warning naming every path
+> tried, exactly like a missing model.
 
 > **Platform note.** On macOS, `engine-sherpa` links sherpa-onnx statically, so
 > the binary is self-contained and the copy above just works. On Linux and

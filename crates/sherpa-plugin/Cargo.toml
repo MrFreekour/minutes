@@ -1,0 +1,29 @@
+[package]
+name = "minutes-sherpa-plugin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Isolated sherpa-onnx transcription plugin for Minutes (issue #685)"
+
+[lib]
+name = "minutes_sherpa"
+crate-type = ["cdylib"]
+
+# Deliberately outside the workspace. This crate embeds the whole sherpa-onnx
+# stack, so building it downloads a large prebuilt bundle; making it a member
+# would put that on every `cargo clippy --all`. It also ships separately from
+# the binaries, which is the entire point of #685.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Static on macOS: sherpa-onnx AND its own ONNX Runtime live inside this
+# dylib, which is what keeps them away from the host's ort (issue #683).
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "static"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+
+[profile.release]
+opt-level = 2

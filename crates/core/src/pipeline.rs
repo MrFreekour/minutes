@@ -214,6 +214,8 @@ fn detect_engine_fallback_warning(config: &Config) -> Option<ProcessingWarning> 
         parakeet_capability(cfg!(feature = "parakeet")).unavailable_reason()
     } else if requested.eq_ignore_ascii_case("apple-speech") {
         apple_speech_unavailable_reason()
+    } else if requested.eq_ignore_ascii_case("sherpa") {
+        crate::transcribe::sherpa_unavailable_reason(config)
     } else {
         "it is unavailable in this build"
     };
@@ -8243,6 +8245,34 @@ mod tests {
         let mut config = Config::default();
         config.transcription.engine = "whisper".into();
         assert!(detect_engine_fallback_warning(&config).is_none());
+    }
+
+    #[test]
+    fn engine_fallback_warning_records_an_unavailable_sherpa_selection() {
+        // #685: sherpa now runs from a dlopened plugin, so selecting it does
+        // not mean it ran. Sherpa was missing from `effective_batch_engine`,
+        // which is what this detector compares against, so a desktop
+        // sherpa-to-whisper substitution left no trace anywhere: the CLI-only
+        // tracing warning is dropped by the desktop app, and the transcript
+        // said nothing. Silent engine substitution is the exact complaint
+        // behind #633.
+        //
+        // No plugin is installed in a test process, so the unavailable path is
+        // what runs here regardless of build features.
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+        let warning = detect_engine_fallback_warning(&config)
+            .expect("an unavailable sherpa selection must be recorded");
+        assert_eq!(warning.step, "transcribe");
+        assert_eq!(warning.reason, "engine_fallback");
+        let message = warning.message.as_ref().unwrap();
+        assert!(message.contains("`sherpa`"), "names the request: {message}");
+        assert!(message.contains("`whisper`"), "names the actual: {message}");
+        // And says WHY, so the reader can act on it rather than guess.
+        assert!(
+            message.contains("build") || message.contains("model") || message.contains("plugin"),
+            "gives an actionable reason: {message}"
+        );
     }
 
     #[test]
