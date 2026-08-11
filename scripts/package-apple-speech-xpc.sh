@@ -66,9 +66,16 @@ else
 fi
 codesign --verify --strict --verbose=4 "$XPC_BUNDLE"
 
+# Capture the full report first, then parse it. Piping `codesign` straight
+# into an awk that exits at the CDHash line closes the pipe while codesign is
+# still writing the authority/timestamp chain, killing it with SIGPIPE; under
+# `set -o pipefail` that aborts the whole build with exit 141. Ad-hoc signing
+# emits few enough lines to finish first, so this only ever broke real signed
+# builds. The parser also reads to EOF rather than exiting early.
+worker_signing_report="$(codesign -dvvv "$XPC_EXECUTABLE" 2>&1)"
 worker_cdhash="$(
-  codesign -dvvv "$XPC_EXECUTABLE" 2>&1 |
-    awk -F= '/^CDHash=/{print tolower($2); exit}'
+  printf '%s\n' "$worker_signing_report" |
+    awk -F= '/^CDHash=/ && cdhash == "" { cdhash = tolower($2) } END { print cdhash }'
 )"
 if [[ ! "$worker_cdhash" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Signed Apple Speech XPC worker lacked one exact CodeDirectory hash." >&2
