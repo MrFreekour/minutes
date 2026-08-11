@@ -690,8 +690,9 @@ fn inline_text(inlines: &[anydoc::model::Inline]) -> String {
 }
 
 /// Raster coverage, rather than any individual image's shape, identifies a
-/// picture of a page. A 32x32 grid makes unions of strips, tiles, overlaps, and
-/// cropped scans bounded and deterministic.
+/// picture of a page. A 32x32 grid over the visible page box makes unions of
+/// strips, tiles, overlaps, cropped scans, and rectangular clips bounded and
+/// deterministic.
 const PDF_COVERAGE_GRID_SIDE: usize = 32;
 const PDF_COVERAGE_GRID_CELLS: usize = PDF_COVERAGE_GRID_SIDE * PDF_COVERAGE_GRID_SIDE;
 const PDF_SCAN_MIN_COVERED_CELLS: usize = PDF_COVERAGE_GRID_CELLS / 2;
@@ -746,6 +747,18 @@ impl PdfRect {
 
     fn height(self) -> f64 {
         self.y_max - self.y_min
+    }
+
+    fn intersection(self, other: Self) -> Result<Self, ()> {
+        let intersection = Self {
+            x_min: self.x_min.max(other.x_min),
+            y_min: self.y_min.max(other.y_min),
+            x_max: self.x_max.min(other.x_max),
+            y_max: self.y_max.min(other.y_max),
+        };
+        (intersection.x_max > intersection.x_min && intersection.y_max > intersection.y_min)
+            .then_some(intersection)
+            .ok_or(())
     }
 }
 
@@ -872,6 +885,53 @@ struct PdfCoverage {
     contributing_pixels: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PdfCellMask {
+    cells: [bool; PDF_COVERAGE_GRID_CELLS],
+}
+
+impl PdfCellMask {
+    fn empty() -> Self {
+        Self {
+            cells: [false; PDF_COVERAGE_GRID_CELLS],
+        }
+    }
+
+    fn full() -> Self {
+        Self {
+            cells: [true; PDF_COVERAGE_GRID_CELLS],
+        }
+    }
+
+    fn mark_rect(&mut self, page: PdfRect, rect: PdfRect) {
+        for row in 0..PDF_COVERAGE_GRID_SIDE {
+            let cell_y_min =
+                page.y_min + page.height() * (row as f64) / (PDF_COVERAGE_GRID_SIDE as f64);
+            let cell_y_max =
+                page.y_min + page.height() * ((row + 1) as f64) / (PDF_COVERAGE_GRID_SIDE as f64);
+            for column in 0..PDF_COVERAGE_GRID_SIDE {
+                let cell_x_min =
+                    page.x_min + page.width() * (column as f64) / (PDF_COVERAGE_GRID_SIDE as f64);
+                let cell_x_max = page.x_min
+                    + page.width() * ((column + 1) as f64) / (PDF_COVERAGE_GRID_SIDE as f64);
+                if rect.x_max > cell_x_min
+                    && rect.x_min < cell_x_max
+                    && rect.y_max > cell_y_min
+                    && rect.y_min < cell_y_max
+                {
+                    self.cells[row * PDF_COVERAGE_GRID_SIDE + column] = true;
+                }
+            }
+        }
+    }
+
+    fn intersect(&mut self, other: &Self) {
+        for (cell, other_cell) in self.cells.iter_mut().zip(&other.cells) {
+            *cell &= *other_cell;
+        }
+    }
+}
+
 impl PdfCoverage {
     fn new(page: PdfRect) -> Self {
         Self {
@@ -881,7 +941,13 @@ impl PdfCoverage {
         }
     }
 
-    fn mark_image(&mut self, width: i64, height: i64, ctm: PdfMatrix) -> Result<(), ()> {
+    fn mark_image(
+        &mut self,
+        width: i64,
+        height: i64,
+        ctm: PdfMatrix,
+        clip: &PdfCellMask,
+    ) -> Result<(), ()> {
         let width = u64::try_from(width).map_err(|_| ())?;
         let height = u64::try_from(height).map_err(|_| ())?;
         if width == 0 || height == 0 {
@@ -900,12 +966,14 @@ impl PdfCoverage {
                     + self.page.width() * (column as f64) / (PDF_COVERAGE_GRID_SIDE as f64);
                 let cell_x_max = self.page.x_min
                     + self.page.width() * ((column + 1) as f64) / (PDF_COVERAGE_GRID_SIDE as f64);
-                if image.x_max > cell_x_min
+                let cell_index = row * PDF_COVERAGE_GRID_SIDE + column;
+                if clip.cells[cell_index]
+                    && image.x_max > cell_x_min
                     && image.x_min < cell_x_max
                     && image.y_max > cell_y_min
                     && image.y_min < cell_y_max
                 {
-                    self.covered[row * PDF_COVERAGE_GRID_SIDE + column] = true;
+                    self.covered[cell_index] = true;
                     contributes = true;
                 }
             }
@@ -926,17 +994,74 @@ impl PdfCoverage {
 }
 
 #[derive(Debug)]
+struct PdfCurrentPath {
+    cells: PdfCellMask,
+    supported_rectangles_only: bool,
+    clip_pending: bool,
+}
+
+impl PdfCurrentPath {
+    fn new() -> Self {
+        Self {
+            cells: PdfCellMask::empty(),
+            supported_rectangles_only: true,
+            clip_pending: false,
+        }
+    }
+
+    fn add_rectangle(&mut self, page: PdfRect, rect: PdfRect) {
+        self.cells.mark_rect(page, rect);
+    }
+
+    fn mark_unsupported_geometry(&mut self) {
+        self.supported_rectangles_only = false;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PdfSavedGraphicsState {
+    ctm: PdfMatrix,
+    clip: PdfCellMask,
+}
+
+#[derive(Debug)]
 struct PdfGraphicsState {
     ctm: PdfMatrix,
-    stack: Vec<PdfMatrix>,
+    clip: PdfCellMask,
+    path: PdfCurrentPath,
+    stack: Vec<PdfSavedGraphicsState>,
 }
 
 impl PdfGraphicsState {
     fn new(ctm: PdfMatrix) -> Self {
+        Self::new_with_clip(ctm, PdfCellMask::full())
+    }
+
+    fn new_with_clip(ctm: PdfMatrix, clip: PdfCellMask) -> Self {
         Self {
             ctm,
+            clip,
+            path: PdfCurrentPath::new(),
             stack: Vec::new(),
         }
+    }
+
+    fn apply_pending_clip(&mut self) {
+        if self.path.clip_pending && self.path.supported_rectangles_only {
+            self.clip.intersect(&self.path.cells);
+        }
+        // Unsupported path geometry is deliberately not used to narrow the
+        // clip. That can conservatively withhold a quote, but it cannot hide a
+        // visible page scan and turn OCR into an exact quotation.
+        self.path.clear();
+    }
+
+    fn is_balanced(&self) -> bool {
+        self.stack.is_empty() && !self.path.clip_pending
     }
 }
 
@@ -971,7 +1096,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         if let Ok(contents) = page.get(b"Contents") {
             self.process_content_object(contents, resources, &mut state, 0)?;
         }
-        if !state.stack.is_empty() {
+        if !state.is_balanced() {
             return Err(());
         }
         if let Ok(annotations) = page.get(b"Annots") {
@@ -1040,35 +1165,113 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
                         if !operation.operands.is_empty() {
                             return Err(());
                         }
-                        state.stack.push(state.ctm);
+                        state.stack.push(PdfSavedGraphicsState {
+                            ctm: state.ctm,
+                            clip: state.clip.clone(),
+                        });
                     }
                     "Q" => {
                         if !operation.operands.is_empty() {
                             return Err(());
                         }
-                        state.ctm = state.stack.pop().ok_or(())?;
+                        let saved = state.stack.pop().ok_or(())?;
+                        state.ctm = saved.ctm;
+                        state.clip = saved.clip;
                     }
                     "cm" => {
                         let matrix = PdfMatrix::from_objects(self.doc, &operation.operands)?;
                         state.ctm = state.ctm.concat(matrix);
                     }
-                    "Do" => {
-                        self.process_xobject(&operation.operands, resources, state.ctm, depth + 1)?
+                    "re" => {
+                        let [x, y, width, height] = operation.operands.as_slice() else {
+                            return Err(());
+                        };
+                        let x = resolved_number(self.doc, x)?;
+                        let y = resolved_number(self.doc, y)?;
+                        let width = resolved_number(self.doc, width)?;
+                        let height = resolved_number(self.doc, height)?;
+                        let rect = state.ctm.transform_rect(PdfRect {
+                            x_min: x.min(x + width),
+                            y_min: y.min(y + height),
+                            x_max: x.max(x + width),
+                            y_max: y.max(y + height),
+                        })?;
+                        state.path.add_rectangle(self.coverage.page, rect);
                     }
-                    "BI" => self.process_inline_image(&operation.operands, state.ctm)?,
+                    "m" | "l" => {
+                        if operation.operands.len() != 2 {
+                            return Err(());
+                        }
+                        for operand in &operation.operands {
+                            resolved_number(self.doc, operand)?;
+                        }
+                        state.path.mark_unsupported_geometry();
+                    }
+                    "c" => {
+                        if operation.operands.len() != 6 {
+                            return Err(());
+                        }
+                        for operand in &operation.operands {
+                            resolved_number(self.doc, operand)?;
+                        }
+                        state.path.mark_unsupported_geometry();
+                    }
+                    "v" | "y" => {
+                        if operation.operands.len() != 4 {
+                            return Err(());
+                        }
+                        for operand in &operation.operands {
+                            resolved_number(self.doc, operand)?;
+                        }
+                        state.path.mark_unsupported_geometry();
+                    }
+                    "h" => {
+                        if !operation.operands.is_empty() {
+                            return Err(());
+                        }
+                        state.path.mark_unsupported_geometry();
+                    }
+                    "W" | "W*" => {
+                        if !operation.operands.is_empty() {
+                            return Err(());
+                        }
+                        state.path.clip_pending = true;
+                    }
+                    "n" | "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => {
+                        if !operation.operands.is_empty() {
+                            return Err(());
+                        }
+                        state.apply_pending_clip();
+                    }
+                    "Do" => self.process_xobject(
+                        &operation.operands,
+                        resources,
+                        state.ctm,
+                        &state.clip,
+                        depth + 1,
+                    )?,
+                    "BI" => {
+                        self.process_inline_image(&operation.operands, state.ctm, &state.clip)?
+                    }
                     "gs" => self.process_extgstate(
                         &operation.operands,
                         resources,
                         state.ctm,
+                        &state.clip,
                         depth + 1,
                     )?,
-                    "scn" | "SCN" => {
-                        self.process_pattern(&operation.operands, resources, state.ctm, depth + 1)?
-                    }
+                    "scn" | "SCN" => self.process_pattern(
+                        &operation.operands,
+                        resources,
+                        state.ctm,
+                        &state.clip,
+                        depth + 1,
+                    )?,
                     "Tf" => self.process_type3_font(
                         &operation.operands,
                         resources,
                         state.ctm,
+                        &state.clip,
                         depth + 1,
                     )?,
                     _ => {}
@@ -1087,6 +1290,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         operands: &[lopdf::Object],
         resources: Option<&'doc lopdf::Dictionary>,
         ctm: PdfMatrix,
+        clip: &PdfCellMask,
         depth: usize,
     ) -> Result<(), ()> {
         let [name] = operands else {
@@ -1096,18 +1300,19 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         let object = resource_entry(self.doc, resources, b"XObject", name)?;
         let (object_id, stream) = resolved_stream(self.doc, object)?;
         if stream_is_image_xobject(self.doc, stream)? {
-            return self.mark_image_dictionary(&stream.dict, b"Width", b"Height", ctm);
+            return self.mark_image_dictionary(&stream.dict, b"Width", b"Height", ctm, clip);
         }
         if !stream_is_form_xobject(self.doc, stream)? {
             return Err(());
         }
-        self.process_form(object_id, stream, resources, ctm, depth)
+        self.process_form(object_id, stream, resources, ctm, clip, depth)
     }
 
     fn process_inline_image(
         &mut self,
         operands: &[lopdf::Object],
         ctm: PdfMatrix,
+        clip: &PdfCellMask,
     ) -> Result<(), ()> {
         let [lopdf::Object::Stream(image)] = operands else {
             return Err(());
@@ -1122,7 +1327,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         } else {
             b"Height".as_slice()
         };
-        self.mark_image_dictionary(&image.dict, width_key, height_key, ctm)
+        self.mark_image_dictionary(&image.dict, width_key, height_key, ctm, clip)
     }
 
     fn mark_image_dictionary(
@@ -1131,6 +1336,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         width_key: &[u8],
         height_key: &[u8],
         ctm: PdfMatrix,
+        clip: &PdfCellMask,
     ) -> Result<(), ()> {
         let width = resolved_dict_value(self.doc, dictionary, width_key)?
             .as_i64()
@@ -1138,7 +1344,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         let height = resolved_dict_value(self.doc, dictionary, height_key)?
             .as_i64()
             .map_err(|_| ())?;
-        self.coverage.mark_image(width, height, ctm)
+        self.coverage.mark_image(width, height, ctm, clip)
     }
 
     fn process_form(
@@ -1147,14 +1353,21 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         stream: &'doc lopdf::Stream,
         parent_resources: Option<&'doc lopdf::Dictionary>,
         ctm: PdfMatrix,
+        parent_clip: &PdfCellMask,
         depth: usize,
     ) -> Result<(), ()> {
         let matrix = optional_matrix(self.doc, &stream.dict, b"Matrix")?;
+        let bbox = PdfRect::from_object(self.doc, stream.dict.get(b"BBox").map_err(|_| ())?)?;
         let resources =
             optional_dictionary(self.doc, &stream.dict, b"Resources")?.or(parent_resources);
-        let mut state = PdfGraphicsState::new(ctm.concat(matrix));
+        let form_ctm = ctm.concat(matrix);
+        let mut clip = parent_clip.clone();
+        let mut bbox_mask = PdfCellMask::empty();
+        bbox_mask.mark_rect(self.coverage.page, form_ctm.transform_rect(bbox)?);
+        clip.intersect(&bbox_mask);
+        let mut state = PdfGraphicsState::new_with_clip(form_ctm, clip);
         self.process_stream(object_id, stream, resources, &mut state, depth)?;
-        state.stack.is_empty().then_some(()).ok_or(())
+        state.is_balanced().then_some(()).ok_or(())
     }
 
     fn process_extgstate(
@@ -1162,6 +1375,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         operands: &[lopdf::Object],
         resources: Option<&'doc lopdf::Dictionary>,
         ctm: PdfMatrix,
+        clip: &PdfCellMask,
         depth: usize,
     ) -> Result<(), ()> {
         let [name] = operands else {
@@ -1183,7 +1397,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         if !stream_is_form_xobject(self.doc, stream)? {
             return Err(());
         }
-        self.process_form(object_id, stream, resources, ctm, depth)
+        self.process_form(object_id, stream, resources, ctm, clip, depth)
     }
 
     fn process_pattern(
@@ -1191,6 +1405,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         operands: &[lopdf::Object],
         resources: Option<&'doc lopdf::Dictionary>,
         ctm: PdfMatrix,
+        clip: &PdfCellMask,
         depth: usize,
     ) -> Result<(), ()> {
         let Some(name) = operands
@@ -1208,9 +1423,9 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         let matrix = optional_matrix(self.doc, &stream.dict, b"Matrix")?;
         let pattern_resources =
             optional_dictionary(self.doc, &stream.dict, b"Resources")?.or(resources);
-        let mut state = PdfGraphicsState::new(ctm.concat(matrix));
+        let mut state = PdfGraphicsState::new_with_clip(ctm.concat(matrix), clip.clone());
         self.process_stream(object_id, stream, pattern_resources, &mut state, depth)?;
-        state.stack.is_empty().then_some(()).ok_or(())
+        state.is_balanced().then_some(()).ok_or(())
     }
 
     fn process_type3_font(
@@ -1218,6 +1433,7 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         operands: &[lopdf::Object],
         resources: Option<&'doc lopdf::Dictionary>,
         ctm: PdfMatrix,
+        clip: &PdfCellMask,
         depth: usize,
     ) -> Result<(), ()> {
         let [name, _size] = operands else {
@@ -1236,9 +1452,9 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         let font_resources = optional_dictionary(self.doc, font, b"Resources")?.or(resources);
         for (_, char_proc) in char_procs.iter() {
             let (object_id, stream) = resolved_stream(self.doc, char_proc)?;
-            let mut state = PdfGraphicsState::new(ctm.concat(font_matrix));
+            let mut state = PdfGraphicsState::new_with_clip(ctm.concat(font_matrix), clip.clone());
             self.process_stream(object_id, stream, font_resources, &mut state, depth)?;
-            if !state.stack.is_empty() {
+            if !state.is_balanced() {
                 return Err(());
             }
         }
@@ -1340,9 +1556,11 @@ impl<'doc, 'budget> PdfPageAnalyzer<'doc, 'budget> {
         };
         let resources =
             optional_dictionary(self.doc, &stream.dict, b"Resources")?.or(page_resources);
-        let mut state = PdfGraphicsState::new(fit.concat(matrix));
+        let mut clip = PdfCellMask::empty();
+        clip.mark_rect(self.coverage.page, annotation_rect);
+        let mut state = PdfGraphicsState::new_with_clip(fit.concat(matrix), clip);
         self.process_stream(object_id, stream, resources, &mut state, depth)?;
-        state.stack.is_empty().then_some(()).ok_or(())
+        state.is_balanced().then_some(()).ok_or(())
     }
 }
 
@@ -1400,7 +1618,14 @@ fn pdf_page_scan_verdict_with_budget(
         let page_verdict = (|| {
             let media_box = inherited_page_value(doc, *page_id, b"MediaBox")?.ok_or(())?;
             let media_box = PdfRect::from_object(doc, media_box)?;
-            PdfPageAnalyzer::new(doc, &mut budget, media_box).analyze_page(*page_id)
+            let visible_box = match inherited_page_value(doc, *page_id, b"CropBox")? {
+                Some(crop_box) => {
+                    let crop_box = PdfRect::from_object(doc, crop_box)?;
+                    media_box.intersection(crop_box)?
+                }
+                None => media_box,
+            };
+            PdfPageAnalyzer::new(doc, &mut budget, visible_box).analyze_page(*page_id)
         })();
         match page_verdict {
             Ok(true) => {
@@ -2787,6 +3012,61 @@ mod tests {
         assemble_pdf(&objects)
     }
 
+    fn synthetic_raster_pdf_with_page_boxes(
+        pages_boxes: &str,
+        page_boxes: &str,
+        draw: &str,
+    ) -> Vec<u8> {
+        let stream = format!("BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET {draw}");
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {pages_boxes} >>").into_bytes(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R {page_boxes} /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>"
+            )
+            .into_bytes(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            pdf_stream("", stream.into_bytes()),
+            grayscale_image_xobject(1000, 1300),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    fn synthetic_form_with_small_bbox_pdf() -> Vec<u8> {
+        let page_stream = b"BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET /Fm1 Do";
+        let form_stream = b"q 612 0 0 792 0 0 cm /Im1 Do Q";
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            pdf_stream("", page_stream.to_vec()),
+            pdf_stream(
+                "/Type /XObject /Subtype /Form /BBox [72 72 144 144] /Resources << /XObject << /Im1 7 0 R >> >>",
+                form_stream.to_vec(),
+            ),
+            grayscale_image_xobject(1000, 1300),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    fn synthetic_split_stream_clip_pdf() -> Vec<u8> {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 7 0 R >> >> /Contents [5 0 R 6 0 R] >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            pdf_stream(
+                "",
+                b"BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET 72 72 72 72 re W n"
+                    .to_vec(),
+            ),
+            pdf_stream("", b"612 0 0 792 0 0 cm /Im1 Do".to_vec()),
+            grayscale_image_xobject(1000, 1300),
+        ];
+        assemble_pdf(&objects)
+    }
+
     fn synthetic_four_strip_scan_pdf() -> Vec<u8> {
         let stream = b"BT /F1 12 Tf 72 720 Td (Readable page text.) Tj ET \
             q 612 0 0 198 0 0 cm /Im1 Do Q \
@@ -3339,6 +3619,102 @@ mod tests {
         assert_eq!(pdf_has_page_scan_image_with_budget(&parsed, 128), Ok(false));
         let document =
             convert_bytes(SourceFormat::Pdf, &bytes).expect("convert letterhead-banner PDF");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+        assert!(document.machine_read_anchors.is_empty());
+    }
+
+    #[test]
+    fn an_inherited_crop_box_defines_the_visible_page_coverage() {
+        // Fails if coverage is again normalized to an oversized MediaBox instead of the inherited
+        // CropBox that a renderer exposes to the reader.
+        let bytes = synthetic_raster_pdf_with_page_boxes(
+            "/MediaBox [0 0 2000 2000] /CropBox [0 0 612 792]",
+            "",
+            "q 612 0 0 792 0 0 cm /Im1 Do Q",
+        );
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert cropped-page PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+        assert_eq!(
+            document.machine_read_anchors,
+            BTreeSet::from(["page:0001".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_crop_box_is_clipped_to_the_media_box() {
+        // Fails if off-media CropBox area dilutes coverage or if the visible intersection is not
+        // the page rectangle used by the coverage grid.
+        let bytes = synthetic_raster_pdf_with_page_boxes(
+            "",
+            "/MediaBox [0 0 612 792] /CropBox [-100 -100 612 792]",
+            "q 612 0 0 792 0 0 cm /Im1 Do Q",
+        );
+        let document =
+            convert_bytes(SourceFormat::Pdf, &bytes).expect("convert intersected-box PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_page_sized_image_clipped_to_a_small_seal_does_not_demote_the_page() {
+        // Fails if `re W n` stops narrowing the image's credited coverage to the visible seal.
+        for clip_operator in ["W", "W*"] {
+            let draw = format!("q 72 72 72 72 re {clip_operator} n 612 0 0 792 0 0 cm /Im1 Do Q");
+            let bytes = synthetic_raster_pdf_with_draw(1000, 1300, &draw);
+            let document =
+                convert_bytes(SourceFormat::Pdf, &bytes).expect("convert clipped-seal PDF");
+            assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+            assert!(document.machine_read_anchors.is_empty());
+        }
+    }
+
+    #[test]
+    fn clipping_state_carries_across_a_page_content_stream_array() {
+        // Fails if independently decoded page streams accidentally reset the PDF graphics state.
+        // PDF treats a Contents array as one concatenated stream, so the first stream's clip must
+        // still constrain the image drawn by the second stream.
+        let bytes = synthetic_split_stream_clip_pdf();
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert split-stream PDF");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+        assert!(document.machine_read_anchors.is_empty());
+    }
+
+    #[test]
+    fn restoring_graphics_state_restores_the_pre_clip_region() {
+        // Fails if a clip established inside q/Q leaks out and hides a later visible page scan.
+        let draw = "q 72 72 72 72 re W n 612 0 0 792 0 0 cm /Im1 Do Q \
+                    q 612 0 0 792 0 0 cm /Im1 Do Q";
+        let bytes = synthetic_raster_pdf_with_draw(1000, 1300, draw);
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert restored-clip PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn an_unsupported_complex_clip_cannot_hide_a_visible_scan() {
+        // Fails if unsupported path geometry is allowed to narrow coverage and create an OCR
+        // false negative. The conservative result may withhold a quote but cannot manufacture it.
+        let draw = "q 0 0 m 72 0 l 72 72 l 0 72 l h W n \
+                    612 0 0 792 0 0 cm /Im1 Do Q";
+        let bytes = synthetic_raster_pdf_with_draw(1000, 1300, draw);
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert complex-clip PDF");
+        assert_eq!(document.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_dangling_clip_operator_fails_the_page_closed() {
+        // Fails if a malformed clipping operation can be ignored and leave readable OCR eligible
+        // for quotation instead of producing an unknown, machine-read page verdict.
+        let bytes =
+            synthetic_raster_pdf_with_page_boxes("", "/MediaBox [0 0 612 792]", "72 72 72 72 re W");
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load dangling-clip PDF");
+        assert_eq!(pdf_has_page_scan_image(&document), Err(()));
+        assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn a_form_bbox_clips_image_coverage() {
+        // Fails if a Form XObject's mandatory BBox stops acting as its implicit clipping path.
+        let bytes = synthetic_form_with_small_bbox_pdf();
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert clipped-Form PDF");
         assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
         assert!(document.machine_read_anchors.is_empty());
     }

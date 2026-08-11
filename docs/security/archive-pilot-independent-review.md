@@ -158,17 +158,29 @@ ordinary rename defeated it; inspection and identity capture now happen
 together, but closing the inode-reuse gap would require holding an open
 directory capability across the build, which is a separate design.
 
-**A PDF containing a page scan is not quotable at all.** A scan means a raster
-that is at least 1,000 pixels wide and at least 1,000 pixels tall, whether it is
-an image object or an inline image in any PDF stream. Signatures, logos, stamps,
-and headshots that are large in only one direction do not meet that rule. The
-converter enumerates the whole object table and every stream instead of trying
-to follow every possible resource path; if it finds one scan, every provision
-in that PDF is shown only as a machine reading and must be checked against the
-source. A born-digital page-sized chart, figure, letterhead, or watermark can
-therefore make the whole PDF unquotable. This conservative document-wide rule
-is the price of provenance that does not depend on incomplete path traversal or
-analysing the rendered page.
+**A PDF page whose visible area is mostly raster imagery is not quotable.** The
+converter walks each page's bounded content graph and tracks image placement on
+a 32 by 32 coverage grid. The grid uses the inherited CropBox intersected with
+the MediaBox, matching the part a reader can actually see. A page is treated as
+machine-read when raster draws cover at least half that visible grid and the
+contributing images contain at least 250,000 source pixels. This catches one
+page image, strips, tiles, cropped scans, inline images, and images reached
+through Forms without decoding their pixel data.
+
+Rectangular clipping paths and Form bounding boxes narrow credited coverage;
+graphics-state save and restore carries both transforms and clipping. More
+complex path geometry is intentionally conservative: it is not allowed to
+reduce credited image coverage. That can withhold quotations from a page whose
+large image is clipped by a curve or text outline, but it cannot hide a visible
+scan and present OCR as the author's exact words.
+
+The verdict is page-local. Provisions on a machine-read page are shown only as
+a machine reading and must be checked against the source; independently typed
+pages in the same PDF remain eligible for exact quotations. A born-digital
+chart or photograph covering most of one page can therefore cost that page's
+quotability, but does not demote the rest of the document. Signatures, logos,
+stamps, and letterhead that occupy only a small visible region do not meet the
+coverage rule.
 
 ## Stop-ship criteria
 
