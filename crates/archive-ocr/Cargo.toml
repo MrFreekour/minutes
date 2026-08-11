@@ -10,6 +10,7 @@ name = "minutes-archive-ocr-worker"
 path = "src/main.rs"
 
 [dependencies]
+minutes-archive-worker-control = { path = "../archive-worker-control" }
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true

@@ -321,6 +321,10 @@ fn main() {
         .then(|| BoundedTranscriber::bind(Path::new(&worker_path)).ok())
         .flatten();
 
+    let excluded_identity = minutes_archive_core::portable_identity_for(
+        &fs::metadata(root.join("attachments")).expect("excluded folder metadata"),
+    )
+    .expect("excluded folder identity");
     let approved = approve_roots(&[root]).expect("approve root");
     let started = Instant::now();
     let vault = build_authorized_document_vault(
@@ -330,6 +334,7 @@ fn main() {
             excluded_paths: vec![ExcludedFolder {
                 root_index: 0,
                 relative_path: PathBuf::from("attachments"),
+                identity: excluded_identity,
             }],
             ..DocumentVaultLimits::default()
         },

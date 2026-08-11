@@ -85,6 +85,7 @@ const vaultReport = {
   docx_documents: 1,
   duplicate_files_skipped: 0,
   transcribed_documents: 4,
+  mixed_provenance_documents: 2,
   budget_reached: true,
   documents_left_unread: 5000,
   directories_left_unread: 3,
@@ -102,6 +103,7 @@ const vaultReport = {
   converter_sandbox_verified: true,
   semantic_worker_sandbox_verified: true,
   excluded_directories: 2,
+  excluded_folder_changes: 1,
   semantic_retrieval_enabled: true,
   // The worker died partway through this build. Partial suggestion coverage
   // must be stated, not inferred from a smaller vector count.
@@ -114,7 +116,7 @@ const vaultReport = {
     model_download_requested: false,
   },
   semantic_provisions_indexed: 4,
-  semantic_provisions_skipped: 0,
+  semantic_provisions_skipped: 7,
   semantic_derivatives_persisted: false,
   semantic_model_download_requested: false,
   supported_formats: [".docx", ".md", ".pdf", ".text", ".txt"],
@@ -149,7 +151,28 @@ const evidence = {
       index_fresh: true,
     },
   ],
-  documents: [],
+  documents: [
+    {
+      document_title: "Capped Evidence Agreement",
+      matched_concepts: ["confidentiality", "assignment"],
+      criterion_evidence: [
+        {
+          document_id: "document-0000000000000004",
+          document_title: "Capped Evidence Agreement",
+          provision_heading: "65. ASSIGNMENT",
+          source_anchor: "section:0065",
+          exact_excerpt: "Neither party may assign this Agreement without consent.",
+          sentence_count: 1,
+          source_converter: "utf8-text-v1",
+          why_matched: "Matched assignment in the same provision; 1 sentence.",
+          index_fresh: true,
+        },
+      ],
+      criterion_evidence_truncated: true,
+      why_matched: "Matched confidentiality, assignment across 64 provisions in this document.",
+      index_fresh: true,
+    },
+  ],
   semantic_suggestions: [
     {
       vault_id: "local-private-vault",
@@ -398,11 +421,20 @@ try {
         const body = document.body.innerText;
         if (
           !body.includes("Synthetic Agreement") ||
-          !body.includes("Checked against the file") ||
+          !body.includes("Checked for this search") ||
+          !body.includes("when this search ran") ||
           !body.toLowerCase().includes("not exact matches") ||
           !body.includes("Closing this window forgets everything")
         ) {
           throw new Error("Evidence provenance or session-disposal notice did not render");
+        }
+        const documentWarning = document.querySelector(".document-evidence-warning");
+        if (
+          !documentWarning ||
+          !documentWarning.textContent.includes("Some matching passages are not shown") ||
+          !documentWarning.textContent.includes("may be supported by a passage")
+        ) {
+          throw new Error("A cut document card did not disclose its missing passages");
         }
         // A transcription must render as its own thing: never inside an
         // exact-excerpt element, and always carrying its confidence.
@@ -447,19 +479,22 @@ try {
         }
 
         const vaultSummary = document.querySelector("#vault-summary").textContent;
+        // Fails if the UI again implies that any provision in a scan-bearing PDF is quotable.
         if (
           !vaultSummary.includes("aliases or shortcuts (2)") ||
           !vaultSummary.includes("have a second name elsewhere on the disk (3)") ||
           !vaultSummary.includes("9,023 items could not be read") ||
-          !vaultSummary.includes("4 scanned pages read by the text reader") ||
+          !vaultSummary.includes("4 documents contain text read from scans") ||
+          !vaultSummary.includes("an imported PDF containing any page scan is not quotable at all") ||
           !vaultSummary.includes("This index is PARTIAL") ||
           !vaultSummary.includes("5,000 documents were not read") ||
           !vaultSummary.includes("3 folders were too deep to enter") ||
           !vaultSummary.includes("blocked by macOS permissions (9,000)") ||
           !vaultSummary.includes("scans the text reader could not make out (12)") ||
           !vaultSummary.includes("changed while being read (2)") ||
-          !vaultSummary.includes("suggestion model stopped partway") ||
-          !vaultSummary.includes("2 folders were skipped at your request")
+          !vaultSummary.includes("7 passages were not prepared for suggestions") ||
+          !vaultSummary.includes("2 folders were skipped at your request") ||
+          !vaultSummary.includes("1 skipped folder was moved or replaced")
         ) {
           throw new Error("Skipped links are not disclosed: " + vaultSummary);
         }

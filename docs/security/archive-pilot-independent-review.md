@@ -138,6 +138,50 @@ The "Evidence fidelity" row above is exact about excerpts, revisions, and
 anchors -- the excerpt is genuinely the source text at the cited anchor -- but
 provision *extent* in a structureless PDF is inferred.
 
+**Reveal is a check-then-open race.** `source_path_for_reveal` re-verifies the
+source revision and then hands a path to `/usr/bin/open -R`. A process that
+rewrites the file between that check and Finder resolving the path can make
+Finder show a document that no longer matches the quotation. The race requires
+a process actively changing the owner's own filesystem, and it affects only
+what Finder displays: the quoted text was checked against the source bytes at
+response time. Rechecking immediately before reveal was tried and retained;
+it cannot make Finder consume the already-verified file handle because Finder's
+reveal interface accepts a path.
+
+**Folder exclusions can be defeated by inode reuse.** A skipped folder is
+bound to its device and inode. If it is deleted and the filesystem is forced to
+reuse that inode for a new folder at the same relative path, the skip applies
+to the wrong folder without a separate warning. This requires deliberate local
+manipulation of the owner's own filesystem between choosing the skip and
+building the vault. Path-only binding was tried and rejected because an
+ordinary rename defeated it; inspection and identity capture now happen
+together, but closing the inode-reuse gap would require holding an open
+directory capability across the build, which is a separate design.
+
+**A PDF page whose visible area is mostly raster imagery is not quotable.** The
+converter walks each page's bounded content graph and tracks image placement on
+a 32 by 32 coverage grid. The grid uses the inherited CropBox intersected with
+the MediaBox, matching the part a reader can actually see. A page is treated as
+machine-read when raster draws cover at least half that visible grid and the
+contributing images contain at least 250,000 source pixels. This catches one
+page image, strips, tiles, cropped scans, inline images, and images reached
+through Forms without decoding their pixel data.
+
+Rectangular clipping paths and Form bounding boxes narrow credited coverage;
+graphics-state save and restore carries both transforms and clipping. More
+complex path geometry is intentionally conservative: it is not allowed to
+reduce credited image coverage. That can withhold quotations from a page whose
+large image is clipped by a curve or text outline, but it cannot hide a visible
+scan and present OCR as the author's exact words.
+
+The verdict is page-local. Provisions on a machine-read page are shown only as
+a machine reading and must be checked against the source; independently typed
+pages in the same PDF remain eligible for exact quotations. A born-digital
+chart or photograph covering most of one page can therefore cost that page's
+quotability, but does not demote the rest of the document. Signatures, logos,
+stamps, and letterhead that occupy only a small visible region do not meet the
+coverage rule.
+
 ## Stop-ship criteria
 
 The pilot must not be delivered if the reviewer finds any unresolved issue

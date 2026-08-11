@@ -337,8 +337,11 @@ pub fn validate_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, CensusError> {
         .collect())
 }
 
+/// Stable filesystem identity used to bind an approved choice to the same
+/// file or directory after a rename. Its components stay private so callers
+/// can compare identities but cannot invent one from a pathname.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileIdentity {
+pub struct FileIdentity {
     first: u64,
     second: u64,
 }
@@ -925,7 +928,7 @@ pub(crate) fn open_approved_root(root: &ApprovedRoot) -> Result<Dir, CensusError
 /// because Finder needs a real path; the identity check is the same one the
 /// evidence fence uses, so a file swapped since indexing is refused.
 #[cfg(unix)]
-pub(crate) fn portable_identity_for(metadata: &fs::Metadata) -> Option<FileIdentity> {
+pub fn portable_identity_for(metadata: &fs::Metadata) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     Some(FileIdentity {
         first: metadata.dev(),
@@ -934,7 +937,7 @@ pub(crate) fn portable_identity_for(metadata: &fs::Metadata) -> Option<FileIdent
 }
 
 #[cfg(not(unix))]
-pub(crate) fn portable_identity_for(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+pub fn portable_identity_for(_metadata: &fs::Metadata) -> Option<FileIdentity> {
     None
 }
 

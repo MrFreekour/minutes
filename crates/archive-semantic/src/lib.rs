@@ -5,12 +5,13 @@
 //! dependency. Vectors are normalized in memory and callers remain responsible
 //! for vault scoping, derivative lifetime, and source-revision checks.
 
+use minutes_archive_worker_control::{RegisteredChild, WorkerProcessControl};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -103,6 +104,7 @@ pub struct BoundedSemanticEngine {
     executable_identity: FileIdentity,
     executable_bytes: u64,
     executable_digest: [u8; 32],
+    process_control: Option<WorkerProcessControl>,
 }
 
 /// Device and inode of the pinned worker.
@@ -137,6 +139,20 @@ impl std::fmt::Debug for BoundedSemanticEngine {
 
 impl BoundedSemanticEngine {
     pub fn bind(worker_executable: &Path) -> Result<Self, SemanticError> {
+        Self::bind_inner(worker_executable, None)
+    }
+
+    pub fn bind_with_process_control(
+        worker_executable: &Path,
+        process_control: WorkerProcessControl,
+    ) -> Result<Self, SemanticError> {
+        Self::bind_inner(worker_executable, Some(process_control))
+    }
+
+    fn bind_inner(
+        worker_executable: &Path,
+        process_control: Option<WorkerProcessControl>,
+    ) -> Result<Self, SemanticError> {
         let canonical = fs::canonicalize(worker_executable)
             .map_err(|_| SemanticError::ExecutableUnavailable)?;
         let lexical =
@@ -178,6 +194,7 @@ impl BoundedSemanticEngine {
             executable_identity,
             executable_bytes,
             executable_digest,
+            process_control,
         };
         engine.verify_sandbox()?;
         Ok(engine)
@@ -185,7 +202,7 @@ impl BoundedSemanticEngine {
 
     pub fn open_session(&self) -> Result<BoundedSemanticSession, SemanticError> {
         self.verify_executable()?;
-        BoundedSemanticSession::spawn(&self.executable_path)
+        BoundedSemanticSession::spawn(&self.executable_path, self.process_control.as_ref())
     }
 
     pub fn embed_once(&self, text: &str) -> Result<Vec<f32>, SemanticError> {
@@ -196,20 +213,28 @@ impl BoundedSemanticEngine {
     fn verify_sandbox(&self) -> Result<(), SemanticError> {
         self.verify_executable()?;
         let mut command = self.worker_command("sandbox-self-test");
-        let mut child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = RegisteredChild::spawn(&mut command, self.process_control.as_ref())
             .map_err(|_| SemanticError::WorkerFailed)?;
         let deadline = Instant::now() + WORKER_RESPONSE_DEADLINE;
         loop {
+            if self
+                .process_control
+                .as_ref()
+                .is_some_and(WorkerProcessControl::is_cancelled)
+            {
+                child.terminate();
+                return Err(SemanticError::WorkerBudgetExceeded);
+            }
             match child.try_wait().map_err(|_| SemanticError::WorkerFailed)? {
                 Some(status) if status.success() => return Ok(()),
                 Some(_) => return Err(SemanticError::SecurityBoundaryUnavailable),
                 None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 None => {
-                    terminate_child(&mut child);
+                    child.terminate();
                     return Err(SemanticError::WorkerBudgetExceeded);
                 }
             }
@@ -249,10 +274,11 @@ impl BoundedSemanticEngine {
 }
 
 pub struct BoundedSemanticSession {
-    child: Child,
+    child: RegisteredChild,
     stdin: Option<ChildStdin>,
     responses: Receiver<Result<Vec<u8>, ()>>,
     reader: Option<JoinHandle<()>>,
+    process_control: Option<WorkerProcessControl>,
 }
 
 impl std::fmt::Debug for BoundedSemanticSession {
@@ -280,12 +306,28 @@ impl SemanticEmbedder for BoundedSemanticSession {
 }
 
 impl BoundedSemanticSession {
-    fn spawn(executable: &Path) -> Result<Self, SemanticError> {
+    fn spawn(
+        executable: &Path,
+        process_control: Option<&WorkerProcessControl>,
+    ) -> Result<Self, SemanticError> {
         let mut command = worker_command(executable, "embed-stream");
-        let mut child = command.spawn().map_err(|_| SemanticError::WorkerFailed)?;
-        let stdin = child.stdin.take().ok_or(SemanticError::WorkerFailed)?;
-        let mut stdout = child.stdout.take().ok_or(SemanticError::WorkerFailed)?;
-        let stderr = child.stderr.take().ok_or(SemanticError::WorkerFailed)?;
+        let mut child = RegisteredChild::spawn(&mut command, process_control)
+            .map_err(|_| SemanticError::WorkerFailed)?;
+        let stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or(SemanticError::WorkerFailed)?;
+        let mut stdout = child
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or(SemanticError::WorkerFailed)?;
+        let stderr = child
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or(SemanticError::WorkerFailed)?;
         let (sender, responses) = mpsc::channel();
         let reader = thread::spawn(move || loop {
             let response = read_frame(&mut stdout, MAX_WORKER_RESPONSE_BYTES).map_err(|_| ());
@@ -313,6 +355,7 @@ impl BoundedSemanticSession {
             stdin: Some(stdin),
             responses,
             reader: Some(reader),
+            process_control: process_control.cloned(),
         })
     }
 
@@ -327,14 +370,30 @@ impl BoundedSemanticSession {
         }
         let stdin = self.stdin.as_mut().ok_or(SemanticError::WorkerFailed)?;
         write_frame(stdin, &bytes, MAX_WORKER_REQUEST_BYTES)?;
-        let bytes = match self.responses.recv_timeout(WORKER_RESPONSE_DEADLINE) {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => {
-                return Err(SemanticError::WorkerFailed);
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                terminate_child(&mut self.child);
+        let deadline = Instant::now() + WORKER_RESPONSE_DEADLINE;
+        let bytes = loop {
+            if self
+                .process_control
+                .as_ref()
+                .is_some_and(WorkerProcessControl::is_cancelled)
+            {
+                self.child.terminate();
                 return Err(SemanticError::WorkerBudgetExceeded);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.child.terminate();
+                return Err(SemanticError::WorkerBudgetExceeded);
+            }
+            match self
+                .responses
+                .recv_timeout(remaining.min(Duration::from_millis(20)))
+            {
+                Ok(Ok(bytes)) => break bytes,
+                Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(SemanticError::WorkerFailed);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
             }
         };
         let response: WorkerResponse =
@@ -356,7 +415,7 @@ impl Drop for BoundedSemanticSession {
                 Ok(Some(_)) => break,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 _ => {
-                    terminate_child(&mut self.child);
+                    self.child.terminate();
                     break;
                 }
             }
@@ -515,15 +574,6 @@ fn worker_command(executable: &Path, operation: &str) -> Command {
         }
     }
     command
-}
-
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Measure the pinned worker without moving anyone's file offset.

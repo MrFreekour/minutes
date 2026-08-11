@@ -1231,6 +1231,17 @@ a:focus-visible {
   line-height: 1.5;
 }
 
+.document-evidence-warning {
+  margin: 11px 0 0;
+  padding: 10px 12px;
+  color: var(--ink-2);
+  border: 1px solid var(--gold);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
 .criterion-list {
   display: grid;
   gap: 8px;

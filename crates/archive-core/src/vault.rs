@@ -94,6 +94,8 @@ pub struct ExcludedFolder {
     pub root_index: usize,
     /// Path of the folder relative to that root.
     pub relative_path: PathBuf,
+    /// Identity of the directory the owner chose, retained across renames.
+    pub identity: FileIdentity,
 }
 
 // No longer `Copy`: the exclusion list owns its paths.
@@ -237,8 +239,14 @@ pub struct TextVaultBuildReport {
     pub directories_left_unread: u64,
     /// Folders the operator chose not to index.
     pub excluded_directories: u64,
+    /// Skipped-folder choices whose directory moved or whose old pathname now
+    /// names a different directory. The original identity remains excluded;
+    /// the replacement does not inherit that choice.
+    pub excluded_folder_changes: u64,
     /// Scans that were read. Searchable, but only ever as transcriptions.
     pub transcribed_documents: u64,
+    /// Documents containing both quotable source text and machine-read pages.
+    pub mixed_provenance_documents: u64,
     pub directory_errors: u64,
     pub source_content_persisted: bool,
     pub retrieval_index_persisted: bool,
@@ -331,20 +339,16 @@ impl AuthorizedTextVault {
     /// it against the roots the vault already holds, and only the Rust side
     /// ever sees the path. Nothing about it reaches the webview.
     ///
-    /// Refuses unless the file is still the one that was indexed, checked the
-    /// same way a quotation is: same device and inode, still a regular file,
-    /// still inside its approved root. Revealing a path that now names
-    /// something else would point counsel at the wrong document.
+    /// Refuses unless the file is still the exact revision that was indexed,
+    /// checked the same way a quotation is: same authority, identity, link
+    /// status, byte length and SHA-256. Revealing a changed file beside a stale
+    /// quotation would invite counsel to attribute the quote to the wrong
+    /// source revision.
     pub fn source_path_for_reveal(&self, document_id: &DocumentId) -> Option<PathBuf> {
         let source = self.sources.get(document_id)?;
         let root = self.roots.get(source.root_index)?;
         let path = root.approval.canonical_path().join(&source.relative_path);
-        let metadata = std::fs::symlink_metadata(&path).ok()?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return None;
-        }
-        let current = crate::portable_identity_for(&metadata)?;
-        if current != source.identity {
+        if !self.source_is_current(source) {
             return None;
         }
         Some(path)
@@ -625,7 +629,9 @@ struct BuildCounters {
     changed_while_reading: u64,
     directories_left_unread: u64,
     excluded_directories: u64,
+    excluded_folder_changes: u64,
     transcribed_documents: u64,
+    mixed_provenance_documents: u64,
     indexed_bytes: u64,
     unsupported_files_skipped: u64,
     oversized_files_skipped: u64,
@@ -644,6 +650,25 @@ struct BuildCounters {
     semantic_provisions_skipped: u64,
     semantic_unavailable: bool,
     semantic_coverage_partial: bool,
+}
+
+fn note_semantic_capacity_skip(counters: &mut BuildCounters) {
+    counters.semantic_coverage_partial = true;
+    counters.semantic_provisions_skipped = counters.semantic_provisions_skipped.saturating_add(1);
+}
+
+fn note_mixed_provenance_document(counters: &mut BuildCounters, document: &NormalizedDocument) {
+    let has_transcribed = document
+        .provisions
+        .iter()
+        .any(|provision| provision.text_provenance == TextProvenance::Transcribed);
+    let has_extracted = document
+        .provisions
+        .iter()
+        .any(|provision| provision.text_provenance == TextProvenance::Extracted);
+    if document.has_mixed_page_provenance || has_transcribed && has_extracted {
+        counters.mixed_provenance_documents = counters.mixed_provenance_documents.saturating_add(1);
+    }
 }
 
 /// Live counts for a build in flight.
@@ -770,6 +795,7 @@ fn build_authorized_vault(
     let mut index = LegalIndex::new(vault_id.clone()).map_err(VaultError::from)?;
     let mut sources = BTreeMap::new();
     let mut identities = HashSet::new();
+    let mut disclosed_exclusion_changes = HashSet::new();
     let mut counters = BuildCounters::default();
     let batch_size = extraction_batch_size();
     let mut pending_documents: Vec<PendingDocument> = Vec::with_capacity(batch_size);
@@ -863,20 +889,35 @@ fn build_authorized_vault(
                         counters.unsupported_files_skipped.saturating_add(1);
                     continue;
                 }
-                // Folders the operator excluded are not entered at all.
-                //
-                // The only unit of choice used to be a whole approved folder,
-                // so a notes vault with 2,873 screenshots and recordings under
-                // one subfolder had to be indexed whole or not at all. An
-                // exclusion names one folder inside one root: it covers that
-                // folder and everything beneath it, and a folder of the same
-                // name in another approved root is untouched.
+                // Folders the operator excluded are bound to directory
+                // identity, not to the name they had when chosen. A rename
+                // must keep the original directory out, while a new directory
+                // created at the old name must not inherit the skip.
                 let relative = current.relative_path.join(&name);
-                if limits.excluded_paths.iter().any(|excluded| {
-                    excluded.root_index == current.root_index
-                        && (relative == excluded.relative_path
-                            || relative.starts_with(&excluded.relative_path))
-                }) {
+                let directory_identity = cap_metadata_identity_portable(&metadata);
+                let mut excluded_by_identity = false;
+                for (exclusion_index, excluded) in limits.excluded_paths.iter().enumerate() {
+                    if excluded.root_index != current.root_index {
+                        continue;
+                    }
+                    if directory_identity == Some(excluded.identity) {
+                        excluded_by_identity = true;
+                        if relative != excluded.relative_path
+                            && disclosed_exclusion_changes.insert(exclusion_index)
+                        {
+                            counters.excluded_folder_changes =
+                                counters.excluded_folder_changes.saturating_add(1);
+                        }
+                        break;
+                    }
+                    if relative == excluded.relative_path
+                        && disclosed_exclusion_changes.insert(exclusion_index)
+                    {
+                        counters.excluded_folder_changes =
+                            counters.excluded_folder_changes.saturating_add(1);
+                    }
+                }
+                if excluded_by_identity {
                     counters.excluded_directories = counters.excluded_directories.saturating_add(1);
                     continue;
                 }
@@ -1149,7 +1190,9 @@ fn build_authorized_vault(
         changed_while_reading: counters.changed_while_reading,
         directories_left_unread: counters.directories_left_unread,
         excluded_directories: counters.excluded_directories,
+        excluded_folder_changes: counters.excluded_folder_changes,
         transcribed_documents: counters.transcribed_documents,
+        mixed_provenance_documents: counters.mixed_provenance_documents,
         directory_errors: counters.directory_errors,
         source_content_persisted: false,
         retrieval_index_persisted: false,
@@ -1206,63 +1249,19 @@ enum ExtractionOutcome {
     ConverterUnavailable,
 }
 
-/// Send a conversion down the road its text origin has earned.
+/// Normalize conversion output with the page provenance carried by the
+/// converter.
 ///
-/// A copier's OCR layer extracts like text and is not text: the characters
-/// are a machine's reading of a page image. When the converter's typed
-/// verdict says so, the document takes the transcription road -- the only
-/// road that produces `Transcribed` -- so the reader sees it as what it is
-/// and nothing ever quotes it as the exact language of the source. The
-/// converter name says what actually read the page, because it was not this
-/// build's recogniser.
+/// `text_origin` is a document summary only. The normalizer still reads each
+/// provision's page anchor so independently produced OCR provenance is not
+/// flattened. The PDF converter now records every page when it finds a scan.
 fn normalize_conversion_by_origin(
     document_id: DocumentId,
     title: &str,
     bytes: &[u8],
     converted: &minutes_archive_convert::ConvertedDocument,
 ) -> Result<NormalizedDocument, RetrievalError> {
-    if converted.text_origin == minutes_archive_convert::TextOrigin::MachineReadLayer {
-        normalize_transcribed_document(
-            document_id,
-            title,
-            bytes,
-            "pdf-embedded-ocr-layer-v1",
-            &machine_read_pages(converted),
-        )
-    } else {
-        normalize_converted_document(document_id, title, bytes, converted)
-    }
-}
-
-/// Regroup a demoted PDF's page-anchored blocks into transcription pages.
-///
-/// The PDF converter anchors every block `page:NNNN`, so the page number is
-/// recovered from the anchor rather than re-derived. A block whose anchor
-/// does not parse lands on page zero instead of being dropped: losing text
-/// during a demotion would turn a safety rule into a coverage gap. The
-/// confidence is `None` -- an embedded layer reports none.
-fn machine_read_pages(
-    converted: &minutes_archive_convert::ConvertedDocument,
-) -> Vec<(u32, String, Option<f32>)> {
-    let mut pages: Vec<(u32, String)> = Vec::new();
-    for block in &converted.blocks {
-        let page_number = block
-            .source_anchor
-            .strip_prefix("page:")
-            .and_then(|digits| digits.parse::<u32>().ok())
-            .unwrap_or(0);
-        match pages.last_mut() {
-            Some((current, text)) if *current == page_number => {
-                text.push('\n');
-                text.push_str(&block.text);
-            }
-            _ => pages.push((page_number, block.text.clone())),
-        }
-    }
-    pages
-        .into_iter()
-        .map(|(page_number, text)| (page_number, text, None))
-        .collect()
+    normalize_converted_document(document_id, title, bytes, converted)
 }
 
 /// The one expensive step, with no access to the index, the counters, or
@@ -1452,8 +1451,7 @@ fn index_extracted_batch(
             let mut embeddings = Vec::with_capacity(normalized.provisions.len());
             for (position, provision) in normalized.provisions.iter().enumerate() {
                 if position >= remaining {
-                    counters.semantic_provisions_skipped =
-                        counters.semantic_provisions_skipped.saturating_add(1);
+                    note_semantic_capacity_skip(counters);
                     embeddings.push(None);
                     continue;
                 }
@@ -1543,6 +1541,11 @@ fn index_extracted_batch(
                 }
             }
         } else {
+            if counters.semantic_coverage_partial {
+                counters.semantic_provisions_skipped = counters
+                    .semantic_provisions_skipped
+                    .saturating_add(normalized.provisions.len() as u64);
+            }
             index
                 .replace_document(&normalized)
                 .map_err(VaultError::from)?;
@@ -1550,6 +1553,7 @@ fn index_extracted_batch(
         let source_kind = pending.source_kind;
         let source_len = pending.source_len;
         let text_provenance = normalized.text_provenance;
+        note_mixed_provenance_document(counters, &normalized);
         sources.insert(
             pending.document_id,
             AuthorizedSource {
@@ -1729,8 +1733,8 @@ fn relative_source_identity_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approve_roots;
     use crate::retrieval::MatchScope;
+    use crate::{approve_roots, portable_identity_for};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1914,6 +1918,37 @@ mod tests {
             .expect("search");
         assert!(response.evidence.is_empty());
         assert_eq!(response.stale_evidence_withdrawn, 1);
+    }
+
+    #[test]
+    fn reveal_refuses_a_source_mutated_in_place() {
+        let temp = TempDir::new().expect("temp");
+        let (vault, source) = build(&temp);
+        let response = vault
+            .interpret_and_search(
+                "Find confidentiality provisions within three sentences covering affiliates, compelled disclosure, and survival.",
+            )
+            .expect("search");
+        let document_id = response.evidence[0].document_id.clone();
+        assert!(
+            vault.source_path_for_reveal(&document_id).is_some(),
+            "the unchanged source should still be revealable"
+        );
+        let identity_before = portable_identity_for(&fs::metadata(&source).expect("before"));
+        fs::write(
+            &source,
+            "7. PUBLICITY\nPress releases require approval. This replacement is deliberately a different length.",
+        )
+        .expect("mutate in place");
+        let identity_after = portable_identity_for(&fs::metadata(&source).expect("after"));
+        assert_eq!(
+            identity_before, identity_after,
+            "the fixture replaced the inode instead of exercising in-place mutation"
+        );
+        assert!(
+            vault.source_path_for_reveal(&document_id).is_none(),
+            "Finder reveal accepted bytes that no longer match the indexed revision"
+        );
     }
 
     #[test]
@@ -2126,6 +2161,14 @@ mod tests {
                 "{failure:?} after {answers} answers degraded silently; partial suggestion \
                  coverage must be reported"
             );
+            assert_eq!(
+                report
+                    .semantic_provisions_indexed
+                    .saturating_add(report.semantic_provisions_skipped),
+                36,
+                "{failure:?} after {answers} answers did not count every one of the 36 \
+                 provisions as either prepared or skipped"
+            );
 
             // The product is exact evidence, and it must be untouched.
             let response = vault
@@ -2138,6 +2181,17 @@ mod tests {
                 "{failure:?} after {answers} answers left exact search unable to answer"
             );
         }
+    }
+
+    #[test]
+    fn reaching_semantic_capacity_marks_coverage_partial_and_counts_the_gap() {
+        let mut counters = BuildCounters::default();
+        note_semantic_capacity_skip(&mut counters);
+        assert!(
+            counters.semantic_coverage_partial,
+            "capacity exhaustion would read as complete suggestion coverage"
+        );
+        assert_eq!(counters.semantic_provisions_skipped, 1);
     }
 
     /// An excluded folder is not entered, and every namesake is kept.
@@ -2177,6 +2231,10 @@ mod tests {
         )
         .expect("second-root namesake file");
 
+        let excluded_identity = portable_identity_for(
+            &fs::metadata(root.join("attachments")).expect("excluded folder metadata"),
+        )
+        .expect("excluded folder identity");
         let approved = approve_roots(&[root, other]).expect("approve");
         let vault = build_authorized_text_vault(
             VaultId::parse("excluding").expect("vault"),
@@ -2185,6 +2243,7 @@ mod tests {
                 excluded_paths: vec![ExcludedFolder {
                     root_index: 0,
                     relative_path: PathBuf::from("attachments"),
+                    identity: excluded_identity,
                 }],
                 ..TextVaultLimits::default()
             },
@@ -2200,6 +2259,72 @@ mod tests {
         assert_eq!(
             report.indexed_documents, 3,
             "the excluded folder was entered, or a namesake was wrongly skipped"
+        );
+    }
+
+    #[test]
+    fn a_renamed_excluded_folder_stays_excluded_and_its_replacement_is_disclosed() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("approved");
+        let skipped = root.join("attachments");
+        let renamed = root.join("renamed-attachments");
+        fs::create_dir_all(&skipped).expect("skipped folder");
+        fs::write(
+            skipped.join("privileged.txt"),
+            "CONFIDENTIALITY\nThe original skipped folder contains Confidential Information.",
+        )
+        .expect("skipped document");
+        let skipped_identity =
+            portable_identity_for(&fs::metadata(&skipped).expect("skipped folder metadata"))
+                .expect("skipped folder identity");
+
+        let approved = approve_roots(std::slice::from_ref(&root)).expect("approve root");
+        fs::rename(&skipped, &renamed).expect("rename skipped folder");
+        fs::create_dir(&skipped).expect("replacement at old name");
+        fs::write(
+            skipped.join("replacement.txt"),
+            "ASSIGNMENT\nNeither party may assign this Agreement.",
+        )
+        .expect("replacement document");
+
+        let vault = build_authorized_text_vault(
+            VaultId::parse("renamed-exclusion").expect("vault"),
+            &approved,
+            TextVaultLimits {
+                excluded_paths: vec![ExcludedFolder {
+                    root_index: 0,
+                    relative_path: PathBuf::from("attachments"),
+                    identity: skipped_identity,
+                }],
+                ..TextVaultLimits::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("build");
+
+        let report = vault.build_report();
+        assert_eq!(report.excluded_directories, 1);
+        assert_eq!(
+            report.excluded_folder_changes, 1,
+            "the path substitution was not disclosed"
+        );
+        assert_eq!(
+            report.indexed_documents, 1,
+            "the renamed original was read or the replacement inherited its skip"
+        );
+        let original = vault
+            .interpret_and_search("Find documents containing confidentiality.")
+            .expect("search excluded content");
+        assert!(
+            original.evidence.is_empty() && original.documents.is_empty(),
+            "documents in the renamed excluded folder became searchable"
+        );
+        let replacement = vault
+            .interpret_and_search("Find documents containing assignment.")
+            .expect("search replacement content");
+        assert!(
+            !replacement.evidence.is_empty() || !replacement.documents.is_empty(),
+            "the new directory at the old name wrongly inherited the skip"
         );
     }
 
@@ -2344,16 +2469,10 @@ mod tests {
         assert_eq!(report.documents_left_unread, 35);
     }
 
-    /// A converter verdict of `MachineReadLayer` sends the document down the
-    /// transcription road, whole.
-    ///
-    /// The failure this pins down: a scanned PDF carrying a copier's embedded
-    /// OCR extracts like any text layer, and before the typed verdict it
-    /// normalized as `Extracted` -- a machine's reading of a fax, quotable as
-    /// the exact language of the source. Demotion must change provenance, the
-    /// converter attribution, and nothing about whether the text is seen.
+    /// Per-anchor provenance survives independently of the document summary.
     #[test]
-    fn a_machine_read_text_layer_normalizes_as_transcribed_not_extracted() {
+    fn per_anchor_provenance_survives_normalization_independently_of_the_summary() {
+        // Fails if normalization replaces anchor provenance with the document summary.
         let block = |page: &str, text: &str| minutes_archive_convert::ConvertedBlock {
             is_heading: None,
             source_anchor: page.to_string(),
@@ -2371,39 +2490,46 @@ mod tests {
                 block("page:0004", "Neither party may assign this Agreement."),
             ],
             warnings: vec![minutes_archive_convert::PDF_UNSUPPORTED_STRUCTURE_WARNING.to_string()],
-            text_origin: minutes_archive_convert::TextOrigin::MachineReadLayer,
+            text_origin: minutes_archive_convert::TextOrigin::AuthorWritten,
+            machine_read_anchors: std::collections::BTreeSet::from(["page:0001".to_string()]),
         };
 
-        let transcribed = normalize_conversion_by_origin(
+        let mixed = normalize_conversion_by_origin(
             DocumentId::parse("copier-scan").expect("id"),
             "Copier Scan",
             b"%PDF-synthetic",
             &converted,
         )
         .expect("normalize");
-        assert_eq!(transcribed.text_provenance, TextProvenance::Transcribed);
-        assert_eq!(
-            transcribed.provision_boundaries,
-            ProvisionBoundaries::Inferred
-        );
-        assert_eq!(transcribed.converter, "pdf-embedded-ocr-layer-v1");
-        // Same-page blocks fold into one page reading; the page number in the
-        // anchor is the page the scanner named, not a renumbering.
-        assert_eq!(transcribed.provisions.len(), 2);
-        assert_eq!(transcribed.provisions[0].anchor, "page:0001");
-        assert_eq!(transcribed.provisions[1].anchor, "page:0004");
-        assert!(transcribed.provisions[0].text.contains("affiliate data"));
+        assert_eq!(mixed.text_provenance, TextProvenance::Extracted);
         assert!(
-            transcribed
-                .provisions
-                .iter()
-                .all(|provision| provision.transcription_confidence.is_none()),
-            "an embedded layer reports no confidence, and none may be invented"
+            mixed.has_mixed_page_provenance,
+            "the page-level machine-read verdict must survive normalization"
+        );
+        assert_eq!(mixed.provision_boundaries, ProvisionBoundaries::Inferred);
+        assert_eq!(mixed.converter, "pdf-extract-0.12.0-v1");
+        assert_eq!(mixed.provisions.len(), 2);
+        assert_eq!(
+            mixed.provisions[0].text_provenance,
+            TextProvenance::Transcribed
+        );
+        assert_eq!(mixed.provisions[0].anchor, "page:0001/section:0001");
+        assert!(mixed.provisions[0].text.contains("affiliate data"));
+        assert_eq!(
+            mixed.provisions[1].text_provenance,
+            TextProvenance::Extracted
+        );
+        assert_eq!(mixed.provisions[1].anchor, "page:0004/section:0002");
+        let mut counters = BuildCounters::default();
+        note_mixed_provenance_document(&mut counters, &mixed);
+        assert_eq!(
+            counters.mixed_provenance_documents, 1,
+            "the build report must disclose this mixed document"
         );
 
-        // The same blocks with an author-written verdict stay extracted, so
-        // the demotion above cannot be the normalizer's general behaviour.
-        converted.text_origin = minutes_archive_convert::TextOrigin::AuthorWritten;
+        // Clearing the page verdict makes the same page extracted. The
+        // unchanged document summary proves it was never the quoting gate.
+        converted.machine_read_anchors.clear();
         let extracted = normalize_conversion_by_origin(
             DocumentId::parse("born-digital").expect("id"),
             "Born Digital",
@@ -2413,5 +2539,14 @@ mod tests {
         .expect("normalize");
         assert_eq!(extracted.text_provenance, TextProvenance::Extracted);
         assert_eq!(extracted.converter, "pdf-extract-0.12.0-v1");
+        assert!(extracted
+            .provisions
+            .iter()
+            .all(|provision| provision.text_provenance == TextProvenance::Extracted));
+        note_mixed_provenance_document(&mut counters, &extracted);
+        assert_eq!(
+            counters.mixed_provenance_documents, 1,
+            "an entirely readable document must not inflate the mixed count"
+        );
     }
 }
