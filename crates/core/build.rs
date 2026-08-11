@@ -53,6 +53,17 @@ fn compile_macos_graph_xpc_authority_bridge() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=minutes_macos_graph_xpc_authority");
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
+    // The Apple Speech bridge uses Swift Concurrency (Task, async), so the
+    // linked binary carries a weak @rpath load of libswift_Concurrency. That
+    // dylib lives only in the dyld shared cache, not on disk, so its @rpath
+    // resolves only when the binary has an rpath pointing at /usr/lib/swift.
+    // Without it the weak load is silently skipped, every Concurrency type
+    // descriptor stays null, and the worker aborts inside
+    // swift_getTypeByMangledName the moment the analyzer's async types
+    // resolve. A link search path is not a runtime rpath; this is the runtime
+    // rpath, present on every macOS, and it is what lets the real worker run
+    // Speech at all.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     if let Some(swiftc) = engine_process::command("xcrun")
         .args(["--find", "swiftc"])
         .output()

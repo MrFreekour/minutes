@@ -42,6 +42,10 @@ const files = {
     "tauri/src-tauri/minutes-apple-speech-worker.entitlements",
     "utf8",
   ),
+  // Structural-only (deliberately not golden-hashed): build.rs changes for
+  // unrelated reasons and should not force a reseal, but the Swift Concurrency
+  // rpath is load-bearing and must not silently regress.
+  coreBuild: readFileSync("crates/core/build.rs", "utf8"),
 };
 
 
@@ -169,6 +173,16 @@ function validate(candidate, checkGoldens = true) {
   ) {
     errors.push("the Apple Speech worker entitlement allowlist must be App Sandbox only");
   }
+
+  // Without this runtime rpath the weak libswift_Concurrency load resolves to
+  // null and the worker aborts in swift_getTypeByMangledName as soon as it
+  // constructs a Speech (async) type. Proven on hardware; the analyzer cannot
+  // run without it.
+  requireText(
+    candidate.coreBuild,
+    "cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift",
+    "the worker build must add the Swift Concurrency runtime rpath (/usr/lib/swift)",
+  );
 
   for (const value of [
     "MINUTES_APPLE_SPEECH_WORKER_CDHASH_V1=",
