@@ -507,6 +507,18 @@ jobs:
           if (-not $needed) { throw 'no VC runtime imports detected; the import scan is probably broken' }
           Write-Host "runtime imports: $($needed -join ', ')"
           $stagedNames = $staged | ForEach-Object { $_.Name }
+
+          # Negative control. dumpbin reports MSVCP140.dll while build.rs
+          # stages msvcp140.dll, so this comparison only works because
+          # -notcontains is case-insensitive, and it has never been observed
+          # rejecting anything. Proving it can fail costs three lines and is
+          # the difference between a check and a decoration.
+          $control = @('MSVCP140.dll', 'definitely-not-staged.dll') |
+                     Where-Object { $stagedNames -notcontains $_ }
+          if ($control -ne 'definitely-not-staged.dll') {
+            throw "the import comparison is broken: it flagged '$control' instead of the one absent DLL"
+          }
+
           $missing = $needed | Where-Object { $stagedNames -notcontains $_ }
           if ($missing) {
             throw "minutes-app.exe imports runtime DLLs that are not staged: $($missing -join ', '). Add them to RUNTIME_DLLS in tauri/src-tauri/build.rs and to the release packaging lists (#657)."
