@@ -111,6 +111,11 @@ jobs:
             echo "Until then, bump the tap by hand: docs/release/procedure.md step 16."
             exit 0
           fi
+          # Reading the tap needs no more than public access, so a green dry
+          # run says nothing about whether the token can commit. Proving it
+          # here means a token scoped Read-only fails on demand rather than at
+          # the next release, which is the worst moment to find out.
+          python3 scripts/bump_homebrew_tap.py --check-access
           # Branch rather than splat an empty variable into the argv, which is
           # unquoted expansion and shellcheck rightly rejects it.
           if [ -n "${DRY_RUN:-}" ]; then
