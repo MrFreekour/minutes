@@ -185,6 +185,22 @@ export type CorpusLeaseHooks = {
    * worker that knew the corpus still poisons.
    */
   forceUnconfirmedTerminationForTest?: boolean;
+
+  /**
+   * Held *in addition to* the real reap before a stranded child counts as
+   * confirmed dead. Without it both halves of the contract race, because the
+   * child is SIGKILLed and so reaped within milliseconds: a test cannot
+   * observe "still refused" before recovery overtakes it.
+   *
+   * A promise the test never settles pins the refusing half; one it settles
+   * pins the recovering half. Because recovery waits for this promise *and*
+   * the real termination, it can only ever delay recovery relative to
+   * production. It cannot unlock the process before the child is genuinely
+   * reaped, so it cannot manufacture a pass out of a parent that fails closed
+   * too weakly. An earlier draft used `??` here, which substituted the hook
+   * for real termination and did exactly that.
+   */
+  confirmTerminationForTest?: Promise<void>;
 };
 
 type RootIdentity = {
@@ -1662,8 +1678,23 @@ type ParentPause = {
   until: Promise<void>;
 };
 
-let corpusWorkerPoisoned = false;
+// How many children were killed without their death being confirmed inside
+// the grace, and are still unreaped. Every one of them may still be alive and
+// reading the corpus, so while this is above zero no further lease may run.
+//
+// A count rather than a flag because two leases can each strand a child, and
+// the first one reaped must not clear the second one's refusal. Only the
+// transition back to zero reopens the process.
+let unconfirmedCorpusWorkers = 0;
 let activeCorpusWorkerCount = 0;
+
+function retainUnconfirmedCorpusWorker(): void {
+  unconfirmedCorpusWorkers += 1;
+}
+
+function releaseUnconfirmedCorpusWorker(): void {
+  unconfirmedCorpusWorkers = Math.max(0, unconfirmedCorpusWorkers - 1);
+}
 let nextPauseId = 1;
 
 function corpusWorkerInvocation(scriptOverride?: string): {
@@ -1794,8 +1825,10 @@ async function dispatchStableCorpusLease<T>(
   if (hooks.beforeSentinelCreate) {
     return withStableCorpusLeaseInProcess(root, operation, hooks);
   }
-  if (corpusWorkerPoisoned) {
-    throw new Error("Access denied: meeting corpus worker requires a process restart");
+  if (unconfirmedCorpusWorkers > 0) {
+    throw new Error(
+      "Access denied: a meeting corpus worker was killed without confirming it died"
+    );
   }
   const budgets = resolveCorpusReadBudgets(hooks.budgets);
   const deadline = authorizationDeadline(hooks.timeoutMs);
@@ -1831,6 +1864,15 @@ async function dispatchStableCorpusLease<T>(
   // Guards the admission slot against a double release when a late-reaped
   // child's termination promise resolves after the cleanup block already ran.
   let workerAdmissionReleased = false;
+  // Everything this lease may have left running that could still be reading
+  // the corpus. The process stays closed until all of them settle.
+  const unconfirmedHazards: Promise<unknown>[] = [];
+  const noteUnconfirmedHazard = (hazard: Promise<unknown>): void => {
+    // The first hazard closes the process; later ones only extend how long it
+    // stays closed, so the hold is taken exactly once per lease.
+    if (unconfirmedHazards.length === 0) retainUnconfirmedCorpusWorker();
+    unconfirmedHazards.push(hazard);
+  };
   // Whether the `begin` message, the only thing that tells the child which
   // corpus to read, was actually handed to the child's stdin. Authority is the
   // write itself, never anything the child echoes back, and never merely
@@ -2269,7 +2311,22 @@ async function dispatchStableCorpusLease<T>(
       // the worker is still starting (issue #689).
       if (!confirmed) {
         if (corpusRootDisclosed) {
-          corpusWorkerPoisoned = true;
+          // Fail closed for as long as the danger is real, which is exactly
+          // as long as the child's death is unconfirmed. Reaping it later
+          // ends that danger definitively: a reaped child reads nothing, and
+          // it cannot have read anything after it died. Holding the refusal
+          // past that point protects nothing and costs the whole process,
+          // which is the same reasoning the admission slot below already
+          // uses, applied to the poison and the reservation.
+          //
+          // SIGKILL cannot be caught, so a child outliving the grace is a
+          // slow reap under load, not a child refusing to die. That is a
+          // recoverable condition and must not require a process restart.
+          noteUnconfirmedHazard(
+            hooks.confirmTerminationForTest
+              ? Promise.all([termination, hooks.confirmTerminationForTest])
+              : termination
+          );
           releaseReservation = false;
           releaseWorkerAdmission = false;
         } else {
@@ -2305,10 +2362,30 @@ async function dispatchStableCorpusLease<T>(
         }),
       ]);
       if (!operationConfirmed) {
-        corpusWorkerPoisoned = true;
+        // Same bargain as the worker above: refuse while the projection may
+        // still be running, recover once it is confirmed finished.
+        noteUnconfirmedHazard(operationTermination);
         releaseReservation = false;
         releaseWorkerAdmission = false;
       }
+    }
+    if (unconfirmedHazards.length > 0) {
+      // One hold for the whole lease, released only when every hazard it left
+      // behind has settled. Retaining and releasing per hazard would let the
+      // count fall to zero between the worker branch and the projection branch
+      // above, which are separated by an await: the worker's reap can land
+      // inside that window, and a lease admitted there would run while this
+      // lease's projection still holds corpus data.
+      //
+      // allSettled, not all: a hazard that rejects is still a hazard that
+      // finished, and a rejection here must not strand the process closed.
+      void Promise.allSettled(unconfirmedHazards).then(() => {
+        releaseUnconfirmedCorpusWorker();
+        releaseCorpusMemory(reservation);
+        if (workerAdmissionReleased) return;
+        workerAdmissionReleased = true;
+        activeCorpusWorkerCount = Math.max(0, activeCorpusWorkerCount - 1);
+      });
     }
     if (releaseWorkerAdmission && !workerAdmissionReleased) {
       workerAdmissionReleased = true;
