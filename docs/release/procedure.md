@@ -273,6 +273,11 @@ cask hashes is guaranteed to exist.
 before and after versions and then re-reads the tap over HTTPS the way `brew`
 does, failing if either file disagrees with the release.
 
+After writing, it re-runs its own bump in dry-run mode against the published
+tap, so the postcondition covers the cask's `sha256` and not just the version
+string: a cask carrying a correct version with a wrong hash fails every
+install, and a version comparison would call it fine.
+
 If `HOMEBREW_TAP_TOKEN` is missing the workflow warns and exits 0 rather than
 turning a good release red, so a green release does not by itself prove the tap
 moved. Check the run, or:
