@@ -727,12 +727,14 @@ impl PdfStreamBudget {
     }
 }
 
-/// Classify the complete PDF, without following resource references.
+/// Classify the complete PDF without following the page drawing graph.
 ///
-/// Pass one enumerates every parsed object for image XObjects. Pass two
-/// enumerates every stream for inline images. A malformed object-table entry,
-/// an undecodable stream, or an exhausted byte budget is an unknown result and
-/// fails closed at the caller. Reference shape, depth, and cycles are irrelevant.
+/// Pass one enumerates every parsed image XObject and evaluates its declared
+/// dimensions without decoding compressed pixels. Pass two decodes only streams
+/// that can contain page-description operators: page contents, Form XObjects,
+/// tiling patterns, annotation appearances, and Type3 glyph procedures. An
+/// undecodable content stream or exhausted content-stream byte budget is an
+/// unknown result and fails closed at the caller.
 fn pdf_has_page_scan_image(doc: &lopdf::Document) -> PdfScanCheck {
     pdf_has_page_scan_image_with_budget(doc, MAX_PDF_SWEEP_DECOMPRESSED_BYTES)
 }
@@ -761,17 +763,105 @@ fn pdf_has_page_scan_image_with_budget(
         }
     }
 
+    let content_stream_ids = collect_content_stream_ids(doc)?;
     let mut budget = PdfStreamBudget::new(decompressed_byte_limit);
-    for object in doc.objects.values() {
+    for (object_id, object) in &doc.objects {
         let lopdf::Object::Stream(stream) = object else {
             continue;
         };
+        if stream_is_image_xobject(doc, stream)? {
+            continue;
+        }
+        if !content_stream_ids.contains(object_id)
+            && !stream_is_form_xobject(doc, stream)?
+            && !stream_is_tiling_pattern(doc, stream)?
+        {
+            continue;
+        }
         let bytes = decode_stream_for_sweep(stream, &mut budget)?;
         if stream_bytes_have_page_scan_inline_image(doc, &bytes, &page_aspect_ratios)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Find indirect streams reached from the content-bearing dictionary entries
+/// whose stream dictionaries do not identify their role themselves.
+fn collect_content_stream_ids(doc: &lopdf::Document) -> Result<BTreeSet<lopdf::ObjectId>, ()> {
+    let mut stream_ids = BTreeSet::new();
+    for object in doc.objects.values() {
+        let lopdf::Object::Dictionary(dictionary) = object else {
+            continue;
+        };
+
+        if dictionary_name_is(doc, dictionary, b"Type", b"Page")? {
+            if let Ok(contents) = dictionary.get(b"Contents") {
+                collect_referenced_stream_ids(
+                    doc,
+                    contents,
+                    &mut stream_ids,
+                    &mut BTreeSet::new(),
+                )?;
+            }
+        }
+
+        // `/Type /Annot` is optional in practice, so the presence of `/AP` is
+        // the reliable root for normal, rollover, and down appearances.
+        if let Ok(appearances) = dictionary.get(b"AP") {
+            collect_referenced_stream_ids(doc, appearances, &mut stream_ids, &mut BTreeSet::new())?;
+        }
+
+        if dictionary_name_is(doc, dictionary, b"Subtype", b"Type3")? {
+            if let Ok(char_procs) = dictionary.get(b"CharProcs") {
+                collect_referenced_stream_ids(
+                    doc,
+                    char_procs,
+                    &mut stream_ids,
+                    &mut BTreeSet::new(),
+                )?;
+            }
+        }
+    }
+    Ok(stream_ids)
+}
+
+fn collect_referenced_stream_ids(
+    doc: &lopdf::Document,
+    object: &lopdf::Object,
+    stream_ids: &mut BTreeSet<lopdf::ObjectId>,
+    visited: &mut BTreeSet<lopdf::ObjectId>,
+) -> Result<(), ()> {
+    match object {
+        lopdf::Object::Reference(object_id) => {
+            if !visited.insert(*object_id) {
+                return Ok(());
+            }
+            let referenced = doc.objects.get(object_id).ok_or(())?;
+            if matches!(referenced, lopdf::Object::Stream(_)) {
+                stream_ids.insert(*object_id);
+                return Ok(());
+            }
+            collect_referenced_stream_ids(doc, referenced, stream_ids, visited)
+        }
+        lopdf::Object::Array(objects) => {
+            for object in objects {
+                collect_referenced_stream_ids(doc, object, stream_ids, visited)?;
+            }
+            Ok(())
+        }
+        lopdf::Object::Dictionary(dictionary) => {
+            for (_, object) in dictionary.iter() {
+                collect_referenced_stream_ids(doc, object, stream_ids, visited)?;
+            }
+            Ok(())
+        }
+        // PDF stream objects are required to be indirect. Treating a direct
+        // stream at one of these roots as malformed preserves fail-closed
+        // behavior rather than silently omitting content.
+        lopdf::Object::Stream(_) => Err(()),
+        _ => Ok(()),
+    }
 }
 
 /// Collect page shapes without walking page resources or following content.
@@ -841,11 +931,34 @@ fn object_table_is_complete(doc: &lopdf::Document) -> Result<(), ()> {
 }
 
 fn stream_is_image_xobject(doc: &lopdf::Document, stream: &lopdf::Stream) -> PdfScanCheck {
-    let subtype = match stream.dict.get(b"Subtype") {
-        Ok(subtype) => doc.dereference(subtype).map_err(|_| ())?.1,
+    dictionary_name_is(doc, &stream.dict, b"Subtype", b"Image")
+}
+
+fn stream_is_form_xobject(doc: &lopdf::Document, stream: &lopdf::Stream) -> PdfScanCheck {
+    dictionary_name_is(doc, &stream.dict, b"Subtype", b"Form")
+}
+
+fn stream_is_tiling_pattern(doc: &lopdf::Document, stream: &lopdf::Stream) -> PdfScanCheck {
+    if !dictionary_name_is(doc, &stream.dict, b"Type", b"Pattern")? {
+        return Ok(false);
+    }
+    let pattern_type = resolved_dict_value(doc, &stream.dict, b"PatternType")?
+        .as_i64()
+        .map_err(|_| ())?;
+    Ok(pattern_type == 1)
+}
+
+fn dictionary_name_is(
+    doc: &lopdf::Document,
+    dictionary: &lopdf::Dictionary,
+    key: &[u8],
+    expected: &[u8],
+) -> PdfScanCheck {
+    let value = match dictionary.get(key) {
+        Ok(value) => doc.dereference(value).map_err(|_| ())?.1,
         Err(_) => return Ok(false),
     };
-    Ok(subtype.as_name().map_err(|_| ())? == b"Image")
+    Ok(value.as_name().map_err(|_| ())? == expected)
 }
 
 fn decode_stream_for_sweep<'a>(
@@ -953,10 +1066,9 @@ fn stream_bytes_have_page_scan_inline_image(
     bytes: &[u8],
     page_aspect_ratios: &[f64],
 ) -> PdfScanCheck {
-    // Most streams are fonts, image samples, metadata, or other non-content.
-    // Only invoke the strict content parser when the bytes contain a standalone
-    // `BI` operator candidate; this still sweeps every stream without treating
-    // arbitrary binary bytes as malformed page-description syntax.
+    // Only invoke the strict content parser when a content-bearing stream has a
+    // standalone `BI` operator candidate. Content streams without inline images
+    // need no operator parsing for this provenance check.
     if !bytes.windows(2).enumerate().any(|(index, pair)| {
         pair == b"BI"
             && (index == 0 || pdf_token_boundary(bytes[index - 1]))
@@ -1940,15 +2052,24 @@ mod tests {
         .concat()
     }
 
-    fn grayscale_image_xobject(width: usize, height: usize) -> Vec<u8> {
-        let pixels = vec![0x80; width.checked_mul(height).expect("fixture dimensions")];
+    fn image_xobject(
+        width: usize,
+        height: usize,
+        extra_dictionary_entries: &str,
+        content: Vec<u8>,
+    ) -> Vec<u8> {
         pdf_stream(
             &format!(
                 "/Type /XObject /Subtype /Image /Width {width} /Height {height} \
-                 /ColorSpace /DeviceGray /BitsPerComponent 8"
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 {extra_dictionary_entries}"
             ),
-            pixels,
+            content,
         )
+    }
+
+    fn grayscale_image_xobject(width: usize, height: usize) -> Vec<u8> {
+        let pixels = vec![0x80; width.checked_mul(height).expect("fixture dimensions")];
+        image_xobject(width, height, "", pixels)
     }
 
     fn synthetic_pdf() -> Vec<u8> {
@@ -1964,6 +2085,19 @@ mod tests {
                 b"\nendstream".to_vec(),
             ]
             .concat(),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    fn synthetic_typed_pdf_with_image(image: Vec<u8>) -> Vec<u8> {
+        let stream = b"BT /F1 12 Tf 72 720 Td (Readable typed page text.) Tj ET /Im1 Do";
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            pdf_stream("", stream.to_vec()),
+            image,
         ];
         assemble_pdf(&objects)
     }
@@ -2106,6 +2240,58 @@ mod tests {
                 "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << >>",
                 form_stream,
             ),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    fn inline_scan_content() -> Vec<u8> {
+        let mut content = b"BI /W 500 /H 647 /CS /Gray /BPC 8 ID\n".to_vec();
+        content.extend(std::iter::repeat_n(0x80, 500 * 647));
+        content.extend_from_slice(b"\nEI\n");
+        content
+    }
+
+    fn synthetic_inline_image_in_tiling_pattern_pdf() -> Vec<u8> {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>"
+                .to_vec(),
+            pdf_stream("", b"q Q".to_vec()),
+            pdf_stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 612 792] /XStep 612 /YStep 792 /Resources << >>",
+                inline_scan_content(),
+            ),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    fn synthetic_inline_image_in_annotation_appearance_pdf() -> Vec<u8> {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [5 0 R] >>"
+                .to_vec(),
+            pdf_stream("", b"q Q".to_vec()),
+            b"<< /Type /Annot /Subtype /Stamp /Rect [0 0 612 792] /AP << /N 6 0 R >> >>"
+                .to_vec(),
+            // Deliberately omit `/Subtype /Form` so this exercises the `/AP`
+            // root rather than the independently recognized Form path.
+            pdf_stream("/BBox [0 0 612 792] /Resources << >>", inline_scan_content()),
+        ];
+        assemble_pdf(&objects)
+    }
+
+    fn synthetic_inline_image_in_type3_glyph_pdf() -> Vec<u8> {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F3 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            pdf_stream("", b"q Q".to_vec()),
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 612 792] /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R >> >>"
+                .to_vec(),
+            pdf_stream("", inline_scan_content()),
         ];
         assemble_pdf(&objects)
     }
@@ -2494,10 +2680,47 @@ mod tests {
     }
 
     #[test]
-    fn a_high_resolution_logo_does_not_demote_a_page() {
-        // Fails if one long edge overrides the wide banner's page-shape mismatch.
-        let document = convert_bytes(SourceFormat::Pdf, &synthetic_raster_pdf(1200, 300))
-            .expect("convert banner PDF");
+    fn a_dctdecode_logo_on_a_typed_page_is_author_written() {
+        // Fails if JPEG pixel bytes are decoded as content instead of trusting image dimensions.
+        let jpeg = vec![0xff, 0xd8, 0xff, 0xd9];
+        let bytes =
+            synthetic_typed_pdf_with_image(image_xobject(300, 75, "/Filter /DCTDecode", jpeg));
+        let document = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert JPEG-logo PDF");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+        assert!(document.machine_read_anchors.is_empty());
+    }
+
+    #[test]
+    fn a_flate_predictor_logo_on_a_typed_page_is_author_written() {
+        // Fails if image `/DecodeParms` are treated as an undecodable content-stream signal.
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder
+            .write_all(&vec![0x80; 300 * 75])
+            .expect("compress logo pixels");
+        let compressed = encoder.finish().expect("finish compressed logo");
+        let bytes = synthetic_typed_pdf_with_image(image_xobject(
+            300,
+            75,
+            "/Filter /FlateDecode /DecodeParms << /Predictor 1 >>",
+            compressed,
+        ));
+        let document =
+            convert_bytes(SourceFormat::Pdf, &bytes).expect("convert Flate predictor-logo PDF");
+        assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
+        assert!(document.machine_read_anchors.is_empty());
+    }
+
+    #[test]
+    fn a_high_resolution_letterhead_banner_does_not_demote_or_consume_the_budget() {
+        // Fails if the banner's pixels count toward the content budget or its long edge mimics a scan.
+        let bytes = synthetic_raster_pdf(1200, 300);
+        let parsed = pdf_extract::Document::load_mem(&bytes).expect("load banner PDF");
+        assert_eq!(pdf_has_page_scan_image_with_budget(&parsed, 128), Ok(false));
+        let document =
+            convert_bytes(SourceFormat::Pdf, &bytes).expect("convert letterhead-banner PDF");
         assert_eq!(document.text_origin, TextOrigin::AuthorWritten);
         assert!(document.machine_read_anchors.is_empty());
     }
@@ -2577,13 +2800,37 @@ mod tests {
 
     #[test]
     fn an_inline_image_in_a_form_xobject_is_found() {
-        // Fails if the stream sweep misses inline BI/ID/EI data outside page content streams.
+        // Fails if Form XObjects stop being decoded and swept for inline BI/ID/EI scan data.
         let bytes = synthetic_inline_image_in_form_pdf();
         let document = pdf_extract::Document::load_mem(&bytes).expect("load inline-image PDF");
         assert_eq!(pdf_has_page_scan_image(&document), Ok(true));
         assert_eq!(pdf_text_origin(&document), TextOrigin::MachineReadLayer);
         let converted = convert_bytes(SourceFormat::Pdf, &bytes).expect("convert inline-image PDF");
         assert_eq!(converted.text_origin, TextOrigin::MachineReadLayer);
+    }
+
+    #[test]
+    fn an_inline_image_in_a_tiling_pattern_is_found() {
+        // Fails if `/PatternType 1` streams leave the content-bearing sweep allowlist.
+        let bytes = synthetic_inline_image_in_tiling_pattern_pdf();
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load tiling-pattern PDF");
+        assert_eq!(pdf_has_page_scan_image(&document), Ok(true));
+    }
+
+    #[test]
+    fn an_inline_image_in_an_annotation_appearance_is_found() {
+        // Fails if annotation `/AP` references are no longer collected as content streams.
+        let bytes = synthetic_inline_image_in_annotation_appearance_pdf();
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load appearance PDF");
+        assert_eq!(pdf_has_page_scan_image(&document), Ok(true));
+    }
+
+    #[test]
+    fn an_inline_image_in_a_type3_glyph_procedure_is_found() {
+        // Fails if Type3 `/CharProcs` references are no longer collected as content streams.
+        let bytes = synthetic_inline_image_in_type3_glyph_pdf();
+        let document = pdf_extract::Document::load_mem(&bytes).expect("load Type3 PDF");
+        assert_eq!(pdf_has_page_scan_image(&document), Ok(true));
     }
 
     #[test]
@@ -2605,13 +2852,14 @@ mod tests {
     }
 
     #[test]
-    fn an_undecodable_stream_fails_closed() {
-        // Fails if stream decode errors are ignored during the flat sweep.
+    fn an_undecodable_content_stream_fails_closed() {
+        // Fails if a page content-stream decode error no longer produces an unknown verdict.
         let page_stream = b"BT (Readable text.) Tj ET";
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] >>"
+                .to_vec(),
             pdf_stream("", page_stream.to_vec()),
             pdf_stream("/Filter /UnsupportedDecode", b"not decodable".to_vec()),
         ];
@@ -2623,7 +2871,7 @@ mod tests {
 
     #[test]
     fn the_stream_sweep_enforces_a_cumulative_decompressed_byte_budget() {
-        // Fails if decoded bytes are not accumulated across every stream in the document.
+        // Fails if decoded bytes are not accumulated across all swept content streams.
         let first = b"q 1 0 0 1 0 0 cm Q";
         let second = b"BT (Readable text.) Tj ET";
         let objects = [
@@ -2657,7 +2905,7 @@ mod tests {
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
             pdf_stream("/Filter /FlateDecode", compressed),
         ];
         let bytes = assemble_pdf(&objects);
