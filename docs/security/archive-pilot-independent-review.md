@@ -71,6 +71,9 @@ The reviewer should independently attempt at least these cases:
 | Same, with a signature that is valid but was made over different bytes | the download is refused |
 | Drive `check_for_archive_update` in a loop from the webview console before approving anything | exactly one request leaves the process |
 | Serve a manifest that never finishes, or a 500, or malformed JSON | the app reports that it could not check and is otherwise unaffected |
+| Invoke the folder picker directly while a check or download is in flight | exactly one side proceeds; the other is refused, and no panel/archive access overlaps network traffic |
+| Supply a signed archive with a link, special file, wrong Team ID, or wrong bundle identifier | installation is refused before replacement and the current app is unchanged |
+| Make the same-volume atomic exchange fail | installation is refused and both the current and staged paths remain unchanged |
 | Close the only window after indexing | process exits and cannot answer without rebuilding the vault |
 
 ## The bounded update surface, and what it costs
@@ -122,14 +125,16 @@ compare-exchange with an unconditional store makes
 closed when the folder picker opens, before the operator has chosen anything,
 so cancelling the panel does not restore it.
 
-**Signature verification.** Installation goes through
-`Update::download_and_install`, which verifies the minisign signature against
-the public key in `tauri.conf.json` before writing. That is the same key the
-main Minutes application uses; no second key was introduced. There is no other
-install path in the file -- the plugin's bare `install` would accept whatever
-bytes it was given, and adding a second entry point is how an unverified one
-appears later. A download only happens if the operator presses the button
-against a visible offer.
+**Signature verification and replacement.** The download goes through
+`Update::download`, which verifies the minisign signature against the public
+key in `tauri.conf.json` before returning bytes. That is the same key the main
+Minutes application uses; no second key was introduced. The pinned plugin's
+macOS replacement routine is not used because its rollback is incomplete.
+Archive extracts only one link-free `Minutes Archive.app`, verifies its
+Developer ID Team ID and bundle identifier, and atomically exchanges it with
+the current bundle on the same volume. A failed exchange changes neither path.
+A download only happens if the operator presses the button against a visible
+offer.
 
 **What did not change.** `archive-main` still does not carry `updater:default`,
 so the plugin's own commands remain unreachable from the webview; the "Webview
@@ -152,10 +157,10 @@ update and names the signed DMG as the recovery path.
 
 ## Egress and observation checks
 
-Use synthetic documents only for security testing. With networking disabled,
-exercise census, content authorization, PDF and DOCX conversion, semantic
-suggestions, export, and close. Repeat with networking enabled while observing
-the app and both workers.
+Use synthetic documents only for security testing. Exercise census, content
+authorization, PDF and DOCX conversion, semantic suggestions, export, and close
+with normal connectivity while observing the app and both workers. Do not
+disable the Mac's Wi-Fi or alter system-wide connectivity for this review.
 
 The expected observation without accepting an update is exactly one updater
 check, from the parent process only, to the configured update endpoint, before

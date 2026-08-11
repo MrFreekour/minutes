@@ -24,7 +24,7 @@ use minutes_archive_worker_control::LiveWorkerProcesses;
 use serde::Serialize;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
@@ -102,6 +102,15 @@ struct NetworkWindow {
     /// Spent by the one permitted download, which happens only if the operator
     /// asks for it.
     download_spent: AtomicBool,
+    /// True while either bounded network operation is alive.
+    ///
+    /// The webview disables folder controls during those operations, but the
+    /// Rust boundary must also arbitrate a compromised or racing caller. A
+    /// folder-panel command that arrives while this is true closes the network
+    /// window permanently but does not open the panel; the operator can choose
+    /// the folder after the request finishes, and no archive state can overlap
+    /// the request.
+    operation_in_flight: AtomicBool,
 }
 
 /// The one update this session may install, held between the check and consent.
@@ -186,6 +195,10 @@ const WINDOW_SPENT_REFUSAL: &str =
     "Minutes Archive allows each update step once per session, and this step \
      already ran.";
 
+/// Shown when a folder-panel command races the bounded update operation.
+const NETWORK_BUSY_REFUSAL: &str =
+    "Wait for the update check or installation to finish, then choose folders.";
+
 /// Shown when the request could not be completed, for any reason at all.
 ///
 /// One sentence for offline, endpoint down, DNS failure, malformed JSON, and a
@@ -193,8 +206,8 @@ const WINDOW_SPENT_REFUSAL: &str =
 /// nothing they can act on, and the raw error text is the one place a URL or a
 /// local path could leak into the interface.
 const UPDATE_UNAVAILABLE: &str =
-    "Minutes Archive could not reach the update file. Nothing was sent and \
-     nothing changed.";
+    "Minutes Archive could not complete the update check. No archive-derived \
+     data, query string, or request body was sent, and nothing changed.";
 
 #[derive(Debug)]
 struct ArchiveState {
@@ -395,7 +408,32 @@ fn session_has_seen_archive(session: &SessionState) -> bool {
 
 /// Closes the network window for the rest of the session.
 fn close_network_window(state: &ArchiveState) {
-    state.network.archive_seen.store(true, Ordering::Release);
+    state.network.archive_seen.store(true, Ordering::SeqCst);
+}
+
+/// Starts an archive interaction only when no updater request is alive.
+///
+/// Setting `archive_seen` first makes the race one-sided: either this call wins
+/// and the network claim refuses, or the network claim is already alive and
+/// this call refuses before opening the native panel. They can never both
+/// proceed.
+fn begin_archive_interaction(state: &ArchiveState) -> Result<(), String> {
+    close_network_window(state);
+    if state.network.operation_in_flight.load(Ordering::SeqCst) {
+        return Err(NETWORK_BUSY_REFUSAL.to_string());
+    }
+    Ok(())
+}
+
+/// Releases the exclusive updater-operation claim on every return path.
+struct NetworkOperationClaim<'a> {
+    in_flight: &'a AtomicBool,
+}
+
+impl Drop for NetworkOperationClaim<'_> {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Refuses unless this is still a launch-time, archive-free session.
@@ -404,8 +442,26 @@ fn close_network_window(state: &ArchiveState) {
 /// no second path. `spend` is the one-shot latch for the operation being
 /// claimed, so an interface that is compromised -- or merely looping on a bug
 /// -- cannot turn the launch check or consented download into a poll.
-fn claim_network_window(state: &ArchiveState, spend: &AtomicBool) -> Result<(), String> {
-    if state.network.archive_seen.load(Ordering::Acquire) {
+fn claim_network_window<'a>(
+    state: &'a ArchiveState,
+    spend: &AtomicBool,
+) -> Result<NetworkOperationClaim<'a>, String> {
+    if state.network.archive_seen.load(Ordering::SeqCst) {
+        return Err(WINDOW_CLOSED_REFUSAL.to_string());
+    }
+    state
+        .network
+        .operation_in_flight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| NETWORK_BUSY_REFUSAL.to_string())?;
+    let claim = NetworkOperationClaim {
+        in_flight: &state.network.operation_in_flight,
+    };
+
+    // `archive_seen` may have changed between the optimistic read above and
+    // the exclusive claim. A folder command that raced us sets it before it
+    // checks this claim, so this second read decides which side proceeds.
+    if state.network.archive_seen.load(Ordering::SeqCst) {
         return Err(WINDOW_CLOSED_REFUSAL.to_string());
     }
     {
@@ -421,7 +477,14 @@ fn claim_network_window(state: &ArchiveState, spend: &AtomicBool) -> Result<(), 
     spend
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .map_err(|_| WINDOW_SPENT_REFUSAL.to_string())?;
-    Ok(())
+    // One last read closes the interleaving where an archive interaction set
+    // its latch while the live session was being inspected. If it set the
+    // latch after this read, it necessarily observes `operation_in_flight` and
+    // refuses before opening a panel.
+    if state.network.archive_seen.load(Ordering::SeqCst) {
+        return Err(WINDOW_CLOSED_REFUSAL.to_string());
+    }
+    Ok(claim)
 }
 
 /// Records what the operator should see, and returns it for the same reason.
@@ -477,12 +540,15 @@ async fn check_for_archive_update(
     app: tauri::AppHandle,
     state: State<'_, ArchiveState>,
 ) -> Result<UpdateReport, String> {
-    if let Err(reason) = claim_network_window(&state, &state.network.check_spent) {
-        return Ok(publish_update_report(
-            &state,
-            UpdateReport::Refused { reason },
-        ));
-    }
+    let _network_claim = match claim_network_window(&state, &state.network.check_spent) {
+        Ok(claim) => claim,
+        Err(reason) => {
+            return Ok(publish_update_report(
+                &state,
+                UpdateReport::Refused { reason },
+            ));
+        }
+    };
 
     let installed = app.package_info().version.to_string();
     publish_update_report(&state, UpdateReport::Checking);
@@ -502,7 +568,10 @@ async fn check_for_archive_update(
     };
 
     Ok(match outcome {
-        Ok(Some(update)) => {
+        Ok(Some(mut update)) => {
+            // The manifest check is deliberately short; the consented app
+            // download is larger and gets its own bounded request lifetime.
+            update.timeout = Some(std::time::Duration::from_secs(10 * 60));
             let offered = update.version.clone();
             publish_update_offer(
                 &state,
@@ -520,25 +589,30 @@ async fn check_for_archive_update(
     })
 }
 
-/// Downloads and installs the update the operator just asked for.
+/// Downloads, verifies, and atomically swaps in the update the operator asked for.
 ///
-/// `download_and_install` verifies the minisign signature against the public
-/// key in `tauri.conf.json` -- the same key the main Minutes application signs
-/// with -- before a byte is written anywhere. There is deliberately no other
-/// install path in this file: the plugin's `install` alone would take whatever
-/// bytes it was handed, and a second entry point is how an unverified one gets
-/// added later.
+/// `Update::download` verifies the minisign signature against the public key in
+/// `tauri.conf.json` -- the same key the main Minutes application signs with --
+/// before returning bytes. The pinned plugin's macOS installer is deliberately
+/// not used: it moves the current app into a temporary backup and has failure
+/// paths that can delete that backup. The replacement below is first extracted
+/// and code-signature checked in a sibling directory, then exchanged with the
+/// running bundle in one filesystem operation. A failed exchange changes
+/// neither path.
 #[tauri::command]
 async fn install_archive_update(state: State<'_, ArchiveState>) -> Result<UpdateReport, String> {
     // The same window, for the same reasons. Consent does not reopen it: if the
     // operator approved a folder while the offer was on screen, the answer is
     // no, and quitting and reopening is the way to take it.
-    if let Err(reason) = claim_network_window(&state, &state.network.download_spent) {
-        return Ok(publish_update_report(
-            &state,
-            UpdateReport::Refused { reason },
-        ));
-    }
+    let _network_claim = match claim_network_window(&state, &state.network.download_spent) {
+        Ok(claim) => claim,
+        Err(reason) => {
+            return Ok(publish_update_report(
+                &state,
+                UpdateReport::Refused { reason },
+            ));
+        }
+    };
 
     let offered = state
         .update
@@ -557,16 +631,198 @@ async fn install_archive_update(state: State<'_, ArchiveState>) -> Result<Update
 
     let version = offered.0.version.clone();
     publish_update_report(&state, UpdateReport::Installing);
+    let downloaded = offered.0.download(|_, _| {}, || {}).await;
     Ok(
-        match offered.0.download_and_install(|_, _| {}, || {}).await {
+        match downloaded.and_then(|bytes| {
+            install_verified_archive(&bytes).map_err(tauri_plugin_updater::Error::Io)
+        }) {
             Ok(()) => publish_update_report(&state, UpdateReport::Installed { offered: version }),
-            // Includes a signature that does not verify. The old application is
-            // still in place and still works, which is the whole point of refusing.
+            // Includes a signature or local code-signature failure. The atomic
+            // exchange has not happened, so the current application is unchanged.
             Err(_) => {
                 publish_update_report(&state, UpdateReport::InstallFailed { offered: version })
             }
         },
     )
+}
+
+#[cfg(target_os = "macos")]
+fn running_app_bundle_path() -> std::io::Result<PathBuf> {
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let macos = executable
+        .parent()
+        .ok_or_else(|| std::io::Error::other("running executable has no parent"))?;
+    let contents = macos
+        .parent()
+        .ok_or_else(|| std::io::Error::other("running executable is not in an app bundle"))?;
+    let app = contents
+        .parent()
+        .ok_or_else(|| std::io::Error::other("running executable is not in an app bundle"))?;
+    if macos.file_name().and_then(|name| name.to_str()) != Some("MacOS")
+        || contents.file_name().and_then(|name| name.to_str()) != Some("Contents")
+        || app.extension().and_then(|extension| extension.to_str()) != Some("app")
+    {
+        return Err(std::io::Error::other(
+            "running executable is not in a macOS app bundle",
+        ));
+    }
+    Ok(app.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_update_archive(bytes: &[u8], destination: &Path) -> std::io::Result<PathBuf> {
+    use flate2::read::GzDecoder;
+    use std::ffi::OsStr;
+    use std::io::Cursor;
+
+    let mut archive = tar::Archive::new(GzDecoder::new(Cursor::new(bytes)));
+    let expected_root = OsStr::new("Minutes Archive.app");
+    let mut saw_payload = false;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let mut components = path.components();
+        match components.next() {
+            Some(std::path::Component::Normal(component)) if component == expected_root => {}
+            _ => {
+                return Err(std::io::Error::other(
+                    "update archive has an unexpected top-level path",
+                ));
+            }
+        }
+        if components.any(|component| !matches!(component, std::path::Component::Normal(_))) {
+            return Err(std::io::Error::other(
+                "update archive contains an unsafe path",
+            ));
+        }
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(std::io::Error::other(
+                "update archive contains a link or special file",
+            ));
+        }
+        if !entry.unpack_in(destination)? {
+            return Err(std::io::Error::other(
+                "update archive tried to escape its staging directory",
+            ));
+        }
+        saw_payload = true;
+    }
+    let staged_app = destination.join(expected_root);
+    if !saw_payload || !staged_app.is_dir() {
+        return Err(std::io::Error::other(
+            "update archive does not contain Minutes Archive.app",
+        ));
+    }
+    Ok(staged_app)
+}
+
+#[cfg(target_os = "macos")]
+fn reject_links_in_tree(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "staged update contains a symbolic link",
+        ));
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            reject_links_in_tree(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_staged_archive_app(app: &Path) -> std::io::Result<()> {
+    reject_links_in_tree(app)?;
+    let executable = app.join("Contents/MacOS/minutes-archive-app");
+    if !executable.is_file() {
+        return Err(std::io::Error::other(
+            "staged update has no Archive executable",
+        ));
+    }
+
+    let verification = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict", "--verbose=4"])
+        .arg(app)
+        .output()?;
+    if !verification.status.success() {
+        return Err(std::io::Error::other(
+            "staged update failed its Developer ID signature check",
+        ));
+    }
+    let identity = std::process::Command::new("/usr/bin/codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(app)
+        .output()?;
+    if !identity.status.success() {
+        return Err(std::io::Error::other(
+            "staged update identity could not be read",
+        ));
+    }
+    let details = String::from_utf8_lossy(&identity.stderr);
+    if !details
+        .lines()
+        .any(|line| line == "TeamIdentifier=63TMLKT8HN")
+        || !details
+            .lines()
+            .any(|line| line == "Identifier=com.useminutes.archive")
+    {
+        return Err(std::io::Error::other(
+            "staged update is not the signed Minutes Archive application",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_swap_paths(first: &Path, second: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let first = CString::new(first.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("application path contains a null byte"))?;
+    let second = CString::new(second.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("staging path contains a null byte"))?;
+    // Both paths are siblings on the same volume. RENAME_SWAP is one atomic
+    // filesystem transaction: success leaves the new app at the original path
+    // and the old app in staging; failure changes neither path.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_verified_archive(bytes: &[u8]) -> std::io::Result<()> {
+    let current_app = running_app_bundle_path()?;
+    let parent = current_app
+        .parent()
+        .ok_or_else(|| std::io::Error::other("application bundle has no parent"))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".minutes-archive-update-")
+        .tempdir_in(parent)?;
+    let staged_app = extract_update_archive(bytes, staging.path())?;
+    verify_staged_archive_app(&staged_app)?;
+    atomic_swap_paths(&current_app, &staged_app)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_verified_archive(_bytes: &[u8]) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "Minutes Archive updates are supported only on macOS",
+    ))
 }
 
 /// Counts for the build in flight.
@@ -707,7 +963,7 @@ async fn choose_archive_locations(
     // network window closes here rather than after a folder is actually
     // approved. Cancelling the panel does not reopen it: the intent to point
     // this application at an archive is the event, not the outcome.
-    close_network_window(&state);
+    begin_archive_interaction(&state)?;
     let selected = app
         .dialog()
         .file()
@@ -2477,16 +2733,15 @@ mod tests {
     #[test]
     fn a_launch_session_that_has_seen_nothing_may_check_once() {
         let state = ArchiveState::default();
-        assert_eq!(
-            claim_network_window(&state, &state.network.check_spent),
-            Ok(())
-        );
+        let claim = claim_network_window(&state, &state.network.check_spent)
+            .expect("a pristine session may claim its launch check");
+        drop(claim);
         // ...and exactly once. The claim on screen and in Peter's disclosure is
         // "one request", so a second call is refused even though nothing about
         // the session has changed.
         assert_eq!(
-            claim_network_window(&state, &state.network.check_spent),
-            Err(WINDOW_SPENT_REFUSAL.to_string())
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_SPENT_REFUSAL.to_string())
         );
     }
 
@@ -2512,8 +2767,8 @@ mod tests {
             });
 
         assert_eq!(
-            claim_network_window(&state, &state.network.check_spent),
-            Err(WINDOW_CLOSED_REFUSAL.to_string()),
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
             "an update check was permitted after a folder was approved"
         );
         assert!(
@@ -2523,8 +2778,8 @@ mod tests {
         // The download path is the same gate, so consenting to an install the
         // operator was offered before approving a folder is refused too.
         assert_eq!(
-            claim_network_window(&state, &state.network.download_spent),
-            Err(WINDOW_CLOSED_REFUSAL.to_string()),
+            claim_network_window(&state, &state.network.download_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
             "an update download was permitted after a folder was approved"
         );
     }
@@ -2567,8 +2822,8 @@ mod tests {
         state.session.lock().expect("session").text_vault = Some(vault);
 
         assert_eq!(
-            claim_network_window(&state, &state.network.check_spent),
-            Err(WINDOW_CLOSED_REFUSAL.to_string()),
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
             "an update check was permitted while an index of the operator's documents was open"
         );
     }
@@ -2606,8 +2861,8 @@ mod tests {
         }
 
         assert_eq!(
-            claim_network_window(&state, &state.network.check_spent),
-            Err(WINDOW_CLOSED_REFUSAL.to_string()),
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
             "removing the approved location reopened the network window"
         );
     }
@@ -2618,8 +2873,150 @@ mod tests {
         let state = ArchiveState::default();
         state.session.lock().expect("session").scan.running = true;
         assert_eq!(
-            claim_network_window(&state, &state.network.check_spent),
-            Err(WINDOW_CLOSED_REFUSAL.to_string())
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string())
+        );
+    }
+
+    /// A direct IPC race cannot overlap the updater with a native folder panel.
+    ///
+    /// UI buttons are disabled while the request is alive, but that is a
+    /// convenience, not the boundary. This exercises the Rust arbitration
+    /// that a compromised webview cannot bypass.
+    #[test]
+    fn an_archive_interaction_cannot_overlap_a_network_operation() {
+        let state = ArchiveState::default();
+        let claim = claim_network_window(&state, &state.network.check_spent)
+            .expect("the launch check should own the operation slot");
+
+        assert_eq!(
+            begin_archive_interaction(&state),
+            Err(NETWORK_BUSY_REFUSAL.to_string()),
+            "a folder panel could open while update traffic was alive"
+        );
+        assert!(
+            state.network.archive_seen.load(Ordering::SeqCst),
+            "the racing folder request did not close the network window"
+        );
+
+        drop(claim);
+        assert_eq!(
+            claim_network_window(&state, &state.network.download_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
+            "the completed update operation reopened the raced window"
+        );
+    }
+
+    #[test]
+    fn a_network_operation_cannot_start_after_archive_interaction_begins() {
+        let state = ArchiveState::default();
+        begin_archive_interaction(&state).expect("an idle launch may open its folder panel");
+        assert_eq!(
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string())
+        );
+        assert!(
+            !state.network.check_spent.load(Ordering::Acquire),
+            "a refused race consumed the one launch check"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn synthetic_update_archive(include_link: bool) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Cursor;
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for path in [
+            "Minutes Archive.app/",
+            "Minutes Archive.app/Contents/",
+            "Minutes Archive.app/Contents/MacOS/",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_size(0);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, std::io::empty())
+                .expect("append directory");
+        }
+
+        let payload = b"synthetic signed executable";
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o755);
+        header.set_size(payload.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "Minutes Archive.app/Contents/MacOS/minutes-archive-app",
+                Cursor::new(payload),
+            )
+            .expect("append executable");
+
+        if include_link {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_size(0);
+            header.set_cksum();
+            archive
+                .append_link(
+                    &mut header,
+                    "Minutes Archive.app/Contents/escape",
+                    "/tmp/outside",
+                )
+                .expect("append link");
+        }
+
+        archive
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn updater_extraction_accepts_only_one_link_free_archive_bundle() {
+        let destination = TempDir::new().expect("destination");
+        let app = extract_update_archive(&synthetic_update_archive(false), destination.path())
+            .expect("extract safe update");
+        assert_eq!(
+            fs::read(app.join("Contents/MacOS/minutes-archive-app")).expect("read payload"),
+            b"synthetic signed executable"
+        );
+
+        let refused = TempDir::new().expect("refused destination");
+        assert!(
+            extract_update_archive(&synthetic_update_archive(true), refused.path()).is_err(),
+            "a linked updater archive crossed the staging boundary"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn updater_replacement_is_one_atomic_exchange() {
+        let temp = TempDir::new().expect("temp");
+        let current = temp.path().join("Minutes Archive.app");
+        let staged = temp.path().join("staged.app");
+        fs::create_dir(&current).expect("current app");
+        fs::create_dir(&staged).expect("staged app");
+        fs::write(current.join("identity"), b"current").expect("current marker");
+        fs::write(staged.join("identity"), b"staged").expect("staged marker");
+
+        atomic_swap_paths(&current, &staged).expect("atomic app exchange");
+        assert_eq!(
+            fs::read(current.join("identity")).expect("new app"),
+            b"staged"
+        );
+        assert_eq!(
+            fs::read(staged.join("identity")).expect("old app"),
+            b"current"
         );
     }
 

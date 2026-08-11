@@ -1091,7 +1091,8 @@ const updateCopy = {
     headline: "Checking for a signed update",
     detail:
       "One request for a version file, made before any folder is approved. " +
-      "Nothing about you or your documents is sent.",
+      "No archive data or app-supplied identifier is sent. The server still " +
+      "sees this Mac's IP address and request time.",
   }),
   current: (report) => ({
     headline: `Minutes Archive ${report.installed} is up to date`,
@@ -1170,6 +1171,10 @@ async function checkForUpdate() {
 async function installUpdate() {
   setLocationControlsDisabled(true);
   elements.installUpdate.disabled = true;
+  // The button is about to disappear. Move keyboard and VoiceOver focus to
+  // the atomic live region so the offered version and installation state are
+  // announced together instead of dropping focus into the page.
+  elements.updateStrip.focus();
   renderUpdate({ state: "installing" });
   try {
     renderUpdate(await invoke("install_archive_update"));

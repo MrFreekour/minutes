@@ -35,6 +35,7 @@ jobs:
       candidate_sha: ${{ steps.authorize.outputs.candidate_sha }}
       checkout_ref: ${{ steps.authorize.outputs.checkout_ref }}
       release_tag: ${{ steps.authorize.outputs.release_tag }}
+      tooling_sha: ${{ steps.authorize.outputs.tooling_sha }}
     steps:
       - name: Bind the request to its protected acceptance tag
         id: authorize
@@ -42,6 +43,7 @@ jobs:
           REQUESTED_SHA: ${{ inputs.candidate_sha }}
           REF_NAME: ${{ github.ref_name }}
           EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "push" ]; then
@@ -63,6 +65,18 @@ jobs:
           fi
           tag="${CHECKOUT_REF#refs/tags/}"
           remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          TOOLING_SHA="$(
+            git ls-remote --heads "$remote" refs/heads/main |
+              awk '$2 == "refs/heads/main" {print $1}'
+          )"
+          if [[ ! "$TOOLING_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not bind release tooling to one exact main commit" >&2
+            exit 1
+          fi
+          if [ "$EVENT_NAME" != "push" ] && [ "$TOOLING_SHA" != "$WORKFLOW_SHA" ]; then
+            echo "Dispatched workflow definition is not the exact current main commit" >&2
+            exit 1
+          fi
           # `git ls-remote` patterns tail-match across ref namespaces, so a
           # pattern of "refs/tags/<tag>" also matches a branch literally named
           # "refs/tags/<tag>" (full ref refs/heads/refs/tags/<tag>). Restrict
@@ -97,6 +111,10 @@ jobs:
           resolved="${peeled:-$exact}"
           if [ "$EVENT_NAME" = "push" ]; then
             CANDIDATE_SHA="$resolved"
+            if [ "$CANDIDATE_SHA" != "$TOOLING_SHA" ]; then
+              echo "Archive release tag must point to the exact current main commit" >&2
+              exit 1
+            fi
           elif [ "$resolved" != "$CANDIDATE_SHA" ]; then
             echo "Protected tag $tag does not resolve exactly to $CANDIDATE_SHA" >&2
             exit 1
@@ -105,6 +123,7 @@ jobs:
             echo "candidate_sha=$CANDIDATE_SHA"
             echo "checkout_ref=$CHECKOUT_REF"
             echo "release_tag=$RELEASE_TAG"
+            echo "tooling_sha=$TOOLING_SHA"
           } >> "$GITHUB_OUTPUT"
 
   build-unsigned:
@@ -211,12 +230,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Release tooling and presentation assets come from reviewed main, not
-      # from candidate-controlled code. They are installed/read before either
-      # the Apple identity or updater signing key is exposed.
-      - name: Check out reviewed release tooling only
+      # Release tooling and presentation assets come from the exact main SHA
+      # resolved by the authorization job, not from the event's implicit tag
+      # checkout. They are installed/read before either the Apple identity or
+      # updater signing key is exposed.
+      - name: Check out exact reviewed-main release tooling only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ needs.authorize-candidate.outputs.tooling_sha }}
           fetch-depth: 1
           persist-credentials: false
           sparse-checkout: |
@@ -225,6 +246,11 @@ jobs:
             tauri/src-tauri/icons/icon.icns
             docs/release/notes
           sparse-checkout-cone-mode: false
+
+      - name: Verify exact release-tooling checkout
+        env:
+          TOOLING_SHA: ${{ needs.authorize-candidate.outputs.tooling_sha }}
+        run: test "$(git rev-parse HEAD)" = "$TOOLING_SHA"
 
       - name: Install pinned Tauri signer before credentials unlock
         run: cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
@@ -378,18 +404,6 @@ jobs:
 
           executable="$app/Contents/MacOS/minutes-archive-app"
 
-          # Prove the SIGNED app can run its own workers, before anything is
-          # published. Every other check here is about provenance: is it the
-          # right bytes, signed by the right identity, notarized and stapled.
-          # All of that passed on a build that could not index a single
-          # document, because the workers were copied to a temp directory and a
-          # copy of a bundle-signed binary is killed on exec. Local testing used
-          # an ad-hoc-signed app whose copy runs fine, and the smokes above run
-          # on the unsigned build, so nothing saw it until a human clicked the
-          # button. This is the only step that exercises the artifact as
-          # shipped.
-          "$executable" --archive-signed-worker-selftest
-
           executable_sha="$(shasum -a 256 "$executable" | awk '{print $1}')"
           printf 'candidate=%s\nteam_id=%s\nidentifier=%s\nexecutable_sha256=%s\nnotarized=true\nstapled=true\n' \
             "$CANDIDATE_SHA" "$team_id" "$identifier" "$executable_sha" \
@@ -532,6 +546,16 @@ jobs:
             "${ARCHIVE_API_KEY_PATH:-}" \
             "$RUNNER_TEMP/Minutes-Archive-notary.zip" \
             "$RUNNER_TEMP/archive-dmg-notary-submit.json"
+
+      # Candidate code is exercised only after the Developer ID keychain,
+      # notarization key, and updater signing secret have all left scope. This
+      # proves the shipped signed app can run its workers without giving that
+      # app an opportunity to read release credentials.
+      - name: Exercise exact signed app after credential teardown
+        run: |
+          set -euo pipefail
+          signed/Minutes\ Archive.app/Contents/MacOS/minutes-archive-app \
+            --archive-signed-worker-selftest
 
       - name: Upload short-lived notarized Archive pilot
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

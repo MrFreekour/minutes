@@ -120,7 +120,9 @@ result, verifier output, and verifier Mac details.
 After source approval, create and push the exact version tag shown in the
 Archive config, for example `archive-v0.2.0`. The protected signing workflow
 creates a **private draft release** and stops. It does not make the version
-public and does not touch `archive-stable`.
+public and does not touch `archive-stable`. The tag must point to the exact
+current `main` commit; the workflow resolves that SHA itself and checks out
+release tooling by SHA rather than implicitly trusting the tag checkout.
 
 Download that draft with `gh release download`, run the artifact verifier, and
 complete the independent Finder/security review against its exact DMG. Record
@@ -146,9 +148,24 @@ only then advances `archive-stable/latest-archive.json` with the same reviewed
 manifest. Neither the Archive version nor its machine-readable channel replaces
 the normal Minutes release marked “Latest” on GitHub.
 
+If promotion stops after the versioned draft becomes public but before the
+stable manifest is verified, do not rebuild or replace anything. Rerun the
+promotion with the same three reviewed inputs. It accepts that partial state
+only after rechecking the protected tag, exact asset set, checksum-record hash,
+and every asset digest, then resumes at public-byte verification and stable
+publication.
+
 Confirm the stable URL returns 200, its version and asset URL match the reviewed
 release, and the public DMG has the reviewed SHA-256 before delivery. The normal
 Minutes `latest.json` channel is not involved.
+
+Before Peter receives the first updater-enabled build, exercise the public
+stable channel with a disposable older development copy installed in a
+temporary app folder. It must discover the reviewed version, download only
+after the test operator presses Install, verify the updater signature and
+Developer ID identity, atomically replace only that disposable app, and reopen
+as the reviewed version. Use synthetic fixtures only and compare the installed
+executable hash with the signed provenance record.
 
 ## Human and independent acceptance
 
@@ -170,10 +187,11 @@ folder is approved. The app never wrote outside its own
 space. The leak sweep still has to distinguish the two every time, so keep the
 fixtures off synced volumes and the question does not arise.
 
-The release operator completes the Finder interaction once with networking
-disabled and once with networking enabled under observation. The independent
-reviewer follows `docs/security/archive-pilot-independent-review.md` and owns
-the review decision.
+The release operator completes the Finder interaction with normal connectivity
+under observation. Do not disable the Mac's Wi-Fi or alter system-wide
+connectivity. The independent reviewer follows
+`docs/security/archive-pilot-independent-review.md` and owns the review
+decision.
 
 The app may be handed to Peter only when:
 
@@ -181,7 +199,6 @@ The app may be handed to Peter only when:
 - native folder-picker, cancellation, census export, content authorization,
   exact retrieval, stale-source withdrawal, and close-time purge have been
   click-tested;
-- the offline run succeeds;
 - in the observed online run, no worker opens a network connection at all, and
   the parent performs exactly one launch update check, to the configured
   endpoint and any GitHub-owned release redirect, before any folder is approved,

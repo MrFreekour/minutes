@@ -12,12 +12,12 @@ downloaded notarized artifact with
 `scripts/verify-archive-pilot-artifact.sh`. An independent reviewer approves the
 security packet in `docs/security/archive-pilot-independent-review.md`. The
 operator then performs the complete installed-app interaction once with
-networking disabled and once with networking enabled under network
-observation. Under observation the expected result is one update check at
-launch, to the configured GitHub endpoint and any GitHub release-asset redirect,
-before any folder is approved, and nothing else for the rest of the session.
-Any second check, or any connection after a folder is approved, is a stop-ship
-finding.
+normal connectivity under network observation. Do not disable the Mac's Wi-Fi
+or alter system-wide connectivity for this test. The expected result is one
+update check at launch, to the configured GitHub endpoint and any GitHub
+release-asset redirect, before any folder is approved, and nothing else for the
+rest of the session. Any second check, or any connection after a folder is
+approved, is a stop-ship finding.
 
 Do not use Peter's documents for those release tests. Use synthetic legal
 fixtures with distinctive canary text. The release operator creates the
@@ -95,10 +95,11 @@ That check happens the moment the app opens, before you have chosen a folder,
 so at that point the app has not seen a single one of your documents and has
 nothing about them it could send. It is the only automatic internet use.
 
-The request sends nothing about you. Not your name, not your Mac, not a licence
-number, not a count of anything, not a folder, not a filename, not a word of
-any document. It asks for one small file on the Minutes download page — the
-same file everybody's copy asks for — and reads a version number out of it.
+The request contains no app-supplied identifier and nothing from the archive:
+not your name, not a licence number, not a count, not a folder, not a filename,
+and not a word of any document. It asks for one small file on the Minutes
+download page — the same file everybody's copy asks for — and reads a version
+number out of it.
 
 What the far end does learn, because every internet request works this way, is
 that some computer at your office's internet address opened Minutes Archive at

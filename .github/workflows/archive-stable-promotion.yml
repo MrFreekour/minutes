@@ -40,7 +40,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
-      - name: Bind promotion to the exact protected tag and private draft
+      - name: Bind promotion to the exact protected tag and staged release
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^archive-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -86,10 +86,8 @@ jobs:
           import os
 
           release = json.loads(os.environ["RELEASE_JSON"])
-          if not release.get("draft"):
-              raise SystemExit("Versioned release is not a private draft")
           if release.get("tag_name") != os.environ["RELEASE_TAG"]:
-              raise SystemExit("Draft release tag does not match the requested tag")
+              raise SystemExit("Staged release tag does not match the requested tag")
           PY
 
       - name: Download and verify the exact independently reviewed asset set
@@ -211,7 +209,12 @@ jobs:
       - name: Publish draft, verify public bytes, then advance stable manifest last
         run: |
           set -euo pipefail
-          gh release edit "$RELEASE_TAG" --draft=false
+          # A retry after a partial run may find that the exact reviewed release
+          # is already public but `archive-stable` was never advanced. The
+          # checksum-bound steps above make that state safe to resume.
+          if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = "true" ]; then
+            gh release edit "$RELEASE_TAG" --draft=false --latest=false
+          fi
 
           mkdir public
           while IFS= read -r asset; do

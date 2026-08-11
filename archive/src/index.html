@@ -34,14 +34,19 @@
         id="update-strip"
         class="update-strip"
         aria-label="Update check"
+        aria-atomic="true"
+        aria-live="polite"
+        role="status"
+        tabindex="-1"
         hidden
       >
         <span id="update-dot" class="update-dot" aria-hidden="true"></span>
         <div>
           <strong id="update-headline">Checking for a signed update</strong>
-          <p id="update-detail" role="status" aria-live="polite">
+          <p id="update-detail">
             One request for a version file, made before any folder is approved.
-            Nothing about you or your documents is sent.
+            No archive data or app-supplied identifier is sent. The server still
+            sees this Mac's IP address and request time.
           </p>
         </div>
         <button id="install-update" class="button button-secondary" type="button" hidden>

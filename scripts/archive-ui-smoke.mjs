@@ -385,6 +385,13 @@ try {
           throw new Error("the update check ran without saying so on screen");
         }
         if (
+          updateStrip.getAttribute("role") !== "status" ||
+          updateStrip.getAttribute("aria-live") !== "polite" ||
+          updateStrip.getAttribute("aria-atomic") !== "true"
+        ) {
+          throw new Error("the complete update announcement is not one atomic live region");
+        }
+        if (
           !updateStrip.textContent.includes("0.2.0") ||
           !updateStrip.textContent.includes("0.1.0")
         ) {
@@ -398,6 +405,10 @@ try {
         if (installUpdate.hidden) {
           throw new Error("an available update offered no way to consent to it");
         }
+        installUpdate.focus();
+        if (document.activeElement !== installUpdate) {
+          throw new Error("the update consent control could not receive focus");
+        }
         installUpdate.click();
         await waitFor(
           () => updateStrip.dataset.state === "installed",
@@ -405,6 +416,12 @@ try {
         );
         if (!installUpdate.hidden) {
           throw new Error("the install button survived the install it performed");
+        }
+        if (document.activeElement !== updateStrip) {
+          throw new Error("focus was lost when the install button disappeared");
+        }
+        if (!updateStrip.textContent.includes("0.2.0")) {
+          throw new Error("the live update result omitted the installed version");
         }
         const setupButtonBounds = document
           .querySelector("#add-locations")
