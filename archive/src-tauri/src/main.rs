@@ -737,6 +737,13 @@ fn reject_links_in_tree(path: &Path) -> std::io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn verify_staged_archive_app(app: &Path) -> std::io::Result<()> {
+    // Match Apple's designated requirement for a Developer ID Application
+    // signed by the Minutes team. `codesign --verify` alone proves only that a
+    // signature is internally consistent; this external requirement also
+    // proves that the chain anchors at Apple and carries the Developer ID
+    // Application certificate extensions.
+    const DEVELOPER_ID_REQUIREMENT: &str = r#"=identifier "com.useminutes.archive" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "63TMLKT8HN""#;
+
     reject_links_in_tree(app)?;
     let executable = app.join("Contents/MacOS/minutes-archive-app");
     if !executable.is_file() {
@@ -746,7 +753,14 @@ fn verify_staged_archive_app(app: &Path) -> std::io::Result<()> {
     }
 
     let verification = std::process::Command::new("/usr/bin/codesign")
-        .args(["--verify", "--deep", "--strict", "--verbose=4"])
+        .args([
+            "--verify",
+            "--deep",
+            "--strict",
+            "--verbose=4",
+            "--test-requirement",
+            DEVELOPER_ID_REQUIREMENT,
+        ])
         .arg(app)
         .output()?;
     if !verification.status.success() {
