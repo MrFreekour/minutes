@@ -311,7 +311,33 @@ struct LiveTranscriptWriter {
     dropped_utterances: u64,
     diagnostic: Option<String>,
     last_status_write: Instant,
+    /// Apple Speech shadow measurement, `None` unless the session opted in
+    /// (`transcription.apple_speech_shadow`). Lives on the writer because the
+    /// writer is already threaded through every finalize path, so hooking it
+    /// here needs no signature churn in the capture code.
+    #[cfg(target_os = "macos")]
+    shadow: Option<LiveShadow>,
 }
+
+/// Per-session Apple Speech shadow state for a live transcript.
+///
+/// `StreamingWhisper` owns its accumulated audio internally and does not hand it
+/// back, so shadow keeps its own parallel copy of the utterance samples. The
+/// buffer is bounded: an utterance past [`SHADOW_MAX_SAMPLES`] marks the session
+/// sample overflowed and is skipped entirely rather than compared on truncated
+/// audio, which would understate Apple Speech and corrupt the measurement.
+#[cfg(target_os = "macos")]
+struct LiveShadow {
+    runner: crate::apple_speech_shadow::ShadowRunner,
+    samples: Vec<f32>,
+    overflowed: bool,
+}
+
+/// Cap on shadow's parallel sample buffer: 120 s at 16 kHz (~7.7 MB). Live
+/// utterances are VAD-segmented and far shorter; anything past this is skipped
+/// rather than truncated, keeping both memory and the measurement honest.
+#[cfg(target_os = "macos")]
+const SHADOW_MAX_SAMPLES: usize = 16_000 * 120;
 
 /// Lightweight sidecar written atomically on each utterance.
 /// Status readers check this instead of reparsing the full JSONL.
@@ -409,10 +435,80 @@ impl LiveTranscriptWriter {
             last_status_write: Instant::now()
                 .checked_sub(SIDECAR_HEARTBEAT_INTERVAL)
                 .unwrap_or_else(Instant::now),
+            #[cfg(target_os = "macos")]
+            shadow: None,
         };
 
         Ok(writer)
     }
+
+    /// Arm Apple Speech shadow measurement for this session when the user opted
+    /// in. No-op when shadow is off (the default), when the runner thread cannot
+    /// be spawned, or on non-macOS. Independent of the product transport gate:
+    /// shadow measures alongside Whisper and never changes what is written.
+    #[cfg(target_os = "macos")]
+    fn enable_shadow(&mut self, config: &Config) {
+        if !crate::apple_speech_shadow::shadow_enabled(config) {
+            return;
+        }
+        match crate::apple_speech_shadow::spawn_live_shadow_runner(config) {
+            Some(runner) => {
+                tracing::info!("apple-speech shadow measurement armed for this live session");
+                self.shadow = Some(LiveShadow {
+                    runner,
+                    samples: Vec::new(),
+                    overflowed: false,
+                });
+            }
+            None => tracing::warn!(
+                "apple-speech shadow requested but its worker thread could not start; continuing without shadow"
+            ),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn enable_shadow(&mut self, _config: &Config) {}
+
+    /// Accumulate raw utterance samples for the shadow comparison, mirroring what
+    /// `StreamingWhisper` is fed. Bounded by [`SHADOW_MAX_SAMPLES`]; past that the
+    /// utterance is marked overflowed and will be skipped, not truncated.
+    #[cfg(target_os = "macos")]
+    fn push_shadow_samples(&mut self, samples: &[f32]) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            if shadow.samples.len().saturating_add(samples.len()) > SHADOW_MAX_SAMPLES {
+                shadow.overflowed = true;
+                shadow.samples = Vec::new();
+                return;
+            }
+            if !shadow.overflowed {
+                shadow.samples.extend_from_slice(samples);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn push_shadow_samples(&mut self, _samples: &[f32]) {}
+
+    /// Hand the finished utterance to the shadow runner: the Whisper text that is
+    /// actually shipping, plus the samples that produced it. Called only where
+    /// Whisper is the shipped engine, so the comparison is always shadow-vs-shipped.
+    /// Ownership of the buffer moves to the runner (no copy on this thread), and
+    /// the runner drops the job if it is busy — capture is never blocked.
+    #[cfg(target_os = "macos")]
+    fn submit_whisper_shadow(&mut self, whisper_text: &str) {
+        let Some(shadow) = self.shadow.as_mut() else {
+            return;
+        };
+        let samples = std::mem::take(&mut shadow.samples);
+        let overflowed = std::mem::replace(&mut shadow.overflowed, false);
+        if overflowed || samples.is_empty() {
+            return;
+        }
+        shadow.runner.try_submit(samples, whisper_text.to_string());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn submit_whisper_shadow(&mut self, _whisper_text: &str) {}
 
     /// Write the lightweight status file (atomic rename).
     fn write_status(
@@ -801,6 +897,7 @@ fn run_inner(
     // Only now create the writer (which truncates the JSONL and WAV files)
     let mut writer =
         LiveTranscriptWriter::new(config, context_session_id, TranscriptSource::Standalone)?;
+    writer.enable_shadow(config);
     writer.mark_healthy();
     crate::events::append_event(crate::events::recording_started_event(
         writer.session_id.clone(),
@@ -1168,6 +1265,9 @@ fn run_inner(
                     parakeet_utterance_samples.extend_from_slice(&chunk.samples);
                 }
             } else if let Ok(whisper_ctx) = ensure_live_whisper_ctx(&mut whisper_ctx, config) {
+                // Shadow keeps its own copy of what whisper is fed: StreamingWhisper
+                // does not hand its buffer back. No-op unless shadow is armed.
+                writer.push_shadow_samples(&chunk.samples);
                 if let Some(sr) = streaming.feed(&chunk.samples, whisper_ctx) {
                     if let Some(publisher) = partial_publisher.as_mut() {
                         let _ = publisher
@@ -2177,6 +2277,9 @@ fn finalize_live_utterance(
     let write_ok = match ensure_live_whisper_ctx(whisper_ctx, config) {
         Ok(whisper_ctx) => {
             let ok = if let Some(sr) = streaming.finalize(whisper_ctx) {
+                // Whisper is the shipped engine here, so this is the one place a
+                // shadow comparison is valid. No-op unless shadow is armed.
+                writer.submit_whisper_shadow(&sr.text);
                 writer.write_utterance(&sr.text, sr.duration_secs)
             } else {
                 true
@@ -2297,6 +2400,9 @@ fn finalize_live_utterance(
     let write_ok = match ensure_live_whisper_ctx(whisper_ctx, config) {
         Ok(whisper_ctx) => {
             if let Some(sr) = streaming.finalize(whisper_ctx) {
+                // Whisper is the shipped engine here, so this is the one place a
+                // shadow comparison is valid. No-op unless shadow is armed.
+                writer.submit_whisper_shadow(&sr.text);
                 writer.write_utterance(&sr.text, sr.duration_secs)
             } else {
                 true
