@@ -432,6 +432,27 @@ impl SelfAttributionOutcome {
     }
 }
 
+/// Why voice matching did not name the recorder on a source-backed stem.
+///
+/// Voice matching does run on that path, so a deterministic outcome there means
+/// it ran and came back without the recorder's name. Reporting nothing left
+/// "never enrolled" and "enrolled, but this stem matched nobody" producing
+/// byte-identical debug records, and the second is the interesting one: on a
+/// shared-room recording it is the signature of two voices diarized into one
+/// cluster, whose averaged embedding resembles neither person (issue #169).
+fn voice_stem_fallback_note(
+    matched_self: bool,
+    self_profile_exists: bool,
+) -> Option<SelfAttributionSkippedReason> {
+    if matched_self {
+        None
+    } else if self_profile_exists {
+        Some(SelfAttributionSkippedReason::VoiceStemNoSelfMatch)
+    } else {
+        Some(SelfAttributionSkippedReason::NoSelfProfile)
+    }
+}
+
 /// Match diarized speaker embeddings against enrolled voice profiles (Level 2).
 ///
 /// For each speaker label, `match_embedding` returns at most one name — the
@@ -2514,11 +2535,14 @@ fn single_stem_speaker_self_attribution(
         if let Some(source_backed_label) = source_backed_speaker_label.clone() {
             if let Some(voice_stem_result) = diarize::diarize(&stems.voice, config) {
                 let voice_stem_speakers = diarize::attributed_speaker_count(&voice_stem_result);
-                let matched_self =
-                    match_speakers_by_voice(config, &voice_stem_result.speaker_embeddings)
-                        .attributions
-                        .iter()
-                        .any(|attr| attr.name == *my_name);
+                let voice_match =
+                    match_speakers_by_voice(config, &voice_stem_result.speaker_embeddings);
+                let matched_self = voice_match
+                    .attributions
+                    .iter()
+                    .any(|attr| attr.name == *my_name);
+                let voice_note =
+                    voice_stem_fallback_note(matched_self, voice_match.self_profile_exists);
                 return SelfAttributionOutcome::applied(
                     diarize::SpeakerAttribution {
                         speaker_label: source_backed_label,
@@ -2539,7 +2563,7 @@ fn single_stem_speaker_self_attribution(
                     } else {
                         SelfAttributionAppliedVia::SourceBackedStem
                     },
-                    None,
+                    voice_note,
                 )
                 .with_voice_stem_speaker_count(voice_stem_speakers);
             }
@@ -9046,6 +9070,28 @@ mod tests {
             Some("March 21".into())
         );
         assert_eq!(extract_due_date("Just do this thing"), None);
+    }
+
+    #[test]
+    fn voice_stem_fallback_note_separates_never_enrolled_from_no_match() {
+        // A match leaves no note: the outcome already says enrollment named the
+        // recorder, so there is nothing to explain.
+        assert_eq!(voice_stem_fallback_note(true, true), None);
+        assert_eq!(voice_stem_fallback_note(true, false), None);
+
+        // The #169 shape. Enrolled, voice matching ran, and the stem matched
+        // nobody, which is what a two-people-one-cluster stem looks like.
+        assert_eq!(
+            voice_stem_fallback_note(false, true),
+            Some(SelfAttributionSkippedReason::VoiceStemNoSelfMatch)
+        );
+
+        // Nothing to match against. Reports as its own cause so it is never
+        // read as evidence of a blended cluster.
+        assert_eq!(
+            voice_stem_fallback_note(false, false),
+            Some(SelfAttributionSkippedReason::NoSelfProfile)
+        );
     }
 
     #[test]
