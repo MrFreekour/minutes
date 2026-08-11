@@ -36,12 +36,22 @@ pub enum ShadowOutcome {
 /// so it can categorize accurately; and a closed enum makes it *impossible* for a
 /// raw message — which can embed recognized speech — to reach a shadow log. That
 /// is a stronger guarantee than trying to redact free text after the fact.
+///
+/// The variants cover the known worker outcomes so the wiring step can map onto
+/// them without guessing. That mapping is the wiring increment's job, and it may
+/// need to enrich `apple_speech_worker` to surface a typed outcome: today
+/// transport failures flatten to `MinutesError::Io`, framework failures live in
+/// `AppleSpeechTranscriptionResult.error`, and `runtime_supported == false` is a
+/// bool — so the wiring, not this primitive, owns turning those into the right
+/// [`ShadowError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShadowError {
     /// The worker process died (crash / abort).
     WorkerCrashed,
     /// The XPC connection was interrupted or invalidated.
     XpcInterrupted,
+    /// The device/runtime cannot run Apple Speech (`runtime_supported == false`).
+    RuntimeUnsupported,
     /// Speech assets are not installed for the locale.
     AssetsUnavailable,
     /// A Speech-framework or analyzer error.
@@ -56,6 +66,7 @@ impl ShadowError {
         match self {
             Self::WorkerCrashed => "worker_crashed",
             Self::XpcInterrupted => "xpc_interrupted",
+            Self::RuntimeUnsupported => "runtime_unsupported",
             Self::AssetsUnavailable => "assets_unavailable",
             Self::SpeechError => "speech_error",
             Self::Unknown => "unknown",
@@ -223,25 +234,32 @@ pub fn shadow_enabled(config: &Config) -> bool {
     config.transcription.apple_speech_shadow
 }
 
-/// Lowercased, punctuation-insensitive words. The two engines format
-/// differently (casing, spacing, and especially punctuation — Whisper writes
-/// `Hello, world!` where Apple Speech may write `hello world`), and shadow mode
-/// measures word content, not typography. Non-alphanumeric, non-whitespace
-/// characters are mapped to spaces before splitting, mirroring
-/// `apple_speech::eval_text_for_compare_punct_insensitive` so the shadow metric
-/// and the offline evaluator agree on what "same words" means.
+/// Lowercased, timestamp- and punctuation-insensitive words. The two engines
+/// format differently: batch Whisper prefixes lines with `[mm:ss]` timestamps
+/// and punctuates (`Hello, world!`) where Apple Speech emits plain `hello world`.
+/// Shadow mode measures word content, not typography, so each line is first run
+/// through `pipeline::clean_transcript_line` (stripping `[...]` prefixes, exactly
+/// as the offline evaluator does) and then non-alphanumeric, non-whitespace
+/// characters are mapped to spaces. This keeps the shadow metric and the offline
+/// evaluator (`apple_speech::eval_text_for_compare_punct_insensitive`) in
+/// agreement on what "same words" means.
 fn normalized_words(text: &str) -> Vec<String> {
-    text.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c.is_whitespace() {
-                c
-            } else {
-                ' '
-            }
+    text.lines()
+        .filter_map(crate::pipeline::clean_transcript_line)
+        .flat_map(|line| {
+            line.chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c.is_whitespace() {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
+                .collect::<String>()
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .collect::<Vec<_>>()
         })
-        .collect::<String>()
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
         .collect()
 }
 
@@ -309,6 +327,17 @@ mod tests {
         assert_eq!(cmp.whisper_words, 2);
         assert_eq!(cmp.apple_words, 2);
         assert!(cmp.apple_error.is_none());
+    }
+
+    #[test]
+    fn timestamped_whisper_lines_are_stripped_before_comparison() {
+        // Batch Whisper output carries [mm:ss] prefixes; Apple Speech does not.
+        // Identical speech must still score 1.0, not be penalized for timestamps.
+        let cmp = compare("[0:05] hello world", Ok(Some("hello world")));
+        assert_eq!(cmp.outcome, ShadowOutcome::Usable);
+        assert!(cmp.exact_match, "timestamp prefix must be stripped");
+        assert_eq!(cmp.similarity, Some(1.0));
+        assert_eq!(cmp.whisper_words, 2, "the 0 and 05 must not count as words");
     }
 
     #[test]
