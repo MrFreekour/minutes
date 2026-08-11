@@ -46,14 +46,28 @@ minutes setup --sherpa     # downloads the int8 ONNX model + sets engine = "sher
 > version, transcription falls back to Whisper with a warning naming every path
 > tried, exactly like a missing model.
 
-> **Platform note.** On macOS, `engine-sherpa` links sherpa-onnx statically, so
-> the binary is self-contained and the copy above just works. On Linux and
-> Windows, sherpa-rs still links dynamic libraries (`libsherpa-onnx-c-api`,
-> `libonnxruntime`) that live in the cargo `target/` tree: a binary copied out
-> of `target/` fails at startup with a library-not-found error. On those
-> platforms run from the repo (`cargo run --release -p minutes-cli --features
-> engine-sherpa -- ...`) or put the libraries on your loader path yourself.
-> Installable Linux/Windows packaging is tracked in #369.
+> **Platform note.** On macOS, the plugin links sherpa-onnx statically, so it is
+> self-contained and the copy above is all you need.
+>
+> On Linux, sherpa-rs links dynamic libraries (`libsherpa-onnx-c-api.so`,
+> `libonnxruntime.so`) that are built into the plugin crate's `target/release`.
+> The plugin carries an `$ORIGIN` runpath, so it finds them in whatever
+> directory it is installed to, but they have to travel with it. Copy the whole
+> set, not just the plugin:
+>
+> ```bash
+> mkdir -p ~/.minutes/lib
+> cp crates/sherpa-plugin/target/release/*.so ~/.minutes/lib/
+> ```
+>
+> The binary itself no longer links sherpa at all, so it needs nothing beside
+> it. The released `minutes-linux-x64-sherpa.tar.gz` ships exactly this layout,
+> with the plugin next to the executable instead, which is the other path the
+> loader searches.
+>
+> Windows resolves a DLL's dependencies from the loading process's search path
+> rather than the DLL's own directory, so the same trick does not apply there
+> and it needs its own packaging. That is tracked in #645.
 
 `minutes setup --sherpa` downloads the four model files (with a size-floor
 integrity check) and writes `transcription.engine = "sherpa"` to your config, so
