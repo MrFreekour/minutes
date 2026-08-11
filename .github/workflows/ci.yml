@@ -471,6 +471,48 @@ jobs:
           GGML_AVX512_VNNI: "OFF"
           GGML_AVX512_BF16: "OFF"
 
+      - name: The desktop binary must not outgrow its packaged runtime (#657)
+        # release-windows-desktop.yml refuses to zip a desktop build whose
+        # runtime DLLs build.rs did not stage, and release-cli.yml refuses an
+        # archive missing a DLL the binary actually imports. Both live only in
+        # tag-triggered workflows, so the condition they guard is first
+        # observed during a release. #657 is what that looks like when it gets
+        # out, and #733 was the same shape reaching a different artifact.
+        #
+        # Asserted here instead, on the Windows build the pull request already
+        # pays for.
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # build.rs must have staged the runtime beside the crate; the release
+          # zip copies exactly these.
+          $staged = Get-ChildItem 'tauri/src-tauri/vcruntime140*.dll','tauri/src-tauri/msvcp140*.dll' -ErrorAction SilentlyContinue
+          if (-not $staged) {
+            throw 'build.rs staged no runtime DLLs; a release would ship a desktop build that cannot start (#657)'
+          }
+          Write-Host "staged: $(($staged | ForEach-Object { $_.Name }) -join ', ')"
+
+          # And the binary must not import a runtime DLL that is not staged.
+          # Read from the import table rather than a fixed list, because the
+          # failure mode is a dependency adding an import such as MSVCP140_2.dll
+          # (C++17 special math) that nobody thought to package.
+          $exe = 'target/release/minutes-app.exe'
+          if (-not (Test-Path $exe)) { throw "expected $exe from the bundle build" }
+          $dumpbin = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found; cannot verify the import table' }
+          $imports = & $dumpbin.FullName /dependents $exe |
+                     Select-String -Pattern '^\s+(\S+\.dll)$' |
+                     ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $needed = $imports | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)' }
+          if (-not $needed) { throw 'no VC runtime imports detected; the import scan is probably broken' }
+          Write-Host "runtime imports: $($needed -join ', ')"
+          $stagedNames = $staged | ForEach-Object { $_.Name }
+          $missing = $needed | Where-Object { $stagedNames -notcontains $_ }
+          if ($missing) {
+            throw "minutes-app.exe imports runtime DLLs that are not staged: $($missing -join ', '). Add them to RUNTIME_DLLS in tauri/src-tauri/build.rs and to the release packaging lists (#657)."
+          }
+          Write-Host 'every runtime import is staged for packaging'
+
   mcp:
     name: MCP Server
     runs-on: ubuntu-latest
