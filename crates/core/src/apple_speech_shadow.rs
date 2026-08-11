@@ -21,7 +21,8 @@ use crate::config::Config;
 pub enum ShadowOutcome {
     /// Apple Speech returned a non-empty transcript.
     Usable,
-    /// Apple Speech returned successfully but with no text (silence or a blip).
+    /// Apple Speech returned successfully but with no words: silence, a blip, or
+    /// the native bridge's empty-segment `""`.
     Empty,
     /// Apple Speech failed: worker crash, XPC interruption, or a Speech error.
     Failed,
@@ -50,8 +51,8 @@ pub struct ShadowComparison {
     pub similarity: f32,
     /// True when both engines produced the same normalized text.
     pub exact_match: bool,
-    /// Failure detail when `outcome == Failed`; `None` otherwise. This is an
-    /// error string, never transcript content.
+    /// Failure detail when `outcome == Failed`; `None` otherwise. A bounded,
+    /// single-line error category, never transcript content.
     pub apple_error: Option<String>,
 }
 
@@ -61,20 +62,45 @@ pub struct ShadowComparison {
 /// runs are far below this, so the exact metric is what actually gets used.
 const SIMILARITY_WORD_CAP: usize = 3000;
 
+/// Cap on the stored `apple_error` length. Worker errors are structured status
+/// strings, but `compare` accepts an arbitrary `&str`, so the message is
+/// collapsed to one line and truncated to defend the "no transcript content in
+/// shadow logs" guarantee against a caller whose error embeds recognized text.
+const MAX_ERROR_CHARS: usize = 160;
+
 /// Build a shadow comparison from the shipped Whisper transcript and the Apple
 /// Speech attempt result for the same audio.
 ///
 /// `apple` is `Ok(Some(text))` for a usable transcript, `Ok(None)` for an empty
 /// result, or `Err(msg)` when the attempt failed. Whisper is always present
-/// because it is the shipped output.
+/// because it is the shipped output. A `Some` value that normalizes to zero
+/// words (e.g. the native bridge's empty-segment `""`) is classified `Empty`,
+/// not `Usable`, so capability-success rates are not inflated.
 pub fn compare(whisper: &str, apple: Result<Option<&str>, &str>) -> ShadowComparison {
     let whisper_words_vec = normalized_words(whisper);
     let whisper_chars = normalized_char_count(whisper);
     let whisper_words = whisper_words_vec.len();
 
+    let empty = |outcome, apple_error| ShadowComparison {
+        outcome,
+        whisper_chars,
+        whisper_words,
+        apple_chars: 0,
+        apple_words: 0,
+        similarity: 0.0,
+        exact_match: false,
+        apple_error,
+    };
+
     match apple {
         Ok(Some(apple_text)) => {
             let apple_words_vec = normalized_words(apple_text);
+            if apple_words_vec.is_empty() {
+                // A Some("") / whitespace / punctuation-only result is not a
+                // usable transcript — the native bridge returns "" when there
+                // are no segments. Record it as Empty.
+                return empty(ShadowOutcome::Empty, None);
+            }
             ShadowComparison {
                 outcome: ShadowOutcome::Usable,
                 whisper_chars,
@@ -86,61 +112,40 @@ pub fn compare(whisper: &str, apple: Result<Option<&str>, &str>) -> ShadowCompar
                 apple_error: None,
             }
         }
-        Ok(None) => ShadowComparison {
-            outcome: ShadowOutcome::Empty,
-            whisper_chars,
-            whisper_words,
-            apple_chars: 0,
-            apple_words: 0,
-            similarity: 0.0,
-            exact_match: false,
-            apple_error: None,
-        },
-        Err(msg) => ShadowComparison {
-            outcome: ShadowOutcome::Failed,
-            whisper_chars,
-            whisper_words,
-            apple_chars: 0,
-            apple_words: 0,
-            similarity: 0.0,
-            exact_match: false,
-            apple_error: Some(msg.to_string()),
-        },
+        Ok(None) => empty(ShadowOutcome::Empty, None),
+        Err(msg) => empty(ShadowOutcome::Failed, Some(bounded_error(msg))),
     }
 }
 
-/// Emit a shadow comparison to the structured log under the `apple_speech_shadow`
-/// target. Logging only, so it is failure-isolated from capture: a shadow
-/// attempt that crashed still lands here as an event, never as a panic.
+/// Persist a shadow comparison to the structured JSONL log.
+///
+/// Writes through [`crate::logging::append_log`] so the measurement is durable:
+/// the CLI's tracing subscriber only reaches stderr and the Tauri entry point
+/// installs no subscriber at all, so tracing-only events would be dropped on
+/// exactly the desktop path shadow mode most needs to measure. The write is
+/// failure-isolated — a logging error is swallowed so it can never affect
+/// capture — and a `debug` trace is emitted alongside for live tailing.
 pub fn log_comparison(source: &str, cmp: &ShadowComparison) {
-    match cmp.outcome {
-        ShadowOutcome::Usable => tracing::info!(
-            target: "apple_speech_shadow",
-            source,
-            outcome = "usable",
-            whisper_words = cmp.whisper_words,
-            apple_words = cmp.apple_words,
-            whisper_chars = cmp.whisper_chars,
-            apple_chars = cmp.apple_chars,
-            similarity = cmp.similarity,
-            exact_match = cmp.exact_match,
-            "apple-speech shadow comparison"
-        ),
-        ShadowOutcome::Empty => tracing::info!(
-            target: "apple_speech_shadow",
-            source,
-            outcome = "empty",
-            whisper_words = cmp.whisper_words,
-            "apple-speech shadow: empty result while whisper produced text"
-        ),
-        ShadowOutcome::Failed => tracing::warn!(
-            target: "apple_speech_shadow",
-            source,
-            outcome = "failed",
-            error = cmp.apple_error.as_deref().unwrap_or(""),
-            "apple-speech shadow: attempt failed, whisper used"
-        ),
-    }
+    let outcome = match cmp.outcome {
+        ShadowOutcome::Usable => "usable",
+        ShadowOutcome::Empty => "empty",
+        ShadowOutcome::Failed => "failed",
+    };
+    let entry = serde_json::json!({
+        "event": "apple_speech_shadow",
+        "source": source,
+        "outcome": outcome,
+        "whisper_words": cmp.whisper_words,
+        "apple_words": cmp.apple_words,
+        "whisper_chars": cmp.whisper_chars,
+        "apple_chars": cmp.apple_chars,
+        "similarity": cmp.similarity,
+        "exact_match": cmp.exact_match,
+        "apple_error": cmp.apple_error,
+    });
+    // Failure-isolated: a logging failure must never affect capture.
+    let _ = crate::logging::append_log(&entry);
+    tracing::debug!(target: "apple_speech_shadow", source, outcome, "apple-speech shadow comparison");
 }
 
 /// Whether shadow mode is switched on in config.
@@ -154,15 +159,30 @@ pub fn shadow_enabled(config: &Config) -> bool {
     config.transcription.apple_speech_shadow
 }
 
-/// Lowercased whitespace-split words. Casing and spacing differ between the two
-/// engines' formatting, and shadow mode measures word content, not typography,
-/// so both are normalized away before comparison.
+/// Lowercased, punctuation-insensitive words. The two engines format
+/// differently (casing, spacing, and especially punctuation — Whisper writes
+/// `Hello, world!` where Apple Speech may write `hello world`), and shadow mode
+/// measures word content, not typography. Non-alphanumeric, non-whitespace
+/// characters are mapped to spaces before splitting, mirroring
+/// `apple_speech::eval_text_for_compare_punct_insensitive` so the shadow metric
+/// and the offline evaluator agree on what "same words" means.
 fn normalized_words(text: &str) -> Vec<String> {
-    text.split_whitespace().map(|w| w.to_lowercase()).collect()
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect()
 }
 
-/// Character count of the normalized (lowercased, single-spaced) text. A size
-/// signal for the log, not used in the similarity metric.
+/// Character count of the normalized (lowercased, punctuation-free, single-spaced)
+/// text. A size signal for the log, not used in the similarity metric.
 fn normalized_char_count(text: &str) -> usize {
     normalized_words(text).join(" ").chars().count()
 }
@@ -171,9 +191,6 @@ fn normalized_char_count(text: &str) -> usize {
 /// normalized inverse of the word error rate. Two empty transcripts are treated
 /// as identical (`1.0`); one empty and one not is `0.0`.
 fn word_similarity(a: &[String], b: &[String]) -> f32 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
     let max_len = a.len().max(b.len());
     if max_len == 0 {
         return 1.0;
@@ -211,15 +228,30 @@ fn word_edit_distance(a: &[String], b: &[String]) -> usize {
     prev[short.len()]
 }
 
+/// Collapse an error to a bounded, single-line diagnostic (see `MAX_ERROR_CHARS`).
+fn bounded_error(msg: &str) -> String {
+    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > MAX_ERROR_CHARS {
+        let truncated: String = one_line.chars().take(MAX_ERROR_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        one_line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn identical_transcripts_are_a_perfect_match() {
-        let cmp = compare("Hello world", Ok(Some("hello   WORLD")));
+    fn punctuation_and_casing_normalize_away_to_a_perfect_match() {
+        // The engines punctuate and case differently; only word content counts.
+        let cmp = compare("Hello, world!", Ok(Some("hello   WORLD")));
         assert_eq!(cmp.outcome, ShadowOutcome::Usable);
-        assert!(cmp.exact_match, "casing/spacing must normalize away");
+        assert!(
+            cmp.exact_match,
+            "punctuation/casing/spacing must normalize away"
+        );
         assert_eq!(cmp.similarity, 1.0);
         assert_eq!(cmp.whisper_words, 2);
         assert_eq!(cmp.apple_words, 2);
@@ -248,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_apple_result_is_recorded_without_latching_a_failure() {
+    fn an_empty_apple_result_is_recorded_without_a_failure() {
         let cmp = compare("whisper had text", Ok(None));
         assert_eq!(cmp.outcome, ShadowOutcome::Empty);
         assert_eq!(cmp.apple_words, 0);
@@ -257,7 +289,23 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_apple_attempt_carries_the_error_not_the_transcript() {
+    fn a_blank_or_punctuation_only_some_is_empty_not_usable() {
+        // The native bridge returns "" when there are no segments; scoring that
+        // as Usable/1.0 would inflate the capability-success rate.
+        for blank in ["", "   ", " ...!? "] {
+            let cmp = compare("whisper had text", Ok(Some(blank)));
+            assert_eq!(
+                cmp.outcome,
+                ShadowOutcome::Empty,
+                "{blank:?} should classify as Empty"
+            );
+            assert_eq!(cmp.apple_words, 0);
+            assert_eq!(cmp.similarity, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_failed_apple_attempt_carries_a_bounded_error_not_the_transcript() {
         let cmp = compare("whisper had text", Err("worker crashed (XPC interrupted)"));
         assert_eq!(cmp.outcome, ShadowOutcome::Failed);
         assert_eq!(cmp.apple_words, 0);
@@ -270,22 +318,27 @@ mod tests {
     }
 
     #[test]
+    fn a_long_multiline_error_is_bounded_to_one_line() {
+        let huge = format!("failure: {}", "context ".repeat(80));
+        let cmp = compare("hi", Err(&huge));
+        let stored = cmp.apple_error.expect("failed attempt records an error");
+        assert!(!stored.contains('\n'));
+        assert!(
+            stored.chars().count() <= MAX_ERROR_CHARS + 1,
+            "bounded to {} chars, got {}",
+            MAX_ERROR_CHARS,
+            stored.chars().count()
+        );
+        assert!(stored.ends_with('…'), "truncation marker present");
+    }
+
+    #[test]
     fn similarity_is_symmetric_in_edit_distance() {
         let a = compare("one two three four", Ok(Some("one two three")));
         let b = compare("one two three", Ok(Some("one two three four")));
         assert!((a.similarity - b.similarity).abs() < 1e-6);
         // One deletion out of four: 0.75.
         assert!((a.similarity - 0.75).abs() < 1e-6, "got {}", a.similarity);
-    }
-
-    #[test]
-    fn both_empty_is_a_perfect_match() {
-        let cmp = compare("", Ok(Some("")));
-        assert_eq!(cmp.outcome, ShadowOutcome::Usable);
-        assert_eq!(cmp.similarity, 1.0);
-        assert!(cmp.exact_match);
-        assert_eq!(cmp.whisper_words, 0);
-        assert_eq!(cmp.apple_words, 0);
     }
 
     #[test]
