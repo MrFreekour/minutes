@@ -56,6 +56,12 @@ pub enum ShadowError {
     XpcInterrupted,
     /// The device/runtime cannot run Apple Speech (`runtime_supported == false`).
     RuntimeUnsupported,
+    /// This process cannot address the worker at all: the worker is only
+    /// reachable from a trusted installed app bundle, so a CLI binary or test
+    /// harness always lands here, as does an installed app whose signing or
+    /// packaging authority fails. Says nothing about the device's Speech
+    /// capability, and must not be counted as a capability failure.
+    WorkerUnavailable,
     /// Speech assets are not installed for the locale.
     AssetsUnavailable,
     /// A Speech-framework or analyzer error.
@@ -71,6 +77,7 @@ impl ShadowError {
             Self::WorkerCrashed => "worker_crashed",
             Self::XpcInterrupted => "xpc_interrupted",
             Self::RuntimeUnsupported => "runtime_unsupported",
+            Self::WorkerUnavailable => "worker_unavailable",
             Self::AssetsUnavailable => "assets_unavailable",
             Self::SpeechError => "speech_error",
             Self::Unknown => "unknown",
@@ -291,12 +298,16 @@ pub fn worker_ok_to_shadow(
 
 /// Map a worker-call transport failure (the `Err` arm of `transcribe_samples`)
 /// into the shadow taxonomy by its `io::ErrorKind`, without reading the message.
-/// `Other` is the XPC/worker layer failing (crash, interruption, or the 180s
-/// budget); the rest are environment or our-side faults (missing worker
-/// authority, over-budget or malformed input/response) with no Speech-capability
-/// signal, recorded as `Unknown`.
+///
+/// `PermissionDenied` is how a failed worker *authority* surfaces — this process
+/// cannot address the worker at all, which is the normal outcome outside an
+/// installed trusted app bundle and says nothing about the device, so it is kept
+/// distinct from a capability failure. `Other` is the XPC/worker layer failing
+/// (crash, interruption, or the 180s budget). The rest are our-side faults
+/// (over-budget or malformed input/response) with no capability signal.
 pub fn transport_error_category(kind: std::io::ErrorKind) -> ShadowError {
     match kind {
+        std::io::ErrorKind::PermissionDenied => ShadowError::WorkerUnavailable,
         std::io::ErrorKind::Other => ShadowError::XpcInterrupted,
         _ => ShadowError::Unknown,
     }
@@ -742,10 +753,11 @@ mod tests {
             transport_error_category(ErrorKind::Other),
             ShadowError::XpcInterrupted
         );
-        // Environment / our-side faults carry no Speech-capability signal.
+        // A failed worker authority: cannot address the worker at all. Distinct
+        // from a capability failure, and the normal outcome outside an app bundle.
         assert_eq!(
             transport_error_category(ErrorKind::PermissionDenied),
-            ShadowError::Unknown
+            ShadowError::WorkerUnavailable
         );
         assert_eq!(
             transport_error_category(ErrorKind::InvalidData),

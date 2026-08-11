@@ -303,21 +303,6 @@ fn acceptance_canary_samples() -> Vec<f32> {
         .collect()
 }
 
-/// Why this process cannot reach the Apple Speech worker, or `None` if it can.
-///
-/// Authority can fail for several distinct reasons — not running from a trusted
-/// installed app bundle (`Contents/MacOS/...` beside `Contents/XPCServices`, which
-/// a plain CLI binary or test harness never satisfies), an unavailable
-/// peer-requirement API, a missing worker executable or manifest, or a cdhash
-/// mismatch. Optional consumers (shadow measurement) check this up front so they
-/// can decline with the *actual* reason instead of arming themselves and failing
-/// on the first utterance. The returned string is code-controlled (constants and
-/// bundle paths); it never carries recognized speech.
-#[cfg(target_os = "macos")]
-pub(crate) fn worker_authority_error() -> Option<String> {
-    authority().err()
-}
-
 #[cfg(target_os = "macos")]
 fn authority() -> Result<MacAppleSpeechWorkerAuthority, String> {
     if let Some(authority) = APPLE_SPEECH_WORKER_AUTHORITY.get() {

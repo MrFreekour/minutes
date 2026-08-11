@@ -457,20 +457,12 @@ impl LiveTranscriptWriter {
             TranscriptSource::Standalone => "standalone",
             TranscriptSource::RecordingSidecar => "recording-sidecar",
         };
-        // The worker is only reachable from a trusted installed app bundle, so a
-        // CLI-run session would fail its first attempt and latch off, logging a
-        // failure that says nothing about device capability. Decline up front,
-        // carrying the authority layer's own reason (not-an-app-bundle, cdhash
-        // mismatch, missing manifest, unavailable peer API — they are different
-        // diagnoses) and persist it, so a run with zero shadow rows is never
-        // confused with "no eligible audio".
-        if let Some(reason) = crate::apple_speech_worker::worker_authority_error() {
-            crate::apple_speech_shadow::log_shadow_disabled(
-                source,
-                &format!("worker unreachable: {reason}"),
-            );
-            return;
-        }
+        // No up-front authority probe: the worker is only reachable from a
+        // trusted installed app bundle, and a process that cannot address it
+        // gets PermissionDenied on the first attempt, which the runner records
+        // as ShadowError::WorkerUnavailable and latches off. That is a precise,
+        // durable row and it costs one attempt, whereas probing here would mean
+        // reaching into the signed worker-authority surface for a diagnostic.
         match crate::apple_speech_shadow::spawn_live_shadow_runner(config, source) {
             Some(runner) => {
                 tracing::info!("apple-speech shadow measurement armed for this live session");
