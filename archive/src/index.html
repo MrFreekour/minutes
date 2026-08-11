@@ -19,10 +19,35 @@
           <span>Minutes Archive</span>
         </a>
         <div class="mode-badges" aria-label="Application protections">
-          <span class="badge badge-local"><span class="dot"></span>Local only</span>
+          <span class="badge badge-local"><span class="dot"></span>Documents stay local</span>
           <span class="badge">Private pilot</span>
         </div>
       </header>
+
+      <!--
+        The one place this application touches the network, stated where it
+        happens rather than in a settings pane nobody opens. It reports the
+        check before, during and after, so "an update check ran" is something
+        the operator saw rather than something they have to take on trust.
+      -->
+      <section
+        id="update-strip"
+        class="update-strip"
+        aria-label="Update check"
+        hidden
+      >
+        <span id="update-dot" class="update-dot" aria-hidden="true"></span>
+        <div>
+          <strong id="update-headline">Checking for a signed update</strong>
+          <p id="update-detail" role="status" aria-live="polite">
+            One request for a version file, made before any folder is approved.
+            Nothing about you or your documents is sent.
+          </p>
+        </div>
+        <button id="install-update" class="button button-secondary" type="button" hidden>
+          Install update
+        </button>
+      </section>
 
       <section id="main-content" class="hero">
         <p class="eyebrow">Local only · nothing is uploaded</p>
@@ -352,7 +377,7 @@
       <footer>
         <span id="build-identity">Minutes Archive</span>
         <span aria-hidden="true">•</span>
-        <span>Networking is switched off</span>
+        <span>Updates only before folders open</span>
         <span aria-hidden="true">•</span>
         <span>Closing this window forgets everything</span>
       </footer>

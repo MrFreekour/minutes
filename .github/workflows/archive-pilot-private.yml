@@ -210,7 +210,11 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-          sparse-checkout: scripts/archive-bundle-integrity.py
+          sparse-checkout: |
+            scripts/archive-bundle-integrity.py
+            scripts/create-branded-dmg.sh
+            tauri/src-tauri/dmg-background.png
+            tauri/src-tauri/icons/icon.icns
           sparse-checkout-cone-mode: false
 
       - name: Download exact unsigned Archive candidate
@@ -388,6 +392,38 @@ jobs:
             printf 'notarized=true\nstapled=true\n'
           } > signed-archive-provenance.txt
 
+      - name: Create, notarize, and staple Archive DMG
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            'signed/Minutes Archive.app/Contents/Info.plist')"
+          dmg="Minutes_Archive_${version}_aarch64.dmg"
+          scripts/create-branded-dmg.sh \
+            --app "signed/Minutes Archive.app" \
+            --version "$version" \
+            --output "$dmg"
+          submit_json="$RUNNER_TEMP/archive-dmg-notary-submit.json"
+          xcrun notarytool submit "$dmg" \
+            --key "$ARCHIVE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 30m \
+            --output-format json > "$submit_json"
+          status="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("status",""))' "$submit_json")"
+          if [ "$status" != "Accepted" ]; then
+            echo "DMG notarization did not return Accepted; refusing candidate" >&2
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=4 "$dmg"
+          shasum -a 256 "$dmg" >> signed-archive-provenance.txt
+          echo "ARCHIVE_DMG=$dmg" >> "$GITHUB_ENV"
+
       - name: Encrypt pilot artifact to its single recipient
         env:
           AGE_RECIPIENT: ${{ vars.ARCHIVE_PILOT_AGE_RECIPIENT }}
@@ -420,10 +456,14 @@ jobs:
           age -R "$recipients" \
             -o minutes-archive-pilot-notarized.zip.age \
             minutes-archive-pilot-notarized.zip
-          rm -f minutes-archive-pilot-notarized.zip
+          age -R "$recipients" \
+            -o "${ARCHIVE_DMG}.age" \
+            "$ARCHIVE_DMG"
+          rm -f minutes-archive-pilot-notarized.zip "$ARCHIVE_DMG"
           test -s minutes-archive-pilot-notarized.zip.age
+          test -s "${ARCHIVE_DMG}.age"
           # Fail closed if the plaintext build survived into the upload set.
-          if [ -e minutes-archive-pilot-notarized.zip ]; then
+          if [ -e minutes-archive-pilot-notarized.zip ] || [ -e "$ARCHIVE_DMG" ]; then
             echo "plaintext signed build still present; refusing to upload" >&2
             exit 1
           fi
@@ -437,7 +477,8 @@ jobs:
           rm -f \
             "$RUNNER_TEMP/minutes-archive-pilot.p12" \
             "${ARCHIVE_API_KEY_PATH:-}" \
-            "$RUNNER_TEMP/Minutes-Archive-notary.zip"
+            "$RUNNER_TEMP/Minutes-Archive-notary.zip" \
+            "$RUNNER_TEMP/archive-dmg-notary-submit.json"
 
       - name: Upload encrypted Archive pilot
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -445,6 +486,7 @@ jobs:
           name: minutes-archive-pilot-${{ needs.authorize-candidate.outputs.candidate_sha }}
           path: |
             minutes-archive-pilot-notarized.zip.age
+            Minutes_Archive_*_aarch64.dmg.age
             signed-archive-provenance.txt
             archive-bundle-report.txt
           if-no-files-found: error
