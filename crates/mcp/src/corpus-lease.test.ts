@@ -909,7 +909,10 @@ describe("stable corpus lease", () => {
           await hold;
         },
       });
-      await retained;
+      // Racing the lease surfaces an admission failure as its own error. A
+      // bare `await retained` hangs to the suite timeout instead, because the
+      // baseline hook that resolves it never runs.
+      await Promise.race([retained, first]);
       await expect(
         withStableCorpusLease(root, () => "must not allocate", {
           budgets: leanBudgets,
@@ -1512,7 +1515,7 @@ describe("stable corpus lease", () => {
       expect(Date.now() - started).toBeLessThan(2_500);
       await expect(
         withStableCorpusLease(root, () => "must not reuse")
-      ).rejects.toThrow("requires a process restart");
+      ).rejects.toThrow("killed without confirming it died");
     });
   }, 10_000);
 });
