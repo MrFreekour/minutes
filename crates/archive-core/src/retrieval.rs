@@ -2564,7 +2564,7 @@ mod tests {
 
     fn two_page_pdf_with_a_scan_on_page_two() -> Vec<u8> {
         let first_page = b"BT /F1 12 Tf 72 720 Td (1. CONFIDENTIALITY) Tj 0 -20 Td (Recipient shall protect Confidential Information.) Tj ET";
-        let second_page = b"BT /F1 12 Tf 72 720 Td (2. GOVERNING LAW) Tj 0 -20 Td (This Agreement is governed by Arizona law.) Tj ET /Im1 Do";
+        let second_page = b"BT /F1 12 Tf 72 720 Td (2. GOVERNING LAW) Tj 0 -20 Td (This Agreement is governed by Arizona law.) Tj ET q 612 0 0 792 0 0 cm /Im1 Do Q";
         let pixels = vec![0x80; 1275 * 1650];
         assemble_pdf(&[
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
@@ -3100,18 +3100,19 @@ mod tests {
     }
 
     #[test]
-    fn a_pdf_with_a_page_scan_is_never_quoted_after_real_conversion() {
-        // Fails if conversion does not propagate one scan to every PDF provision's provenance.
+    fn a_scanned_page_does_not_cost_the_typed_pages_their_quotations() {
+        // Fails if conversion misses the full-page draw, spreads page-two scan
+        // provenance onto page one, or retrieval gates on the document summary.
         let bytes = two_page_pdf_with_a_scan_on_page_two();
         let converted = minutes_archive_convert::convert_bytes(SourceFormat::Pdf, &bytes)
             .expect("convert scan-bearing PDF");
         assert_eq!(
             converted.text_origin,
-            minutes_archive_convert::TextOrigin::MachineReadLayer
+            minutes_archive_convert::TextOrigin::AuthorWritten
         );
         assert_eq!(
             converted.machine_read_anchors,
-            BTreeSet::from(["page:0001".to_string(), "page:0002".to_string()])
+            BTreeSet::from(["page:0002".to_string()])
         );
 
         let normalized = normalize_converted_document(
@@ -3121,48 +3122,80 @@ mod tests {
             &converted,
         )
         .expect("normalize converted PDF");
-        assert_eq!(normalized.text_provenance, TextProvenance::Transcribed);
-        assert!(
-            normalized
-                .provisions
-                .iter()
-                .all(|provision| provision.text_provenance == TextProvenance::Transcribed),
-            "every provision in the scan-bearing PDF must be transcription-only"
-        );
-        assert!(normalized
+        assert_eq!(normalized.text_provenance, TextProvenance::Extracted);
+        let page_one = normalized
             .provisions
             .iter()
-            .any(|provision| provision.text.contains("Confidential Information")));
+            .filter(|provision| provision.anchor.starts_with("page:0001/"))
+            .collect::<Vec<_>>();
+        let page_two = normalized
+            .provisions
+            .iter()
+            .filter(|provision| provision.anchor.starts_with("page:0002/"))
+            .collect::<Vec<_>>();
+        assert!(
+            !page_one.is_empty()
+                && page_one
+                    .iter()
+                    .all(|provision| provision.text_provenance == TextProvenance::Extracted),
+            "typed page one must retain extracted provision provenance"
+        );
+        assert!(
+            !page_two.is_empty()
+                && page_two
+                    .iter()
+                    .all(|provision| provision.text_provenance == TextProvenance::Transcribed),
+            "scanned page two must have transcription-only provision provenance"
+        );
 
         let revisions = CurrentRevisionSet::from_documents([&normalized]);
         let mut index =
             LegalIndex::new(VaultId::parse("converter-scan-vault").expect("vault")).expect("index");
         index.replace_document(&normalized).expect("ingest");
-        for scope in [MatchScope::SameProvision, MatchScope::AnywhereInDocument] {
-            let response = index
-                .search(
-                    index.vault_id(),
-                    LegalQuery {
-                        raw: "confidentiality".to_string(),
-                        scope,
-                        required_concepts: vec![LegalConcept::Confidentiality],
-                        excluded_concepts: Vec::new(),
-                        exact_phrase: None,
-                        max_sentences: None,
-                        limit: 10,
-                    },
-                    &revisions,
-                )
-                .expect("search");
-            assert!(response.evidence.is_empty(), "{scope:?} returned a quote");
-            assert!(
-                response
-                    .documents
-                    .iter()
-                    .all(|document| document.criterion_evidence.is_empty()),
-                "{scope:?} returned document-level quoted evidence"
-            );
-        }
+
+        let typed_page_response = index
+            .search(
+                index.vault_id(),
+                LegalQuery {
+                    raw: "confidentiality".to_string(),
+                    scope: MatchScope::AnywhereInDocument,
+                    required_concepts: vec![LegalConcept::Confidentiality],
+                    excluded_concepts: Vec::new(),
+                    exact_phrase: None,
+                    max_sentences: None,
+                    limit: 10,
+                },
+                &revisions,
+            )
+            .expect("search typed page");
+        assert_eq!(typed_page_response.documents.len(), 1);
+        assert_eq!(typed_page_response.documents[0].criterion_evidence.len(), 1);
+        assert!(typed_page_response.documents[0].criterion_evidence[0]
+            .source_anchor
+            .starts_with("page:0001/"));
+        assert!(typed_page_response.transcriptions.is_empty());
+
+        let scanned_page_response = index
+            .search(
+                index.vault_id(),
+                LegalQuery {
+                    raw: "governing law".to_string(),
+                    scope: MatchScope::AnywhereInDocument,
+                    required_concepts: vec![LegalConcept::GoverningLaw],
+                    excluded_concepts: Vec::new(),
+                    exact_phrase: None,
+                    max_sentences: None,
+                    limit: 10,
+                },
+                &revisions,
+            )
+            .expect("search scanned page");
+        assert!(scanned_page_response.evidence.is_empty());
+        assert!(scanned_page_response.documents.is_empty());
+        assert_eq!(scanned_page_response.transcriptions.len(), 1);
+        assert!(scanned_page_response.transcriptions[0]
+            .page_anchor
+            .starts_with("page:0002/"));
     }
 
     /// An excluded concept filters transcriptions on every retrieval path.
