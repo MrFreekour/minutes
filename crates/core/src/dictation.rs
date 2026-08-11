@@ -1,3 +1,4 @@
+use crate::apple_speech_session::AppleSpeechSession;
 use crate::config::Config;
 use crate::dictation_cleanup::{clean_dictation_text, CleanupEngine, CleanupOptions};
 use crate::error::{DictationError, MinutesError, TranscribeError};
@@ -356,6 +357,13 @@ where
     let run_start = Instant::now();
     startup_debug("run_inner_start", Some(&config.dictation.model), None, None);
     let final_backend = dictation_final_backend(config);
+    // Session-scoped Apple Speech capability latch: the worker runs in a separate
+    // XPC process, so a crash on an incapable device is failure-isolated and we
+    // fall back to Whisper. Without this latch each utterance would re-spawn the
+    // worker only to crash again; the first failure switches the rest of the
+    // session to Whisper. Dormant while the transport gate stays closed (the
+    // backend never resolves to apple-speech today), armed for when it opens.
+    let apple_session = AppleSpeechSession::new();
 
     // Try to use preloaded model, fall back to loading on demand
     #[cfg(feature = "whisper")]
@@ -497,6 +505,7 @@ where
                     if let Some(finalized) = finalize_dictation_transcription(
                         config,
                         final_backend,
+                        &apple_session,
                         &final_utterance_samples,
                         &mut streaming,
                         whisper_ctx.as_ref(),
@@ -526,6 +535,7 @@ where
                     if let Some(finalized) = finalize_dictation_transcription(
                         config,
                         final_backend,
+                        &apple_session,
                         &final_utterance_samples,
                         &mut streaming,
                         whisper_ctx.as_ref(),
@@ -626,6 +636,7 @@ where
                     if let Some(finalized) = finalize_dictation_transcription(
                         config,
                         final_backend,
+                        &apple_session,
                         &final_utterance_samples,
                         &mut streaming,
                         whisper_ctx.as_ref(),
@@ -654,6 +665,7 @@ where
                     if let Some(finalized) = finalize_dictation_transcription(
                         config,
                         final_backend,
+                        &apple_session,
                         &final_utterance_samples,
                         &mut streaming,
                         whisper_ctx.as_ref(),
@@ -764,28 +776,51 @@ fn parakeet_dictation_ready(config: &Config) -> bool {
     status.ready
 }
 
+/// Whether this utterance should attempt Apple Speech: the resolved backend is
+/// apple-speech *and* the session has not already latched onto Whisper after a
+/// prior failure. Extracted so the latch decision is unit-testable without the
+/// macOS-only worker (the attempt itself is `target_os = "macos"`).
+#[cfg(any(test, target_os = "macos"))]
+fn dictation_should_attempt_apple(
+    backend: DictationFinalBackend,
+    session: &AppleSpeechSession,
+) -> bool {
+    backend == DictationFinalBackend::AppleSpeech && session.should_attempt()
+}
+
 #[cfg(feature = "whisper")]
 fn finalize_dictation_transcription(
     _config: &Config,
     _final_backend: DictationFinalBackend,
+    apple_session: &AppleSpeechSession,
     _final_utterance_samples: &[f32],
     streaming: &mut StreamingWhisper,
     whisper_ctx: Option<&whisper_rs::WhisperContext>,
 ) -> Option<FinalizedDictation> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = apple_session;
+
     #[cfg(target_os = "macos")]
-    if _final_backend == DictationFinalBackend::AppleSpeech {
+    if dictation_should_attempt_apple(_final_backend, apple_session) {
         match transcribe_utterance_with_apple_speech(_final_utterance_samples, _config) {
             Ok(Some(transcript)) => {
+                apple_session.record_success();
                 return Some(FinalizedDictation {
                     transcript,
                     backend: DictationFinalBackend::AppleSpeech,
                 });
             }
+            // Empty result (e.g. sub-1s blip): not a failure, so don't latch the
+            // session off Apple Speech; just yield nothing for this utterance.
             Ok(None) => {}
             Err(error) => {
+                // Worker crash or Speech error: latch this session to Whisper so
+                // the next utterance doesn't re-spawn a worker that will crash
+                // again, and fall through to the Whisper path below.
+                apple_session.record_failure();
                 tracing::warn!(
                     error = %error,
-                    "apple-speech dictation failed; using whisper fallback for this utterance"
+                    "apple-speech dictation failed; latching this session to whisper fallback"
                 );
             }
         }
@@ -1456,6 +1491,31 @@ mod tests {
             },
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn dictation_latches_off_apple_speech_after_a_failure() {
+        let session = AppleSpeechSession::new();
+        // Fresh session with the apple-speech backend selected: attempt it.
+        assert!(dictation_should_attempt_apple(
+            DictationFinalBackend::AppleSpeech,
+            &session
+        ));
+
+        // A worker failure latches the session: the next utterance must not
+        // re-attempt apple-speech (which would re-spawn a crashing worker).
+        session.record_failure();
+        assert!(!dictation_should_attempt_apple(
+            DictationFinalBackend::AppleSpeech,
+            &session
+        ));
+
+        // A whisper session never routes through apple-speech, latch or not.
+        let whisper_session = AppleSpeechSession::new();
+        assert!(!dictation_should_attempt_apple(
+            DictationFinalBackend::Whisper,
+            &whisper_session
+        ));
     }
 
     #[test]
