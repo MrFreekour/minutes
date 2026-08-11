@@ -61,6 +61,7 @@ jobs:
               - 'crates/archive-core/**'
               - 'crates/archive-ocr/**'
               - 'crates/archive-semantic/**'
+              - 'crates/archive-worker-control/**'
               # Not a workspace member and not an npm package: fixture audio
               # read by tests and scripts. 'crates/**' used to cover it.
               - 'crates/assets/**'
