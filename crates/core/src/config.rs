@@ -367,6 +367,15 @@ pub struct TranscriptionConfig {
     /// Post-pass person-name correction mode. Off by default.
     #[serde(default)]
     pub name_correction: NameCorrectionMode,
+    /// Apple Speech shadow mode: attempt Apple Speech alongside Whisper for
+    /// measurement only, log the comparison, and never affect the user-visible
+    /// transcript or recording. Off by default and independent of the product
+    /// transport gate (`apple_speech_private_audio_transport_supported`) — this
+    /// is the activation plan's Phase 6 shadow switch, not an activation. Even
+    /// when true, an attempt only happens on capable macOS where the worker is
+    /// available; everywhere else it is a no-op.
+    #[serde(default)]
+    pub apple_speech_shadow: bool,
 }
 
 pub const VALID_PARAKEET_MODELS: &[&str] = &["tdt-ctc-110m", "tdt-600m"];
@@ -1363,6 +1372,7 @@ impl Default for TranscriptionConfig {
             parakeet_vocab: "tdt-600m.tokenizer.vocab".into(),
             partial_max_secs: 30,
             name_correction: NameCorrectionMode::Off,
+            apple_speech_shadow: false,
         }
     }
 }
