@@ -53,6 +53,14 @@ fn compile_macos_graph_xpc_authority_bridge() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=minutes_macos_graph_xpc_authority");
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
+    // Runtime rpath for the Swift Concurrency dylib (libswift_Concurrency lives
+    // only in the dyld shared cache, so its weak @rpath load resolves only with
+    // an rpath into /usr/lib/swift). cargo:rustc-link-arg applies to
+    // minutes-core's OWN targets only (its tests and examples that exercise the
+    // async Speech bridge), NOT to downstream binaries. The shipping worker
+    // gets its rpath from crates/cli/build.rs on the worker bin; this line is
+    // what lets a minutes-core test or example resolve the same symbols.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     if let Some(swiftc) = engine_process::command("xcrun")
         .args(["--find", "swiftc"])
         .output()

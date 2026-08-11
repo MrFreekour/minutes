@@ -29,4 +29,16 @@ fn main() {
             plist.display()
         );
     }
+
+    // The Apple Speech worker links the Swift Concurrency bridge (Task, async).
+    // Its binary carries a weak @rpath load of libswift_Concurrency, which on
+    // macOS lives only in the dyld shared cache, not on disk, so that @rpath
+    // resolves only with a runtime rpath into the OS Swift libraries. Without
+    // it the weak load is silently skipped, every Concurrency type descriptor
+    // is null, and the worker aborts inside swift_getTypeByMangledName the
+    // instant the analyzer's async types resolve. A cargo:rustc-link-arg from
+    // the minutes-core build script does NOT reach this downstream binary, so
+    // the rpath must be set here, on the worker bin itself. Proven on Apple
+    // Silicon: without this the real worker aborts; with it it transcribes.
+    println!("cargo:rustc-link-arg-bin=minutes-apple-speech-worker=-Wl,-rpath,/usr/lib/swift");
 }
