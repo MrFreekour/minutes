@@ -4236,7 +4236,12 @@ mod tests {
         assert_eq!(backend, "whisper");
         let diagnostic = diagnostic.expect("fallback reason must remain visible");
         assert!(diagnostic.contains("retained apple-speech"));
-        assert!(diagnostic.contains("cannot receive secure private audio"));
+        // Assert against the reason function rather than a copy of its wording:
+        // this assertion previously hardcoded an older phrasing and silently went
+        // stale when the reason was reworded, which no CI job compiles (every
+        // unit-test job runs --no-default-features, so this feature-gated module
+        // is never built there).
+        assert!(diagnostic.contains(crate::pipeline::apple_speech_unavailable_reason()));
         assert!(!diagnostic.contains("applies only to standalone"));
     }
 
