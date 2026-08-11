@@ -193,7 +193,12 @@ jobs:
       # it). build.rs stages it from target/release/minutes, so the CLI must be
       # built first or the bundle ships a placeholder stub (#324).
       - name: Build release CLI for bundling
-        # engine-sherpa held out per #683 (conflicts with diarize on macOS; see crates/core/src/lib.rs guard)
+        # engine-sherpa held out pending packaging (#369), not because it
+        # conflicts. #685 moved sherpa into a dlopened plugin with its own
+        # ONNX Runtime, so it coexists with diarize now and CI compiles the
+        # pair on purpose. What is missing is a signed, notarized plugin
+        # beside the binary; an unsigned dylib loaded by this hardened,
+        # notarized app is refused at load.
         run: cargo build --release -p minutes-cli --features parakeet,metal
 
       - name: Build signed bundle (helper identity is repaired before notarization)
@@ -207,7 +212,11 @@ jobs:
         # workspace, so cargo resolves --features against every member, and
         # minutes-archive-app has neither parakeet nor metal.
         working-directory: tauri/src-tauri
-        # engine-sherpa held out per #683 (the app hard-enables diarize; see crates/core/src/lib.rs guard)
+        # engine-sherpa held out pending packaging (#369). The #683 conflict
+        # that once justified this is gone: #685 put sherpa in its own
+        # dlopened image, so the app can hard-enable diarize and still load
+        # it. The plugin just is not signed and shipped inside the bundle
+        # yet.
         run: cargo tauri build --features parakeet,metal --bundles app
 
       - name: Sign graph helper inside-out and notarize the final exact app
