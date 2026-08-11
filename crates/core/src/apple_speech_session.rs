@@ -1,17 +1,18 @@
-//! Session-scoped safe fallback for Apple Speech transcription.
+//! Session-scoped safe-fallback latch for Apple Speech transcription.
 //!
 //! Apple Speech runs in a separate XPC worker process, so a worker crash is
-//! failure-isolated: the parent observes an error and can fall back to Whisper
-//! for that utterance without losing it. This is the RFC 0004 failure-isolation
+//! failure-isolated: the parent observes an error and falls back to Whisper for
+//! that utterance without losing it. This is the RFC 0004 failure-isolation
 //! boundary and the standing "recording must never be degraded by an optional
 //! consumer" decision, applied to engine selection.
 //!
 //! Runtime capability cannot be predicted before attempting (a device may lack
-//! Speech assets, or abort constructing the analyzer), so this attempts once
-//! and caches the verdict: the first failure marks Apple Speech unavailable for
-//! the rest of the session, so the worker is never re-spawned only to crash
-//! again. The orchestrator is generic over the transcribe closures so it is
-//! unit-testable without a real Speech runtime.
+//! Speech assets, or abort while constructing the analyzer), so callers attempt
+//! once and cache the verdict here: the first failure latches the session onto
+//! Whisper, so the worker is never re-spawned only to crash again for the same
+//! reason. The latch uses interior mutability (an atomic) so a shared `&self`
+//! reference threads cleanly through a per-utterance loop without `&mut`
+//! plumbing.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -47,7 +48,11 @@ impl AppleSpeechSession {
 
     /// Record that Apple Speech produced a usable transcript this session.
     pub fn record_success(&self) {
-        self.state.store(USABLE, Ordering::Release);
+        // Never overwrite a latched failure: a mid-session recovery claim must
+        // not re-arm a worker that already crashed once this session.
+        let _ = self
+            .state
+            .compare_exchange(UNKNOWN, USABLE, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Record that Apple Speech failed (crash, error, or unusable result).
@@ -62,126 +67,47 @@ impl AppleSpeechSession {
     }
 }
 
-/// Outcome of a fallback-orchestrated utterance: which engine produced the
-/// transcript, so callers can surface the honest backend and log shadow deltas.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Engine {
-    AppleSpeech,
-    Whisper,
-}
-
-/// Attempt Apple Speech for one utterance, falling back to Whisper on any
-/// failure, and never losing the utterance.
-///
-/// `attempt_apple` returns `Ok(t)` only when the worker returned a response; a
-/// worker crash or XPC interruption is an `Err`. `is_usable` decides whether an
-/// `Ok` response is a real transcript (runtime supported and non-empty) versus a
-/// structured "unsupported" result that must still fall back. `whisper` is
-/// infallible from the caller's perspective: it is the guaranteed transcript, so
-/// the utterance is never dropped.
-///
-/// A failure (error or unusable result) latches the session onto Whisper for
-/// every later utterance.
-pub fn transcribe_or_fall_back<T, E>(
-    session: &AppleSpeechSession,
-    attempt_apple: impl FnOnce() -> Result<T, E>,
-    is_usable: impl FnOnce(&T) -> bool,
-    whisper: impl FnOnce() -> T,
-) -> (Engine, T) {
-    if session.should_attempt() {
-        if let Ok(result) = attempt_apple() {
-            if is_usable(&result) {
-                session.record_success();
-                return (Engine::AppleSpeech, result);
-            }
-        }
-        // Error or unusable result: latch the session onto Whisper.
-        session.record_failure();
-    }
-    (Engine::Whisper, whisper())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_usable_apple_result_is_returned_and_keeps_the_session_usable() {
+    fn a_fresh_session_attempts_apple_speech() {
         let session = AppleSpeechSession::new();
-        let (engine, text) = transcribe_or_fall_back(
-            &session,
-            || Ok::<_, ()>("apple transcript".to_string()),
-            |t| !t.is_empty(),
-            || "whisper transcript".to_string(),
-        );
-        assert_eq!(engine, Engine::AppleSpeech);
-        assert_eq!(text, "apple transcript");
         assert!(session.should_attempt());
         assert!(!session.is_unavailable());
     }
 
     #[test]
-    fn a_worker_error_falls_back_to_whisper_and_latches_unavailable() {
+    fn a_failure_latches_the_session_off_apple_speech() {
         let session = AppleSpeechSession::new();
-        let (engine, text) = transcribe_or_fall_back(
-            &session,
-            || Err::<String, _>("worker crashed (XPC interrupted)"),
-            |t| !t.is_empty(),
-            || "whisper transcript".to_string(),
-        );
-        assert_eq!(engine, Engine::Whisper);
-        assert_eq!(text, "whisper transcript");
+        session.record_failure();
+        assert!(!session.should_attempt());
+        assert!(session.is_unavailable());
+    }
+
+    #[test]
+    fn a_success_keeps_the_session_attempting() {
+        let session = AppleSpeechSession::new();
+        session.record_success();
+        assert!(session.should_attempt());
+        assert!(!session.is_unavailable());
+    }
+
+    #[test]
+    fn a_latched_failure_is_not_undone_by_a_later_success() {
+        // A worker that crashed once this session must stay latched off, even if
+        // some later code path reports a stray success: never re-spawn a crasher.
+        let session = AppleSpeechSession::new();
+        session.record_failure();
+        session.record_success();
         assert!(session.is_unavailable());
         assert!(!session.should_attempt());
     }
 
     #[test]
-    fn an_unusable_apple_result_falls_back_and_latches_unavailable() {
-        // runtimeSupported=false comes back as Ok but not usable.
-        let session = AppleSpeechSession::new();
-        let (engine, text) = transcribe_or_fall_back(
-            &session,
-            || Ok::<_, ()>(String::new()),
-            |t| !t.is_empty(),
-            || "whisper transcript".to_string(),
-        );
-        assert_eq!(engine, Engine::Whisper);
-        assert_eq!(text, "whisper transcript");
-        assert!(session.is_unavailable());
-    }
-
-    #[test]
-    fn after_a_failure_apple_is_not_attempted_again_this_session() {
-        let session = AppleSpeechSession::new();
-        session.record_failure();
-        let mut attempted = false;
-        let (engine, text) = transcribe_or_fall_back(
-            &session,
-            || {
-                attempted = true;
-                Ok::<_, ()>("apple transcript".to_string())
-            },
-            |t| !t.is_empty(),
-            || "whisper transcript".to_string(),
-        );
-        assert!(
-            !attempted,
-            "must not re-spawn the worker after a session failure"
-        );
-        assert_eq!(engine, Engine::Whisper);
-        assert_eq!(text, "whisper transcript");
-    }
-
-    #[test]
-    fn the_utterance_is_never_lost_even_when_both_paths_are_exercised() {
-        // Whisper is the guaranteed transcript, so a caller always gets text.
-        let session = AppleSpeechSession::new();
-        let (_, text) = transcribe_or_fall_back(
-            &session,
-            || Err::<String, _>("crash"),
-            |t| !t.is_empty(),
-            || "whisper fallback".to_string(),
-        );
-        assert!(!text.is_empty());
+    fn the_default_impl_matches_new() {
+        let session = AppleSpeechSession::default();
+        assert!(session.should_attempt());
     }
 }
