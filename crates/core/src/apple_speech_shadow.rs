@@ -290,23 +290,33 @@ struct ShadowJob {
     whisper_text: String,
 }
 
+/// Process-wide admission: at most one shadow attempt runs at a time across every
+/// `ShadowRunner` (and therefore every recording session) in the process. A
+/// per-runner flag would let rapid stop/start cycles leave several detached 180s
+/// worker jobs overlapping a new recording; a single global gate bounds that to
+/// one, keeping shadow's CPU/memory/asset-download load off active capture.
+static SHADOW_ADMISSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// A non-blocking, failure-isolated executor for shadow comparisons.
 ///
-/// The shadow attempt runs on a dedicated *detached* thread. An `in_flight` flag
-/// admits exactly one attempt at a time; any utterance arriving while one is
-/// running is dropped, never queued. `try_submit` never blocks. This upholds the
-/// standing "recording must never be degraded by an optional consumer" decision
-/// (RFC 0004): the sidecar cannot be stalled or back-pressured, and — critically
-/// — shutdown does not join the worker thread, so a shadow attempt still inside
-/// the worker's 180s budget cannot delay Stop or WAV preservation. Dropping the
-/// runner closes the channel; the thread finishes its current attempt in the
-/// background and exits. The last in-flight comparison is therefore best-effort
-/// (it may be lost at process exit) — an acceptable trade for never delaying
-/// capture. A per-session [`AppleSpeechSession`] latch stops attempts after the
-/// first failure, so an incapable device is not re-probed every utterance.
+/// The shadow attempt runs on a dedicated *detached* thread. A process-wide
+/// admission gate ([`SHADOW_ADMISSION`]) admits exactly one attempt at a time
+/// across all sessions; any utterance arriving while one is running is dropped,
+/// never queued. `try_submit` never blocks and never copies audio (it takes
+/// ownership). This upholds the standing "recording must never be degraded by an
+/// optional consumer" decision (RFC 0004): the sidecar cannot be stalled or
+/// back-pressured, and — critically — shutdown does not join the worker thread,
+/// so a shadow attempt still inside the worker's 180s budget cannot delay Stop or
+/// WAV preservation. Dropping the runner sets a cancel flag and closes the
+/// channel: a queued-but-not-started job is skipped, and a call already inside the
+/// worker finishes in the background. The last in-flight comparison is therefore
+/// best-effort (it may be lost at process exit) — an acceptable trade for never
+/// delaying capture. A per-session [`AppleSpeechSession`] latch stops attempts
+/// after the first failure, so an incapable device is not re-probed every
+/// utterance.
 pub struct ShadowRunner {
     tx: std::sync::mpsc::SyncSender<ShadowJob>,
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     session: std::sync::Arc<AppleSpeechSession>,
 }
 
@@ -335,16 +345,19 @@ impl ShadowRunner {
         use std::sync::atomic::{AtomicBool, Ordering};
         let (tx, rx) = std::sync::mpsc::sync_channel::<ShadowJob>(1);
         let session = std::sync::Arc::new(AppleSpeechSession::new());
-        let in_flight = std::sync::Arc::new(AtomicBool::new(false));
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
         let thread_session = std::sync::Arc::clone(&session);
-        let thread_in_flight = std::sync::Arc::clone(&in_flight);
+        let thread_cancelled = std::sync::Arc::clone(&cancelled);
         // `.ok()?` discards the JoinHandle, detaching the thread: nothing ever
         // joins it, so shutdown cannot block on an in-flight worker attempt.
         std::thread::Builder::new()
             .name("apple-speech-shadow".to_string())
             .spawn(move || {
                 for job in rx {
-                    if thread_session.should_attempt() {
+                    // Skip a queued job if the runner was dropped (cancelled) or
+                    // the session latched off, but still release admission below.
+                    if !thread_cancelled.load(Ordering::Acquire) && thread_session.should_attempt()
+                    {
                         let apple = attempt(&job.samples);
                         let cmp = compare(
                             &job.whisper_text,
@@ -359,44 +372,57 @@ impl ShadowRunner {
                         }
                         sink(source, &cmp);
                     }
-                    // Release the slot only after the attempt fully settles, so a
-                    // new submission cannot start a second concurrent worker.
-                    thread_in_flight.store(false, Ordering::Release);
+                    // Release the process-wide slot only after the attempt fully
+                    // settles, whether it ran or was skipped, so a new submission
+                    // (this or another session) cannot start a second worker.
+                    SHADOW_ADMISSION.store(false, Ordering::Release);
                 }
             })
             .ok()?;
         Some(Self {
             tx,
-            in_flight,
+            cancelled,
             session,
         })
     }
 
-    /// Submit an utterance for shadow comparison without ever blocking the caller.
-    /// Returns `false` (skips) when the utterance is too short to be worth a
-    /// worker spawn, when the session has latched off after a failure, or when a
-    /// prior attempt is still in flight. A dropped sample is acceptable for
-    /// measurement and keeps capture unblocked.
-    pub fn try_submit(&self, samples: &[f32], whisper_text: &str) -> bool {
+    /// Submit an utterance for shadow comparison without ever blocking the caller
+    /// and without copying audio: ownership of `samples` moves into the runner, so
+    /// there is no infallible allocation on the capture path. Returns `false`
+    /// (skips) when the utterance is too short, when the session has latched off
+    /// after a failure, or when a shadow attempt is already in flight anywhere in
+    /// the process. A dropped sample is acceptable for measurement.
+    pub fn try_submit(&self, samples: Vec<f32>, whisper_text: String) -> bool {
         use std::sync::atomic::Ordering;
         if samples.len() < SHADOW_MIN_SAMPLES || !self.session.should_attempt() {
             return false;
         }
-        // Claim the single slot; if an attempt is already in flight, drop.
-        if self.in_flight.swap(true, Ordering::AcqRel) {
+        // Claim the process-wide slot; if an attempt is already in flight, drop.
+        if SHADOW_ADMISSION.swap(true, Ordering::AcqRel) {
             return false;
         }
         match self.tx.try_send(ShadowJob {
-            samples: samples.to_vec(),
-            whisper_text: whisper_text.to_string(),
+            samples,
+            whisper_text,
         }) {
             Ok(()) => true,
             Err(_) => {
                 // Receiver gone (thread ended): release the slot we claimed.
-                self.in_flight.store(false, Ordering::Release);
+                SHADOW_ADMISSION.store(false, Ordering::Release);
                 false
             }
         }
+    }
+}
+
+impl Drop for ShadowRunner {
+    fn drop(&mut self) {
+        // Cancel a queued-but-not-started job so it can't run the worker during a
+        // later session, then let `tx` drop to close the channel. We never join:
+        // a call already inside the worker finishes in the background, so Stop and
+        // WAV preservation are never delayed.
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -710,13 +736,24 @@ mod tests {
         vec![0.1_f32; SHADOW_MIN_SAMPLES]
     }
 
+    /// Serialize the runner tests and reset the process-wide admission gate, so a
+    /// prior test's detached thread cannot leave `SHADOW_ADMISSION` set and make a
+    /// later test's submission spuriously drop.
+    fn runner_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        SHADOW_ADMISSION.store(false, std::sync::atomic::Ordering::Release);
+        guard
+    }
+
     #[test]
     fn runner_skips_utterances_shorter_than_the_threshold() {
+        let _guard = runner_test_guard();
         let runner =
             ShadowRunner::spawn_with_sink("test", |_| Ok(Some("apple".to_string())), |_, _| {})
                 .expect("spawn shadow runner");
         assert!(
-            !runner.try_submit(&[0.1; 10], "whisper"),
+            !runner.try_submit(vec![0.1; 10], "whisper".to_string()),
             "sub-threshold utterance must be dropped without a worker spawn"
         );
     }
@@ -724,6 +761,7 @@ mod tests {
     #[test]
     fn runner_compares_a_submitted_utterance_and_persists_via_the_sink() {
         use std::sync::mpsc;
+        let _guard = runner_test_guard();
         let (done_tx, done_rx) = mpsc::channel();
         let runner = ShadowRunner::spawn_with_sink(
             "test",
@@ -731,7 +769,7 @@ mod tests {
             move |_, cmp| done_tx.send(cmp.clone()).unwrap(),
         )
         .expect("spawn shadow runner");
-        assert!(runner.try_submit(&long_samples(), "the quick brown fox"));
+        assert!(runner.try_submit(long_samples(), "the quick brown fox".to_string()));
         let cmp = done_rx.recv().unwrap();
         assert_eq!(cmp.outcome, ShadowOutcome::Usable);
         assert!(cmp.exact_match);
@@ -742,6 +780,7 @@ mod tests {
     fn runner_latches_off_after_a_failure_and_stops_attempting() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{mpsc, Arc};
+        let _guard = runner_test_guard();
         let calls = Arc::new(AtomicUsize::new(0));
         let thread_calls = Arc::clone(&calls);
         let (done_tx, done_rx) = mpsc::channel();
@@ -755,13 +794,13 @@ mod tests {
         )
         .expect("spawn shadow runner");
 
-        assert!(runner.try_submit(&long_samples(), "whisper text"));
+        assert!(runner.try_submit(long_samples(), "whisper text".to_string()));
         // Wait for the first attempt to be processed so the session has latched.
         assert_eq!(done_rx.recv().unwrap(), ShadowOutcome::Failed);
 
         // The session is now latched off: further submits are skipped and the
         // attempt closure is never called again.
-        assert!(!runner.try_submit(&long_samples(), "whisper text"));
+        assert!(!runner.try_submit(long_samples(), "whisper text".to_string()));
         drop(runner);
         assert_eq!(
             calls.load(Ordering::SeqCst),
