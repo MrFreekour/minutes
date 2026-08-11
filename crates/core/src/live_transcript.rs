@@ -461,7 +461,13 @@ impl LiveTranscriptWriter {
             );
             return;
         }
-        match crate::apple_speech_shadow::spawn_live_shadow_runner(config) {
+        // Attribute the evidence to the surface that produced it, using the
+        // canonical transcript-source vocabulary.
+        let source = match self.source {
+            TranscriptSource::Standalone => "standalone",
+            TranscriptSource::RecordingSidecar => "recording-sidecar",
+        };
+        match crate::apple_speech_shadow::spawn_live_shadow_runner(config, source) {
             Some(runner) => {
                 tracing::info!("apple-speech shadow measurement armed for this live session");
                 self.shadow = Some(LiveShadow {
@@ -504,21 +510,49 @@ impl LiveTranscriptWriter {
     /// Whisper is the shipped engine, so the comparison is always shadow-vs-shipped.
     /// Ownership of the buffer moves to the runner (no copy on this thread), and
     /// the runner drops the job if it is busy — capture is never blocked.
+    ///
+    /// The text is normalized exactly as `write_utterance` normalizes it, so a
+    /// comparison is only recorded for a transcript the user actually received:
+    /// normalization rejects (`[BLANK_AUDIO]` and friends) persist no line, so
+    /// shadow must not count them either. Either way the audio is consumed, so it
+    /// can never bleed into the next utterance.
     #[cfg(target_os = "macos")]
     fn submit_whisper_shadow(&mut self, whisper_text: &str) {
+        let normalized = normalize_live_transcript_text(whisper_text);
         let Some(shadow) = self.shadow.as_mut() else {
             return;
         };
         let samples = std::mem::take(&mut shadow.samples);
         let overflowed = std::mem::replace(&mut shadow.overflowed, false);
+        let Some(text) = normalized else {
+            return;
+        };
         if overflowed || samples.is_empty() {
             return;
         }
-        shadow.runner.try_submit(samples, whisper_text.to_string());
+        shadow.runner.try_submit(samples, text);
     }
 
     #[cfg(not(target_os = "macos"))]
     fn submit_whisper_shadow(&mut self, _whisper_text: &str) {}
+
+    /// Drop any accumulated shadow audio without comparing it.
+    ///
+    /// Called wherever the Whisper stream is reset or discarded without producing
+    /// a finalized utterance (sub-second VAD segments, empty results, transcription
+    /// errors, reconnect discards). Without this the samples would carry into the
+    /// next utterance and Apple Speech would be handed several utterances of audio
+    /// while being scored against only the latest Whisper text.
+    #[cfg(target_os = "macos")]
+    fn discard_shadow_samples(&mut self) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.samples = Vec::new();
+            shadow.overflowed = false;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn discard_shadow_samples(&mut self) {}
 
     /// Write the lightweight status file (atomic rename).
     fn write_status(
@@ -1120,6 +1154,9 @@ fn run_inner(
                         }
                     }
                     streaming.reset();
+                    // Whisper's buffer was discarded, so shadow's parallel copy
+                    // must go too or it would bleed into the next utterance.
+                    writer.discard_shadow_samples();
                     #[cfg(target_os = "macos")]
                     apple_utterance_samples.clear();
                     #[cfg(feature = "parakeet")]
@@ -1200,6 +1237,9 @@ fn run_inner(
                             }
                         }
                         streaming.reset();
+                        // Whisper's buffer was discarded, so shadow's parallel
+                        // copy must go too or it would bleed into the next one.
+                        writer.discard_shadow_samples();
                         #[cfg(target_os = "macos")]
                         apple_utterance_samples.clear();
                         #[cfg(feature = "parakeet")]
@@ -2295,6 +2335,10 @@ fn finalize_live_utterance(
                 true
             };
             streaming.reset();
+            // No-op after a successful submit (which consumed the buffer), but
+            // load-bearing when finalize returned None: without it that audio
+            // would join the next utterance and be scored against its text.
+            writer.discard_shadow_samples();
             ok
         }
         Err(error) => {
@@ -2303,6 +2347,7 @@ fn finalize_live_utterance(
                 "failed to load whisper backend for live transcript"
             );
             streaming.reset();
+            writer.discard_shadow_samples();
             false
         }
     };
@@ -2429,6 +2474,9 @@ fn finalize_live_utterance(
     #[cfg(not(target_os = "macos"))]
     let _ = (&apple_live_enabled, &config, source);
     streaming.reset();
+    // No-op after a successful submit; load-bearing when finalize returned None
+    // or the whisper context failed to load.
+    writer.discard_shadow_samples();
     write_ok
 }
 

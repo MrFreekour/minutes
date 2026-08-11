@@ -426,18 +426,21 @@ impl Drop for ShadowRunner {
     }
 }
 
-/// Build a live-sidecar shadow runner that drives the real Apple Speech worker.
+/// Build a live shadow runner that drives the real Apple Speech worker.
 ///
-/// macOS only, because it calls the XPC worker. The sidecar constructs this once
+/// macOS only, because it calls the XPC worker. The caller constructs this once
 /// per session when [`shadow_enabled`] is true, then feeds it finalized Whisper
-/// utterances via [`ShadowRunner::try_submit`]. A successful call is decoded by
+/// utterances via [`ShadowRunner::try_submit`]. `source` labels the surface in
+/// the log and must use the repository's canonical transcript-source vocabulary
+/// (`"standalone"` / `"recording-sidecar"`) so rollout evidence is attributed to
+/// the surface that actually produced it. A successful call is decoded by
 /// [`worker_ok_to_shadow`]; a transport `Err` is categorized by its
 /// `io::ErrorKind` via [`transport_error_category`]. Returns `None` if the worker
 /// thread cannot be spawned, disabling shadow rather than affecting capture.
 #[cfg(target_os = "macos")]
-pub fn spawn_live_shadow_runner(config: &Config) -> Option<ShadowRunner> {
+pub fn spawn_live_shadow_runner(config: &Config, source: &'static str) -> Option<ShadowRunner> {
     let language = config.transcription.language.clone();
-    ShadowRunner::spawn("live-sidecar", move |samples| {
+    ShadowRunner::spawn(source, move |samples| {
         let locale = crate::apple_speech::live_locale_hint(language.as_deref());
         match crate::apple_speech_worker::transcribe_samples(
             samples,
