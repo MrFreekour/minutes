@@ -262,7 +262,29 @@ Vercel project that `307`-redirected to www. The site looked fine, and the entir
 40-route content build stayed effectively unindexed: 496 referring domains, one
 ranking keyword.
 
-### 16. Update the Homebrew tap: formula AND cask, every release
+### 16. Homebrew tap: automated, but confirm it ran
+
+`Update Homebrew Tap` (`.github/workflows/homebrew-tap.yml`) fires on
+`release: published` and points both tap files at the new version. Publishing
+rather than tagging is the trigger because that is the first moment the DMG the
+cask hashes is guaranteed to exist.
+
+**Confirm it, do not assume it.** The run appears under Actions; it prints the
+before and after versions and then re-reads the tap over HTTPS the way `brew`
+does, failing if either file disagrees with the release.
+
+If `HOMEBREW_TAP_TOKEN` is missing the workflow warns and exits 0 rather than
+turning a good release red, so a green release does not by itself prove the tap
+moved. Check the run, or:
+
+```bash
+brew update && brew info silverstein/tap/minutes && brew info --cask silverstein/tap/minutes
+```
+
+The daily triage sweep also compares the latest release against both tap files,
+so drift surfaces within a day even if nobody looks.
+
+#### Doing it by hand (if the workflow is unavailable)
 Two files in `silverstein/homebrew-tap`, and they drift independently. The
 formula (`Formula/minutes.rb`, CLI) was faithfully bumped while the cask
 (`Casks/minutes.rb`, desktop app) sat at 0.18.2 through six releases until a
@@ -288,5 +310,10 @@ SHA=$(gh api repos/silverstein/homebrew-tap/contents/Casks/minutes.rb --jq '.sha
 
 Verify both: `brew update && brew info silverstein/tap/minutes && brew info --cask silverstein/tap/minutes`.
 
-Automating the bump from the release pipeline is tracked in #736; it needs a
-cross-repository token, so until that lands this manual step is the mechanism.
+Or run the same logic the workflow runs, which is safer than hand-editing
+because it refuses rather than guesses when a tap file has been restructured:
+
+```bash
+HOMEBREW_TAP_TOKEN=... python3 scripts/bump_homebrew_tap.py --version X.Y.Z --dry-run
+HOMEBREW_TAP_TOKEN=... python3 scripts/bump_homebrew_tap.py --version X.Y.Z
+```

@@ -1,0 +1,105 @@
+name: Update Homebrew Tap
+
+# The tap's cask sat at 0.18.2 while releases reached 0.24.0, because bumping
+# it was a step someone had to remember (#736). This removes the memory.
+#
+# `release: published` rather than a tag push: the release procedure creates
+# the release as a draft, waits for the release workflows to attach assets,
+# then un-drafts it. Publishing is therefore the first moment the DMG this
+# needs is guaranteed to exist. A tag push fires while the assets are still
+# building.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to point the tap at, for example 0.24.0"
+        required: true
+        type: string
+      dry_run:
+        description: "Report what would change without writing"
+        type: boolean
+        default: true
+
+# This job holds a token that can write to another repository, so it takes
+# nothing it does not need: no checkout credentials, no third-party actions,
+# and a read-only default token.
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Point the tap at the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify the bump logic before using it
+        run: python3 scripts/bump_homebrew_tap.py --self-test
+
+      - name: Resolve version
+        id: version
+        env:
+          # Through env, never interpolated into the shell, so a crafted
+          # release name cannot become code here.
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-${EVENT_TAG#v}}"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump the formula and the cask
+        id: bump
+        env:
+          # A fine-grained PAT scoped to silverstein/homebrew-tap with
+          # contents: write. The default GITHUB_TOKEN cannot reach another
+          # repository, which is the whole reason this needs a secret.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run && 'yes' || '' }}
+        run: |
+          set -euo pipefail
+          echo "wrote=false" >> "$GITHUB_OUTPUT"
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            # Deliberately not a failure. Until the secret exists this
+            # workflow must not turn a good release red; it just says what it
+            # would have done, loudly enough to be seen.
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set, so the tap was not updated."
+            echo "Create a fine-grained PAT scoped to silverstein/homebrew-tap"
+            echo "(contents: write) and add it as the HOMEBREW_TAP_TOKEN secret."
+            echo "Until then, bump the tap by hand: docs/release/procedure.md step 16."
+            exit 0
+          fi
+          # Branch rather than splat an empty variable into the argv, which
+          # is unquoted-expansion and shellcheck rightly rejects it.
+          if [ -n "${DRY_RUN:-}" ]; then
+            python3 scripts/bump_homebrew_tap.py --version "$VERSION" --dry-run
+          else
+            python3 scripts/bump_homebrew_tap.py --version "$VERSION"
+            echo "wrote=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only when something was actually written. An earlier version gated
+      # this on a token variable it never declared, so the check was always
+      # skipped: a verification step that cannot fail verifies nothing.
+      - name: Confirm the tap now serves the release
+        if: steps.bump.outputs.wrote == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Reads the tap over plain HTTPS, the same way brew does, rather than
+          # trusting the write to have taken effect.
+          cask=$(curl -fsSL https://raw.githubusercontent.com/silverstein/homebrew-tap/main/Casks/minutes.rb \
+                 | grep -oE 'version "[0-9.]+"' | grep -oE '[0-9.]+')
+          formula=$(curl -fsSL https://raw.githubusercontent.com/silverstein/homebrew-tap/main/Formula/minutes.rb \
+                 | grep -oE 'tag: "v[0-9.]+"' | grep -oE '[0-9.]+')
+          echo "release $VERSION | cask $cask | formula $formula"
+          failed=0
+          [ "$cask" = "$VERSION" ] || { echo "::error::cask is $cask, expected $VERSION"; failed=1; }
+          [ "$formula" = "$VERSION" ] || { echo "::error::formula is $formula, expected $VERSION"; failed=1; }
+          exit "$failed"
