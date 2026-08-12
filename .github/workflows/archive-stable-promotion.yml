@@ -96,10 +96,10 @@ jobs:
           release = json.loads(os.environ["RELEASE_JSON"])
           if release.get("tag_name") != os.environ["RELEASE_TAG"]:
               raise SystemExit("Staged release tag does not match the requested tag")
-          if not release.get("draft"):
-              raise SystemExit("Staged release must remain a private draft before promotion")
           if release.get("target_commitish") != os.environ["CANDIDATE_SHA"]:
               raise SystemExit("Staged release target does not match the reviewed candidate")
+          if release.get("prerelease"):
+              raise SystemExit("Reviewed Archive release must not be a prerelease")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
               env.write(f"RELEASE_ID={release['id']}\n")
