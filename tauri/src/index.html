@@ -9328,7 +9328,7 @@
     let liveTransitionLabel = '';
     let liveTransitionTimer = null;
 
-    function beginLiveTransition(button, label) {
+    function beginLiveTransition(button, label, rescueMs) {
       endLiveTransition();
       if (!button) return;
       liveTransitionButton = button;
@@ -9338,7 +9338,14 @@
       // Safety net: if the confirming event never arrives (a wedged session, a
       // dropped event) the control must not stay disabled forever. Restoring it
       // is always safe -- the worst case is the user clicking again.
-      liveTransitionTimer = window.setTimeout(endLiveTransition, 60000);
+      //
+      // The budget is per-transition because the two are not comparable.
+      // Starting waits on a model load. Stopping emits :stopped only after the
+      // whole session finishes, which with live_transcript.promote_on_stop =
+      // process includes the meeting pipeline and can legitimately run for
+      // minutes; a short rescue there would revert "Stopping..." mid-run and
+      // recreate the very "did my click register?" state this fixes.
+      liveTransitionTimer = window.setTimeout(endLiveTransition, rescueMs);
     }
 
     function endLiveTransition() {
@@ -9380,7 +9387,7 @@
       // reverting the button in between made a successful click look like it
       // had been ignored -- users reported clicking Live and watching it
       // "unclick itself" repeatedly.
-      beginLiveTransition(btn, 'Starting...');
+      beginLiveTransition(btn, 'Starting...', 60000);
       try {
         await invoke('cmd_start_live_transcript');
       } catch (e) {
@@ -9402,7 +9409,7 @@
       // Same rule in reverse: stopping runs the session's finalize and (with
       // promote_on_stop) its processing, so the control sat unchanged for 10-15
       // seconds looking like the click had not registered.
-      beginLiveTransition(event.currentTarget, 'Stopping...');
+      beginLiveTransition(event.currentTarget, 'Stopping...', 600000);
       try {
         await invoke('cmd_stop_live_transcript');
       } catch (e) {

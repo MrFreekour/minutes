@@ -445,6 +445,7 @@ window.__MINUTES_I18N['zh-CN'] = {
     "no longer available": "已不可用",
     "Optional": "可选",
     "Starting...": "正在启动…",
+    "Stopping...": "正在停止…",
 
     // ── Sub-windows: note / prompt / dictation / palette ────────────
     "Quick capture": "快速记录",
