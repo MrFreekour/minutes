@@ -10508,7 +10508,7 @@
       }, 250);
     }
 
-    async function loadMeetings() {
+    async function loadMeetings(options = {}) {
       if (documentsViewActive) {
         await loadDocuments();
         return;
@@ -10516,10 +10516,12 @@
       const generation = ++meetingInventoryGeneration;
       let meetings = [];
       try {
-        meetings = await withUiDeadline(
-          invoke('cmd_list_meetings', { limit: 30 }),
-          'Meeting inventory'
-        );
+        meetings = options.patient === true
+          ? await invokeInventoryPatiently(120000)
+          : await withUiDeadline(
+              invoke('cmd_list_meetings', { limit: 30 }),
+              'Meeting inventory'
+            );
         if (generation !== meetingInventoryGeneration) return;
         const nextFingerprint = fingerprintMeetingInventory(meetings);
         if (meetingInventoryFingerprint !== null && meetingInventoryFingerprint !== nextFingerprint) {
@@ -10536,6 +10538,12 @@
           // private-projection budget, preserve the already-rendered primary
           // inventory and retry instead of flashing an empty or error state.
           scheduleMeetingInventoryRetry();
+          return;
+        }
+        if (inventoryPatientRetryActive && options.patient !== true) {
+          // A user-initiated retry owns the worker; this automatic refresh just
+          // bumped into it. Leave the retry's "Reading…" state alone rather than
+          // replacing it with a competing Try again button.
           return;
         }
         setSearchError(e);
@@ -10786,50 +10794,55 @@
       if (retry) retry.addEventListener('click', () => retryInventoryPatiently(retry));
     }
 
+    // True while a user-initiated patient retry owns the backend worker, so an
+    // automatic refresh that merely bumps into it does not present that as a
+    // fresh failure and offer a competing button.
+    let inventoryPatientRetryActive = false;
+
     // An explicit Try again must be able to succeed where the automatic load
     // could not. loadMeetings() bounds its wait at five seconds so first paint
-    // is quick, but that is the very deadline a large library trips, and the
-    // abandoned scan is never replayed by the backend -- so simply calling
-    // loadMeetings() again would time out identically and the button would be
-    // decorative for exactly the people who see it.
+    // stays quick, but that is the very deadline a large library trips, and the
+    // abandoned scan is never replayed by the backend -- so calling it again
+    // unchanged would time out identically and the button would be decorative
+    // for exactly the people who see it.
     //
-    // This path therefore awaits the real result instead of racing a deadline,
-    // and tolerates the backend's single-flight "busy" answer while a previous
-    // scan is still finishing, up to an overall budget. It is user-initiated and
-    // shows progress on the button, so a long wait is honest rather than a hang.
+    // So the retry runs THROUGH loadMeetings (inheriting its generation check,
+    // fingerprint comparison, proactive-context invalidation and Documents
+    // guard) and only swaps in a patient wait.
     async function retryInventoryPatiently(button) {
-      const budgetMs = 120000;
-      const deadline = Date.now() + budgetMs;
       const originalLabel = button ? button.textContent : '';
       if (button) {
         button.disabled = true;
         button.textContent = 'Reading…';
       }
+      inventoryPatientRetryActive = true;
       setSearchError(null);
       try {
-        while (true) {
-          try {
-            const meetings = await invoke('cmd_list_meetings', { limit: 30 });
-            setSearchError(null);
-            renderMeetings(meetings);
-            return;
-          } catch (e) {
-            const busy = String((e && e.message) || e || '').toLowerCase()
-              .includes('still checking');
-            if (!busy || Date.now() >= deadline) throw e;
-            // A previous scan still owns the worker; wait for it rather than
-            // starting a competing one.
-            await new Promise((resolve) => window.setTimeout(resolve, 1000));
-          }
-        }
-      } catch (e) {
-        console.error('Inventory retry:', e);
-        setSearchError(e);
-        renderInventoryUnavailableState();
+        await loadMeetings({ patient: true });
       } finally {
+        inventoryPatientRetryActive = false;
         if (button && button.isConnected) {
           button.disabled = false;
           button.textContent = originalLabel;
+        }
+      }
+    }
+
+    // Await the real scan rather than racing a deadline, tolerating the
+    // backend's single-flight "still checking" answer while a previous scan
+    // finishes. The budget bounds how long we keep RETRYING; one already-running
+    // scan can still exceed it, because the backend worker cannot be cancelled
+    // and abandoning it would only waste the work.
+    async function invokeInventoryPatiently(budgetMs) {
+      const deadline = Date.now() + budgetMs;
+      while (true) {
+        try {
+          return await invoke('cmd_list_meetings', { limit: 30 });
+        } catch (e) {
+          const busy = String((e && e.message) || e || '').toLowerCase()
+            .includes('still checking');
+          if (!busy || Date.now() >= deadline) throw e;
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
         }
       }
     }
