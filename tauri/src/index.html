@@ -5377,7 +5377,7 @@
       <div class="live-level">
         <div class="live-level-fill" id="live-level-fill"></div>
       </div>
-      <div class="live-utterances" id="live-utterances">0 utterances</div>
+      <div class="live-utterances" id="live-utterances">Listening…</div>
       <div class="live-actions">
         <button class="btn btn-secondary btn-sm coach-toggle" id="btn-coach-live" type="button" aria-pressed="false">Coach</button>
         <button class="btn btn-secondary btn-sm" id="btn-stop-live">Stop Live</button>
@@ -7947,7 +7947,16 @@
               const min = Math.floor(d / 60);
               const sec = d % 60;
               document.getElementById('live-time').textContent = `${min}:${String(sec).padStart(2, '0')}`;
-              document.getElementById('live-utterances').textContent = `${n} utterance${n !== 1 ? 's' : ''}`;
+              // Say what is happening, not what the pipeline calls it. An
+              // "utterance" is a VAD-bounded chunk finalized on a pause, so this
+              // is legitimately 0 while someone is still talking -- but "0
+              // utterances" beside a moving level meter reads as "this is
+              // broken", and the term means nothing to the person using it. A
+              // user reported exactly that: "it says zero utterances even though
+              // the green bar is moving" / "that goes over my head".
+              document.getElementById('live-utterances').textContent = n === 0
+                ? 'Listening…'
+                : `${n} line${n !== 1 ? 's' : ''} captured`;
               const lvl = Math.min(100, liveStatus.audioLevel || 0);
               document.getElementById('live-level-fill').style.width = lvl + '%';
               if (!wasLive) startFastPoll();
