@@ -494,6 +494,33 @@ Minutes exposes a standard MCP server. Point any MCP-compatible client at it:
 }
 ```
 
+#### Transports
+
+`minutes-mcp` speaks stdio by default, which is what the config above uses: the client spawns the server as a subprocess and owns its lifetime. Nothing changes for existing setups.
+
+Pass `--transport http` to run one long-lived Streamable HTTP server instead, so several clients share a single process rather than each spawning their own:
+
+```bash
+minutes-mcp --transport http --port 7373
+```
+
+Then point clients at the endpoint:
+
+```json
+{
+  "mcpServers": {
+    "minutes": {
+      "type": "http",
+      "url": "http://127.0.0.1:7373/mcp"
+    }
+  }
+}
+```
+
+Flags: `--host` (default `127.0.0.1`), `--port` (default `7373`; `0` asks the OS for a free port and the chosen one is printed to stderr), `--max-sessions` (default 16). Each accepts an environment variable instead: `MINUTES_MCP_TRANSPORT`, `MINUTES_MCP_HOST`, `MINUTES_MCP_PORT`, `MINUTES_MCP_MAX_SESSIONS`. `GET /health` reports live session count.
+
+HTTP mode has no authentication. It binds `127.0.0.1`, so only this machine can reach it, and it rejects requests whose `Host` or `Origin` is not loopback. That second check matters: binding to loopback does not by itself stop a web page you have open from POSTing to a local port. Do not bind a public address or forward the port.
+
 Canonical MCP reference now lives at:
 
 - <https://useminutes.app/docs/mcp/tools>
