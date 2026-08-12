@@ -10287,6 +10287,7 @@
     }
 
     function renderDocuments(documents) {
+      markListOwner('documents');
       meetingsScroll.replaceChildren();
       footer.classList.remove('footer-hidden');
 
@@ -10401,11 +10402,13 @@
 
       if (!meetings || meetings.length === 0) {
         footer.classList.add('footer-hidden');
+        markListOwner('setup');
         renderSetupEmptyState();
         return;
       }
 
       footer.classList.remove('footer-hidden');
+      markListOwner('inventory');
 
       const groups = groupByDate(meetings);
       for (const [label, items] of Object.entries(groups)) {
@@ -10496,9 +10499,17 @@
     // that the running scan had already read past, so its snapshot can be stale
     // for them; one trailing scan after the leader settles makes it current.
     let meetingInventoryDirty = false;
-    // Whether a real list is currently on screen. Guards against replacing a
-    // usable list with a loading message during a slow background refresh.
-    let meetingInventoryRendered = false;
+    // Whoever paints the shared list container stamps it, so we can always ask
+    // what is actually on screen instead of trusting a flag that goes stale when
+    // Documents or search takes the container over and later hands it back.
+    function markListOwner(owner) {
+      if (meetingsScroll) meetingsScroll.dataset.listOwner = owner;
+    }
+
+    // True only when a usable inventory list is the thing currently displayed.
+    function inventoryListIsShowing() {
+      return !!meetingsScroll && meetingsScroll.dataset.listOwner === 'inventory';
+    }
 
     // Coalesce concurrent callers onto one scan. Without this, a refresh that
     // arrives mid-scan (an artifacts:changed event, a retry) supersedes the
@@ -10511,6 +10522,7 @@
         meetingInventoryDirty = true;
         return meetingInventoryInFlight;
       }
+      meetingInventoryDirty = false;
       const request = invoke('cmd_list_meetings', { limit: 30 });
       meetingInventoryInFlight = request;
       request
@@ -10583,6 +10595,7 @@
       // Thought) reachable: being unable to list past meetings must never take
       // away the ability to capture a new one.
       footer.classList.remove('footer-hidden');
+      markListOwner('pending');
       const pending = document.createElement('div');
       pending.className = 'empty-state';
       const slow = attempts >= 4;
@@ -10607,6 +10620,7 @@
       appendProactiveContextCard();
       // Same rule as the pending state: never remove capture controls.
       footer.classList.remove('footer-hidden');
+      markListOwner('error');
       const failed = document.createElement('div');
       failed.className = 'empty-state';
       failed.innerHTML = `
@@ -10647,7 +10661,7 @@
         // not tear down a list the user is already reading.
         if (generation === meetingInventoryGeneration &&
             inventoryViewOwnsList() &&
-            !meetingInventoryRendered) {
+            !inventoryListIsShowing()) {
           renderInventoryPendingState(meetingInventoryPendingAttempts);
         }
       }, INVENTORY_PENDING_NOTICE_MS);
@@ -10677,7 +10691,7 @@
           // Deliberately no search error: nothing has failed yet.
           meetingInventoryPendingAttempts += 1;
           setSearchError(null);
-          if (!meetingInventoryRendered) {
+          if (!inventoryListIsShowing()) {
             renderInventoryPendingState(meetingInventoryPendingAttempts);
           }
           scheduleMeetingInventoryRetry(
@@ -10688,18 +10702,17 @@
         // A real failure. Surface it, but still never claim the user has no
         // meetings — that is a statement about their data we have not earned.
         setSearchError(e);
-        meetingInventoryRendered = false;
         renderInventoryErrorState();
         return;
       } finally {
         window.clearTimeout(pendingNotice);
       }
       meetingInventoryPendingAttempts = 0;
-      meetingInventoryRendered = Array.isArray(meetings) && meetings.length > 0;
       if (meetingInventoryDirty) {
         // Someone asked for a refresh mid-scan; satisfy it with one fresh pass
-        // so a just-saved meeting cannot stay missing until the next event.
-        meetingInventoryDirty = false;
+        // so a just-saved meeting cannot stay missing until the next event. The
+        // flag is cleared by whichever scan actually starts, so a discarded or
+        // failed pass cannot leave it set and buy a redundant corpus walk.
         scheduleMeetingInventoryRetry(0);
       }
       // The proactive context bundle runs several corpus-wide scans and is only
