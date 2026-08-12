@@ -10489,6 +10489,26 @@
     // How long the list may stay blank before we say we are still reading. This
     // only controls a message; it never abandons the in-flight scan.
     const INVENTORY_PENDING_NOTICE_MS = 5000;
+    // The single in-flight inventory scan, shared by every caller.
+    let meetingInventoryInFlight = null;
+
+    // Coalesce concurrent callers onto one scan. Without this, a refresh that
+    // arrives mid-scan (an artifacts:changed event, a retry) supersedes the
+    // leader, whose completed result is then dropped on the generation check --
+    // and since the backend deliberately never replays a finished snapshot, the
+    // work has to be redone. On a large library that means repeated full scans
+    // that can keep restarting for as long as refreshes keep arriving.
+    function fetchMeetingInventory() {
+      if (meetingInventoryInFlight) return meetingInventoryInFlight;
+      const request = invoke('cmd_list_meetings', { limit: 30 });
+      meetingInventoryInFlight = request;
+      request
+        .catch(() => {})
+        .finally(() => {
+          if (meetingInventoryInFlight === request) meetingInventoryInFlight = null;
+        });
+      return request;
+    }
 
     function fingerprintMeetingInventory(meetings) {
       return JSON.stringify(meetings.map((meeting) => [
@@ -10511,6 +10531,13 @@
     // guard rejected a second request because the first is in flight. Both mean
     // "work in progress", NOT "this user has no meetings" — a distinction that
     // matters most for the largest corpora, which are the slowest to scan.
+    // Documents view and an active search both take over meetingsScroll without
+    // advancing the inventory generation, so inventory rendering must defer to
+    // them or it will overwrite a correct list with an unfiltered one.
+    function inventoryViewOwnsList() {
+      return !documentsViewActive && !activeSearchQuery;
+    }
+
     function isInventoryInFlightError(error) {
       const message = String((error && error.message) || error || '').toLowerCase();
       return message.includes('taking longer than expected') ||
@@ -10536,6 +10563,9 @@
     // are a brand new user reads as data loss, and the bigger the corpus the
     // longer this state lasts.
     function renderInventoryPendingState(attempts) {
+      // renderMeetings() guards the same way: never paint over a view that
+      // another surface owns.
+      if (!inventoryViewOwnsList()) return;
       meetingsScroll.replaceChildren();
       appendProactiveContextCard();
       // Keep the footer's capture controls (Start Recording, Live, Quick
@@ -10559,6 +10589,9 @@
     // retry; still never asserts the library is empty, because a failed read
     // tells us nothing about what is on disk.
     function renderInventoryErrorState() {
+      // renderMeetings() guards the same way: never paint over a view that
+      // another surface owns.
+      if (!inventoryViewOwnsList()) return;
       meetingsScroll.replaceChildren();
       appendProactiveContextCard();
       // Same rule as the pending state: never remove capture controls.
@@ -10597,13 +10630,15 @@
       // that the backend deliberately never replays, so a library that always
       // takes longer than the deadline would rescan forever and never render.
       const pendingNotice = window.setTimeout(() => {
-        if (generation === meetingInventoryGeneration) {
+        // Documents and search share meetingsScroll and do not bump the
+        // inventory generation, so check the view is still ours before painting.
+        if (generation === meetingInventoryGeneration && inventoryViewOwnsList()) {
           renderInventoryPendingState(meetingInventoryPendingAttempts);
         }
       }, INVENTORY_PENDING_NOTICE_MS);
       try {
-        meetings = await invoke('cmd_list_meetings', { limit: 30 });
-        if (generation !== meetingInventoryGeneration) return;
+        meetings = await fetchMeetingInventory();
+        if (generation !== meetingInventoryGeneration || !inventoryViewOwnsList()) return;
         const nextFingerprint = fingerprintMeetingInventory(meetings);
         if (meetingInventoryFingerprint !== null && meetingInventoryFingerprint !== nextFingerprint) {
           invalidateProactiveContextBundle();
