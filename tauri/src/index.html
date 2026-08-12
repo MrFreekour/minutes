@@ -7935,6 +7935,7 @@
           try {
             const liveStatus = await invoke('cmd_live_transcript_status');
             isLiveTranscript = !!liveStatus.active;
+            reconcileLiveTransition(isLiveTranscript);
             if (isLiveTranscript) {
               statusPill.className = 'status-pill live';
               statusPill.textContent = 'live';
@@ -9326,13 +9327,20 @@
     // live-transcript event confirms the new state.
     let liveTransitionButton = null;
     let liveTransitionLabel = '';
+    let liveTransitionTarget = null;
     let liveTransitionTimer = null;
 
-    function beginLiveTransition(button, label, rescueMs) {
+    function beginLiveTransition(button, label, rescueMs, targetActive, canonicalLabel) {
       endLiveTransition();
       if (!button) return;
       liveTransitionButton = button;
-      liveTransitionLabel = button.textContent;
+      // Restore the canonical ENGLISH label, not whatever is currently rendered:
+      // under zh-CN the DOM holds the translated string, and writing that back
+      // creates a text node that is not a catalog key, so the localization
+      // observer can no longer map it and switching back to English would strand
+      // the button in Chinese.
+      liveTransitionLabel = canonicalLabel || button.textContent;
+      liveTransitionTarget = targetActive;
       button.disabled = true;
       button.textContent = label;
       // Safety net: if the confirming event never arrives (a wedged session, a
@@ -9359,10 +9367,27 @@
         liveTransitionButton = null;
         liveTransitionLabel = '';
       }
+      liveTransitionTarget = null;
+    }
+
+    // (2) Reconcile against observed truth. A session started or stopped from
+    // the CLI cannot emit this window's live-transcript events, so without this
+    // a pending transition would survive until its rescue timer -- long enough
+    // for polling to reopen the live bar with its Stop button still disabled and
+    // reading "Stopping...".
+    function reconcileLiveTransition(observedActive) {
+      if (liveTransitionTarget === null) return;
+      if (observedActive === liveTransitionTarget) endLiveTransition();
     }
 
     document.getElementById('btn-live').addEventListener('click', async () => {
       const btn = document.getElementById('btn-live');
+      // Acknowledge the click before anything else. On first use the explainer
+      // below deliberately waits three seconds before the start even begins, and
+      // the control used to sit untouched through it -- so the honest reading of
+      // "I clicked Live and nothing happened" is that, for three seconds,
+      // nothing had.
+      beginLiveTransition(btn, 'Starting...', 60000, true, 'Live');
 
       // First-use explainer (shown once, stored in localStorage)
       if (!localStorage.getItem('minutes_live_intro_seen')) {
@@ -9387,7 +9412,6 @@
       // reverting the button in between made a successful click look like it
       // had been ignored -- users reported clicking Live and watching it
       // "unclick itself" repeatedly.
-      beginLiveTransition(btn, 'Starting...', 60000);
       try {
         await invoke('cmd_start_live_transcript');
       } catch (e) {
@@ -9409,7 +9433,7 @@
       // Same rule in reverse: stopping runs the session's finalize and (with
       // promote_on_stop) its processing, so the control sat unchanged for 10-15
       // seconds looking like the click had not registered.
-      beginLiveTransition(event.currentTarget, 'Stopping...', 600000);
+      beginLiveTransition(event.currentTarget, 'Stopping...', 600000, false, 'Stop Live');
       try {
         await invoke('cmd_stop_live_transcript');
       } catch (e) {
