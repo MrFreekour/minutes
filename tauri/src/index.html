@@ -10483,6 +10483,9 @@
     let meetingInventoryGeneration = 0;
     let meetingInventoryRetryTimer = null;
     let meetingInventoryFingerprint = null;
+    // Consecutive "scan still running" results, used to back off the retry and
+    // to word the pending message. Reset on any completed load.
+    let meetingInventoryPendingAttempts = 0;
 
     function fingerprintMeetingInventory(meetings) {
       return JSON.stringify(meetings.map((meeting) => [
@@ -10500,12 +10503,75 @@
         (message.includes('capacity') || message.includes('already active'));
     }
 
-    function scheduleMeetingInventoryRetry() {
+    // The inventory scan is still running: either the UI deadline fired while
+    // the backend was still walking the corpus, or the backend's single-flight
+    // guard rejected a second request because the first is in flight. Both mean
+    // "work in progress", NOT "this user has no meetings" — a distinction that
+    // matters most for the largest corpora, which are the slowest to scan.
+    function isInventoryInFlightError(error) {
+      const message = String((error && error.message) || error || '').toLowerCase();
+      return message.includes('taking longer than expected') ||
+        message.includes('still checking') ||
+        message.includes('one background worker') ||
+        message.includes('limited to one worker');
+    }
+
+    function scheduleMeetingInventoryRetry(delayMs = 250) {
       if (meetingInventoryRetryTimer) return;
       meetingInventoryRetryTimer = setTimeout(() => {
         meetingInventoryRetryTimer = null;
         loadMeetings();
-      }, 250);
+      }, delayMs);
+    }
+
+    // Shown while the corpus is still being scanned. Deliberately NOT the
+    // first-run setup card: telling someone with hundreds of meetings that they
+    // are a brand new user reads as data loss, and the bigger the corpus the
+    // longer this state lasts.
+    function renderInventoryPendingState(attempts) {
+      meetingsScroll.replaceChildren();
+      appendProactiveContextCard();
+      footer.classList.add('footer-hidden');
+      const pending = document.createElement('div');
+      pending.className = 'empty-state';
+      const slow = attempts >= 4;
+      pending.innerHTML = `
+        <div class="onboarding-content">
+          <h2>Reading your meetings…</h2>
+          <p class="onboarding-sub">${slow
+            ? 'Still working. A large meeting library can take a while the first time after an update, and your existing notes are untouched.'
+            : 'Checking your meeting folder. This can take a moment on a large library.'}</p>
+        </div>`;
+      meetingsScroll.appendChild(pending);
+    }
+
+    // A real failure to read the library. Says what happened and offers a
+    // retry; still never asserts the library is empty, because a failed read
+    // tells us nothing about what is on disk.
+    function renderInventoryErrorState() {
+      meetingsScroll.replaceChildren();
+      appendProactiveContextCard();
+      footer.classList.add('footer-hidden');
+      const failed = document.createElement('div');
+      failed.className = 'empty-state';
+      failed.innerHTML = `
+        <div class="onboarding-content">
+          <h2>Couldn't read your meetings</h2>
+          <p class="onboarding-sub">Your notes on disk are untouched. This was a problem reading the list.</p>
+          <div class="onboarding-actions">
+            <button class="btn btn-primary btn-sm" id="inventory-retry-btn">Try again</button>
+          </div>
+        </div>`;
+      meetingsScroll.appendChild(failed);
+      const retry = failed.querySelector('#inventory-retry-btn');
+      if (retry) {
+        retry.addEventListener('click', () => {
+          meetingInventoryPendingAttempts = 0;
+          setSearchError(null);
+          renderInventoryPendingState(0);
+          loadMeetings();
+        });
+      }
     }
 
     async function loadMeetings() {
@@ -10538,10 +10604,25 @@
           scheduleMeetingInventoryRetry();
           return;
         }
+        if (isInventoryInFlightError(e)) {
+          // The scan is still running. Show that, and keep checking with a
+          // backoff so a large library is never mistaken for an empty one.
+          // Deliberately no search error: nothing has failed yet.
+          meetingInventoryPendingAttempts += 1;
+          setSearchError(null);
+          renderInventoryPendingState(meetingInventoryPendingAttempts);
+          scheduleMeetingInventoryRetry(
+            Math.min(500 * meetingInventoryPendingAttempts, 4000)
+          );
+          return;
+        }
+        // A real failure. Surface it, but still never claim the user has no
+        // meetings — that is a statement about their data we have not earned.
         setSearchError(e);
-        renderMeetings([]);
+        renderInventoryErrorState();
         return;
       }
+      meetingInventoryPendingAttempts = 0;
       // The proactive context bundle runs several corpus-wide scans and is only
       // needed for the ambient-context card, not the meetings list itself. Load
       // it in the background and re-render once it resolves, so first paint is
