@@ -4,6 +4,16 @@ This document evaluates whether Minutes should add in-app update support for the
 desktop app, and if so, how to do it without violating the project’s trust
 model.
 
+**Scope note.** This record is about `tauri/` — the Minutes desktop app. It is
+not about Minutes Archive, which is a separate target with a different trust
+model and a different user. Archive's updater is a single launch-time check
+that is refused for the rest of the session once the app has seen any of the
+operator's documents, with install only on explicit consent; the residual is
+written up for the reviewer in
+`docs/security/archive-pilot-independent-review.md` and disclosed to the pilot
+attorney in `docs/release/archive-peter-acceptance.md`. Nothing in this
+document licenses an ungated updater in either target.
+
 ## Summary
 
 Recommendation:
@@ -210,3 +220,21 @@ them could index a single document.
 Delivering a fix stays a person handing over a signed build. For one user that
 is not a hardship; it is a smaller trust surface than an updater, and it keeps
 the footer honest.
+
+## Minutes Archive decision update (2026-08-11)
+
+The owner superseded the Archive-specific deferral above and authorized a DMG
+plus an in-app update notification. The normal Minutes desktop recommendation
+in this document remains unchanged.
+
+Archive now uses Tauri Updater with narrower behavior than the normal desktop
+app: one bounded check when the process opens, before folder controls become
+available; no automatic download; an explicit install button; signature
+verification; and a monotone network latch that closes when the folder picker
+opens. The webview still has no updater capability of its own.
+
+The release train is separate too. `archive-vX.Y.Z` publishes a notarized DMG
+and versioned signed updater archive, then advances the fixed `archive-stable`
+manifest only after those assets exist. The normal Minutes `latest.json` can
+never offer an Archive update. The signed DMG remains the manual recovery path,
+and a failed in-app install leaves the current app in place and says so.

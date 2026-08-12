@@ -25,10 +25,13 @@ use serde::Serialize;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_updater::UpdaterExt;
 
 const NATIVE_LIFECYCLE_SELFTEST_MARKER: &str = "--archive-native-lifecycle-selftest";
 /// Proves the SIGNED application can actually run its own workers.
@@ -70,6 +73,144 @@ struct SessionState {
     scan: ScanControl,
 }
 
+/// The single network exception, and the thing that keeps it single.
+///
+/// Minutes Archive is network-denied everywhere it can be: both worker
+/// processes run under a seatbelt profile carrying `(deny network*)`, and the
+/// parent holds no entitlement it could use to reach anywhere. The updater
+/// makes the parent the one exception, because the attorney this is built for
+/// cannot be asked to notice a release and download the application again.
+///
+/// An exception kept by convention becomes a habit. So the window is closed by
+/// the session's own state rather than by remembering not to call: the instant
+/// anything of the operator's archive is in this process -- an approved folder,
+/// a census, an index, a scan in flight -- every network operation is refused
+/// for the rest of the session, and the refusal is what the interface shows.
+#[derive(Debug, Default)]
+struct NetworkWindow {
+    /// Closed the moment this session takes on anything of the archive, and
+    /// never reopened.
+    ///
+    /// Deliberately here rather than in `SessionState`: `purge_session`
+    /// replaces that whole value with a default, and a latch a reset can clear
+    /// is not a latch. Removing an approved location does not un-see it either
+    /// -- approve, remove, then check would otherwise reopen the window.
+    archive_seen: AtomicBool,
+    /// Spent by the one permitted check.
+    ///
+    /// One-shot rather than rate-limited. A repeated check is a beacon whether
+    /// or not it carries anything.
+    check_spent: AtomicBool,
+    /// Spent by the one permitted download, which happens only if the operator
+    /// asks for it.
+    download_spent: AtomicBool,
+    /// True while either bounded network operation is alive.
+    ///
+    /// The webview disables folder controls during those operations, but the
+    /// Rust boundary must also arbitrate a compromised or racing caller. A
+    /// folder-panel command that arrives while this is true closes the network
+    /// window permanently but does not open the panel; the operator can choose
+    /// the folder after the request finishes, and no archive state can overlap
+    /// the request.
+    operation_in_flight: AtomicBool,
+}
+
+/// The one update this session may install, held between the check and consent.
+///
+/// Held rather than re-checked. Consent must not cost a second request to the
+/// same file, and re-checking at install time would let the answer change
+/// between what the operator was shown and what gets installed.
+struct OfferedUpdate(tauri_plugin_updater::Update);
+
+impl std::fmt::Debug for OfferedUpdate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The version only. The rest of `Update` carries a download URL and a
+        // signature that have no business in a debug line.
+        formatter
+            .debug_struct("OfferedUpdate")
+            .field("version", &self.0.version)
+            .finish()
+    }
+}
+
+/// What the launch check found, and the update it may install.
+#[derive(Debug, Default)]
+struct UpdateSlot {
+    report: UpdateReport,
+    offered: Option<OfferedUpdate>,
+}
+
+/// What the interface is told about the update check.
+///
+/// Every state is visible: there is no branch here that checks quietly, and no
+/// branch that installs without the operator asking. The only two values that
+/// ever come from the network are `offered` and the presence of an update at
+/// all -- both are semver strings the plugin has already parsed. Release notes
+/// are deliberately not carried: they are remote-controlled prose, and an
+/// attorney reading them inside a tool that promises to show only their own
+/// documents is a worse trade than not showing them.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum UpdateReport {
+    /// No check has run in this session yet.
+    #[default]
+    NotChecked,
+    Checking,
+    /// The check ran and this build is the current one.
+    Current {
+        installed: String,
+    },
+    /// The check ran and a newer signed build exists. Nothing is downloaded
+    /// until the operator asks.
+    Available {
+        installed: String,
+        offered: String,
+    },
+    /// The window was closed before the check could run. Not an error: this is
+    /// the boundary doing its job, and it says so in those words.
+    Refused {
+        reason: String,
+    },
+    /// The check ran and could not complete. The application is unaffected.
+    Unavailable {
+        reason: String,
+    },
+    Installing,
+    /// A signed build was verified and written into place.
+    Installed {
+        offered: String,
+    },
+    /// Verification or replacement failed. The current app remains intact and
+    /// the notarized DMG is the explicit recovery path.
+    InstallFailed {
+        offered: String,
+    },
+}
+
+/// Shown when the session has already seen the operator's archive.
+const WINDOW_CLOSED_REFUSAL: &str =
+    "Minutes Archive has already opened this session's archive, so it will not \
+     use the network again until you quit and reopen it.";
+
+/// Shown when one of the two bounded update steps is attempted twice.
+const WINDOW_SPENT_REFUSAL: &str =
+    "Minutes Archive allows each update step once per session, and this step \
+     already ran.";
+
+/// Shown when a folder-panel command races the bounded update operation.
+const NETWORK_BUSY_REFUSAL: &str =
+    "Wait for the update check or installation to finish, then choose folders.";
+
+/// Shown when the request could not be completed, for any reason at all.
+///
+/// One sentence for offline, endpoint down, DNS failure, malformed JSON, and a
+/// signature that does not verify. Distinguishing them would tell the operator
+/// nothing they can act on, and the raw error text is the one place a URL or a
+/// local path could leak into the interface.
+const UPDATE_UNAVAILABLE: &str =
+    "Minutes Archive could not complete the update check. No archive-derived \
+     data, query string, or request body was sent, and nothing changed.";
+
 #[derive(Debug)]
 struct ArchiveState {
     session: Mutex<SessionState>,
@@ -77,6 +218,10 @@ struct ArchiveState {
     /// Every converter, recogniser, and semantic worker alive in this process.
     /// Purge kills their process groups before the desktop process exits.
     live_workers: LiveWorkerProcesses,
+    /// The single network exception. See `NetworkWindow`.
+    network: NetworkWindow,
+    /// What the launch check found, and the update it may install.
+    update: Mutex<UpdateSlot>,
     /// Snapshot directories of workers that are currently alive.
     ///
     /// During a vault build the converter and engine live inside a blocking
@@ -99,6 +244,8 @@ impl Default for ArchiveState {
             session: Mutex::new(SessionState::default()),
             next_location_id: AtomicU64::new(1),
             live_workers: LiveWorkerProcesses::default(),
+            network: NetworkWindow::default(),
+            update: Mutex::new(UpdateSlot::default()),
             live_snapshots: Arc::new(Mutex::new(Vec::new())),
             build_progress: Mutex::new(Arc::new(BuildProgress::default())),
         }
@@ -168,16 +315,18 @@ struct BootstrapState {
     scan_running: bool,
     report: Option<CensusReport>,
     text_vault_report: Option<DocumentVaultBuildReport>,
+    /// Carried here so a reloaded webview shows the result of the check that
+    /// already ran instead of asking for another one. The window would refuse
+    /// the second request anyway; this is what stops the interface from having
+    /// to ask to find that out.
+    update: UpdateReport,
 }
 
 /// Version plus a short digest of the executable that is actually running.
 ///
-/// Reads nothing but its own binary and reaches no network -- the whole point
-/// of this application is that it does not, and knowing which build you have
-/// must not be the exception. Auto-update was considered and deliberately not
-/// wired: docs/investigations/auto-update-evaluation.md holds the decision, and
-/// a shipped updater endpoint sat in the configuration for a while contradicting
-/// the "networking disabled by design" line in this app's own footer.
+/// Reads nothing but its own binary and reaches no network. Update traffic is
+/// handled separately by the one-shot, launch-only window below; identifying
+/// the build itself never depends on that window or on a remote service.
 fn build_identity() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let digest = std::env::current_exe()
@@ -243,6 +392,453 @@ fn ensure_scan_idle(session: &SessionState) -> Result<(), String> {
         return Err("Wait for the current census to finish or cancel it first.".to_string());
     }
     Ok(())
+}
+
+/// True once this session holds anything that came from the operator's archive.
+///
+/// Reads the live session rather than a flag someone has to remember to set, so
+/// a field added to `SessionState` later -- another cache, another report --
+/// closes the window even if whoever adds it never thinks about the updater.
+/// The latch in `NetworkWindow` covers the other direction: state that was
+/// here and has since been cleared.
+fn session_has_seen_archive(session: &SessionState) -> bool {
+    !session.locations.is_empty()
+        || session.last_report.is_some()
+        || session.text_vault.is_some()
+        || session.scan.running
+}
+
+/// Closes the network window for the rest of the session.
+fn close_network_window(state: &ArchiveState) {
+    state.network.archive_seen.store(true, Ordering::SeqCst);
+}
+
+/// Starts an archive interaction only when no updater request is alive.
+///
+/// Setting `archive_seen` first makes the race one-sided: either this call wins
+/// and the network claim refuses, or the network claim is already alive and
+/// this call refuses before opening the native panel. They can never both
+/// proceed.
+fn begin_archive_interaction(state: &ArchiveState) -> Result<(), String> {
+    close_network_window(state);
+    if state.network.operation_in_flight.load(Ordering::SeqCst) {
+        return Err(NETWORK_BUSY_REFUSAL.to_string());
+    }
+    Ok(())
+}
+
+/// Releases the exclusive updater-operation claim on every return path.
+struct NetworkOperationClaim<'a> {
+    in_flight: &'a AtomicBool,
+}
+
+impl Drop for NetworkOperationClaim<'_> {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Refuses unless this is still a launch-time, archive-free session.
+///
+/// Every network operation in the application goes through here, and there is
+/// no second path. `spend` is the one-shot latch for the operation being
+/// claimed, so an interface that is compromised -- or merely looping on a bug
+/// -- cannot turn the launch check or consented download into a poll.
+fn claim_network_window<'a>(
+    state: &'a ArchiveState,
+    spend: &AtomicBool,
+) -> Result<NetworkOperationClaim<'a>, String> {
+    if state.network.archive_seen.load(Ordering::SeqCst) {
+        return Err(WINDOW_CLOSED_REFUSAL.to_string());
+    }
+    state
+        .network
+        .operation_in_flight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| NETWORK_BUSY_REFUSAL.to_string())?;
+    let claim = NetworkOperationClaim {
+        in_flight: &state.network.operation_in_flight,
+    };
+
+    // `archive_seen` may have changed between the optimistic read above and
+    // the exclusive claim. A folder command that raced us sets it before it
+    // checks this claim, so this second read decides which side proceeds.
+    if state.network.archive_seen.load(Ordering::SeqCst) {
+        return Err(WINDOW_CLOSED_REFUSAL.to_string());
+    }
+    {
+        let session = state.session.lock().map_err(|_| lock_error())?;
+        if session_has_seen_archive(&session) {
+            // Observing it is enough to close it permanently. Whatever put the
+            // archive into this session, the window does not reopen when it
+            // goes away again.
+            close_network_window(state);
+            return Err(WINDOW_CLOSED_REFUSAL.to_string());
+        }
+    }
+    spend
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| WINDOW_SPENT_REFUSAL.to_string())?;
+    // One last read closes the interleaving where an archive interaction set
+    // its latch while the live session was being inspected. If it set the
+    // latch after this read, it necessarily observes `operation_in_flight` and
+    // refuses before opening a panel.
+    if state.network.archive_seen.load(Ordering::SeqCst) {
+        return Err(WINDOW_CLOSED_REFUSAL.to_string());
+    }
+    Ok(claim)
+}
+
+/// Records what the operator should see, and returns it for the same reason.
+///
+/// Leaves any held offer alone. Reporting a refusal is not a reason to discard
+/// an offer the operator was already shown: the gate decides whether it can be
+/// installed, and it decides that at install time.
+fn publish_update_report(state: &ArchiveState, report: UpdateReport) -> UpdateReport {
+    if let Ok(mut slot) = state.update.lock() {
+        slot.report = report.clone();
+    }
+    report
+}
+
+/// Holds the offer the operator may consent to, alongside the report naming it.
+fn publish_update_offer(
+    state: &ArchiveState,
+    report: UpdateReport,
+    offered: OfferedUpdate,
+) -> UpdateReport {
+    if let Ok(mut slot) = state.update.lock() {
+        slot.report = report.clone();
+        slot.offered = Some(offered);
+    }
+    report
+}
+
+/// What the launch check found, for an interface that has just loaded.
+#[tauri::command]
+fn archive_update_report(state: State<'_, ArchiveState>) -> UpdateReport {
+    state
+        .update
+        .lock()
+        .map(|slot| slot.report.clone())
+        .unwrap_or_default()
+}
+
+/// The one automatic network request Minutes Archive is allowed to make.
+///
+/// A plain GET of a static JSON file. Nothing is appended to it: the configured
+/// endpoint carries none of the `{{current_version}}`, `{{target}}` or
+/// `{{arch}}` placeholders the plugin would otherwise substitute, `clear_headers`
+/// removes anything a caller might have attached, and no identifier, count, or
+/// value derived from a document exists in this process yet to send. The
+/// request is made before the operator has approved a folder, so there is
+/// nothing about their archive to leak even in principle.
+///
+/// Never returns `Err`. A refusal, an unreachable endpoint, a malformed file
+/// and an offline Mac are all ordinary reports the interface renders, because
+/// the application must work exactly as it does today when the check fails.
+#[tauri::command]
+async fn check_for_archive_update(
+    app: tauri::AppHandle,
+    state: State<'_, ArchiveState>,
+) -> Result<UpdateReport, String> {
+    let _network_claim = match claim_network_window(&state, &state.network.check_spent) {
+        Ok(claim) => claim,
+        Err(reason) => {
+            return Ok(publish_update_report(
+                &state,
+                UpdateReport::Refused { reason },
+            ));
+        }
+    };
+
+    let installed = app.package_info().version.to_string();
+    publish_update_report(&state, UpdateReport::Checking);
+
+    // Keep launch usable when the release host is slow or unreachable. The
+    // folder controls stay disabled while this request is alive so the app
+    // cannot begin holding archive state while its automatic network request is
+    // still in flight.
+    let outcome = match app
+        .updater_builder()
+        .clear_headers()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(updater) => updater.check().await,
+        Err(error) => Err(error),
+    };
+
+    Ok(match outcome {
+        Ok(Some(mut update)) => {
+            // The manifest check is deliberately short; the consented app
+            // download is larger and gets its own bounded request lifetime.
+            update.timeout = Some(std::time::Duration::from_secs(10 * 60));
+            let offered = update.version.clone();
+            publish_update_offer(
+                &state,
+                UpdateReport::Available { installed, offered },
+                OfferedUpdate(update),
+            )
+        }
+        Ok(None) => publish_update_report(&state, UpdateReport::Current { installed }),
+        Err(_) => publish_update_report(
+            &state,
+            UpdateReport::Unavailable {
+                reason: UPDATE_UNAVAILABLE.to_string(),
+            },
+        ),
+    })
+}
+
+/// Downloads, verifies, and atomically swaps in the update the operator asked for.
+///
+/// `Update::download` verifies the minisign signature against the public key in
+/// `tauri.conf.json` -- the same key the main Minutes application signs with --
+/// before returning bytes. The pinned plugin's macOS installer is deliberately
+/// not used: it moves the current app into a temporary backup and has failure
+/// paths that can delete that backup. The replacement below is first extracted
+/// and code-signature checked in a sibling directory, then exchanged with the
+/// running bundle in one filesystem operation. A failed exchange changes
+/// neither path.
+#[tauri::command]
+async fn install_archive_update(state: State<'_, ArchiveState>) -> Result<UpdateReport, String> {
+    // The same window, for the same reasons. Consent does not reopen it: if the
+    // operator approved a folder while the offer was on screen, the answer is
+    // no, and quitting and reopening is the way to take it.
+    let _network_claim = match claim_network_window(&state, &state.network.download_spent) {
+        Ok(claim) => claim,
+        Err(reason) => {
+            return Ok(publish_update_report(
+                &state,
+                UpdateReport::Refused { reason },
+            ));
+        }
+    };
+
+    let offered = state
+        .update
+        .lock()
+        .map_err(|_| lock_error())?
+        .offered
+        .take();
+    let Some(offered) = offered else {
+        return Ok(publish_update_report(
+            &state,
+            UpdateReport::Refused {
+                reason: "No update was offered in this session.".to_string(),
+            },
+        ));
+    };
+
+    let version = offered.0.version.clone();
+    publish_update_report(&state, UpdateReport::Installing);
+    let downloaded = offered.0.download(|_, _| {}, || {}).await;
+    Ok(
+        match downloaded.and_then(|bytes| {
+            install_verified_archive(&bytes).map_err(tauri_plugin_updater::Error::Io)
+        }) {
+            Ok(()) => publish_update_report(&state, UpdateReport::Installed { offered: version }),
+            // Includes a signature or local code-signature failure. The atomic
+            // exchange has not happened, so the current application is unchanged.
+            Err(_) => {
+                publish_update_report(&state, UpdateReport::InstallFailed { offered: version })
+            }
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn running_app_bundle_path() -> std::io::Result<PathBuf> {
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let macos = executable
+        .parent()
+        .ok_or_else(|| std::io::Error::other("running executable has no parent"))?;
+    let contents = macos
+        .parent()
+        .ok_or_else(|| std::io::Error::other("running executable is not in an app bundle"))?;
+    let app = contents
+        .parent()
+        .ok_or_else(|| std::io::Error::other("running executable is not in an app bundle"))?;
+    if macos.file_name().and_then(|name| name.to_str()) != Some("MacOS")
+        || contents.file_name().and_then(|name| name.to_str()) != Some("Contents")
+        || app.extension().and_then(|extension| extension.to_str()) != Some("app")
+    {
+        return Err(std::io::Error::other(
+            "running executable is not in a macOS app bundle",
+        ));
+    }
+    Ok(app.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_update_archive(bytes: &[u8], destination: &Path) -> std::io::Result<PathBuf> {
+    use flate2::read::GzDecoder;
+    use std::ffi::OsStr;
+    use std::io::Cursor;
+
+    let mut archive = tar::Archive::new(GzDecoder::new(Cursor::new(bytes)));
+    let expected_root = OsStr::new("Minutes Archive.app");
+    let mut saw_payload = false;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let mut components = path.components();
+        match components.next() {
+            Some(std::path::Component::Normal(component)) if component == expected_root => {}
+            _ => {
+                return Err(std::io::Error::other(
+                    "update archive has an unexpected top-level path",
+                ));
+            }
+        }
+        if components.any(|component| !matches!(component, std::path::Component::Normal(_))) {
+            return Err(std::io::Error::other(
+                "update archive contains an unsafe path",
+            ));
+        }
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(std::io::Error::other(
+                "update archive contains a link or special file",
+            ));
+        }
+        if !entry.unpack_in(destination)? {
+            return Err(std::io::Error::other(
+                "update archive tried to escape its staging directory",
+            ));
+        }
+        saw_payload = true;
+    }
+    let staged_app = destination.join(expected_root);
+    if !saw_payload || !staged_app.is_dir() {
+        return Err(std::io::Error::other(
+            "update archive does not contain Minutes Archive.app",
+        ));
+    }
+    Ok(staged_app)
+}
+
+#[cfg(target_os = "macos")]
+fn reject_links_in_tree(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "staged update contains a symbolic link",
+        ));
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            reject_links_in_tree(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_staged_archive_app(app: &Path) -> std::io::Result<()> {
+    // Match Apple's designated requirement for a Developer ID Application
+    // signed by the Minutes team. `codesign --verify` alone proves only that a
+    // signature is internally consistent; this external requirement also
+    // proves that the chain anchors at Apple and carries the Developer ID
+    // Application certificate extensions.
+    const DEVELOPER_ID_REQUIREMENT: &str = r#"=identifier "com.useminutes.archive" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "63TMLKT8HN""#;
+
+    reject_links_in_tree(app)?;
+    let executable = app.join("Contents/MacOS/minutes-archive-app");
+    if !executable.is_file() {
+        return Err(std::io::Error::other(
+            "staged update has no Archive executable",
+        ));
+    }
+
+    let verification = std::process::Command::new("/usr/bin/codesign")
+        .args([
+            "--verify",
+            "--deep",
+            "--strict",
+            "--verbose=4",
+            "--test-requirement",
+            DEVELOPER_ID_REQUIREMENT,
+        ])
+        .arg(app)
+        .output()?;
+    if !verification.status.success() {
+        return Err(std::io::Error::other(
+            "staged update failed its Developer ID signature check",
+        ));
+    }
+    let identity = std::process::Command::new("/usr/bin/codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(app)
+        .output()?;
+    if !identity.status.success() {
+        return Err(std::io::Error::other(
+            "staged update identity could not be read",
+        ));
+    }
+    let details = String::from_utf8_lossy(&identity.stderr);
+    if !details
+        .lines()
+        .any(|line| line == "TeamIdentifier=63TMLKT8HN")
+        || !details
+            .lines()
+            .any(|line| line == "Identifier=com.useminutes.archive")
+    {
+        return Err(std::io::Error::other(
+            "staged update is not the signed Minutes Archive application",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_swap_paths(first: &Path, second: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let first = CString::new(first.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("application path contains a null byte"))?;
+    let second = CString::new(second.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("staging path contains a null byte"))?;
+    // Both paths are siblings on the same volume. RENAME_SWAP is one atomic
+    // filesystem transaction: success leaves the new app at the original path
+    // and the old app in staging; failure changes neither path.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_verified_archive(bytes: &[u8]) -> std::io::Result<()> {
+    let current_app = running_app_bundle_path()?;
+    let parent = current_app
+        .parent()
+        .ok_or_else(|| std::io::Error::other("application bundle has no parent"))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".minutes-archive-update-")
+        .tempdir_in(parent)?;
+    let staged_app = extract_update_archive(bytes, staging.path())?;
+    verify_staged_archive_app(&staged_app)?;
+    atomic_swap_paths(&current_app, &staged_app)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_verified_archive(_bytes: &[u8]) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "Minutes Archive updates are supported only on macOS",
+    ))
 }
 
 /// Counts for the build in flight.
@@ -362,6 +958,11 @@ fn archive_bootstrap(state: State<'_, ArchiveState>) -> Result<BootstrapState, S
             .text_vault
             .as_ref()
             .map(|vault| vault.build_report().clone()),
+        update: state
+            .update
+            .lock()
+            .map(|slot| slot.report.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -374,6 +975,11 @@ async fn choose_archive_locations(
         let session = state.session.lock().map_err(|_| lock_error())?;
         ensure_scan_idle(&session)?;
     }
+    // Launch is over the moment the operator reaches for a folder, so the
+    // network window closes here rather than after a folder is actually
+    // approved. Cancelling the panel does not reopen it: the intent to point
+    // this application at an archive is the event, not the outcome.
+    begin_archive_interaction(&state)?;
     let selected = app
         .dialog()
         .file()
@@ -1308,6 +1914,13 @@ fn main() {
     tauri::Builder::default()
         .manage(ArchiveState::default())
         .plugin(tauri_plugin_dialog::init())
+        // Registered for the Rust side only. `archive-main` deliberately does
+        // not carry `updater:default`, so the plugin's own commands are not
+        // reachable from the webview: the only way to the network is through
+        // the two gated commands below, and the capability file stays the
+        // literal statement the security packet cites -- no updater capability
+        // is exposed to the interface.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             // Erase any panel state a PREVIOUS run left behind, before this
             // one can show a window. The erasure after each panel and at
@@ -1375,6 +1988,9 @@ fn main() {
             reveal_archive_document,
             reveal_archive_location,
             search_archive_text_vault,
+            archive_update_report,
+            check_for_archive_update,
+            install_archive_update,
         ])
         .build(tauri::generate_context!())
         .expect("Minutes Archive failed to start")
@@ -1512,6 +2128,16 @@ fn purge_archive_state(state: &ArchiveState) {
     // process group while the desktop process is still alive; each launcher
     // then reaps and deregisters its child as cancellation unwinds the build.
     state.live_workers.terminate_all();
+
+    // The offer holds a download URL and a signature. Neither is privileged,
+    // but nothing here should outlive the session it was fetched in, and the
+    // window is closed by then in any case.
+    let mut update = state
+        .update
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    update.offered = None;
+    drop(update);
 
     let mut snapshots = state
         .live_snapshots
@@ -2113,6 +2739,377 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// A pristine session is the only one that may reach the network.
+    ///
+    /// Stated first so the refusal tests below cannot pass vacuously: if the
+    /// window never opened at all they would still be green, and the feature
+    /// would be broken rather than safe.
+    #[test]
+    fn a_launch_session_that_has_seen_nothing_may_check_once() {
+        let state = ArchiveState::default();
+        let claim = claim_network_window(&state, &state.network.check_spent)
+            .expect("a pristine session may claim its launch check");
+        drop(claim);
+        // ...and exactly once. The claim on screen and in Peter's disclosure is
+        // "one request", so a second call is refused even though nothing about
+        // the session has changed.
+        assert_eq!(
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_SPENT_REFUSAL.to_string())
+        );
+    }
+
+    /// An approved location ends the network window for the whole session.
+    #[test]
+    fn an_update_check_is_refused_once_a_location_is_approved() {
+        let temp = TempDir::new().expect("temp");
+        let client = temp.path().join("client-matter");
+        fs::create_dir(&client).expect("client folder");
+        let mut roots = approve_roots(&[client]).expect("approve");
+
+        let state = ArchiveState::default();
+        // Only the approved location closes the window: no census has run and
+        // no index exists, so this test pins that one condition alone.
+        state
+            .session
+            .lock()
+            .expect("session")
+            .locations
+            .push(ApprovedLocation {
+                id: 1,
+                root: roots.remove(0),
+            });
+
+        assert_eq!(
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
+            "an update check was permitted after a folder was approved"
+        );
+        assert!(
+            !state.network.check_spent.load(Ordering::Acquire),
+            "a refused check still consumed the session's one request"
+        );
+        // The download path is the same gate, so consenting to an install the
+        // operator was offered before approving a folder is refused too.
+        assert_eq!(
+            claim_network_window(&state, &state.network.download_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
+            "an update download was permitted after a folder was approved"
+        );
+    }
+
+    /// An existing index ends the network window for the whole session.
+    ///
+    /// Built through the real vault builder rather than by setting a flag: the
+    /// invariant is about the process holding the operator's document text, and
+    /// a test that stubs the vault would keep passing if the field it guards
+    /// were renamed or replaced.
+    #[test]
+    fn an_update_check_is_refused_once_an_index_exists() {
+        use minutes_archive_core::vault::build_authorized_text_vault;
+
+        let temp = TempDir::new().expect("temp");
+        let client = temp.path().join("client-matter");
+        fs::create_dir(&client).expect("client folder");
+        fs::write(
+            client.join("agreement.txt"),
+            b"7. CONFIDENTIALITY\nRecipient shall protect Confidential Information.\n",
+        )
+        .expect("synthetic document");
+        let roots = approve_roots(&[client]).expect("approve");
+        let vault = build_authorized_text_vault(
+            VaultId::parse("gate-probe").expect("vault"),
+            &roots,
+            DocumentVaultLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("index");
+        assert_eq!(
+            vault.build_report().indexed_documents,
+            1,
+            "the fixture built an empty index; this test would prove nothing"
+        );
+
+        let state = ArchiveState::default();
+        // No approved locations recorded and no census report: the index alone
+        // is what must close the window.
+        state.session.lock().expect("session").text_vault = Some(vault);
+
+        assert_eq!(
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
+            "an update check was permitted while an index of the operator's documents was open"
+        );
+    }
+
+    /// Removing what closed the window does not reopen it.
+    ///
+    /// The live-state read alone would let approve, remove, then check through,
+    /// because after the removal the session looks untouched again. It is not:
+    /// the operator has pointed this application at an archive, and the process
+    /// has held its roots.
+    #[test]
+    fn removing_an_approved_location_does_not_reopen_the_window() {
+        let temp = TempDir::new().expect("temp");
+        let client = temp.path().join("client-matter");
+        fs::create_dir(&client).expect("client folder");
+        let mut roots = approve_roots(&[client]).expect("approve");
+
+        let state = ArchiveState::default();
+        {
+            let mut session = state.session.lock().expect("session");
+            close_network_window(&state);
+            session.locations.push(ApprovedLocation {
+                id: 1,
+                root: roots.remove(0),
+            });
+            assert_eq!(session.locations.len(), 1);
+            // What `remove_archive_location` does to the session.
+            session.locations.clear();
+            session.last_report = None;
+            session.text_vault = None;
+            assert!(
+                !session_has_seen_archive(&session),
+                "the session no longer looks touched, which is what makes the latch necessary"
+            );
+        }
+
+        assert_eq!(
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
+            "removing the approved location reopened the network window"
+        );
+    }
+
+    /// A running census closes the window even before it has produced a report.
+    #[test]
+    fn an_update_check_is_refused_while_a_census_is_running() {
+        let state = ArchiveState::default();
+        state.session.lock().expect("session").scan.running = true;
+        assert_eq!(
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string())
+        );
+    }
+
+    /// A direct IPC race cannot overlap the updater with a native folder panel.
+    ///
+    /// UI buttons are disabled while the request is alive, but that is a
+    /// convenience, not the boundary. This exercises the Rust arbitration
+    /// that a compromised webview cannot bypass.
+    #[test]
+    fn an_archive_interaction_cannot_overlap_a_network_operation() {
+        let state = ArchiveState::default();
+        let claim = claim_network_window(&state, &state.network.check_spent)
+            .expect("the launch check should own the operation slot");
+
+        assert_eq!(
+            begin_archive_interaction(&state),
+            Err(NETWORK_BUSY_REFUSAL.to_string()),
+            "a folder panel could open while update traffic was alive"
+        );
+        assert!(
+            state.network.archive_seen.load(Ordering::SeqCst),
+            "the racing folder request did not close the network window"
+        );
+
+        drop(claim);
+        assert_eq!(
+            claim_network_window(&state, &state.network.download_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string()),
+            "the completed update operation reopened the raced window"
+        );
+    }
+
+    #[test]
+    fn a_network_operation_cannot_start_after_archive_interaction_begins() {
+        let state = ArchiveState::default();
+        begin_archive_interaction(&state).expect("an idle launch may open its folder panel");
+        assert_eq!(
+            claim_network_window(&state, &state.network.check_spent).err(),
+            Some(WINDOW_CLOSED_REFUSAL.to_string())
+        );
+        assert!(
+            !state.network.check_spent.load(Ordering::Acquire),
+            "a refused race consumed the one launch check"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn synthetic_update_archive(include_link: bool) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Cursor;
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for path in [
+            "Minutes Archive.app/",
+            "Minutes Archive.app/Contents/",
+            "Minutes Archive.app/Contents/MacOS/",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_size(0);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, std::io::empty())
+                .expect("append directory");
+        }
+
+        let payload = b"synthetic signed executable";
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o755);
+        header.set_size(payload.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "Minutes Archive.app/Contents/MacOS/minutes-archive-app",
+                Cursor::new(payload),
+            )
+            .expect("append executable");
+
+        if include_link {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_size(0);
+            header.set_cksum();
+            archive
+                .append_link(
+                    &mut header,
+                    "Minutes Archive.app/Contents/escape",
+                    "/tmp/outside",
+                )
+                .expect("append link");
+        }
+
+        archive
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn updater_extraction_accepts_only_one_link_free_archive_bundle() {
+        let destination = TempDir::new().expect("destination");
+        let app = extract_update_archive(&synthetic_update_archive(false), destination.path())
+            .expect("extract safe update");
+        assert_eq!(
+            fs::read(app.join("Contents/MacOS/minutes-archive-app")).expect("read payload"),
+            b"synthetic signed executable"
+        );
+
+        let refused = TempDir::new().expect("refused destination");
+        assert!(
+            extract_update_archive(&synthetic_update_archive(true), refused.path()).is_err(),
+            "a linked updater archive crossed the staging boundary"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn updater_rejects_an_ad_hoc_signature_without_developer_id_trust() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp");
+        let app = temp.path().join("Minutes Archive.app");
+        let contents = app.join("Contents");
+        let executable = contents.join("MacOS/minutes-archive-app");
+        fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("create synthetic app");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("write executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        fs::write(
+            contents.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>minutes-archive-app</string>
+<key>CFBundleIdentifier</key><string>com.useminutes.archive</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+"#,
+        )
+        .expect("write plist");
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--deep", "--sign", "-"])
+            .arg(&app)
+            .status()
+            .expect("run ad hoc signing");
+        assert!(signed.success(), "construct the negative-control bundle");
+        assert!(
+            verify_staged_archive_app(&app).is_err(),
+            "an internally valid ad hoc signature crossed the Developer ID boundary"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn updater_replacement_is_one_atomic_exchange() {
+        let temp = TempDir::new().expect("temp");
+        let current = temp.path().join("Minutes Archive.app");
+        let staged = temp.path().join("staged.app");
+        fs::create_dir(&current).expect("current app");
+        fs::create_dir(&staged).expect("staged app");
+        fs::write(current.join("identity"), b"current").expect("current marker");
+        fs::write(staged.join("identity"), b"staged").expect("staged marker");
+
+        atomic_swap_paths(&current, &staged).expect("atomic app exchange");
+        assert_eq!(
+            fs::read(current.join("identity")).expect("new app"),
+            b"staged"
+        );
+        assert_eq!(
+            fs::read(staged.join("identity")).expect("old app"),
+            b"current"
+        );
+    }
+
+    /// A refusal never reaches the operator as a raw error string.
+    ///
+    /// `UpdateReport` is the only thing that crosses IPC for the updater, and
+    /// the endpoint URL, the download URL and the signature must stay behind
+    /// the boundary the same way document paths do.
+    #[test]
+    fn the_update_report_carries_no_endpoint_or_signature() {
+        let report = UpdateReport::Available {
+            installed: "0.1.0".to_string(),
+            offered: "0.2.0".to_string(),
+        };
+        let serialized = serde_json::to_string(&report).expect("serialize report");
+        assert_eq!(
+            serialized,
+            r#"{"state":"available","installed":"0.1.0","offered":"0.2.0"}"#
+        );
+        for forbidden in ["http", "github", "signature", "/"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "{forbidden} reached the interface"
+            );
+        }
+
+        let refused = serde_json::to_string(&UpdateReport::Refused {
+            reason: WINDOW_CLOSED_REFUSAL.to_string(),
+        })
+        .expect("serialize refusal");
+        assert!(refused.contains("quit and reopen"));
+        assert!(!refused.contains("http"));
+
+        let failed = serde_json::to_string(&UpdateReport::InstallFailed {
+            offered: "0.2.0".to_string(),
+        })
+        .expect("serialize failed install");
+        assert_eq!(failed, r#"{"state":"installFailed","offered":"0.2.0"}"#);
+        assert!(!failed.contains("http"));
     }
 
     #[cfg(unix)]

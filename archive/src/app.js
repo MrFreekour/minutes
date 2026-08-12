@@ -43,6 +43,11 @@ const elements = {
   searchStatus: document.querySelector("#search-status"),
   searchResults: document.querySelector("#search-results"),
   buildIdentity: document.querySelector("#build-identity"),
+  updateStrip: document.querySelector("#update-strip"),
+  updateDot: document.querySelector("#update-dot"),
+  updateHeadline: document.querySelector("#update-headline"),
+  updateDetail: document.querySelector("#update-detail"),
+  installUpdate: document.querySelector("#install-update"),
 };
 
 let locations = [];
@@ -1070,6 +1075,119 @@ function backToCensus() {
   else showView("setup");
 }
 
+// Every state the update flow can be in, written out.
+//
+// Nothing here is a template that interpolates remote text: the only value
+// from the network that reaches this file is a version string the Rust side
+// received as parsed semver, and it goes through `textContent`. Release notes
+// are deliberately not carried across the boundary at all.
+const updateCopy = {
+  notChecked: () => ({
+    headline: "No update check has run",
+    detail:
+      "Minutes Archive checks once when it opens, before any folder is approved.",
+  }),
+  checking: () => ({
+    headline: "Checking for a signed update",
+    detail:
+      "One request for a version file, made before any folder is approved. " +
+      "No archive data or app-supplied identifier is sent. The server still " +
+      "sees this Mac's IP address and request time.",
+  }),
+  current: (report) => ({
+    headline: `Minutes Archive ${report.installed} is up to date`,
+    detail:
+      "The check is finished. Minutes Archive will not use the network again " +
+      "in this session.",
+  }),
+  available: (report) => ({
+    headline: `Version ${report.offered} is available`,
+    detail:
+      `You have ${report.installed}. Nothing has been downloaded. If you ` +
+      "install it, the download is checked against the Minutes signing key " +
+      "before anything is replaced. You can ignore this and keep your current version.",
+  }),
+  installing: () => ({
+    headline: "Downloading and verifying the update",
+    detail:
+      "The download is refused unless it carries a valid Minutes signature.",
+  }),
+  installed: (report) => ({
+    headline: `Version ${report.offered} is installed`,
+    detail: "Quit Minutes Archive and open it again to use the new version.",
+  }),
+  installFailed: (report) => ({
+    headline: `Version ${report.offered} was not installed`,
+    detail:
+      "Your current app is unchanged. Use the signed Minutes Archive DMG from " +
+      "the release page, or contact the pilot operator.",
+  }),
+  refused: (report) => ({
+    headline: "Update check declined",
+    detail: report.reason,
+  }),
+  unavailable: (report) => ({
+    headline: "No update check was completed",
+    detail: `${report.reason} Minutes Archive works exactly as it did before.`,
+  }),
+};
+
+function renderUpdate(report) {
+  // An unrecognised state must not blank the strip: the operator is entitled
+  // to see that the network surface exists even if this file does not know
+  // what to call the state it is in.
+  const copy = (updateCopy[report?.state] ?? updateCopy.notChecked)(report ?? {});
+  elements.updateStrip.dataset.state = report?.state ?? "notChecked";
+  elements.updateHeadline.textContent = copy.headline;
+  elements.updateDetail.textContent = copy.detail;
+  // The install button appears only against a live offer, so there is no
+  // control on screen that could start a download at any other moment.
+  elements.installUpdate.hidden = report?.state !== "available";
+  elements.installUpdate.disabled = false;
+  elements.updateStrip.hidden = false;
+}
+
+async function checkForUpdate() {
+  // Do not let the operator approve a folder while the automatic check is
+  // still in flight. This is normally a fraction of a second and is bounded
+  // by the Rust-side timeout.
+  setLocationControlsDisabled(true);
+  renderUpdate({ state: "checking" });
+  try {
+    renderUpdate(await invoke("check_for_archive_update"));
+  } catch {
+    // The command is written never to fail, so reaching here means the IPC
+    // call itself did. Either way a failed check is one line of text and
+    // nothing else: no retry, no banner, no interruption to the session.
+    renderUpdate({
+      state: "unavailable",
+      reason: "Minutes Archive could not run the update check.",
+    });
+  } finally {
+    setLocationControlsDisabled(false);
+  }
+}
+
+async function installUpdate() {
+  setLocationControlsDisabled(true);
+  elements.installUpdate.disabled = true;
+  // The button is about to disappear. Move keyboard and VoiceOver focus to
+  // the atomic live region so the offered version and installation state are
+  // announced together instead of dropping focus into the page.
+  elements.updateStrip.focus();
+  renderUpdate({ state: "installing" });
+  try {
+    renderUpdate(await invoke("install_archive_update"));
+  } catch {
+    renderUpdate({
+      state: "unavailable",
+      reason: "Minutes Archive could not install the update.",
+    });
+  } finally {
+    setLocationControlsDisabled(false);
+  }
+}
+
 async function bootstrap() {
   try {
     const state = await invoke("archive_bootstrap");
@@ -1092,6 +1210,13 @@ async function bootstrap() {
     } else {
       showView("setup");
     }
+    // Asked for once per process, not once per page load. Rust holds the result
+    // and the window that permits the request, so a reloaded webview shows what
+    // the launch check already found instead of asking for another one.
+    renderUpdate(state.update);
+    if (state.update?.state === "notChecked") {
+      await checkForUpdate();
+    }
   } catch (error) {
     showError(error);
   }
@@ -1109,5 +1234,6 @@ elements.buildTextVault.addEventListener("click", buildTextVault);
 elements.backToCensus.addEventListener("click", backToCensus);
 elements.searchForm.addEventListener("submit", searchVault);
 elements.dismissError.addEventListener("click", hideError);
+elements.installUpdate.addEventListener("click", installUpdate);
 
 bootstrap();

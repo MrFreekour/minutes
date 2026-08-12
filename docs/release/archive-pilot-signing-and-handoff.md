@@ -2,7 +2,7 @@
 
 This is the release-operator procedure for producing Peter's private-pilot
 application. Peter does not run these commands. He receives a normal signed and
-notarized `Minutes Archive.app` and uses Finder.
+notarized `Minutes Archive` DMG and uses Finder.
 
 No step in this procedure authorizes use of real client documents. Signing,
 notarization, security review, and operator QA use only the repository's
@@ -29,12 +29,18 @@ Recheck this state immediately before a release; it can drift:
   `acceptance-<sha>` tag and run from `main` as `silverstein`;
 - the active `protect-acceptance-tags` ruleset must cover
   `refs/tags/acceptance-*`;
+- a release-tag ruleset must restrict `refs/tags/archive-v*` to the owner; a
+  pushed Archive version tag creates only a private draft release;
 - the `signed-dev-acceptance` environment must require a reviewer and permit
-  deployment only from `main`; and
-- the six referenced credential names must exist:
+  deployment only from `main` and `archive-v*` tags;
+- the `archive-stable-release` environment must require a reviewer and permit
+  deployment only from `main`; promotion must require the independently
+  recorded SHA-256 of `archive-release-SHA256SUMS.txt`; and
+- the referenced credential names must exist:
   `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
   `APPLE_SIGNING_IDENTITY`, `APPLE_API_ISSUER`, `APPLE_API_KEY`, and
-  `APPLE_API_PRIVATE_KEY`.
+  `APPLE_API_PRIVATE_KEY`, plus `TAURI_SIGNING_PRIVATE_KEY` for updater
+  artifacts.
 
 Do not print, download, or inspect credential values during this preflight.
 
@@ -46,18 +52,18 @@ Do not print, download, or inspect credential values during this preflight.
 3. Run `./scripts/verify-archive-dev-app.sh` from that exact checkout.
 4. Make no candidate changes after review. Any change requires a new commit,
    fresh CI, fresh review, and a different acceptance tag.
-5. After explicit owner approval, merge the fixed signing-workflow pull
-   request into `main`. Do not merge the Archive feature pull request merely to
-   make the signing workflow available.
+5. After explicit owner approval, merge the reviewed Archive pull request into
+   `main`. Record the exact resulting commit; if GitHub creates a different
+   commit, independently confirm its tree is identical to the reviewed head.
 
 ## Authorize the exact commit
 
 Set `CANDIDATE_SHA` to the reviewed 40-character Archive commit:
 
 ```sh
-git fetch origin main feat/minutes-archive-discovery
+git fetch origin main
 git cat-file -e "${CANDIDATE_SHA}^{commit}"
-test "$(git rev-parse "origin/feat/minutes-archive-discovery")" = "$CANDIDATE_SHA"
+test "$(git rev-parse origin/main)" = "$CANDIDATE_SHA"
 git tag -a "acceptance-$CANDIDATE_SHA" "$CANDIDATE_SHA" \
   -m "Authorize Minutes Archive private pilot $CANDIDATE_SHA"
 git push origin "refs/tags/acceptance-$CANDIDATE_SHA"
@@ -92,7 +98,10 @@ Download only the artifact named
 `minutes-archive-pilot-notarized-<candidate-sha>`. It must contain exactly:
 
 - `minutes-archive-pilot-notarized.zip`;
-- `minutes-archive-pilot-notarized.zip.sha256`; and
+- `minutes-archive-pilot-notarized.zip.sha256`;
+- one notarized `Minutes_Archive_<version>_aarch64.dmg`;
+- one signed `Minutes.Archive_<version>_aarch64.app.tar.gz` and its `.sig`;
+- `latest-archive.json` and `archive-release-SHA256SUMS.txt`; and
 - `signed-archive-provenance.txt`.
 
 From the exact candidate checkout, verify it on a Mac before opening:
@@ -105,6 +114,58 @@ From the exact candidate checkout, verify it on a Mac before opening:
 Record the workflow run URL, candidate SHA, zip SHA-256, executable SHA-256,
 Team ID, bundle identifier, notarization result, staple result, Gatekeeper
 result, verifier output, and verifier Mac details.
+
+## Stage and promote the exact release bytes
+
+After source approval, create and push the exact version tag shown in the
+Archive config, for example `archive-v0.2.0`. The protected signing workflow
+creates a **private draft release** and stops. It does not make the version
+public and does not touch `archive-stable`. The tag must point to the exact
+current `main` commit; the workflow resolves that SHA itself and checks out
+release tooling by SHA rather than implicitly trusting the tag checkout.
+
+Download that draft with `gh release download`, run the artifact verifier, and
+complete the independent Finder/security review against its exact DMG. Record
+the SHA-256 of `archive-release-SHA256SUMS.txt` from the reviewed draft. Any
+rerun or asset replacement invalidates that recorded value and requires a new
+artifact review.
+
+Only after the independent decision is `ACCEPT` may the owner dispatch:
+
+```sh
+gh workflow run archive-stable-promotion.yml \
+  --ref main \
+  -f "release_tag=$RELEASE_TAG" \
+  -f "candidate_sha=$CANDIDATE_SHA" \
+  -f "release_sums_sha256=$REVIEWED_SUMS_SHA256"
+```
+
+Approve `archive-stable-release` only after confirming all three inputs match
+the review record. The promotion job refuses a moved tag, changed checksum
+record, unexpected asset, downgrade, or same-version byte replacement. It
+makes the reviewed draft public, downloads and hashes the public bytes, and
+only then advances `archive-stable/latest-archive.json` with the same reviewed
+manifest. Neither the Archive version nor its machine-readable channel replaces
+the normal Minutes release marked “Latest” on GitHub.
+
+If promotion stops after the versioned draft becomes public but before the
+stable manifest is verified, do not rebuild or replace anything. Rerun the
+promotion with the same three reviewed inputs. It accepts that partial state
+only after rechecking the protected tag, exact asset set, checksum-record hash,
+and every asset digest, then resumes at public-byte verification and stable
+publication.
+
+Confirm the stable URL returns 200, its version and asset URL match the reviewed
+release, and the public DMG has the reviewed SHA-256 before delivery. The normal
+Minutes `latest.json` channel is not involved.
+
+Before Peter receives the first updater-enabled build, exercise the public
+stable channel with a disposable older development copy installed in a
+temporary app folder. It must discover the reviewed version, download only
+after the test operator presses Install, verify the updater signature and
+Developer ID identity, atomically replace only that disposable app, and reopen
+as the reviewed version. Use synthetic fixtures only and compare the installed
+executable hash with the signed provenance record.
 
 ## Human and independent acceptance
 
@@ -119,15 +180,18 @@ Do not place the fixture folder anywhere iCloud Drive syncs -- Desktop and
 Documents are synced by default on a Mac with Desktop & Documents enabled. A
 QA run that put fixtures on the Desktop found the canary string in
 `~/Library/Caches/CloudKit/com.apple.bird/`, which is iCloud's own upload
-cache and not the application: the app holds no network sockets and never
-wrote outside its own space. The leak sweep still has to distinguish the two
-every time, so keep the fixtures off synced volumes and the question does not
-arise.
+cache and not the application. Archive workers hold no network sockets; the
+parent's expected operations are the announced launch update check and, only
+when the operator presses Install, one signed download, both before the fixture
+folder is approved. The app never wrote outside its own
+space. The leak sweep still has to distinguish the two every time, so keep the
+fixtures off synced volumes and the question does not arise.
 
-The release operator completes the Finder interaction once with networking
-disabled and once with networking enabled under observation. The independent
-reviewer follows `docs/security/archive-pilot-independent-review.md` and owns
-the review decision.
+The release operator completes the Finder interaction with normal connectivity
+under observation. Do not disable the Mac's Wi-Fi or alter system-wide
+connectivity. The independent reviewer follows
+`docs/security/archive-pilot-independent-review.md` and owns the review
+decision.
 
 The app may be handed to Peter only when:
 
@@ -135,13 +199,17 @@ The app may be handed to Peter only when:
 - native folder-picker, cancellation, census export, content authorization,
   exact retrieval, stale-source withdrawal, and close-time purge have been
   click-tested;
-- the offline run succeeds;
-- no Archive process or worker opens a network connection in the observed
-  online run;
+- in the observed online run, no worker opens a network connection at all, and
+  the parent performs exactly one launch update check, to the configured
+  endpoint and any GitHub-owned release redirect, before any folder is approved,
+  carrying no query string and no body. If Install is pressed, one updater
+  download is additionally expected. A repeated check, repeated download, or
+  any connection after a folder is approved is a failure;
 - no canary, path, filename, content, prompt, or vector leaks to logs, crash
   reports, temporary storage, or the census export;
 - the independent report says approve; and
-- the delivery hash matches the reviewed notarized zip.
+- the delivered DMG hash matches the reviewed notarized DMG; and
+- the stable updater manifest returns 200 and names that exact reviewed version.
 
 Any failure leaves the artifact quarantined. Fixes require a new commit and a
 new acceptance tag; do not mutate or silently replace a reviewed artifact.

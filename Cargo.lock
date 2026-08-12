@@ -3891,8 +3891,9 @@ dependencies = [
 
 [[package]]
 name = "minutes-archive-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "flate2",
  "libc",
  "minutes-archive-convert",
  "minutes-archive-core",
@@ -3902,9 +3903,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tauri-plugin-updater",
  "tempfile",
 ]
 

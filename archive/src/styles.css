@@ -206,6 +206,60 @@ a:focus-visible {
   box-shadow: 0 0 0 3px rgba(57, 145, 110, 0.13);
 }
 
+/* Quiet by default and never dismissable. This is the application's one
+   network surface, so it reports itself in the same register as the privacy
+   strips rather than as a notification the operator learns to close. */
+.update-strip {
+  display: grid;
+  grid-template-columns: 27px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 11px 14px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.update-strip strong {
+  display: block;
+  color: var(--ink-2);
+  font-size: 11px;
+}
+
+.update-strip p {
+  margin: 3px 0 0;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.update-dot {
+  width: 9px;
+  height: 9px;
+  margin-left: 9px;
+  border-radius: 50%;
+  background: var(--line-2);
+}
+
+/* An offer is the only state that earns colour: it is the only one that asks
+   the operator to decide something. */
+.update-strip[data-state="available"] {
+  color: var(--green-muted);
+  border-color: rgba(45, 114, 89, 0.24);
+  background: var(--green-soft);
+}
+
+.update-strip[data-state="available"] strong {
+  color: var(--green);
+}
+
+.update-strip[data-state="available"] .update-dot,
+.update-strip[data-state="installed"] .update-dot,
+.update-strip[data-state="current"] .update-dot {
+  background: var(--green-3);
+}
+
 .hero {
   max-width: 790px;
   padding: 26px 0 20px;

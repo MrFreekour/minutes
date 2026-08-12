@@ -1,6 +1,9 @@
 name: Signed Archive Pilot Acceptance
 
 on:
+  push:
+    tags:
+      - "archive-v*"
   workflow_dispatch:
     inputs:
       candidate_sha:
@@ -23,23 +26,57 @@ env:
 jobs:
   authorize-candidate:
     name: Authorize exact protected Archive candidate
-    if: github.ref == 'refs/heads/main' && github.actor == 'silverstein'
+    if: >-
+      github.actor == 'silverstein' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/archive-v')))
     runs-on: ubuntu-latest
     outputs:
       candidate_sha: ${{ steps.authorize.outputs.candidate_sha }}
+      checkout_ref: ${{ steps.authorize.outputs.checkout_ref }}
+      release_tag: ${{ steps.authorize.outputs.release_tag }}
+      tooling_sha: ${{ steps.authorize.outputs.tooling_sha }}
     steps:
       - name: Bind the request to its protected acceptance tag
         id: authorize
         env:
-          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          REQUESTED_SHA: ${{ inputs.candidate_sha }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          if [ "$EVENT_NAME" = "push" ]; then
+            if [[ ! "$REF_NAME" =~ ^archive-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Archive release tags must be archive-vX.Y.Z" >&2
+              exit 1
+            fi
+            CANDIDATE_SHA=""
+            CHECKOUT_REF="refs/tags/$REF_NAME"
+            RELEASE_TAG="$REF_NAME"
+          else
+            CANDIDATE_SHA="$REQUESTED_SHA"
+            CHECKOUT_REF="refs/tags/acceptance-$CANDIDATE_SHA"
+            RELEASE_TAG=""
+          fi
+          if [ "$EVENT_NAME" != "push" ] && [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "candidate_sha must be a full lowercase commit SHA" >&2
             exit 1
           fi
-          tag="acceptance-$CANDIDATE_SHA"
+          tag="${CHECKOUT_REF#refs/tags/}"
           remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          TOOLING_SHA="$(
+            git ls-remote --heads "$remote" refs/heads/main |
+              awk '$2 == "refs/heads/main" {print $1}'
+          )"
+          if [[ ! "$TOOLING_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not bind release tooling to one exact main commit" >&2
+            exit 1
+          fi
+          if [ "$EVENT_NAME" != "push" ] && [ "$TOOLING_SHA" != "$WORKFLOW_SHA" ]; then
+            echo "Dispatched workflow definition is not the exact current main commit" >&2
+            exit 1
+          fi
           # `git ls-remote` patterns tail-match across ref namespaces, so a
           # pattern of "refs/tags/<tag>" also matches a branch literally named
           # "refs/tags/<tag>" (full ref refs/heads/refs/tags/<tag>). Restrict
@@ -72,11 +109,22 @@ jobs:
           # Annotated tag -> the peeled line is the commit.
           # Lightweight tag -> the ref itself is the commit.
           resolved="${peeled:-$exact}"
-          if [ "$resolved" != "$CANDIDATE_SHA" ]; then
+          if [ "$EVENT_NAME" = "push" ]; then
+            CANDIDATE_SHA="$resolved"
+            if [ "$CANDIDATE_SHA" != "$TOOLING_SHA" ]; then
+              echo "Archive release tag must point to the exact current main commit" >&2
+              exit 1
+            fi
+          elif [ "$resolved" != "$CANDIDATE_SHA" ]; then
             echo "Protected tag $tag does not resolve exactly to $CANDIDATE_SHA" >&2
             exit 1
           fi
-          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "candidate_sha=$CANDIDATE_SHA"
+            echo "checkout_ref=$CHECKOUT_REF"
+            echo "release_tag=$RELEASE_TAG"
+            echo "tooling_sha=$TOOLING_SHA"
+          } >> "$GITHUB_OUTPUT"
 
   build-unsigned:
     name: Build and exercise Archive without signing secrets
@@ -87,7 +135,7 @@ jobs:
       - name: Check out exact protected candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: refs/tags/acceptance-${{ needs.authorize-candidate.outputs.candidate_sha }}
+          ref: ${{ needs.authorize-candidate.outputs.checkout_ref }}
           fetch-depth: 1
 
       - name: Verify exact candidate checkout
@@ -179,7 +227,43 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     environment: signed-dev-acceptance
+    permissions:
+      contents: write
     steps:
+      # Release tooling and presentation assets come from the exact main SHA
+      # resolved by the authorization job, not from the event's implicit tag
+      # checkout. They are installed/read before either the Apple identity or
+      # updater signing key is exposed.
+      - name: Check out exact reviewed-main release tooling only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.authorize-candidate.outputs.tooling_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/create-branded-dmg.sh
+            tauri/src-tauri/dmg-background.png
+            tauri/src-tauri/icons/icon.icns
+            docs/release/notes
+          sparse-checkout-cone-mode: false
+
+      - name: Verify exact release-tooling checkout
+        env:
+          TOOLING_SHA: ${{ needs.authorize-candidate.outputs.tooling_sha }}
+        run: test "$(git rev-parse HEAD)" = "$TOOLING_SHA"
+
+      - name: Install pinned Tauri signer before credentials unlock
+        run: cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+
+      - name: Validate updater signing key exists
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "Missing required updater signing secret: TAURI_SIGNING_PRIVATE_KEY" >&2
+            exit 1
+          fi
+
       - name: Download exact unsigned Archive candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -320,18 +404,6 @@ jobs:
 
           executable="$app/Contents/MacOS/minutes-archive-app"
 
-          # Prove the SIGNED app can run its own workers, before anything is
-          # published. Every other check here is about provenance: is it the
-          # right bytes, signed by the right identity, notarized and stapled.
-          # All of that passed on a build that could not index a single
-          # document, because the workers were copied to a temp directory and a
-          # copy of a bundle-signed binary is killed on exec. Local testing used
-          # an ad-hoc-signed app whose copy runs fine, and the smokes above run
-          # on the unsigned build, so nothing saw it until a human clicked the
-          # button. This is the only step that exercises the artifact as
-          # shipped.
-          "$executable" --archive-signed-worker-selftest
-
           executable_sha="$(shasum -a 256 "$executable" | awk '{print $1}')"
           printf 'candidate=%s\nteam_id=%s\nidentifier=%s\nexecutable_sha256=%s\nnotarized=true\nstapled=true\n' \
             "$CANDIDATE_SHA" "$team_id" "$identifier" "$executable_sha" \
@@ -341,16 +413,155 @@ jobs:
           shasum -a 256 minutes-archive-pilot-notarized.zip \
             > minutes-archive-pilot-notarized.zip.sha256
 
+      - name: Build signed updater artifact and notarized DMG
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          RELEASE_TAG: ${{ needs.authorize-candidate.outputs.release_tag }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          set -euo pipefail
+          app="signed/Minutes Archive.app"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            "$app/Contents/Info.plist")"
+          expected_tag="archive-v${version}"
+          if [ -n "$RELEASE_TAG" ] && [ "$RELEASE_TAG" != "$expected_tag" ]; then
+            echo "Release tag $RELEASE_TAG does not match Archive version $version" >&2
+            exit 1
+          fi
+
+          updater="Minutes.Archive_${version}_aarch64.app.tar.gz"
+          tar -C signed -czf "$updater" "Minutes Archive.app"
+          cargo tauri signer sign "$updater"
+          test -s "${updater}.sig"
+
+          dmg="Minutes_Archive_${version}_aarch64.dmg"
+          scripts/create-branded-dmg.sh \
+            --app "$app" \
+            --version "$version" \
+            --output "$dmg"
+          submit_json="$RUNNER_TEMP/archive-dmg-notary-submit.json"
+          xcrun notarytool submit "$dmg" \
+            --key "$ARCHIVE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 30m \
+            --output-format json > "$submit_json"
+          status="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("status",""))' "$submit_json")"
+          if [ "$status" != "Accepted" ]; then
+            echo "DMG notarization did not return Accepted; refusing release" >&2
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=4 "$dmg"
+
+          notes="docs/release/notes/${expected_tag}.md"
+          if [ ! -s "$notes" ]; then
+            echo "Missing non-empty Archive release notes: $notes" >&2
+            exit 1
+          fi
+          signature="$(cat "${updater}.sig")"
+          update_url="https://github.com/silverstein/minutes/releases/download/${expected_tag}/${updater}"
+          UPDATE_VERSION="$version" \
+          UPDATE_SIGNATURE="$signature" \
+          UPDATE_URL="$update_url" \
+          UPDATE_NOTES_PATH="$notes" \
+          python3 <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = {
+              "version": os.environ["UPDATE_VERSION"],
+              "notes": Path(os.environ["UPDATE_NOTES_PATH"]).read_text(),
+              "pub_date": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {
+                  "darwin-aarch64": {
+                      "signature": os.environ["UPDATE_SIGNATURE"].strip(),
+                      "url": os.environ["UPDATE_URL"],
+                  }
+              },
+          }
+          Path("latest-archive.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+          shasum -a 256 \
+            "$dmg" \
+            "$updater" \
+            "${updater}.sig" \
+            latest-archive.json \
+            signed-archive-provenance.txt \
+            > archive-release-SHA256SUMS.txt
+          {
+            echo "ARCHIVE_VERSION=$version"
+            echo "ARCHIVE_EXPECTED_TAG=$expected_tag"
+            echo "ARCHIVE_DMG=$dmg"
+            echo "ARCHIVE_UPDATER=$updater"
+          } >> "$GITHUB_ENV"
+
+      - name: Stage exact versioned assets in a private draft release
+        if: needs.authorize-candidate.outputs.release_tag != ''
+        env:
+          CANDIDATE_SHA: ${{ needs.authorize-candidate.outputs.candidate_sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.authorize-candidate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          notes="docs/release/notes/${RELEASE_TAG}.md"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
+            if [ "$is_draft" != "true" ]; then
+              echo "Release $RELEASE_TAG is already public; refusing to replace reviewed assets" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --draft \
+              --latest=false \
+              --target "$CANDIDATE_SHA" \
+              --title "Minutes Archive ${ARCHIVE_VERSION}" \
+              --notes-file "$notes"
+          fi
+          gh release upload "$RELEASE_TAG" \
+            "$ARCHIVE_DMG" \
+            "$ARCHIVE_UPDATER" \
+            "${ARCHIVE_UPDATER}.sig" \
+            latest-archive.json \
+            archive-release-SHA256SUMS.txt \
+            signed-archive-provenance.txt \
+            --clobber
+
       - name: Remove ephemeral signing material
         if: always()
         run: |
+          teardown_status=0
           if [ -n "${ARCHIVE_ACCEPTANCE_KEYCHAIN:-}" ]; then
-            security delete-keychain "$ARCHIVE_ACCEPTANCE_KEYCHAIN" || true
+            security delete-keychain "$ARCHIVE_ACCEPTANCE_KEYCHAIN" || teardown_status=$?
           fi
           rm -f \
             "$RUNNER_TEMP/minutes-archive-acceptance.p12" \
             "${ARCHIVE_API_KEY_PATH:-}" \
-            "$RUNNER_TEMP/Minutes-Archive-notary.zip"
+            "$RUNNER_TEMP/Minutes-Archive-notary.zip" \
+            "$RUNNER_TEMP/archive-dmg-notary-submit.json"
+          if [ "$teardown_status" -ne 0 ]; then
+            echo "Signing keychain deletion failed; refusing candidate execution" >&2
+            exit "$teardown_status"
+          fi
+
+      # Candidate code is exercised only after the Developer ID keychain,
+      # notarization key, and updater signing secret have all left scope. This
+      # proves the shipped signed app can run its workers without giving that
+      # app an opportunity to read release credentials.
+      - name: Exercise exact signed app after credential teardown
+        if: success()
+        run: |
+          set -euo pipefail
+          signed/Minutes\ Archive.app/Contents/MacOS/minutes-archive-app \
+            --archive-signed-worker-selftest
 
       - name: Upload short-lived notarized Archive pilot
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -359,6 +570,11 @@ jobs:
           path: |
             minutes-archive-pilot-notarized.zip
             minutes-archive-pilot-notarized.zip.sha256
+            Minutes_Archive_*_aarch64.dmg
+            Minutes.Archive_*_aarch64.app.tar.gz
+            Minutes.Archive_*_aarch64.app.tar.gz.sig
+            latest-archive.json
+            archive-release-SHA256SUMS.txt
             signed-archive-provenance.txt
           if-no-files-found: error
           retention-days: 7

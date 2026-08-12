@@ -12,8 +12,12 @@ downloaded notarized artifact with
 `scripts/verify-archive-pilot-artifact.sh`. An independent reviewer approves the
 security packet in `docs/security/archive-pilot-independent-review.md`. The
 operator then performs the complete installed-app interaction once with
-networking disabled and once with networking enabled under network
-observation.
+normal connectivity under network observation. Do not disable the Mac's Wi-Fi
+or alter system-wide connectivity for this test. The expected result is one
+update check at launch, to the configured GitHub endpoint and any GitHub
+release-asset redirect, before any folder is approved, and nothing else for the
+rest of the session. Any second check, or any connection after a folder is
+approved, is a stop-ship finding.
 
 Do not use Peter's documents for those release tests. Use synthetic legal
 fixtures with distinctive canary text. The release operator creates the
@@ -22,8 +26,9 @@ review folder with `scripts/make-archive-qa-fixtures.sh` and follows
 
 ## Peter's first session
 
-1. Peter opens the delivered `Minutes Archive` application in Finder. macOS
-   should open it normally without an unidentified-developer override.
+1. Peter opens the delivered `Minutes Archive` DMG in Finder, drags Minutes
+   Archive to Applications, then opens it. macOS should open it normally
+   without an unidentified-developer override.
 2. He selects one small, well-understood pilot folder containing roughly
    100–500 documents. He does not need to reorganize or move them.
 3. He runs **Private census**. The application reports only aggregate format,
@@ -77,13 +82,57 @@ legal conclusions, and Peter reviews the source before use. Meaning-similar
 suggestions are separately labeled and are never presented as proof that a
 clause satisfies the question.
 
-## Two things Peter is told before he starts
+## What Peter is told before he starts
 
-These are accepted, disclosed limitations of the pilot, not defects to be
-discovered. The operator states both in plain language when handing over the
-app. Neither should be softened.
+These are accepted, disclosed properties and limitations of the pilot, not
+defects to be discovered. The operator states each of them in plain language
+when handing over the app. None should be softened.
 
-**1. If the app is force-quit or crashes, the location of the folder you chose
+**1. Minutes Archive uses the internet once, when it opens, to ask whether
+there is a newer version of itself.**
+
+That check happens the moment the app opens, before you have chosen a folder,
+so at that point the app has not seen a single one of your documents and has
+nothing about them it could send. It is the only automatic internet use.
+
+The request contains no app-supplied identifier and nothing from the archive:
+not your name, not a licence number, not a count, not a folder, not a filename,
+and not a word of any document. It asks for one small file on the Minutes
+download page — the same file everybody's copy asks for — and reads a version
+number out of it.
+
+What the far end does learn, because every internet request works this way, is
+that some computer at your office's internet address opened Minutes Archive at
+that minute. Not which folder, not which documents, not who you are — but the
+fact that the app was opened, from your address, at that time. If a request
+like that is unacceptable for a particular matter, do not open the app for
+that matter; contact the pilot operator. Do not change the Mac's system-wide
+connectivity for this pilot.
+
+You are told what it found. A line at the top of the window says the check ran
+and whether you already have the current version. If there is a newer one it
+says so and then waits. Nothing is downloaded unless you press the button, and
+if you press it, the download is refused unless it carries the Minutes
+signature. A tampered or unsigned download is discarded and the app you have
+keeps working.
+
+That download is the only other internet use, and it happens only if you press
+Install update while no folder is open.
+
+If installation fails, the current app stays in place. Peter can keep using it
+and install the newer signed DMG manually; the update notice says so rather
+than leaving him at a dead end.
+
+Then the door shuts. From the moment you open the folder picker — whether or
+not you go through with it — Minutes Archive will not use the internet again
+for the rest of that session, and it will say so on screen if anything asks it
+to. To check again, quit the app and open it.
+
+If you are offline, or the check fails for any other reason, the app says it
+could not check and then behaves exactly as it always does. Nothing about
+searching your archive depends on it.
+
+**2. If the app is force-quit or crashes, the location of the folder you chose
 may remain on your Mac until you next open the app.**
 
 When you click "choose folder", macOS itself remembers the last folder you
@@ -94,12 +143,13 @@ force-quit or crashes.
 
 What could remain is the folder's FULL PATH -- its name, the names of every
 folder above it, and the name and identifier of the disk it is on. It is not any
-document, not any text from a document, and nothing is ever sent anywhere. It
+document, not any text from a document, and that saved path is never sent
+anywhere. It
 sits in the app's own settings file on your Mac. In a law practice those folder
 names are often client names, which is why this is stated rather than left
 unsaid. Opening Minutes Archive again clears it.
 
-**2. PDFs and RTFs never answer "in the same clause".**
+**3. PDFs and RTFs never answer "in the same clause".**
 
 Word and OpenDocument files record where each section begins. PDF and RTF do
 not. A PDF records only where ink sits on the page; RTF can carry an outline
@@ -129,7 +179,7 @@ Read the excerpt, which is always shown, before relying on such an answer.
 This is deliberate throughout: a wrong "same clause" answer to a lawyer is
 worse than no answer.
 
-**3. Text read from a scan is a reading, not a quotation.**
+**4. Text read from a scan is a reading, not a quotation.**
 
 A scan is a picture. To search it, the app has macOS read the page and tell it
 what the letters appear to say. That reading is usually good and sometimes
@@ -147,10 +197,13 @@ look at the original before you rely on it.
 ## Stop and contact the pilot operator
 
 Peter should stop the session if macOS shows an unidentified-developer warning,
-the app requests network or unrelated privacy permissions, a census export
-contains a filename or path, a result lacks a source anchor, a changed source
-remains available, the app claims to search an unavailable location, or the
-Archive process remains running after its only window closes.
+the app uses the network for anything other than the single version check it
+announces at launch and one update download Peter explicitly starts, either
+network operation begins after a folder is approved, the app requests unrelated
+privacy permissions, a census export contains a filename or path, a result
+lacks a source anchor, a changed source remains available, the app claims to
+search an unavailable location, or the Archive process remains running after
+its only window closes.
 
 No real client document should be sent to support, copied into an email, or
 uploaded to a model to diagnose the issue. Reproduce with a synthetic document

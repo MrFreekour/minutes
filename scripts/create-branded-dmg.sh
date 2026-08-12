@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create the branded Minutes macOS installer DMG.
+# Create a branded Minutes-family macOS installer DMG.
 #
 # Tauri's built-in create-dmg wrapper hides the useful stderr when the DMG
 # cosmetics step fails on CI. Keep this script small and explicit so release
@@ -8,10 +8,10 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/create-branded-dmg.sh --app <Minutes.app> --version <x.y.z> --output <path.dmg>
+Usage: scripts/create-branded-dmg.sh --app <application.app> --version <x.y.z> --output <path.dmg>
 
 Creates a signed-app installer DMG with:
-  - Minutes.app on the left
+  - the supplied application on the left
   - /Applications symlink on the right
   - the generated Minutes DMG background
 EOF
@@ -81,6 +81,8 @@ mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 OUTPUT_NAME="$(basename "$OUTPUT_PATH")"
 FINAL_DMG="$OUTPUT_DIR/$OUTPUT_NAME"
+APP_NAME="$(basename "$APP_PATH")"
+VOLUME_NAME="${APP_NAME%.app}"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/minutes-dmg.XXXXXX")"
 STAGING_DIR="$WORK_DIR/staging"
@@ -97,7 +99,7 @@ trap cleanup EXIT
 
 echo "Preparing branded DMG staging folder..."
 mkdir -p "$STAGING_DIR/.background" "$MOUNT_DIR"
-cp -R "$APP_PATH" "$STAGING_DIR/Minutes.app"
+cp -R "$APP_PATH" "$STAGING_DIR/$APP_NAME"
 ln -s /Applications "$STAGING_DIR/Applications"
 cp "$BACKGROUND_PATH" "$STAGING_DIR/.background/dmg-background.png"
 cp "$ICON_PATH" "$STAGING_DIR/.VolumeIcon.icns"
@@ -110,7 +112,7 @@ DMG_SIZE_MB="$((APP_SIZE_MB + 80))"
 echo "Creating read/write DMG (${DMG_SIZE_MB} MB)..."
 rm -f "$RW_DMG" "$FINAL_DMG"
 hdiutil create \
-  -volname "Minutes" \
+  -volname "$VOLUME_NAME" \
   -srcfolder "$STAGING_DIR" \
   -fs HFS+ \
   -fsargs "-c c=64,a=16,e=16" \
@@ -133,9 +135,10 @@ if command -v SetFile >/dev/null 2>&1; then
 fi
 chflags hidden "$MOUNT_DIR/.background" "$MOUNT_DIR/.VolumeIcon.icns" || true
 
-osascript - "$MOUNT_DIR" <<'APPLESCRIPT'
+osascript - "$MOUNT_DIR" "$APP_NAME" <<'APPLESCRIPT'
 on run argv
   set mountPath to item 1 of argv
+  set appName to item 2 of argv
   set dmgFolder to POSIX file mountPath as alias
   set bgPic to POSIX file (mountPath & "/.background/dmg-background.png") as alias
 
@@ -153,7 +156,7 @@ on run argv
     set text size of opts to 16
     set background picture of opts to bgPic
 
-    set position of item "Minutes.app" of dmgFolder to {180, 200}
+    set position of item appName of dmgFolder to {180, 200}
     set position of item "Applications" of dmgFolder to {480, 200}
     update dmgFolder without registering applications
     delay 2

@@ -11,6 +11,7 @@ const chrome =
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const profile = await mkdtemp(join(tmpdir(), "minutes-archive-ui-"));
 const screenshot = join(profile, "search-proof.png");
+const updateScreenshot = join(profile, "update-proof.png");
 const frontend = pathToFileURL(resolve("archive/src/index.html")).href;
 
 const census = {
@@ -233,6 +234,7 @@ const mockScript = `
             scanRunning: false,
             report: null,
             textVaultReport: null,
+            update: { state: "notChecked" },
           },
           choose_archive_locations: {
             locations: [{ id: 1, label: "Approved location 1" }],
@@ -252,6 +254,15 @@ const mockScript = `
             total: 3,
           },
           clear_archive_exclusions: 0,
+          // The one network surface, exercised the way an operator meets it:
+          // an offer at launch that must be visible, must name both versions,
+          // and must not download anything until the button is pressed.
+          check_for_archive_update: {
+            state: "available",
+            installed: "0.1.0",
+            offered: "0.2.0",
+          },
+          install_archive_update: { state: "installed", offered: "0.2.0" },
           remove_archive_location: [],
           run_archive_census: census,
           cancel_archive_census: true,
@@ -360,6 +371,58 @@ try {
         if (!document.querySelector("#build-identity").textContent.includes("build 39773037b5d5")) {
           throw new Error("The running build does not identify itself");
         }
+
+        // The update check has to be something the operator SAW, not something
+        // they are asked to take on trust, and nothing may download until they
+        // choose to.
+        const updateStrip = document.querySelector("#update-strip");
+        const installUpdate = document.querySelector("#install-update");
+        await waitFor(
+          () => updateStrip.dataset.state === "available",
+          "update check result",
+        );
+        if (updateStrip.hidden) {
+          throw new Error("the update check ran without saying so on screen");
+        }
+        if (
+          updateStrip.getAttribute("role") !== "status" ||
+          updateStrip.getAttribute("aria-live") !== "polite" ||
+          updateStrip.getAttribute("aria-atomic") !== "true"
+        ) {
+          throw new Error("the complete update announcement is not one atomic live region");
+        }
+        if (
+          !updateStrip.textContent.includes("0.2.0") ||
+          !updateStrip.textContent.includes("0.1.0")
+        ) {
+          throw new Error(
+            "the update offer did not name both versions: " + updateStrip.textContent,
+          );
+        }
+        if (!updateStrip.textContent.includes("Nothing has been downloaded")) {
+          throw new Error("the update offer did not say that nothing was downloaded yet");
+        }
+        if (installUpdate.hidden) {
+          throw new Error("an available update offered no way to consent to it");
+        }
+        installUpdate.focus();
+        if (document.activeElement !== installUpdate) {
+          throw new Error("the update consent control could not receive focus");
+        }
+        installUpdate.click();
+        await waitFor(
+          () => updateStrip.dataset.state === "installed",
+          "update install result",
+        );
+        if (!installUpdate.hidden) {
+          throw new Error("the install button survived the install it performed");
+        }
+        if (document.activeElement !== updateStrip) {
+          throw new Error("focus was lost when the install button disappeared");
+        }
+        if (!updateStrip.textContent.includes("0.2.0")) {
+          throw new Error("the live update result omitted the installed version");
+        }
         const setupButtonBounds = document
           .querySelector("#add-locations")
           .getBoundingClientRect()
@@ -424,7 +487,11 @@ try {
           !body.includes("Checked for this search") ||
           !body.includes("when this search ran") ||
           !body.toLowerCase().includes("not exact matches") ||
-          !body.includes("Closing this window forgets everything")
+          !body.includes("Closing this window forgets everything") ||
+          // The footer used to claim networking was disabled outright. It is
+          // not, and the corrected claim is load-bearing for the disclosure
+          // Peter is given.
+          !body.includes("Updates only before folders open")
         ) {
           throw new Error("Evidence provenance or session-disposal notice did not render");
         }
@@ -518,12 +585,22 @@ try {
     captureBeyondViewport: false,
   });
   await writeFile(screenshot, Buffer.from(image.data, "base64"));
+  await cdp.send("Runtime.evaluate", {
+    expression: "window.scrollTo({ top: 0, behavior: 'instant' })",
+  });
+  const updateImage = await cdp.send("Page.captureScreenshot", {
+    format: "png",
+    captureBeyondViewport: false,
+  });
+  await writeFile(updateScreenshot, Buffer.from(updateImage.data, "base64"));
   cdp.close();
   process.stdout.write(
     `${JSON.stringify(
       {
         ...smoke.result.value,
-        ...(process.env.ARCHIVE_KEEP_UI_SMOKE ? { screenshot } : {}),
+        ...(process.env.ARCHIVE_KEEP_UI_SMOKE
+          ? { screenshot, updateScreenshot }
+          : {}),
       },
       null,
       2,
