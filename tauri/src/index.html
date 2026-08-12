@@ -7003,6 +7003,9 @@
     const liveBar = document.getElementById('live-bar');
     // Live bar elements are accessed by ID inline (live-time, live-utterances)
     let currentMeetingDetail = null;
+    // Bumped every time the detail overlay opens or closes, so an in-flight
+    // refresh can tell "still the same open view" from "closed and reopened".
+    let detailViewGeneration = 0;
     let activeSearchQuery = '';
     let documentsViewActive = false;
     let documentsCache = [];
@@ -9596,6 +9599,7 @@
 
     function closeDetailView() {
       detailOverlay.classList.remove('active');
+      detailViewGeneration += 1;
       currentMeetingPath = null;
       currentMeetingDetail = null;
       persistRecallWorkspaceState({ currentMeetingPath: '' });
@@ -10199,6 +10203,7 @@
       detailScroll.appendChild(bottomCta);
 
       detailOverlay.classList.add('active');
+      detailViewGeneration += 1;
       persistRecallWorkspaceState({ currentMeetingPath: detail.path });
     }
 
@@ -10496,6 +10501,12 @@
     // How long the list may stay blank before we say we are still reading. This
     // only controls a message; it never abandons the in-flight scan.
     const INVENTORY_PENDING_NOTICE_MS = 5000;
+    // After this long we stop claiming things are merely slow. The scan is still
+    // awaited (it may yet land, and the backend cannot be cancelled), but the
+    // user gets a visible, honest terminal state instead of an indefinite
+    // spinner, because a wedged blocking worker holds the backend's single
+    // flight and no retry can succeed until the process restarts.
+    const INVENTORY_STUCK_NOTICE_MS = 90000;
     // The single in-flight inventory scan, shared by every caller.
     let meetingInventoryInFlight = null;
     // Set when a caller joins a scan already in progress. That caller may be
@@ -10616,7 +10627,7 @@
     // A real failure to read the library. Says what happened and offers a
     // retry; still never asserts the library is empty, because a failed read
     // tells us nothing about what is on disk.
-    function renderInventoryErrorState() {
+    function renderInventoryErrorState({ stuck = false } = {}) {
       // renderMeetings() guards the same way: never paint over a view that
       // another surface owns.
       if (!inventoryViewOwnsList()) return;
@@ -10629,8 +10640,10 @@
       failed.className = 'empty-state';
       failed.innerHTML = `
         <div class="onboarding-content">
-          <h2>Couldn't read your meetings</h2>
-          <p class="onboarding-sub">Your notes on disk are untouched. This was a problem reading the list.</p>
+          <h2>${stuck ? 'Still reading your meetings' : "Couldn't read your meetings"}</h2>
+          <p class="onboarding-sub">${stuck
+            ? 'This is taking much longer than expected. Your notes on disk are untouched. If it does not finish, restarting Minutes will start the check over.'
+            : 'Your notes on disk are untouched. This was a problem reading the list.'}</p>
           <div class="onboarding-actions">
             <button class="btn btn-primary btn-sm" id="inventory-retry-btn">Try again</button>
           </div>
@@ -10669,6 +10682,11 @@
           renderInventoryPendingState(meetingInventoryPendingAttempts);
         }
       }, INVENTORY_PENDING_NOTICE_MS);
+      const stuckNotice = window.setTimeout(() => {
+        if (generation === meetingInventoryGeneration && inventoryViewOwnsList()) {
+          renderInventoryErrorState({ stuck: true });
+        }
+      }, INVENTORY_STUCK_NOTICE_MS);
       try {
         meetings = await fetchMeetingInventory();
         if (generation !== meetingInventoryGeneration || !inventoryViewOwnsList()) return;
@@ -10710,6 +10728,7 @@
         return;
       } finally {
         window.clearTimeout(pendingNotice);
+        window.clearTimeout(stuckNotice);
       }
       meetingInventoryPendingAttempts = 0;
       if (meetingInventoryDirty) {
@@ -10737,12 +10756,16 @@
       if (!currentMeetingDetail || !detailOverlay.classList.contains('active')) return;
       const path = currentMeetingDetail.path;
       if (!path) return;
+      // Identity, not just path: closing and reopening the SAME meeting is a new
+      // view, and path equality cannot tell that apart from never having left.
+      const view = detailViewGeneration;
       // The user can close the overlay or open a different meeting while this is
       // in flight -- a wider window now that the refresh starts before the
       // inventory scan rather than after it. Rendering a superseded response
       // would reopen a closed detail, or replace the meeting the user just
       // opened with the previous one.
       const stillShowingRequestedMeeting = () =>
+        detailViewGeneration === view &&
         detailOverlay.classList.contains('active') &&
         !!currentMeetingDetail &&
         currentMeetingDetail.path === path;
@@ -16001,6 +16024,7 @@
       // newly-active md-viewer is actually visible.
       if (detailOverlay.classList.contains('active')) {
         detailOverlay.classList.remove('active');
+        detailViewGeneration += 1;
         // Hiding the overlay bypasses closeDetailView(), so drop any armed
         // "Confirm?" state and its pinned width with it, and clear the banner —
         // which also releases the card pin. Without the clear, a persistent
