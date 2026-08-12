@@ -105,8 +105,9 @@ What the far end does learn, because every internet request works this way, is
 that some computer at your office's internet address opened Minutes Archive at
 that minute. Not which folder, not which documents, not who you are — but the
 fact that the app was opened, from your address, at that time. If a request
-like that is unacceptable for a particular matter, disconnect from the internet
-before opening the app; everything the app does still works.
+like that is unacceptable for a particular matter, do not open the app for
+that matter; contact the pilot operator. Do not change the Mac's system-wide
+connectivity for this pilot.
 
 You are told what it found. A line at the top of the window says the check ran
 and whether you already have the current version. If there is a newer one it
@@ -197,10 +198,12 @@ look at the original before you rely on it.
 
 Peter should stop the session if macOS shows an unidentified-developer warning,
 the app uses the network for anything other than the single version check it
-announces at launch, the app requests unrelated privacy permissions, a census
-export contains a filename or path, a result lacks a source anchor, a changed source
-remains available, the app claims to search an unavailable location, or the
-Archive process remains running after its only window closes.
+announces at launch and one update download Peter explicitly starts, either
+network operation begins after a folder is approved, the app requests unrelated
+privacy permissions, a census export contains a filename or path, a result
+lacks a source anchor, a changed source remains available, the app claims to
+search an unavailable location, or the Archive process remains running after
+its only window closes.
 
 No real client document should be sent to support, copied into an email, or
 uploaded to a model to diagnose the issue. Reproduce with a synthetic document

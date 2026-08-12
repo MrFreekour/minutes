@@ -538,20 +538,26 @@ jobs:
       - name: Remove ephemeral signing material
         if: always()
         run: |
+          teardown_status=0
           if [ -n "${ARCHIVE_ACCEPTANCE_KEYCHAIN:-}" ]; then
-            security delete-keychain "$ARCHIVE_ACCEPTANCE_KEYCHAIN" || true
+            security delete-keychain "$ARCHIVE_ACCEPTANCE_KEYCHAIN" || teardown_status=$?
           fi
           rm -f \
             "$RUNNER_TEMP/minutes-archive-acceptance.p12" \
             "${ARCHIVE_API_KEY_PATH:-}" \
             "$RUNNER_TEMP/Minutes-Archive-notary.zip" \
             "$RUNNER_TEMP/archive-dmg-notary-submit.json"
+          if [ "$teardown_status" -ne 0 ]; then
+            echo "Signing keychain deletion failed; refusing candidate execution" >&2
+            exit "$teardown_status"
+          fi
 
       # Candidate code is exercised only after the Developer ID keychain,
       # notarization key, and updater signing secret have all left scope. This
       # proves the shipped signed app can run its workers without giving that
       # app an opportunity to read release credentials.
       - name: Exercise exact signed app after credential teardown
+        if: success()
         run: |
           set -euo pipefail
           signed/Minutes\ Archive.app/Contents/MacOS/minutes-archive-app \
