@@ -6968,6 +6968,15 @@
     const recoveryBulkErrors = document.getElementById('recovery-bulk-errors');
     const recordButton = document.getElementById('btn-record');
     const liveButton = document.getElementById('btn-live');
+
+    // Live start/stop transition state. Declared here, beside the button it
+    // guards and ABOVE setFooterCaptureMode, because that function consults it
+    // and the status poll can call it during startup -- a `let` read before its
+    // declaration executes is a temporal-dead-zone crash, not a false.
+    let liveTransitionButton = null;
+    let liveTransitionLabel = '';
+    let liveTransitionTarget = null;
+    let liveTransitionTimer = null;
     const quickThoughtButton = document.getElementById('btn-quick-thought');
     const coachButtons = [
       document.getElementById('btn-coach-recording'),
@@ -7935,6 +7944,7 @@
           try {
             const liveStatus = await invoke('cmd_live_transcript_status');
             isLiveTranscript = !!liveStatus.active;
+            reconcileLiveTransition(isLiveTranscript);
             if (isLiveTranscript) {
               statusPill.className = 'status-pill live';
               statusPill.textContent = 'live';
@@ -8123,7 +8133,13 @@
       setClassActive(footer, 'capture-mode', active);
 
       setDisabled(recordButton, active);
-      setDisabled(liveButton, active);
+      // A live transition owns this button until it settles. The idle poll runs
+      // every two seconds and would otherwise re-enable it mid-transition --
+      // including during the first-use explainer's three-second wait, before the
+      // backend has even been called. A second click there starts the session,
+      // and then the original handler starts it again and reports a spurious
+      // "Live transcript failed".
+      setDisabled(liveButton, active || liveTransitionButton === liveButton);
       setDisabled(quickThoughtButton, active);
 
       if (active) {
@@ -9325,8 +9341,88 @@
     });
 
     // ── Live transcript controls ──
+    // ── Live start/stop: show the user's INTENT until reality catches up ──
+    //
+    // Both transitions take seconds during which the backend command has
+    // already returned: starting waits on the whisper model load, stopping runs
+    // finalize plus (with promote_on_stop) processing. Reverting the control
+    // when the command returned meant the button contradicted the click, which
+    // reads as "it ignored me". These hold a pending label until the matching
+    // live-transcript event confirms the new state.
+
+    function beginLiveTransition(button, label, rescueMs, targetActive, canonicalLabel) {
+      endLiveTransition();
+      if (!button) return;
+      liveTransitionButton = button;
+      // Restore the canonical ENGLISH label, not whatever is currently rendered:
+      // under zh-CN the DOM holds the translated string, and writing that back
+      // creates a text node that is not a catalog key, so the localization
+      // observer can no longer map it and switching back to English would strand
+      // the button in Chinese.
+      liveTransitionLabel = canonicalLabel || button.textContent;
+      liveTransitionTarget = targetActive;
+      button.disabled = true;
+      button.textContent = label;
+      // Safety net: if the confirming event never arrives (a wedged session, a
+      // dropped event) the control must not stay disabled forever. Restoring it
+      // is always safe -- the worst case is the user clicking again.
+      //
+      // The budget is per-transition because the two are not comparable.
+      // Starting waits on a model load. Stopping emits :stopped only after the
+      // whole session finishes, which with live_transcript.promote_on_stop =
+      // process includes the meeting pipeline and can legitimately run for
+      // minutes; a short rescue there would revert "Stopping..." mid-run and
+      // recreate the very "did my click register?" state this fixes.
+      liveTransitionTimer = window.setTimeout(function rescue() {
+        // Never contradict observed state. A stop legitimately runs long -- the
+        // stop path completes the whole meeting pipeline before emitting
+        // :stopped, and transcription alone is allowed up to an hour -- so while
+        // the session is still active, "Stopping..." is simply true and
+        // releasing here would recreate the misleading state (and re-enable a
+        // duplicate stop). Keep waiting; the two-second poll reconciles the
+        // moment the session actually ends. The rescue only fires for real when
+        // observation agrees the work is over, which also frees a start whose
+        // session never came up so the user can try again.
+        if (liveTransitionTarget === false && isLiveTranscript) {
+          liveTransitionTimer = window.setTimeout(rescue, 60000);
+          return;
+        }
+        endLiveTransition();
+      }, rescueMs);
+    }
+
+    function endLiveTransition() {
+      if (liveTransitionTimer) {
+        window.clearTimeout(liveTransitionTimer);
+        liveTransitionTimer = null;
+      }
+      if (liveTransitionButton) {
+        liveTransitionButton.disabled = false;
+        if (liveTransitionLabel) liveTransitionButton.textContent = liveTransitionLabel;
+        liveTransitionButton = null;
+        liveTransitionLabel = '';
+      }
+      liveTransitionTarget = null;
+    }
+
+    // (2) Reconcile against observed truth. A session started or stopped from
+    // the CLI cannot emit this window's live-transcript events, so without this
+    // a pending transition would survive until its rescue timer -- long enough
+    // for polling to reopen the live bar with its Stop button still disabled and
+    // reading "Stopping...".
+    function reconcileLiveTransition(observedActive) {
+      if (liveTransitionTarget === null) return;
+      if (observedActive === liveTransitionTarget) endLiveTransition();
+    }
+
     document.getElementById('btn-live').addEventListener('click', async () => {
       const btn = document.getElementById('btn-live');
+      // Acknowledge the click before anything else. On first use the explainer
+      // below deliberately waits three seconds before the start even begins, and
+      // the control used to sit untouched through it -- so the honest reading of
+      // "I clicked Live and nothing happened" is that, for three seconds,
+      // nothing had.
+      beginLiveTransition(btn, 'Starting...', 60000, true, 'Live');
 
       // First-use explainer (shown once, stored in localStorage)
       if (!localStorage.getItem('minutes_live_intro_seen')) {
@@ -9344,12 +9440,17 @@
         if (notice) notice.classList.remove('active');
       }
 
-      const origText = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = 'Starting...';
+      // Hold the pending label until the session ACTUALLY starts (the
+      // live-transcript:started event), not merely until the command returns.
+      // cmd_start_live_transcript returns as soon as the session is spawned,
+      // but the session needs seconds more to come up (whisper model load), and
+      // reverting the button in between made a successful click look like it
+      // had been ignored -- users reported clicking Live and watching it
+      // "unclick itself" repeatedly.
       try {
         await invoke('cmd_start_live_transcript');
       } catch (e) {
+        endLiveTransition();
         console.error('Live:', e);
         // Show visible error using the output-notice pattern
         const noticeIcon = document.getElementById('output-notice-icon');
@@ -9360,16 +9461,18 @@
         if (noticeTitle) noticeTitle.textContent = 'Live transcript failed';
         if (noticeDetail) noticeDetail.textContent = String(e);
         if (notice) notice.classList.add('active');
-      } finally {
-        btn.disabled = false;
-        btn.textContent = origText;
       }
     });
 
-    document.getElementById('btn-stop-live').addEventListener('click', async () => {
+    document.getElementById('btn-stop-live').addEventListener('click', async (event) => {
+      // Same rule in reverse: stopping runs the session's finalize and (with
+      // promote_on_stop) its processing, so the control sat unchanged for 10-15
+      // seconds looking like the click had not registered.
+      beginLiveTransition(event.currentTarget, 'Stopping...', 600000, false, 'Stop Live');
       try {
         await invoke('cmd_stop_live_transcript');
       } catch (e) {
+        endLiveTransition();
         console.error('Stop live:', e);
       }
     });
@@ -15134,6 +15237,7 @@
 
     // ── Listen for live transcript events (T6: immediate UI feedback) ──
     currentWindow.listen('live-transcript:started', () => {
+      endLiveTransition();
       isLiveTranscript = true;
       liveBar.classList.add('active');
       setFooterCaptureMode(true, 'live');
@@ -15144,6 +15248,7 @@
     });
 
     currentWindow.listen('live-transcript:stopped', (event) => {
+      endLiveTransition();
       isLiveTranscript = false;
       liveBar.classList.remove('active');
       setFooterCaptureMode(false);
@@ -15155,6 +15260,7 @@
     });
 
     currentWindow.listen('live-transcript:error', (event) => {
+      endLiveTransition();
       isLiveTranscript = false;
       liveBar.classList.remove('active');
       setFooterCaptureMode(false);
