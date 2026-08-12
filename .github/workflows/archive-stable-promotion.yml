@@ -80,7 +80,15 @@ jobs:
             exit 1
           fi
 
-          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          release_json="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq -sc --arg tag "$RELEASE_TAG" '
+                [.[].[] | select(.tag_name == $tag)] |
+                if length == 1 then .[0]
+                else error("Expected exactly one staged release for " + $tag)
+                end
+              '
+          )"
           RELEASE_JSON="$release_json" python3 <<'PY'
           import json
           import os
@@ -88,6 +96,13 @@ jobs:
           release = json.loads(os.environ["RELEASE_JSON"])
           if release.get("tag_name") != os.environ["RELEASE_TAG"]:
               raise SystemExit("Staged release tag does not match the requested tag")
+          if release.get("target_commitish") != os.environ["CANDIDATE_SHA"]:
+              raise SystemExit("Staged release target does not match the reviewed candidate")
+          if release.get("prerelease"):
+              raise SystemExit("Reviewed Archive release must not be a prerelease")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"RELEASE_ID={release['id']}\n")
           PY
 
       - name: Download and verify the exact independently reviewed asset set
@@ -97,7 +112,21 @@ jobs:
           dmg="Minutes_Archive_${version}_aarch64.dmg"
           updater="Minutes.Archive_${version}_aarch64.app.tar.gz"
           mkdir payload
-          gh release download "$RELEASE_TAG" --dir payload
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          RELEASE_JSON="$release_json" python3 <<'PY' > assets.tsv
+          import json
+          import os
+
+          release = json.loads(os.environ["RELEASE_JSON"])
+          for asset in release.get("assets", []):
+              print(f"{asset['id']}\t{asset['name']}")
+          PY
+          while IFS=$'\t' read -r asset_id asset_name; do
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "payload/${asset_name}"
+          done < assets.tsv
 
           printf '%s\n' \
             "$dmg" \
@@ -212,8 +241,11 @@ jobs:
           # A retry after a partial run may find that the exact reviewed release
           # is already public but `archive-stable` was never advanced. The
           # checksum-bound steps above make that state safe to resume.
-          if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = "true" ]; then
-            gh release edit "$RELEASE_TAG" --draft=false --latest=false
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq .draft)" = "true" ]; then
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -F draft=false \
+              -f make_latest=false >/dev/null
           fi
 
           mkdir public
