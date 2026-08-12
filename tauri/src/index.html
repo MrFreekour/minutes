@@ -10737,11 +10737,22 @@
       if (!currentMeetingDetail || !detailOverlay.classList.contains('active')) return;
       const path = currentMeetingDetail.path;
       if (!path) return;
+      // The user can close the overlay or open a different meeting while this is
+      // in flight -- a wider window now that the refresh starts before the
+      // inventory scan rather than after it. Rendering a superseded response
+      // would reopen a closed detail, or replace the meeting the user just
+      // opened with the previous one.
+      const stillShowingRequestedMeeting = () =>
+        detailOverlay.classList.contains('active') &&
+        !!currentMeetingDetail &&
+        currentMeetingDetail.path === path;
       try {
         const detail = await invoke('cmd_get_meeting_detail', { path });
+        if (!stillShowingRequestedMeeting()) return;
         renderDetailSections(detail);
       } catch (e) {
         console.error('Detail refresh:', e);
+        if (!stillShowingRequestedMeeting()) return;
         renderDetailSections(currentMeetingDetail);
       }
     }
