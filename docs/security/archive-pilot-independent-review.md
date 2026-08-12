@@ -9,7 +9,8 @@ substitute for the attorney's professional-responsibility analysis.
 
 The review object is one notarized `Minutes Archive.app` produced from an exact
 40-character candidate commit by the protected
-`Signed Archive Pilot Acceptance` workflow. The download must contain:
+`Signed Archive Pilot Acceptance` workflow. The complete protected-run artifact
+contains:
 
 - `minutes-archive-pilot-notarized.zip`;
 - `minutes-archive-pilot-notarized.zip.sha256`;
@@ -28,6 +29,13 @@ The verifier fails unless the zip digest, provenance, Developer ID signature,
 Minutes Team ID `63TMLKT8HN`, production identifier
 `com.useminutes.archive`, notarization ticket, staple, Gatekeeper assessment,
 executable digest, and forbidden-entitlement checks all agree.
+
+For release promotion, run the same verifier on the six files downloaded from
+the private draft. In that shape it additionally requires the exact release
+inventory, checksum coverage, updater manifest binding, updater minisign
+signature, safe tar structure, signed DMG container, expected mount layout, and
+byte-identical applications in the DMG and updater archive. The two legacy ZIP
+files are protected-run evidence, not versioned release assets.
 
 ## Product boundary to verify
 

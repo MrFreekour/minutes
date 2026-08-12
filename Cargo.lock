@@ -3893,8 +3893,10 @@ dependencies = [
 name = "minutes-archive-app"
 version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "libc",
+ "minisign-verify",
  "minutes-archive-convert",
  "minutes-archive-core",
  "minutes-archive-ocr",
