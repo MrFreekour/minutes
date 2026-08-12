@@ -6,9 +6,15 @@
  * Starts the built server in `--transport http` mode and drives it over real
  * HTTP. Covers:
  *  1. initialize + tools/list round trip via the MCP SDK client
- *  2. the HTTP surface matches stdio exactly (tools and resources) — the
+ *  2. the HTTP surface matches stdio (tools, resources) — the
  *     per-session server factory is what could silently drop registrations,
- *     so parity against a stdio round trip is the check that matters
+ *     so parity against a stdio round trip is the check that matters. Eight
+ *     tools and two resources sit behind CLI capability gates, and the two
+ *     processes probe those independently, so the comparison is split: core
+ *     parity is exact between processes, and the gated part is checked
+ *     against each process's own declared probe outcome. See
+ *     test/lib/surface-parity.mjs for why, and test/surface_parity_test.mjs
+ *     for the proof that this still fails on a real mismatch
  *  3. two concurrent sessions in one process, each with its own session id
  *  4. session teardown releases server-side state
  *  5. localhost hardening: cross-origin POSTs, non-JSON bodies, unknown
@@ -21,11 +27,24 @@
  * Run: node crates/mcp/test/mcp_http_transport_test.mjs
  */
 
-import { execFileSync, spawn } from "child_process";
+import { spawn } from "child_process";
 import { join } from "path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  CAPABILITY_GATED_RESOURCES,
+  CAPABILITY_GATED_TOOLS,
+  assertCoreParity,
+  assertGateMapMatchesSource,
+  assertOwnStateGatedSurface,
+  assertSameCli,
+  capabilityStatesAgree,
+  describeStateDivergence,
+  probeCapabilityReport,
+  readDeclaredCapabilityState,
+  resolveMinutesBinary,
+} from "./lib/surface-parity.mjs";
 
 const MCP_DIR = join(import.meta.dirname, "..");
 const SERVER_ENTRY = join(MCP_DIR, "dist", "index.js");
@@ -144,19 +163,29 @@ const INITIALIZE_BODY = {
 
 console.log("MCP HTTP Transport Integration Tests\n");
 
-// Both children probe the CLI's capability list with a 2s spawnSync budget and
-// gate optional tools on the result. A cold debug binary can blow that budget
-// in one child and not the other, which reads as surface drift. One warm-up
-// invocation makes the probe deterministic.
-try {
-  execFileSync(
-    join(import.meta.dirname, "..", "..", "..", "target", "debug", "minutes"),
-    ["capabilities"],
-    { encoding: "utf-8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"] }
-  );
-} catch {
-  // Older CLIs have no `capabilities` subcommand; the probe then agrees anyway.
-}
+// Every capability gate in index.ts must be modelled by the parity helper.
+// An unmodelled gate would land in the "core" set and make the cross-process
+// comparison timing-dependent again, so fail before spawning anything.
+assertGateMapMatchesSource();
+
+// Warm the binary the *server* will resolve — release is tried before debug,
+// so warming target/debug unconditionally can warm a file nothing will run —
+// and read its capability report with a budget the server's 2s probe does not
+// have. Warming shrinks the odds of a child's probe timing out; it does not
+// eliminate them, which is why the parity assertions below never depend on
+// the two children agreeing.
+const MINUTES_BIN = resolveMinutesBinary();
+const CAPABILITY_REPORT = probeCapabilityReport(MINUTES_BIN);
+const TEST_START_ISO = new Date().toISOString();
+console.log(
+  `CLI: ${MINUTES_BIN}\nCapability report: ${
+    CAPABILITY_REPORT
+      ? `v${CAPABILITY_REPORT.version} api${CAPABILITY_REPORT.api_version}, ${
+          Object.keys(CAPABILITY_REPORT.features).length
+        } features`
+      : "unavailable (older CLI)"
+  }\n`
+);
 
 const server = await startHttpServer();
 const baseUrl = server.url.replace(/\/mcp$/, "");
@@ -179,7 +208,7 @@ try {
     assert(Array.isArray(httpResources), "resources should be an array");
   });
 
-  test("HTTP tool and resource surface matches stdio exactly", async () => {
+  test("HTTP surface matches stdio, per each process's own capability state", async () => {
     const stdioClient = new Client({ name: "stdio-parity", version: "1.0.0" });
     const stdioTransport = new StdioClientTransport({
       command: process.execPath,
@@ -189,31 +218,112 @@ try {
     });
     await stdioClient.connect(stdioTransport);
     try {
-      const stdioTools = (await stdioClient.listTools()).tools
-        .map((t) => t.name)
-        .sort();
-      const stdioResources = (await stdioClient.listResources()).resources
-        .map((r) => r.uri)
-        .sort();
-      const overHttpTools = httpTools.map((t) => t.name).sort();
-      const overHttpResources = httpResources.map((r) => r.uri).sort();
+      const stdioTools = (await stdioClient.listTools()).tools.map((t) => t.name);
+      const stdioResources = (await stdioClient.listResources()).resources.map((r) => r.uri);
+      const overHttpTools = httpTools.map((t) => t.name);
+      const overHttpResources = httpResources.map((r) => r.uri);
 
-      assert(stdioTools.length > 0, "stdio should expose tools");
-      assertEqual(
-        overHttpTools.join(","),
-        stdioTools.join(","),
-        `tool surface drift.\n  stdio only: ${stdioTools.filter((n) => !overHttpTools.includes(n))}\n  http only: ${overHttpTools.filter((n) => !stdioTools.includes(n))}`
-      );
-      assertEqual(
-        overHttpResources.join(","),
-        stdioResources.join(","),
-        `resource surface drift.\n  stdio only: ${stdioResources.filter((u) => !overHttpResources.includes(u))}\n  http only: ${overHttpResources.filter((u) => !stdioResources.includes(u))}`
-      );
-      // Spot-check a few known registrations so an empty-vs-empty match can
-      // never be mistaken for parity.
-      for (const name of ["get_status", "list_meetings", "resummarize_meeting", "knowledge_status"]) {
-        assert(overHttpTools.includes(name), `${name} must be served over HTTP`);
+      // What each process's own probe decided, read from the line that
+      // process wrote with its own pid. This is the witness that separates
+      // "the probe timed out here" from "the factory dropped registrations",
+      // which are indistinguishable from the advertised surface alone.
+      const httpState = await readDeclaredCapabilityState({
+        pid: server.child.pid,
+        sinceIso: TEST_START_ISO,
+        label: "http server",
+      });
+      const stdioState = await readDeclaredCapabilityState({
+        pid: stdioTransport.pid,
+        sinceIso: TEST_START_ISO,
+        label: "stdio server",
+      });
+      assertSameCli("http server", httpState, CAPABILITY_REPORT);
+      assertSameCli("stdio server", stdioState, CAPABILITY_REPORT);
+
+      // 1. Core parity: exact, between processes. No capability gate can move
+      //    a core name, so this comparison is timing-independent.
+      const coreTools = assertCoreParity({
+        label: "tool surface",
+        aLabel: "http",
+        aNames: overHttpTools,
+        bLabel: "stdio",
+        bNames: stdioTools,
+        gatedMap: CAPABILITY_GATED_TOOLS,
+        requiredAnchors: [
+          "get_status",
+          "list_meetings",
+          "resummarize_meeting",
+          "knowledge_status",
+        ],
+      });
+      assertCoreParity({
+        label: "resource surface",
+        aLabel: "http",
+        aNames: overHttpResources,
+        bLabel: "stdio",
+        bNames: stdioResources,
+        gatedMap: CAPABILITY_GATED_RESOURCES,
+        requiredAnchors: ["minutes://status", "minutes://meetings/recent"],
+      });
+
+      // 2. Gated surface: each process against its own declared state. This is
+      //    what keeps the eight optional tools covered rather than merely
+      //    excluded — a tool the factory replay dropped is missing from a
+      //    process whose own probe says it should be present, and that fails
+      //    here even though it never disturbs core parity.
+      const httpGated = assertOwnStateGatedSurface({
+        label: "http tools",
+        names: overHttpTools,
+        gatedMap: CAPABILITY_GATED_TOOLS,
+        state: httpState,
+        report: CAPABILITY_REPORT,
+      });
+      assertOwnStateGatedSurface({
+        label: "stdio tools",
+        names: stdioTools,
+        gatedMap: CAPABILITY_GATED_TOOLS,
+        state: stdioState,
+        report: CAPABILITY_REPORT,
+      });
+      assertOwnStateGatedSurface({
+        label: "http resources",
+        names: overHttpResources,
+        gatedMap: CAPABILITY_GATED_RESOURCES,
+        state: httpState,
+        report: CAPABILITY_REPORT,
+      });
+      assertOwnStateGatedSurface({
+        label: "stdio resources",
+        names: stdioResources,
+        gatedMap: CAPABILITY_GATED_RESOURCES,
+        state: stdioState,
+        report: CAPABILITY_REPORT,
+      });
+
+      // Together, 1 and 2 pin each process's complete advertised surface:
+      // core is identical across processes, and every gated name is exactly
+      // what that process's own probe predicts. Nothing can silently vanish
+      // over HTTP — it would drop out of core, or out of its own state's
+      // expected set.
+      if (capabilityStatesAgree(httpState, stdioState)) {
+        assertEqual(
+          [...overHttpTools].sort().join(","),
+          [...stdioTools].sort().join(","),
+          "with identical capability states the full tool surfaces must match"
+        );
+        assertEqual(
+          [...overHttpResources].sort().join(","),
+          [...stdioResources].sort().join(","),
+          "with identical capability states the full resource surfaces must match"
+        );
+      } else {
+        console.log(`  ${describeStateDivergence("http", httpState, "stdio", stdioState)}`);
       }
+
+      console.log(
+        `  (core tools ${coreTools.length}, gated ${httpGated.length}/${Object.keys(CAPABILITY_GATED_TOOLS).length}, ` +
+          `states http=${httpState.kind} stdio=${stdioState.kind})`
+      );
     } finally {
       await stdioClient.close();
     }
