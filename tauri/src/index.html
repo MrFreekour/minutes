@@ -10392,7 +10392,7 @@
       }
     }
 
-    function renderMeetings(meetings) {
+    function renderMeetings(meetings, owner = 'inventory') {
       if (documentsViewActive) {
         renderDocuments(documentsCache);
         return;
@@ -10408,11 +10408,11 @@
       }
 
       footer.classList.remove('footer-hidden');
-      // renderMeetings also paints search results. Filtered rows are NOT a
-      // usable inventory list: clearing the query while a scan is still running
-      // must be able to replace them, not leave stale matches under an empty
-      // search box.
-      markListOwner(activeSearchQuery ? 'search' : 'inventory');
+      // renderMeetings also paints search results, and the caller knows which
+      // it is. Inferring from activeSearchQuery would mislabel a search response
+      // that lands after the field is cleared, leaving stale matches parked
+      // under an empty search box for the length of a slow scan.
+      markListOwner(owner);
 
       const groups = groupByDate(meetings);
       for (const [label, items] of Object.entries(groups)) {
@@ -10747,17 +10747,22 @@
     }
 
     async function refreshMeetingsForCurrentView() {
+      // Kick the open detail off first: since the inventory wait is no longer
+      // deadline-bounded, awaiting a large corpus scan before this would leave a
+      // visible detail stale for as long as the scan takes.
+      const detailRefresh = refreshOpenMeetingDetail()
+        .catch((e) => console.error('Detail refresh:', e));
       if (documentsViewActive) {
         await loadDocuments();
-        await refreshOpenMeetingDetail();
+        await detailRefresh;
         return;
       }
       if (activeSearchQuery) {
         try {
           const results = await invoke('cmd_search', { query: activeSearchQuery });
           setSearchError(null);
-          renderMeetings(results);
-          await refreshOpenMeetingDetail();
+          renderMeetings(results, 'search');
+          await detailRefresh;
         } catch (e) {
           console.error('Search refresh:', e);
           if (isPrivateProjectionCapacityError(e)) {
@@ -10769,7 +10774,7 @@
         return;
       }
       await loadMeetings();
-      await refreshOpenMeetingDetail();
+      await detailRefresh;
     }
 
     function scheduleMeetingsRefresh(delay = 350) {
@@ -10803,7 +10808,7 @@
           const results = await invoke('cmd_search', { query });
           if (reqId !== searchRequestId) return; // stale response, newer one in flight
           setSearchError(null);
-          renderMeetings(results);
+          renderMeetings(results, 'search');
           await refreshOpenMeetingDetail();
         } catch (e) {
           if (reqId !== searchRequestId) return;
