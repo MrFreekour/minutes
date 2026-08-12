@@ -10486,6 +10486,9 @@
     // Consecutive "scan still running" results, used to back off the retry and
     // to word the pending message. Reset on any completed load.
     let meetingInventoryPendingAttempts = 0;
+    // How long the list may stay blank before we say we are still reading. This
+    // only controls a message; it never abandons the in-flight scan.
+    const INVENTORY_PENDING_NOTICE_MS = 5000;
 
     function fingerprintMeetingInventory(meetings) {
       return JSON.stringify(meetings.map((meeting) => [
@@ -10520,6 +10523,10 @@
       if (meetingInventoryRetryTimer) return;
       meetingInventoryRetryTimer = setTimeout(() => {
         meetingInventoryRetryTimer = null;
+        // The search view owns the list while a query is active; re-rendering
+        // the unfiltered inventory underneath it would contradict the query
+        // still shown in the box. The next clear/refresh reloads anyway.
+        if (activeSearchQuery) return;
         loadMeetings();
       }, delayMs);
     }
@@ -10531,7 +10538,10 @@
     function renderInventoryPendingState(attempts) {
       meetingsScroll.replaceChildren();
       appendProactiveContextCard();
-      footer.classList.add('footer-hidden');
+      // Keep the footer's capture controls (Start Recording, Live, Quick
+      // Thought) reachable: being unable to list past meetings must never take
+      // away the ability to capture a new one.
+      footer.classList.remove('footer-hidden');
       const pending = document.createElement('div');
       pending.className = 'empty-state';
       const slow = attempts >= 4;
@@ -10551,7 +10561,8 @@
     function renderInventoryErrorState() {
       meetingsScroll.replaceChildren();
       appendProactiveContextCard();
-      footer.classList.add('footer-hidden');
+      // Same rule as the pending state: never remove capture controls.
+      footer.classList.remove('footer-hidden');
       const failed = document.createElement('div');
       failed.className = 'empty-state';
       failed.innerHTML = `
@@ -10581,11 +10592,17 @@
       }
       const generation = ++meetingInventoryGeneration;
       let meetings = [];
+      // Surface a "still reading" notice if the scan is slow, but keep awaiting
+      // the real result. Racing a deadline and rejecting would throw away a scan
+      // that the backend deliberately never replays, so a library that always
+      // takes longer than the deadline would rescan forever and never render.
+      const pendingNotice = window.setTimeout(() => {
+        if (generation === meetingInventoryGeneration) {
+          renderInventoryPendingState(meetingInventoryPendingAttempts);
+        }
+      }, INVENTORY_PENDING_NOTICE_MS);
       try {
-        meetings = await withUiDeadline(
-          invoke('cmd_list_meetings', { limit: 30 }),
-          'Meeting inventory'
-        );
+        meetings = await invoke('cmd_list_meetings', { limit: 30 });
         if (generation !== meetingInventoryGeneration) return;
         const nextFingerprint = fingerprintMeetingInventory(meetings);
         if (meetingInventoryFingerprint !== null && meetingInventoryFingerprint !== nextFingerprint) {
@@ -10621,6 +10638,8 @@
         setSearchError(e);
         renderInventoryErrorState();
         return;
+      } finally {
+        window.clearTimeout(pendingNotice);
       }
       meetingInventoryPendingAttempts = 0;
       // The proactive context bundle runs several corpus-wide scans and is only
