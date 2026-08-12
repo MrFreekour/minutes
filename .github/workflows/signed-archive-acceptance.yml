@@ -441,6 +441,9 @@ jobs:
             --app "$app" \
             --version "$version" \
             --output "$dmg"
+          codesign --force --timestamp \
+            --sign "$ARCHIVE_SIGNING_IDENTITY" "$dmg"
+          codesign --verify --strict --verbose=4 "$dmg"
           submit_json="$RUNNER_TEMP/archive-dmg-notary-submit.json"
           xcrun notarytool submit "$dmg" \
             --key "$ARCHIVE_API_KEY_PATH" \
