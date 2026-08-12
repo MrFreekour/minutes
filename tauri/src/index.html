@@ -9316,6 +9316,44 @@
     });
 
     // ── Live transcript controls ──
+    // ── Live start/stop: show the user's INTENT until reality catches up ──
+    //
+    // Both transitions take seconds during which the backend command has
+    // already returned: starting waits on the whisper model load, stopping runs
+    // finalize plus (with promote_on_stop) processing. Reverting the control
+    // when the command returned meant the button contradicted the click, which
+    // reads as "it ignored me". These hold a pending label until the matching
+    // live-transcript event confirms the new state.
+    let liveTransitionButton = null;
+    let liveTransitionLabel = '';
+    let liveTransitionTimer = null;
+
+    function beginLiveTransition(button, label) {
+      endLiveTransition();
+      if (!button) return;
+      liveTransitionButton = button;
+      liveTransitionLabel = button.textContent;
+      button.disabled = true;
+      button.textContent = label;
+      // Safety net: if the confirming event never arrives (a wedged session, a
+      // dropped event) the control must not stay disabled forever. Restoring it
+      // is always safe -- the worst case is the user clicking again.
+      liveTransitionTimer = window.setTimeout(endLiveTransition, 60000);
+    }
+
+    function endLiveTransition() {
+      if (liveTransitionTimer) {
+        window.clearTimeout(liveTransitionTimer);
+        liveTransitionTimer = null;
+      }
+      if (liveTransitionButton) {
+        liveTransitionButton.disabled = false;
+        if (liveTransitionLabel) liveTransitionButton.textContent = liveTransitionLabel;
+        liveTransitionButton = null;
+        liveTransitionLabel = '';
+      }
+    }
+
     document.getElementById('btn-live').addEventListener('click', async () => {
       const btn = document.getElementById('btn-live');
 
@@ -9335,12 +9373,18 @@
         if (notice) notice.classList.remove('active');
       }
 
-      const origText = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = 'Starting...';
+      // Hold the pending label until the session ACTUALLY starts (the
+      // live-transcript:started event), not merely until the command returns.
+      // cmd_start_live_transcript returns as soon as the session is spawned,
+      // but the session needs seconds more to come up (whisper model load), and
+      // reverting the button in between made a successful click look like it
+      // had been ignored -- users reported clicking Live and watching it
+      // "unclick itself" repeatedly.
+      beginLiveTransition(btn, 'Starting...');
       try {
         await invoke('cmd_start_live_transcript');
       } catch (e) {
+        endLiveTransition();
         console.error('Live:', e);
         // Show visible error using the output-notice pattern
         const noticeIcon = document.getElementById('output-notice-icon');
@@ -9351,16 +9395,18 @@
         if (noticeTitle) noticeTitle.textContent = 'Live transcript failed';
         if (noticeDetail) noticeDetail.textContent = String(e);
         if (notice) notice.classList.add('active');
-      } finally {
-        btn.disabled = false;
-        btn.textContent = origText;
       }
     });
 
-    document.getElementById('btn-stop-live').addEventListener('click', async () => {
+    document.getElementById('btn-stop-live').addEventListener('click', async (event) => {
+      // Same rule in reverse: stopping runs the session's finalize and (with
+      // promote_on_stop) its processing, so the control sat unchanged for 10-15
+      // seconds looking like the click had not registered.
+      beginLiveTransition(event.currentTarget, 'Stopping...');
       try {
         await invoke('cmd_stop_live_transcript');
       } catch (e) {
+        endLiveTransition();
         console.error('Stop live:', e);
       }
     });
@@ -15016,6 +15062,7 @@
 
     // ── Listen for live transcript events (T6: immediate UI feedback) ──
     currentWindow.listen('live-transcript:started', () => {
+      endLiveTransition();
       isLiveTranscript = true;
       liveBar.classList.add('active');
       setFooterCaptureMode(true, 'live');
@@ -15026,6 +15073,7 @@
     });
 
     currentWindow.listen('live-transcript:stopped', (event) => {
+      endLiveTransition();
       isLiveTranscript = false;
       liveBar.classList.remove('active');
       setFooterCaptureMode(false);
@@ -15037,6 +15085,7 @@
     });
 
     currentWindow.listen('live-transcript:error', (event) => {
+      endLiveTransition();
       isLiveTranscript = false;
       liveBar.classList.remove('active');
       setFooterCaptureMode(false);
