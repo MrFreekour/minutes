@@ -10540,6 +10540,25 @@
           scheduleMeetingInventoryRetry();
           return;
         }
+        if (options.patient !== true && !inventoryPatientRetryActive) {
+          // First failure of an automatic load. The scan itself is fast (~2s on
+          // an 825-file library); what pushes it past the five-second deadline
+          // is contention with the rest of app startup. Nothing else
+          // re-triggers this, so without an automatic second attempt the user is
+          // stranded on the error state until an unrelated event happens to fire
+          // -- which is how a transient startup hiccup ends up looking like lost
+          // data. Show the honest state, then quietly try once more, patiently.
+          // Exactly one auto-attempt: the patient path awaits the real result,
+          // so if it fails too, something is genuinely wrong and retrying in a
+          // loop would only burn the corpus repeatedly.
+          //
+          // Nothing scary is shown yet: flashing "Couldn't read your meetings"
+          // for the two seconds before the retry lands would be alarming about
+          // something we are already fixing. If the retry also fails it renders
+          // the error state itself, which is when saying so is earned.
+          retryInventoryPatiently(null);
+          return;
+        }
         if (inventoryPatientRetryActive && options.patient !== true) {
           // A user-initiated retry owns the worker; this automatic refresh just
           // bumped into it. Leave the retry's "Reading…" state alone rather than
