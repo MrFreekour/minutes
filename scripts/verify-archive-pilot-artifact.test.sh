@@ -34,6 +34,12 @@ printf '%s\n' \
 
 printf '%s\n' \
   '#!/bin/bash' \
+  'target="${!#}"' \
+  'if [[ "$1" == "-dv" && "$target" == *.dmg ]]; then' \
+  '  printf "Authority=Developer ID Application: Test (63TMLKT8HN)\n" >&2' \
+  '  printf "TeamIdentifier=%s\n" "${ARCHIVE_TEST_DMG_TEAM_ID:-63TMLKT8HN}" >&2' \
+  '  exit 0' \
+  'fi' \
   "if [[ \"\$1\" == \"-dv\" ]]; then" \
   '  printf "Identifier=com.useminutes.archive\n" >&2' \
   '  printf "Authority=Developer ID Application: Test (63TMLKT8HN)\n" >&2' \
@@ -176,6 +182,17 @@ expect_failure "unexpected draft release asset" \
 make_draft_release
 printf 'changed\n' >>"$ARTIFACT_DIR/Minutes.Archive_0.2.0_aarch64.app.tar.gz"
 expect_failure "changed updater bytes" \
+  env PATH="$MOCK_BIN:$PATH" ARCHIVE_TEST_MOUNT_ROOT="$MOUNT_ROOT" \
+  "$VERIFIER" "$ARTIFACT_DIR"
+
+make_draft_release
+expect_failure "wrong DMG code-signing team" \
+  env PATH="$MOCK_BIN:$PATH" ARCHIVE_TEST_MOUNT_ROOT="$MOUNT_ROOT" \
+  ARCHIVE_TEST_DMG_TEAM_ID=WRONGTEAM "$VERIFIER" "$ARTIFACT_DIR"
+
+make_draft_release
+mkdir -p "$MOUNT_ROOT/Unexpected Installer.app"
+expect_failure "unexpected visible DMG payload" \
   env PATH="$MOCK_BIN:$PATH" ARCHIVE_TEST_MOUNT_ROOT="$MOUNT_ROOT" \
   "$VERIFIER" "$ARTIFACT_DIR"
 

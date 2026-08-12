@@ -220,6 +220,12 @@ PY
 
   DMG_PATH="$ARTIFACT_DIR/$DMG_NAME"
   codesign --verify --strict --verbose=4 "$DMG_PATH"
+  dmg_identity="$(codesign -dv --verbose=4 "$DMG_PATH" 2>&1)"
+  dmg_team_id="$(awk -F= '/^TeamIdentifier=/{print $2}' <<<"$dmg_identity")"
+  [[ "$dmg_team_id" == "$EXPECTED_TEAM_ID" ]] ||
+    fail "DMG code signature Team ID does not match"
+  grep -Fq "Authority=Developer ID Application:" <<<"$dmg_identity" ||
+    fail "DMG is not signed with a Developer ID Application identity"
   xcrun stapler validate "$DMG_PATH"
   spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
   attach_output="$(hdiutil attach -readonly -nobrowse "$DMG_PATH")" || fail "could not mount DMG read-only"
@@ -227,6 +233,10 @@ PY
   [[ -n "$MOUNT_POINT" && -d "$MOUNT_POINT/Minutes Archive.app" ]] || fail "DMG does not contain Minutes Archive.app"
   [[ -L "$MOUNT_POINT/Applications" && "$(readlink "$MOUNT_POINT/Applications")" == "/Applications" ]] ||
     fail "DMG does not contain the expected Applications link"
+  visible_mount_entries="$VERIFY_ROOT/visible-mount-entries.txt"
+  find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 ! -name '.*' -exec basename {} \; | sort >"$visible_mount_entries"
+  diff -u <(printf '%s\n' Applications 'Minutes Archive.app') "$visible_mount_entries" >/dev/null ||
+    fail "DMG contains an unexpected visible root payload"
   ditto "$MOUNT_POINT/Minutes Archive.app" "$VERIFY_ROOT/dmg/Minutes Archive.app"
   hdiutil detach "$MOUNT_POINT" -quiet
   MOUNT_POINT=""
