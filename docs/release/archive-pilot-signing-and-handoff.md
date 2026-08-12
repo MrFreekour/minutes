@@ -124,11 +124,13 @@ public and does not touch `archive-stable`. The tag must point to the exact
 current `main` commit; the workflow resolves that SHA itself and checks out
 release tooling by SHA rather than implicitly trusting the tag checkout.
 
-Download that draft with `gh release download`, run the artifact verifier, and
-complete the independent Finder/security review against its exact DMG. Record
-the SHA-256 of `archive-release-SHA256SUMS.txt` from the reviewed draft. Any
-rerun or asset replacement invalidates that recorded value and requires a new
-artifact review.
+Download that draft with `gh release download` into an otherwise empty
+directory, run the artifact verifier on those exact six release assets, and
+complete the independent Finder/security review against its exact DMG. The
+verifier accepts this draft-release shape without the two legacy ZIP files that
+exist only in the complete Actions artifact. Record the SHA-256 of
+`archive-release-SHA256SUMS.txt` from the reviewed draft. Any rerun or asset
+replacement invalidates that recorded value and requires a new artifact review.
 
 Only after the independent decision is `ACCEPT` may the owner dispatch:
 

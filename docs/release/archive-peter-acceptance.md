@@ -9,9 +9,11 @@ review before this run.
 
 The release operator records the exact candidate commit and verifies the
 downloaded notarized artifact with
-`scripts/verify-archive-pilot-artifact.sh`. An independent reviewer approves the
-security packet in `docs/security/archive-pilot-independent-review.md`. The
-operator then performs the complete installed-app interaction once with
+`scripts/verify-archive-pilot-artifact.sh`. The verifier accepts either the
+complete protected-run artifact or the exact six-file private draft release;
+the latter is the promotion decision object. An independent reviewer approves
+the security packet in `docs/security/archive-pilot-independent-review.md`.
+The operator then performs the complete installed-app interaction once with
 normal connectivity under network observation. Do not disable the Mac's Wi-Fi
 or alter system-wide connectivity for this test. The expected result is one
 update check at launch, to the configured GitHub endpoint and any GitHub
