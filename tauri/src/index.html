@@ -5377,7 +5377,7 @@
       <div class="live-level">
         <div class="live-level-fill" id="live-level-fill"></div>
       </div>
-      <div class="live-utterances" id="live-utterances">0 utterances</div>
+      <div class="live-utterances" id="live-utterances">Listening…</div>
       <div class="live-actions">
         <button class="btn btn-secondary btn-sm coach-toggle" id="btn-coach-live" type="button" aria-pressed="false">Coach</button>
         <button class="btn btn-secondary btn-sm" id="btn-stop-live">Stop Live</button>
@@ -7957,7 +7957,16 @@
               const min = Math.floor(d / 60);
               const sec = d % 60;
               document.getElementById('live-time').textContent = `${min}:${String(sec).padStart(2, '0')}`;
-              document.getElementById('live-utterances').textContent = `${n} utterance${n !== 1 ? 's' : ''}`;
+              // Say what is happening, not what the pipeline calls it. An
+              // "utterance" is a VAD-bounded chunk finalized on a pause, so this
+              // is legitimately 0 while someone is still talking -- but "0
+              // utterances" beside a moving level meter reads as "this is
+              // broken", and the term means nothing to the person using it. A
+              // user reported exactly that: "it says zero utterances even though
+              // the green bar is moving" / "that goes over my head".
+              document.getElementById('live-utterances').textContent = n === 0
+                ? 'Listening…'
+                : `${n} line${n !== 1 ? 's' : ''} captured`;
               const lvl = Math.min(100, liveStatus.audioLevel || 0);
               document.getElementById('live-level-fill').style.width = lvl + '%';
               if (!wasLive) startFastPoll();
@@ -10611,7 +10620,7 @@
       }, 250);
     }
 
-    async function loadMeetings() {
+    async function loadMeetings(options = {}) {
       if (documentsViewActive) {
         await loadDocuments();
         return;
@@ -10619,10 +10628,12 @@
       const generation = ++meetingInventoryGeneration;
       let meetings = [];
       try {
-        meetings = await withUiDeadline(
-          invoke('cmd_list_meetings', { limit: 30 }),
-          'Meeting inventory'
-        );
+        meetings = options.patient === true
+          ? await invokeInventoryPatiently(120000)
+          : await withUiDeadline(
+              invoke('cmd_list_meetings', { limit: 30 }),
+              'Meeting inventory'
+            );
         if (generation !== meetingInventoryGeneration) return;
         const nextFingerprint = fingerprintMeetingInventory(meetings);
         if (meetingInventoryFingerprint !== null && meetingInventoryFingerprint !== nextFingerprint) {
@@ -10641,8 +10652,36 @@
           scheduleMeetingInventoryRetry();
           return;
         }
+        if (options.patient !== true && !inventoryPatientRetryActive) {
+          // First failure of an automatic load. The scan itself is fast (~2s on
+          // an 825-file library); what pushes it past the five-second deadline
+          // is contention with the rest of app startup. Nothing else
+          // re-triggers this, so without an automatic second attempt the user is
+          // stranded on the error state until an unrelated event happens to fire
+          // -- which is how a transient startup hiccup ends up looking like lost
+          // data. Show the honest state, then quietly try once more, patiently.
+          // Exactly one auto-attempt: the patient path awaits the real result,
+          // so if it fails too, something is genuinely wrong and retrying in a
+          // loop would only burn the corpus repeatedly.
+          //
+          // Nothing scary is shown yet: flashing "Couldn't read your meetings"
+          // for the two seconds before the retry lands would be alarming about
+          // something we are already fixing. If the retry also fails it renders
+          // the error state itself, which is when saying so is earned.
+          retryInventoryPatiently(null);
+          return;
+        }
+        if (inventoryPatientRetryActive && options.patient !== true) {
+          // A user-initiated retry owns the worker; this automatic refresh just
+          // bumped into it. Leave the retry's "Reading…" state alone rather than
+          // replacing it with a competing Try again button.
+          return;
+        }
         setSearchError(e);
-        renderMeetings([]);
+        // NOT renderMeetings([]) — an empty array means "this user has no
+        // meetings" and renders the first-run card. A failed read tells us
+        // nothing about what is on disk, so it must not make that claim.
+        renderInventoryUnavailableState();
         return;
       }
       // The proactive context bundle runs several corpus-wide scans and is only
@@ -10858,6 +10897,85 @@
           setFooterCaptureMode(false);
         }
       });
+    }
+
+    // Shown when the meeting list could not be read. Deliberately NOT the
+    // first-run setup card: telling someone with hundreds of meetings that they
+    // are a brand new user reads as data loss, and the bigger the library the
+    // more likely the read is to time out. Capture controls stay reachable,
+    // because failing to LIST past meetings must never remove the ability to
+    // CAPTURE a new one.
+    function renderInventoryUnavailableState() {
+      if (documentsViewActive) return;
+      meetingsScroll.replaceChildren();
+      appendProactiveContextCard();
+      footer.classList.remove('footer-hidden');
+      const failed = document.createElement('div');
+      failed.className = 'empty-state';
+      failed.innerHTML = `
+        <div class="onboarding-content">
+          <h2>Couldn't read your meetings</h2>
+          <p class="onboarding-sub">Your notes on disk are untouched — this was a problem reading the list. A large library can take longer than the check allows.</p>
+          <div class="onboarding-actions">
+            <button class="btn btn-primary btn-sm" id="inventory-retry-btn">Try again</button>
+          </div>
+        </div>`;
+      meetingsScroll.appendChild(failed);
+      const retry = failed.querySelector('#inventory-retry-btn');
+      if (retry) retry.addEventListener('click', () => retryInventoryPatiently(retry));
+    }
+
+    // True while a user-initiated patient retry owns the backend worker, so an
+    // automatic refresh that merely bumps into it does not present that as a
+    // fresh failure and offer a competing button.
+    let inventoryPatientRetryActive = false;
+
+    // An explicit Try again must be able to succeed where the automatic load
+    // could not. loadMeetings() bounds its wait at five seconds so first paint
+    // stays quick, but that is the very deadline a large library trips, and the
+    // abandoned scan is never replayed by the backend -- so calling it again
+    // unchanged would time out identically and the button would be decorative
+    // for exactly the people who see it.
+    //
+    // So the retry runs THROUGH loadMeetings (inheriting its generation check,
+    // fingerprint comparison, proactive-context invalidation and Documents
+    // guard) and only swaps in a patient wait.
+    async function retryInventoryPatiently(button) {
+      const originalLabel = button ? button.textContent : '';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Reading…';
+      }
+      inventoryPatientRetryActive = true;
+      setSearchError(null);
+      try {
+        await loadMeetings({ patient: true });
+      } finally {
+        inventoryPatientRetryActive = false;
+        if (button && button.isConnected) {
+          button.disabled = false;
+          button.textContent = originalLabel;
+        }
+      }
+    }
+
+    // Await the real scan rather than racing a deadline, tolerating the
+    // backend's single-flight "still checking" answer while a previous scan
+    // finishes. The budget bounds how long we keep RETRYING; one already-running
+    // scan can still exceed it, because the backend worker cannot be cancelled
+    // and abandoning it would only waste the work.
+    async function invokeInventoryPatiently(budgetMs) {
+      const deadline = Date.now() + budgetMs;
+      while (true) {
+        try {
+          return await invoke('cmd_list_meetings', { limit: 30 });
+        } catch (e) {
+          const busy = String((e && e.message) || e || '').toLowerCase()
+            .includes('still checking');
+          if (!busy || Date.now() >= deadline) throw e;
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        }
+      }
     }
 
     function renderSetupEmptyState() {
