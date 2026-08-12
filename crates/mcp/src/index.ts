@@ -105,6 +105,12 @@ import {
   type StableCorpusSnapshot,
 } from "./corpus-lease.js";
 import {
+  DEFAULT_HTTP_HOST,
+  DEFAULT_HTTP_PORT,
+  DEFAULT_MAX_SESSIONS,
+  startMinutesHttpServer,
+} from "./httpTransport.js";
+import {
   boundReadFingerprint,
   captureBoundReadExpectation,
   readTextFileFromBoundParent,
@@ -9041,10 +9047,190 @@ registerTool(
   }
 );
 
+// ── Transport selection ─────────────────────────────────────
+// stdio stays the default so every existing client config keeps working
+// untouched. `--transport http` is opt-in and documented as localhost-only.
+
+export type MinutesTransportConfig = {
+  transport: "stdio" | "http";
+  host: string;
+  port: number;
+  maxSessions: number;
+  help: boolean;
+};
+
+function parsePositiveInt(raw: string, flag: string, max: number): number {
+  if (!/^\d+$/.test(raw.trim())) {
+    throw new Error(`${flag} expects a number, got "${raw}"`);
+  }
+  const value = Number(raw.trim());
+  if (value > max) {
+    throw new Error(`${flag} must be <= ${max}, got ${value}`);
+  }
+  return value;
+}
+
+/**
+ * Parse transport flags. Unknown arguments are ignored rather than rejected —
+ * hosts append their own (`--demo` is handled at module load), and a strict
+ * parser here would turn a harmless extra argument into a startup failure.
+ */
+export function parseTransportConfig(
+  argv: string[],
+  env: NodeJS.ProcessEnv = process.env
+): MinutesTransportConfig {
+  const config: MinutesTransportConfig = {
+    transport: "stdio",
+    host: DEFAULT_HTTP_HOST,
+    port: DEFAULT_HTTP_PORT,
+    maxSessions: DEFAULT_MAX_SESSIONS,
+    help: false,
+  };
+
+  const envTransport = env.MINUTES_MCP_TRANSPORT?.trim().toLowerCase();
+  if (envTransport) {
+    if (envTransport !== "stdio" && envTransport !== "http") {
+      throw new Error(
+        `MINUTES_MCP_TRANSPORT must be "stdio" or "http", got "${envTransport}"`
+      );
+    }
+    config.transport = envTransport;
+  }
+  if (env.MINUTES_MCP_HOST?.trim()) {
+    config.host = env.MINUTES_MCP_HOST.trim();
+  }
+  if (env.MINUTES_MCP_PORT?.trim()) {
+    config.port = parsePositiveInt(
+      env.MINUTES_MCP_PORT,
+      "MINUTES_MCP_PORT",
+      65535
+    );
+  }
+  if (env.MINUTES_MCP_MAX_SESSIONS?.trim()) {
+    config.maxSessions = parsePositiveInt(
+      env.MINUTES_MCP_MAX_SESSIONS,
+      "MINUTES_MCP_MAX_SESSIONS",
+      1024
+    );
+  }
+
+  // Accepts both `--flag value` and `--flag=value`.
+  const valueOf = (index: number, flag: string, inline: string | null): string => {
+    if (inline !== null) return inline;
+    const next = argv[index + 1];
+    if (next === undefined || next.startsWith("--")) {
+      throw new Error(`${flag} requires a value`);
+    }
+    return next;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg.startsWith("--")) continue;
+    const eq = arg.indexOf("=");
+    const flag = eq === -1 ? arg : arg.slice(0, eq);
+    const inline = eq === -1 ? null : arg.slice(eq + 1);
+
+    switch (flag) {
+      case "--help":
+        config.help = true;
+        break;
+      case "--transport": {
+        const value = valueOf(i, flag, inline).trim().toLowerCase();
+        if (value !== "stdio" && value !== "http") {
+          throw new Error(
+            `--transport must be "stdio" or "http", got "${value}"`
+          );
+        }
+        config.transport = value;
+        if (inline === null) i++;
+        break;
+      }
+      case "--host":
+        config.host = valueOf(i, flag, inline).trim();
+        if (inline === null) i++;
+        break;
+      case "--port":
+        config.port = parsePositiveInt(valueOf(i, flag, inline), flag, 65535);
+        if (inline === null) i++;
+        break;
+      case "--max-sessions":
+        config.maxSessions = parsePositiveInt(
+          valueOf(i, flag, inline),
+          flag,
+          1024
+        );
+        if (inline === null) i++;
+        break;
+      default:
+        // Unknown flag — leave it to whoever passed it.
+        break;
+    }
+  }
+
+  return config;
+}
+
+function printUsage(): void {
+  console.log(
+    [
+      "minutes-mcp — MCP server for Minutes (conversation memory for AI assistants)",
+      "",
+      "Usage: minutes-mcp [options]",
+      "",
+      "Options:",
+      "  --transport <stdio|http>  Transport to serve on (default: stdio)",
+      `  --host <address>          HTTP bind address (default: ${DEFAULT_HTTP_HOST})`,
+      `  --port <number>           HTTP port, 0 for an OS-assigned port (default: ${DEFAULT_HTTP_PORT})`,
+      `  --max-sessions <number>   Concurrent HTTP sessions (default: ${DEFAULT_MAX_SESSIONS})`,
+      "  --demo                    Install the bundled demo corpus and exit",
+      "  --help                    Show this message",
+      "",
+      "Environment: MINUTES_MCP_TRANSPORT, MINUTES_MCP_HOST, MINUTES_MCP_PORT,",
+      "             MINUTES_MCP_MAX_SESSIONS",
+      "",
+      "HTTP mode serves Streamable HTTP at /mcp and has no authentication. It",
+      "binds 127.0.0.1 so only this machine can reach it — do not bind a public",
+      "address or forward the port.",
+    ].join("\n")
+  );
+}
+
 // ── Start server ────────────────────────────────────────────
 
 async function main() {
   crashTrace("main-start");
+  const config = parseTransportConfig(process.argv.slice(2));
+
+  if (config.help) {
+    printUsage();
+    return;
+  }
+
+  if (config.transport === "http") {
+    crashTrace("main-transport-http", { host: config.host, port: config.port });
+    await afterRequiredCli(async () => {
+      crashTrace("required-cli-ready");
+      const httpServer = await startMinutesHttpServer({
+        host: config.host,
+        port: config.port,
+        maxSessions: config.maxSessions,
+        createServer: createMinutesServer,
+      });
+      crashTrace("transport-connected");
+      console.error(`Minutes MCP server listening on ${httpServer.url}`);
+      console.error(
+        "[Minutes] HTTP transport is unauthenticated — keep it bound to localhost"
+      );
+      const shutdown = () => {
+        void httpServer.close().finally(() => process.exit(0));
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+    });
+    return;
+  }
+
   await afterRequiredCli(async () => {
     crashTrace("required-cli-ready");
     const transport = new StdioServerTransport();
