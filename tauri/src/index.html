@@ -10783,7 +10783,55 @@
         </div>`;
       meetingsScroll.appendChild(failed);
       const retry = failed.querySelector('#inventory-retry-btn');
-      if (retry) retry.addEventListener('click', () => { setSearchError(null); loadMeetings(); });
+      if (retry) retry.addEventListener('click', () => retryInventoryPatiently(retry));
+    }
+
+    // An explicit Try again must be able to succeed where the automatic load
+    // could not. loadMeetings() bounds its wait at five seconds so first paint
+    // is quick, but that is the very deadline a large library trips, and the
+    // abandoned scan is never replayed by the backend -- so simply calling
+    // loadMeetings() again would time out identically and the button would be
+    // decorative for exactly the people who see it.
+    //
+    // This path therefore awaits the real result instead of racing a deadline,
+    // and tolerates the backend's single-flight "busy" answer while a previous
+    // scan is still finishing, up to an overall budget. It is user-initiated and
+    // shows progress on the button, so a long wait is honest rather than a hang.
+    async function retryInventoryPatiently(button) {
+      const budgetMs = 120000;
+      const deadline = Date.now() + budgetMs;
+      const originalLabel = button ? button.textContent : '';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Reading…';
+      }
+      setSearchError(null);
+      try {
+        while (true) {
+          try {
+            const meetings = await invoke('cmd_list_meetings', { limit: 30 });
+            setSearchError(null);
+            renderMeetings(meetings);
+            return;
+          } catch (e) {
+            const busy = String((e && e.message) || e || '').toLowerCase()
+              .includes('still checking');
+            if (!busy || Date.now() >= deadline) throw e;
+            // A previous scan still owns the worker; wait for it rather than
+            // starting a competing one.
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+          }
+        }
+      } catch (e) {
+        console.error('Inventory retry:', e);
+        setSearchError(e);
+        renderInventoryUnavailableState();
+      } finally {
+        if (button && button.isConnected) {
+          button.disabled = false;
+          button.textContent = originalLabel;
+        }
+      }
     }
 
     function renderSetupEmptyState() {
