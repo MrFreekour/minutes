@@ -6968,6 +6968,15 @@
     const recoveryBulkErrors = document.getElementById('recovery-bulk-errors');
     const recordButton = document.getElementById('btn-record');
     const liveButton = document.getElementById('btn-live');
+
+    // Live start/stop transition state. Declared here, beside the button it
+    // guards and ABOVE setFooterCaptureMode, because that function consults it
+    // and the status poll can call it during startup -- a `let` read before its
+    // declaration executes is a temporal-dead-zone crash, not a false.
+    let liveTransitionButton = null;
+    let liveTransitionLabel = '';
+    let liveTransitionTarget = null;
+    let liveTransitionTimer = null;
     const quickThoughtButton = document.getElementById('btn-quick-thought');
     const coachButtons = [
       document.getElementById('btn-coach-recording'),
@@ -8115,7 +8124,13 @@
       setClassActive(footer, 'capture-mode', active);
 
       setDisabled(recordButton, active);
-      setDisabled(liveButton, active);
+      // A live transition owns this button until it settles. The idle poll runs
+      // every two seconds and would otherwise re-enable it mid-transition --
+      // including during the first-use explainer's three-second wait, before the
+      // backend has even been called. A second click there starts the session,
+      // and then the original handler starts it again and reports a spurious
+      // "Live transcript failed".
+      setDisabled(liveButton, active || liveTransitionButton === liveButton);
       setDisabled(quickThoughtButton, active);
 
       if (active) {
@@ -9325,10 +9340,6 @@
     // when the command returned meant the button contradicted the click, which
     // reads as "it ignored me". These hold a pending label until the matching
     // live-transcript event confirms the new state.
-    let liveTransitionButton = null;
-    let liveTransitionLabel = '';
-    let liveTransitionTarget = null;
-    let liveTransitionTimer = null;
 
     function beginLiveTransition(button, label, rescueMs, targetActive, canonicalLabel) {
       endLiveTransition();
