@@ -9364,7 +9364,22 @@
       // process includes the meeting pipeline and can legitimately run for
       // minutes; a short rescue there would revert "Stopping..." mid-run and
       // recreate the very "did my click register?" state this fixes.
-      liveTransitionTimer = window.setTimeout(endLiveTransition, rescueMs);
+      liveTransitionTimer = window.setTimeout(function rescue() {
+        // Never contradict observed state. A stop legitimately runs long -- the
+        // stop path completes the whole meeting pipeline before emitting
+        // :stopped, and transcription alone is allowed up to an hour -- so while
+        // the session is still active, "Stopping..." is simply true and
+        // releasing here would recreate the misleading state (and re-enable a
+        // duplicate stop). Keep waiting; the two-second poll reconciles the
+        // moment the session actually ends. The rescue only fires for real when
+        // observation agrees the work is over, which also frees a start whose
+        // session never came up so the user can try again.
+        if (liveTransitionTarget === false && isLiveTranscript) {
+          liveTransitionTimer = window.setTimeout(rescue, 60000);
+          return;
+        }
+        endLiveTransition();
+      }, rescueMs);
     }
 
     function endLiveTransition() {
