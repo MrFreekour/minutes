@@ -736,14 +736,16 @@ function registerTool(
   annotations: Record<string, unknown>,
   handler: (...args: any[]) => any
 ) {
-  return registerToolWithRestrictedPolicy(
-    server,
-    name,
-    description,
-    inputSchema,
-    annotations,
-    handler
-  );
+  forEachServer((target) => {
+    registerToolWithRestrictedPolicy(
+      target,
+      name,
+      description,
+      inputSchema,
+      annotations,
+      handler
+    );
+  });
 }
 
 export function registerDocsAppToolWithRestrictedPolicy(
@@ -767,17 +769,13 @@ export function registerDocsAppToolWithRestrictedPolicy(
 }
 
 function registerDocsAppTool(
-  serverArg: McpServer,
   name: string,
   config: Record<string, unknown>,
   handler: (...args: any[]) => any
 ) {
-  return registerDocsAppToolWithRestrictedPolicy(
-    serverArg,
-    name,
-    config,
-    handler
-  );
+  forEachServer((target) => {
+    registerDocsAppToolWithRestrictedPolicy(target, name, config, handler);
+  });
 }
 
 const execFileAsync = promisify(execFile);
@@ -4289,12 +4287,115 @@ const server = new McpServer({
 });
 crashTrace("post-mcp-server-construct");
 
+// ── Server instance registry ────────────────────────────────
+// Every registration below is recorded as a builder so an identical surface can
+// be materialized on a second McpServer. stdio keeps using the singleton above.
+// HTTP needs one McpServer per session: `Protocol.connect()` throws on a second
+// transport, and StreamableHTTPServerTransport refuses to be shared. Handlers
+// close over module state, so instances share the CLI bridge and caches — only
+// protocol state is per-instance.
+
+/** A recorded registration. May return a teardown for per-instance state. */
+type ServerBuilder = (target: McpServer) => (() => void) | void;
+
+const SERVER_BUILDERS: ServerBuilder[] = [];
+
+/** Record a registration and apply it to the singleton immediately. */
+function forEachServer(build: ServerBuilder): void {
+  SERVER_BUILDERS.push(build);
+  build(server);
+}
+
+/**
+ * Recorded equivalent of `server.resource(...)`. Typed as the McpServer method
+ * so call sites keep their contextual handler types; the return value is not
+ * usable (a registration now spans every instance) and no call site reads it.
+ */
+const registerResource = ((...args: any[]) => {
+  forEachServer((target) => {
+    (target as any).resource(...args);
+  });
+}) as unknown as McpServer["resource"];
+
+/** Recorded equivalent of `registerAppResource(server, ...)`. */
+function registerAppResourceOnEveryServer(...args: any[]): void {
+  forEachServer((target) => {
+    (registerAppResource as any)(target, ...args);
+  });
+}
+
+export type ServerSurface = {
+  tools: string[];
+  resources: string[];
+  resourceTemplates: string[];
+};
+
+/**
+ * Everything registered on an McpServer, read from the SDK's registries. Lets
+ * a factory-built instance be compared against the stdio singleton without
+ * standing up a transport.
+ */
+export function describeServerSurface(target: McpServer): ServerSurface {
+  const internals = target as any;
+  return {
+    tools: Object.keys(internals._registeredTools ?? {}).sort(),
+    resources: Object.keys(internals._registeredResources ?? {}).sort(),
+    resourceTemplates: Object.keys(
+      internals._registeredResourceTemplates ?? {}
+    ).sort(),
+  };
+}
+
+/** The surface the stdio transport serves — the backward-compatibility baseline. */
+export function describeStdioServerSurface(): ServerSurface {
+  return describeServerSurface(server);
+}
+
+export type MinutesServerInstance = {
+  server: McpServer;
+  /** Stop per-instance background work (live-resource pollers). */
+  dispose: () => void;
+};
+
+/**
+ * Build a fresh McpServer exposing the same tools, resources, and request
+ * handlers as the stdio singleton, by replaying every recorded registration in
+ * declaration order. Used by the HTTP transport, one instance per session.
+ */
+export function createMinutesServer(): MinutesServerInstance {
+  const instance = new McpServer({
+    name: "minutes",
+    version: MCP_SERVER_VERSION,
+  });
+  const teardowns: Array<() => void> = [];
+  for (const build of SERVER_BUILDERS) {
+    const teardown = build(instance);
+    if (typeof teardown === "function") {
+      teardowns.push(teardown);
+    }
+  }
+  return {
+    server: instance,
+    dispose: () => {
+      for (const teardown of teardowns) {
+        try {
+          teardown();
+        } catch {
+          // Teardown is best-effort; a failed poller stop must not block close.
+        }
+      }
+    },
+  };
+}
+
 // Declare MCP Apps extension support so hosts classify this server as interactive.
 // The `extensions` field is part of the draft MCP spec (SEP-1724) — not yet in the
 // stable SDK types, so we cast through `any`.
-(server.server as any).registerCapabilities({
-  extensions: { [EXTENSION_ID]: {} },
-} as any);
+forEachServer((target) => {
+  (target.server as any).registerCapabilities({
+    extensions: { [EXTENSION_ID]: {} },
+  } as any);
+});
 
 // Configurable directories — override via env vars in Claude Desktop extension settings
 const MINUTES_HOME = canonicalizeRoot(
@@ -4374,8 +4475,7 @@ async function getEffectiveMeetingsDirForIsolatedAudio(
 
 // ── UI Resource: MCP App dashboard ──────────────────────────
 
-registerAppResource(
-  server,
+registerAppResourceOnEveryServer(
   "Minutes Dashboard",
   UI_RESOURCE_URI,
   { description: "Interactive meeting dashboard and detail viewer" },
@@ -4789,7 +4889,6 @@ registerTool(
 // ── Tool: list_meetings ─────────────────────────────────────
 
 registerDocsAppTool(
-  server,
   "list_meetings",
   {
     description: "List recent meetings and voice memos. Restricted meetings are excluded. An override requires both an operator launch grant and include_restricted=true, and is durably audited.",
@@ -4855,7 +4954,6 @@ registerDocsAppTool(
 // ── Tool: search_meetings ───────────────────────────────────
 
 registerDocsAppTool(
-  server,
   "search_meetings",
   {
     description: "Search meeting transcripts and voice memos. Restricted meetings are excluded. An override requires both an operator launch grant and include_restricted=true, and is durably audited.",
@@ -4973,7 +5071,6 @@ registerDocsAppTool(
 
 if (hasFeature(CLI_CAPABILITIES, "activity_summary"))
 registerDocsAppTool(
-  server,
   "activity_summary",
   {
     description: "Summarize meeting-adjacent desktop context bound to one exact normal meeting source.",
@@ -5040,7 +5137,6 @@ registerDocsAppTool(
 
 if (hasFeature(CLI_CAPABILITIES, "search_context"))
 registerDocsAppTool(
-  server,
   "search_context",
   {
     description: "Search desktop-context events bound to one exact normal meeting source.",
@@ -5107,7 +5203,6 @@ registerDocsAppTool(
 
 if (hasFeature(CLI_CAPABILITIES, "get_moment"))
 registerDocsAppTool(
-  server,
   "get_moment",
   {
     description: "Show the local rewind bound to one exact normal meeting source.",
@@ -5227,7 +5322,6 @@ export async function readVerifiedScreenImage(
 
 if (hasFeature(CLI_CAPABILITIES, "screen_context"))
 registerDocsAppTool(
-  server,
   "get_screen_context",
   {
     description: "Retrieve up to three verified PNG screenshots bound to one exact normal meeting source, optionally nearest a timestamp.",
@@ -5341,7 +5435,6 @@ registerDocsAppTool(
 // ── Tool: consistency_report ───────────────────────────────
 
 registerDocsAppTool(
-  server,
   "consistency_report",
   {
     description: "Flag conflicting decisions and stale commitments across meetings using structured intent data. Meetings designated `sensitivity: restricted` are always excluded from this report.",
@@ -5420,7 +5513,6 @@ registerDocsAppTool(
 // ── Tool: get_person_profile ───────────────────────────────
 
 registerDocsAppTool(
-  server,
   "get_person_profile",
   {
     description: "Get a relationship profile derived from live, policy-authorized meeting snapshots within the supported corpus bounds. Restricted meetings are excluded unless an operator launch grant plus include_restricted=true is durably audited.",
@@ -5579,7 +5671,6 @@ export function restrictedMeetingStubResult(meeting: PolicyVerifiedMeeting) {
 }
 
 registerDocsAppTool(
-  server,
   "get_meeting",
   {
     description: "Get a full meeting transcript with speaker overlays. A restricted meeting returns a stub. Full access requires an operator launch grant plus include_restricted=true and is durably audited.",
@@ -6705,7 +6796,6 @@ export function relationshipMapStructuredContent<T>(people: readonly T[]) {
 }
 
 registerDocsAppTool(
-  server,
   "track_commitments",
   {
     description: "List open and stale action items and explicit intent commitments from live meeting frontmatter. Optionally filter by person. Answers: 'What did I promise Sarah?' or 'What's overdue?' Meetings designated `sensitivity: restricted` never enter this live-source view.",
@@ -6813,7 +6903,6 @@ registerDocsAppTool(
 // ── Tool: relationship_map ──────────────────────────────────
 
 registerDocsAppTool(
-  server,
   "relationship_map",
   {
     description: "Show contacts with relationship scores, meeting frequency, and losing-touch alerts from the bounded process-private graph projection. Restricted meetings never enter the projection.",
@@ -6934,7 +7023,7 @@ registerDocsAppTool(
 
 // ── Resources ───────────────────────────────────────────────
 
-server.resource(
+registerResource(
   "recent_meetings",
   "minutes://meetings/recent",
   { description: "List of recent meetings and memos" },
@@ -6946,7 +7035,7 @@ server.resource(
   })
 );
 
-server.resource(
+registerResource(
   "recording_status",
   "minutes://status",
   { description: "Current recording status" },
@@ -6963,7 +7052,7 @@ server.resource(
   }
 );
 
-server.resource(
+registerResource(
   "open_actions",
   "minutes://actions/open",
   { description: "All open action items across meetings" },
@@ -6983,7 +7072,7 @@ server.resource(
   })
 );
 
-server.resource(
+registerResource(
   "recent_events",
   "minutes://events/recent",
   { description: "Recent pipeline events with meeting-derived content withheld until source policy provenance is available" },
@@ -6997,7 +7086,7 @@ server.resource(
   }
 );
 
-server.resource(
+registerResource(
   "agent_annotations",
   "minutes://events/agent-annotations",
   { description: "Agent annotations are withheld until their source policy provenance can be revalidated" },
@@ -7013,7 +7102,7 @@ server.resource(
 );
 
 if (LIVE_EVENTS_SUPPORTED) {
-  server.resource(
+  registerResource(
     "live_events",
     LIVE_EVENTS_RESOURCE_URI,
     {
@@ -7023,7 +7112,7 @@ if (LIVE_EVENTS_SUPPORTED) {
     async (uri) => readLiveEventsResource(uri)
   );
 
-  server.resource(
+  registerResource(
     "live_events_since_seq",
     new ResourceTemplate(LIVE_EVENTS_URI_TEMPLATE, { list: undefined }),
     {
@@ -7037,7 +7126,7 @@ if (LIVE_EVENTS_SUPPORTED) {
 }
 
 if (COPILOT_SUPPORTED) {
-  server.resource(
+  registerResource(
     "live_copilot",
     LIVE_COPILOT_RESOURCE_URI,
     {
@@ -7051,16 +7140,22 @@ if (COPILOT_SUPPORTED) {
 }
 
 if (COPILOT_SUPPORTED) {
-  registerLiveEventsSubscriptionHandlers(server, {
-    // Reads remain registered as an honest constant-unavailable resource, but
-    // subscriptions must not poll raw sequence numbers or notify on hidden
-    // restricted events.
-    enableLiveEvents: LIVE_EVENTS_SUBSCRIPTIONS_ENABLED,
-    enableCopilot: COPILOT_SUPPORTED,
+  // Each server instance gets its own controller — the poller and subscription
+  // set are per-connection state, and the returned stop() is the instance
+  // teardown so a closed HTTP session leaves no poller running.
+  forEachServer((target) => {
+    const controller = registerLiveEventsSubscriptionHandlers(target, {
+      // Reads remain registered as an honest constant-unavailable resource, but
+      // subscriptions must not poll raw sequence numbers or notify on hidden
+      // restricted events.
+      enableLiveEvents: LIVE_EVENTS_SUBSCRIPTIONS_ENABLED,
+      enableCopilot: COPILOT_SUPPORTED,
+    });
+    return () => controller.stop();
   });
 }
 
-server.resource(
+registerResource(
   "meeting",
   new ResourceTemplate("minutes://meetings/{slug}", { list: undefined }),
   { description: "Get a specific meeting by its filename slug" },
@@ -7089,7 +7184,7 @@ server.resource(
 
 // ── Resource: recent_ideas (voice memos from last N days) ──
 
-server.resource(
+registerResource(
   "recent-ideas",
   "minutes://ideas/recent",
   { description: "Recent voice memos and ideas captured from any device (last 14 days)" },
@@ -8203,7 +8298,9 @@ export function registerUnavailableCompatibilityTools(
   );
 }
 
-registerUnavailableCompatibilityTools(server);
+forEachServer((target) => {
+  registerUnavailableCompatibilityTools(target);
+});
 
 // ── Tools: real-time copilot control + observation ──────────
 
