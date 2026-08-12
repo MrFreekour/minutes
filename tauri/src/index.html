@@ -10408,7 +10408,11 @@
       }
 
       footer.classList.remove('footer-hidden');
-      markListOwner('inventory');
+      // renderMeetings also paints search results. Filtered rows are NOT a
+      // usable inventory list: clearing the query while a scan is still running
+      // must be able to replace them, not leave stale matches under an empty
+      // search box.
+      markListOwner(activeSearchQuery ? 'search' : 'inventory');
 
       const groups = groupByDate(meetings);
       for (const [label, items] of Object.entries(groups)) {
