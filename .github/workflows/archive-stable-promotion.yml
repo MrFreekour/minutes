@@ -198,11 +198,13 @@ jobs:
       - name: Refuse an accidental downgrade or same-version byte replacement
         run: |
           set -euo pipefail
-          if ! gh release view archive-stable >/dev/null 2>&1; then
+          if ! gh release view archive-stable \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             exit 0
           fi
           mkdir current-stable
           gh release download archive-stable \
+            --repo "$GITHUB_REPOSITORY" \
             --pattern latest-archive.json \
             --dir current-stable
           NEW_MANIFEST=payload/latest-archive.json \
@@ -258,14 +260,18 @@ jobs:
             <(cd payload && while IFS= read -r asset; do sha256sum "$asset"; done < ../actual-assets.txt) \
             <(cd public && while IFS= read -r asset; do sha256sum "$asset"; done < ../actual-assets.txt)
 
-          if ! gh release view archive-stable >/dev/null 2>&1; then
+          if ! gh release view archive-stable \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create archive-stable \
+              --repo "$GITHUB_REPOSITORY" \
               --latest=false \
               --target "$CANDIDATE_SHA" \
               --title "Minutes Archive stable update channel" \
               --notes "Machine-readable stable channel for signed Minutes Archive updates."
           fi
-          gh release upload archive-stable payload/latest-archive.json --clobber
+          gh release upload archive-stable payload/latest-archive.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
           expected_manifest_sha="$(sha256sum payload/latest-archive.json | awk '{print $1}')"
           verified=false
