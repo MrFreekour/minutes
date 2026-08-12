@@ -7003,9 +7003,6 @@
     const liveBar = document.getElementById('live-bar');
     // Live bar elements are accessed by ID inline (live-time, live-utterances)
     let currentMeetingDetail = null;
-    // Bumped every time the detail overlay opens or closes, so an in-flight
-    // refresh can tell "still the same open view" from "closed and reopened".
-    let detailViewGeneration = 0;
     let activeSearchQuery = '';
     let documentsViewActive = false;
     let documentsCache = [];
@@ -9599,7 +9596,6 @@
 
     function closeDetailView() {
       detailOverlay.classList.remove('active');
-      detailViewGeneration += 1;
       currentMeetingPath = null;
       currentMeetingDetail = null;
       persistRecallWorkspaceState({ currentMeetingPath: '' });
@@ -10203,7 +10199,6 @@
       detailScroll.appendChild(bottomCta);
 
       detailOverlay.classList.add('active');
-      detailViewGeneration += 1;
       persistRecallWorkspaceState({ currentMeetingPath: detail.path });
     }
 
@@ -10292,7 +10287,6 @@
     }
 
     function renderDocuments(documents) {
-      markListOwner('documents');
       meetingsScroll.replaceChildren();
       footer.classList.remove('footer-hidden');
 
@@ -10397,7 +10391,7 @@
       }
     }
 
-    function renderMeetings(meetings, owner = 'inventory') {
+    function renderMeetings(meetings) {
       if (documentsViewActive) {
         renderDocuments(documentsCache);
         return;
@@ -10407,17 +10401,11 @@
 
       if (!meetings || meetings.length === 0) {
         footer.classList.add('footer-hidden');
-        markListOwner('setup');
         renderSetupEmptyState();
         return;
       }
 
       footer.classList.remove('footer-hidden');
-      // renderMeetings also paints search results, and the caller knows which
-      // it is. Inferring from activeSearchQuery would mislabel a search response
-      // that lands after the field is cleared, leaving stale matches parked
-      // under an empty search box for the length of a slow scan.
-      markListOwner(owner);
 
       const groups = groupByDate(meetings);
       for (const [label, items] of Object.entries(groups)) {
@@ -10495,58 +10483,6 @@
     let meetingInventoryGeneration = 0;
     let meetingInventoryRetryTimer = null;
     let meetingInventoryFingerprint = null;
-    // Consecutive "scan still running" results, used to back off the retry and
-    // to word the pending message. Reset on any completed load.
-    let meetingInventoryPendingAttempts = 0;
-    // How long the list may stay blank before we say we are still reading. This
-    // only controls a message; it never abandons the in-flight scan.
-    const INVENTORY_PENDING_NOTICE_MS = 5000;
-    // After this long we stop claiming things are merely slow. The scan is still
-    // awaited (it may yet land, and the backend cannot be cancelled), but the
-    // user gets a visible, honest terminal state instead of an indefinite
-    // spinner, because a wedged blocking worker holds the backend's single
-    // flight and no retry can succeed until the process restarts.
-    const INVENTORY_STUCK_NOTICE_MS = 90000;
-    // The single in-flight inventory scan, shared by every caller.
-    let meetingInventoryInFlight = null;
-    // Set when a caller joins a scan already in progress. That caller may be
-    // reacting to a mutation (a saved recording, an artifacts:changed event)
-    // that the running scan had already read past, so its snapshot can be stale
-    // for them; one trailing scan after the leader settles makes it current.
-    let meetingInventoryDirty = false;
-    // Whoever paints the shared list container stamps it, so we can always ask
-    // what is actually on screen instead of trusting a flag that goes stale when
-    // Documents or search takes the container over and later hands it back.
-    function markListOwner(owner) {
-      if (meetingsScroll) meetingsScroll.dataset.listOwner = owner;
-    }
-
-    // True only when a usable inventory list is the thing currently displayed.
-    function inventoryListIsShowing() {
-      return !!meetingsScroll && meetingsScroll.dataset.listOwner === 'inventory';
-    }
-
-    // Coalesce concurrent callers onto one scan. Without this, a refresh that
-    // arrives mid-scan (an artifacts:changed event, a retry) supersedes the
-    // leader, whose completed result is then dropped on the generation check --
-    // and since the backend deliberately never replays a finished snapshot, the
-    // work has to be redone. On a large library that means repeated full scans
-    // that can keep restarting for as long as refreshes keep arriving.
-    function fetchMeetingInventory() {
-      if (meetingInventoryInFlight) {
-        meetingInventoryDirty = true;
-        return meetingInventoryInFlight;
-      }
-      meetingInventoryDirty = false;
-      const request = invoke('cmd_list_meetings', { limit: 30 });
-      meetingInventoryInFlight = request;
-      request
-        .catch(() => {})
-        .finally(() => {
-          if (meetingInventoryInFlight === request) meetingInventoryInFlight = null;
-        });
-      return request;
-    }
 
     function fingerprintMeetingInventory(meetings) {
       return JSON.stringify(meetings.map((meeting) => [
@@ -10564,100 +10500,12 @@
         (message.includes('capacity') || message.includes('already active'));
     }
 
-    // The inventory scan is still running: either the UI deadline fired while
-    // the backend was still walking the corpus, or the backend's single-flight
-    // guard rejected a second request because the first is in flight. Both mean
-    // "work in progress", NOT "this user has no meetings" — a distinction that
-    // matters most for the largest corpora, which are the slowest to scan.
-    // Documents view and an active search both take over meetingsScroll without
-    // advancing the inventory generation, so inventory rendering must defer to
-    // them or it will overwrite a correct list with an unfiltered one.
-    function inventoryViewOwnsList() {
-      return !documentsViewActive && !activeSearchQuery;
-    }
-
-    function isInventoryInFlightError(error) {
-      const message = String((error && error.message) || error || '').toLowerCase();
-      return message.includes('taking longer than expected') ||
-        message.includes('still checking') ||
-        message.includes('one background worker') ||
-        message.includes('limited to one worker');
-    }
-
-    function scheduleMeetingInventoryRetry(delayMs = 250) {
+    function scheduleMeetingInventoryRetry() {
       if (meetingInventoryRetryTimer) return;
       meetingInventoryRetryTimer = setTimeout(() => {
         meetingInventoryRetryTimer = null;
-        // The search view owns the list while a query is active; re-rendering
-        // the unfiltered inventory underneath it would contradict the query
-        // still shown in the box. The next clear/refresh reloads anyway.
-        if (activeSearchQuery) return;
         loadMeetings();
-      }, delayMs);
-    }
-
-    // Shown while the corpus is still being scanned. Deliberately NOT the
-    // first-run setup card: telling someone with hundreds of meetings that they
-    // are a brand new user reads as data loss, and the bigger the corpus the
-    // longer this state lasts.
-    function renderInventoryPendingState(attempts) {
-      // renderMeetings() guards the same way: never paint over a view that
-      // another surface owns.
-      if (!inventoryViewOwnsList()) return;
-      meetingsScroll.replaceChildren();
-      appendProactiveContextCard();
-      // Keep the footer's capture controls (Start Recording, Live, Quick
-      // Thought) reachable: being unable to list past meetings must never take
-      // away the ability to capture a new one.
-      footer.classList.remove('footer-hidden');
-      markListOwner('pending');
-      const pending = document.createElement('div');
-      pending.className = 'empty-state';
-      const slow = attempts >= 4;
-      pending.innerHTML = `
-        <div class="onboarding-content">
-          <h2>Reading your meetings…</h2>
-          <p class="onboarding-sub">${slow
-            ? 'Still working. A large meeting library can take a while the first time after an update, and your existing notes are untouched.'
-            : 'Checking your meeting folder. This can take a moment on a large library.'}</p>
-        </div>`;
-      meetingsScroll.appendChild(pending);
-    }
-
-    // A real failure to read the library. Says what happened and offers a
-    // retry; still never asserts the library is empty, because a failed read
-    // tells us nothing about what is on disk.
-    function renderInventoryErrorState({ stuck = false } = {}) {
-      // renderMeetings() guards the same way: never paint over a view that
-      // another surface owns.
-      if (!inventoryViewOwnsList()) return;
-      meetingsScroll.replaceChildren();
-      appendProactiveContextCard();
-      // Same rule as the pending state: never remove capture controls.
-      footer.classList.remove('footer-hidden');
-      markListOwner('error');
-      const failed = document.createElement('div');
-      failed.className = 'empty-state';
-      failed.innerHTML = `
-        <div class="onboarding-content">
-          <h2>${stuck ? 'Still reading your meetings' : "Couldn't read your meetings"}</h2>
-          <p class="onboarding-sub">${stuck
-            ? 'This is taking much longer than expected. Your notes on disk are untouched. If it does not finish, restarting Minutes will start the check over.'
-            : 'Your notes on disk are untouched. This was a problem reading the list.'}</p>
-          <div class="onboarding-actions">
-            <button class="btn btn-primary btn-sm" id="inventory-retry-btn">Try again</button>
-          </div>
-        </div>`;
-      meetingsScroll.appendChild(failed);
-      const retry = failed.querySelector('#inventory-retry-btn');
-      if (retry) {
-        retry.addEventListener('click', () => {
-          meetingInventoryPendingAttempts = 0;
-          setSearchError(null);
-          renderInventoryPendingState(0);
-          loadMeetings();
-        });
-      }
+      }, 250);
     }
 
     async function loadMeetings() {
@@ -10667,29 +10515,12 @@
       }
       const generation = ++meetingInventoryGeneration;
       let meetings = [];
-      // Surface a "still reading" notice if the scan is slow, but keep awaiting
-      // the real result. Racing a deadline and rejecting would throw away a scan
-      // that the backend deliberately never replays, so a library that always
-      // takes longer than the deadline would rescan forever and never render.
-      const pendingNotice = window.setTimeout(() => {
-        // Documents and search share meetingsScroll and do not bump the
-        // inventory generation, so check the view is still ours before painting.
-        // Only when nothing usable is on screen: a slow BACKGROUND refresh must
-        // not tear down a list the user is already reading.
-        if (generation === meetingInventoryGeneration &&
-            inventoryViewOwnsList() &&
-            !inventoryListIsShowing()) {
-          renderInventoryPendingState(meetingInventoryPendingAttempts);
-        }
-      }, INVENTORY_PENDING_NOTICE_MS);
-      const stuckNotice = window.setTimeout(() => {
-        if (generation === meetingInventoryGeneration && inventoryViewOwnsList()) {
-          renderInventoryErrorState({ stuck: true });
-        }
-      }, INVENTORY_STUCK_NOTICE_MS);
       try {
-        meetings = await fetchMeetingInventory();
-        if (generation !== meetingInventoryGeneration || !inventoryViewOwnsList()) return;
+        meetings = await withUiDeadline(
+          invoke('cmd_list_meetings', { limit: 30 }),
+          'Meeting inventory'
+        );
+        if (generation !== meetingInventoryGeneration) return;
         const nextFingerprint = fingerprintMeetingInventory(meetings);
         if (meetingInventoryFingerprint !== null && meetingInventoryFingerprint !== nextFingerprint) {
           invalidateProactiveContextBundle();
@@ -10707,36 +10538,12 @@
           scheduleMeetingInventoryRetry();
           return;
         }
-        if (isInventoryInFlightError(e)) {
-          // The scan is still running. Show that, and keep checking with a
-          // backoff so a large library is never mistaken for an empty one.
-          // Deliberately no search error: nothing has failed yet.
-          meetingInventoryPendingAttempts += 1;
-          setSearchError(null);
-          if (!inventoryListIsShowing()) {
-            renderInventoryPendingState(meetingInventoryPendingAttempts);
-          }
-          scheduleMeetingInventoryRetry(
-            Math.min(500 * meetingInventoryPendingAttempts, 4000)
-          );
-          return;
-        }
-        // A real failure. Surface it, but still never claim the user has no
-        // meetings — that is a statement about their data we have not earned.
         setSearchError(e);
-        renderInventoryErrorState();
+        // NOT renderMeetings([]) — an empty array means "this user has no
+        // meetings" and renders the first-run card. A failed read tells us
+        // nothing about what is on disk, so it must not make that claim.
+        renderInventoryUnavailableState();
         return;
-      } finally {
-        window.clearTimeout(pendingNotice);
-        window.clearTimeout(stuckNotice);
-      }
-      meetingInventoryPendingAttempts = 0;
-      if (meetingInventoryDirty) {
-        // Someone asked for a refresh mid-scan; satisfy it with one fresh pass
-        // so a just-saved meeting cannot stay missing until the next event. The
-        // flag is cleared by whichever scan actually starts, so a discarded or
-        // failed pass cannot leave it set and buy a redundant corpus walk.
-        scheduleMeetingInventoryRetry(0);
       }
       // The proactive context bundle runs several corpus-wide scans and is only
       // needed for the ambient-context card, not the meetings list itself. Load
@@ -10756,47 +10563,27 @@
       if (!currentMeetingDetail || !detailOverlay.classList.contains('active')) return;
       const path = currentMeetingDetail.path;
       if (!path) return;
-      // Identity, not just path: closing and reopening the SAME meeting is a new
-      // view, and path equality cannot tell that apart from never having left.
-      const view = detailViewGeneration;
-      // The user can close the overlay or open a different meeting while this is
-      // in flight -- a wider window now that the refresh starts before the
-      // inventory scan rather than after it. Rendering a superseded response
-      // would reopen a closed detail, or replace the meeting the user just
-      // opened with the previous one.
-      const stillShowingRequestedMeeting = () =>
-        detailViewGeneration === view &&
-        detailOverlay.classList.contains('active') &&
-        !!currentMeetingDetail &&
-        currentMeetingDetail.path === path;
       try {
         const detail = await invoke('cmd_get_meeting_detail', { path });
-        if (!stillShowingRequestedMeeting()) return;
         renderDetailSections(detail);
       } catch (e) {
         console.error('Detail refresh:', e);
-        if (!stillShowingRequestedMeeting()) return;
         renderDetailSections(currentMeetingDetail);
       }
     }
 
     async function refreshMeetingsForCurrentView() {
-      // Kick the open detail off first: since the inventory wait is no longer
-      // deadline-bounded, awaiting a large corpus scan before this would leave a
-      // visible detail stale for as long as the scan takes.
-      const detailRefresh = refreshOpenMeetingDetail()
-        .catch((e) => console.error('Detail refresh:', e));
       if (documentsViewActive) {
         await loadDocuments();
-        await detailRefresh;
+        await refreshOpenMeetingDetail();
         return;
       }
       if (activeSearchQuery) {
         try {
           const results = await invoke('cmd_search', { query: activeSearchQuery });
           setSearchError(null);
-          renderMeetings(results, 'search');
-          await detailRefresh;
+          renderMeetings(results);
+          await refreshOpenMeetingDetail();
         } catch (e) {
           console.error('Search refresh:', e);
           if (isPrivateProjectionCapacityError(e)) {
@@ -10808,7 +10595,7 @@
         return;
       }
       await loadMeetings();
-      await detailRefresh;
+      await refreshOpenMeetingDetail();
     }
 
     function scheduleMeetingsRefresh(delay = 350) {
@@ -10842,7 +10629,7 @@
           const results = await invoke('cmd_search', { query });
           if (reqId !== searchRequestId) return; // stale response, newer one in flight
           setSearchError(null);
-          renderMeetings(results, 'search');
+          renderMeetings(results);
           await refreshOpenMeetingDetail();
         } catch (e) {
           if (reqId !== searchRequestId) return;
@@ -10971,6 +10758,32 @@
           setFooterCaptureMode(false);
         }
       });
+    }
+
+    // Shown when the meeting list could not be read. Deliberately NOT the
+    // first-run setup card: telling someone with hundreds of meetings that they
+    // are a brand new user reads as data loss, and the bigger the library the
+    // more likely the read is to time out. Capture controls stay reachable,
+    // because failing to LIST past meetings must never remove the ability to
+    // CAPTURE a new one.
+    function renderInventoryUnavailableState() {
+      if (documentsViewActive) return;
+      meetingsScroll.replaceChildren();
+      appendProactiveContextCard();
+      footer.classList.remove('footer-hidden');
+      const failed = document.createElement('div');
+      failed.className = 'empty-state';
+      failed.innerHTML = `
+        <div class="onboarding-content">
+          <h2>Couldn't read your meetings</h2>
+          <p class="onboarding-sub">Your notes on disk are untouched — this was a problem reading the list. A large library can take longer than the check allows.</p>
+          <div class="onboarding-actions">
+            <button class="btn btn-primary btn-sm" id="inventory-retry-btn">Try again</button>
+          </div>
+        </div>`;
+      meetingsScroll.appendChild(failed);
+      const retry = failed.querySelector('#inventory-retry-btn');
+      if (retry) retry.addEventListener('click', () => { setSearchError(null); loadMeetings(); });
     }
 
     function renderSetupEmptyState() {
@@ -16024,7 +15837,6 @@
       // newly-active md-viewer is actually visible.
       if (detailOverlay.classList.contains('active')) {
         detailOverlay.classList.remove('active');
-        detailViewGeneration += 1;
         // Hiding the overlay bypasses closeDetailView(), so drop any armed
         // "Confirm?" state and its pinned width with it, and clear the banner —
         // which also releases the card pin. Without the clear, a persistent
