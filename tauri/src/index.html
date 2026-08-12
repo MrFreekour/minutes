@@ -10491,6 +10491,14 @@
     const INVENTORY_PENDING_NOTICE_MS = 5000;
     // The single in-flight inventory scan, shared by every caller.
     let meetingInventoryInFlight = null;
+    // Set when a caller joins a scan already in progress. That caller may be
+    // reacting to a mutation (a saved recording, an artifacts:changed event)
+    // that the running scan had already read past, so its snapshot can be stale
+    // for them; one trailing scan after the leader settles makes it current.
+    let meetingInventoryDirty = false;
+    // Whether a real list is currently on screen. Guards against replacing a
+    // usable list with a loading message during a slow background refresh.
+    let meetingInventoryRendered = false;
 
     // Coalesce concurrent callers onto one scan. Without this, a refresh that
     // arrives mid-scan (an artifacts:changed event, a retry) supersedes the
@@ -10499,7 +10507,10 @@
     // work has to be redone. On a large library that means repeated full scans
     // that can keep restarting for as long as refreshes keep arriving.
     function fetchMeetingInventory() {
-      if (meetingInventoryInFlight) return meetingInventoryInFlight;
+      if (meetingInventoryInFlight) {
+        meetingInventoryDirty = true;
+        return meetingInventoryInFlight;
+      }
       const request = invoke('cmd_list_meetings', { limit: 30 });
       meetingInventoryInFlight = request;
       request
@@ -10632,7 +10643,11 @@
       const pendingNotice = window.setTimeout(() => {
         // Documents and search share meetingsScroll and do not bump the
         // inventory generation, so check the view is still ours before painting.
-        if (generation === meetingInventoryGeneration && inventoryViewOwnsList()) {
+        // Only when nothing usable is on screen: a slow BACKGROUND refresh must
+        // not tear down a list the user is already reading.
+        if (generation === meetingInventoryGeneration &&
+            inventoryViewOwnsList() &&
+            !meetingInventoryRendered) {
           renderInventoryPendingState(meetingInventoryPendingAttempts);
         }
       }, INVENTORY_PENDING_NOTICE_MS);
@@ -10662,7 +10677,9 @@
           // Deliberately no search error: nothing has failed yet.
           meetingInventoryPendingAttempts += 1;
           setSearchError(null);
-          renderInventoryPendingState(meetingInventoryPendingAttempts);
+          if (!meetingInventoryRendered) {
+            renderInventoryPendingState(meetingInventoryPendingAttempts);
+          }
           scheduleMeetingInventoryRetry(
             Math.min(500 * meetingInventoryPendingAttempts, 4000)
           );
@@ -10671,12 +10688,20 @@
         // A real failure. Surface it, but still never claim the user has no
         // meetings — that is a statement about their data we have not earned.
         setSearchError(e);
+        meetingInventoryRendered = false;
         renderInventoryErrorState();
         return;
       } finally {
         window.clearTimeout(pendingNotice);
       }
       meetingInventoryPendingAttempts = 0;
+      meetingInventoryRendered = Array.isArray(meetings) && meetings.length > 0;
+      if (meetingInventoryDirty) {
+        // Someone asked for a refresh mid-scan; satisfy it with one fresh pass
+        // so a just-saved meeting cannot stay missing until the next event.
+        meetingInventoryDirty = false;
+        scheduleMeetingInventoryRetry(0);
+      }
       // The proactive context bundle runs several corpus-wide scans and is only
       // needed for the ambient-context card, not the meetings list itself. Load
       // it in the background and re-render once it resolves, so first paint is
