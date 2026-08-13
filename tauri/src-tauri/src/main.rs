@@ -3300,6 +3300,44 @@ mod tray_activity_tests {
     }
 
     #[test]
+    fn dev_installer_cannot_validate_a_stale_running_app() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let installer =
+            std::fs::read_to_string(format!("{}/../../scripts/install-dev-app.sh", manifest))
+                .expect("failed to read dev installer");
+        let diagnostic = std::fs::read_to_string(format!(
+            "{}/../../scripts/diagnose-desktop-hotkey.sh",
+            manifest
+        ))
+        .expect("failed to read desktop hotkey diagnostic");
+
+        assert!(
+            installer.contains("stop_idle_installed_dev_app\n  rm -rf \"$INSTALL_APP\""),
+            "the old process must stop immediately before replacement"
+        );
+        assert!(
+            installer.contains("open -a \"$INSTALL_APP\"\n  verify_fresh_installed_dev_process"),
+            "fresh-process verification must immediately follow launch"
+        );
+        assert!(
+            installer.contains("installed_dev_work_is_active")
+                && installer.contains("\"$installed_cli\" status 2>/dev/null")
+                && installer.contains("recording or processing"),
+            "installer must refuse to interrupt active work"
+        );
+        assert!(
+            !installer.contains("\"$installed_cli\" status --json"),
+            "the bundled CLI status command emits JSON without a trailing --json flag"
+        );
+        assert!(
+            diagnostic.contains("APP_EXECUTABLE=\"$APP_PATH/Contents/MacOS/minutes-app\"")
+                && diagnostic.contains("\"$APP_EXECUTABLE\" \\")
+                && !diagnostic.contains("open -n"),
+            "the diagnostic must execute the installed signed binary directly instead of creating a misleading LaunchServices process"
+        );
+    }
+
+    #[test]
     fn dictation_overlay_success_is_not_terminal_dismiss() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let overlay =

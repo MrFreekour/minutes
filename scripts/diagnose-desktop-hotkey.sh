@@ -13,15 +13,26 @@ fi
 
 rm -f "$OUTPUT_PATH"
 
-open -n -a "$APP_PATH" --args \
+APP_EXECUTABLE="$APP_PATH/Contents/MacOS/minutes-app"
+if [[ ! -x "$APP_EXECUTABLE" ]]; then
+  echo "Installed app executable not found: $APP_EXECUTABLE" >&2
+  exit 1
+fi
+
+set +e
+"$APP_EXECUTABLE" \
   --diagnose-hotkey \
   --diagnose-hotkey-keycode "$KEYCODE" \
   --diagnose-hotkey-output "$OUTPUT_PATH"
+DIAGNOSTIC_EXIT=$?
+set -e
 
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if [[ -f "$OUTPUT_PATH" ]]; then
-    cat "$OUTPUT_PATH"
-    STATUS="$(python3 - <<'PY' "$OUTPUT_PATH"
+if [[ ! -f "$OUTPUT_PATH" ]]; then
+  echo "Installed diagnostic exited without writing $OUTPUT_PATH" >&2
+  exit 1
+fi
+
+STATUS="$(python3 - <<'PY' "$OUTPUT_PATH"
 import json, sys
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -29,13 +40,8 @@ payload = json.loads(path.read_text())
 print(payload.get("probe", {}).get("status", "unknown"))
 PY
 )"
-    if [[ "$STATUS" == "active" ]]; then
-      exit 0
-    fi
-    exit 2
-  fi
-  sleep 1
-done
 
-echo "Timed out waiting for LaunchServices diagnostic output: $OUTPUT_PATH" >&2
-exit 1
+if [[ "$STATUS" == "active" && "$DIAGNOSTIC_EXIT" == "0" ]]; then
+  exit 0
+fi
+exit 2

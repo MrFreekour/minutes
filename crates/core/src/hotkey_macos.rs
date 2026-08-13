@@ -179,7 +179,7 @@ pub struct HotkeyMonitor {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HotkeyProbeResult {
     pub keycode: i64,
-    pub accessibility_trusted: bool,
+    pub input_monitoring_granted: bool,
     pub status: String,
     pub message: String,
     pub elapsed_ms: u128,
@@ -239,7 +239,7 @@ fn should_consume_matched_events(keycode: i64) -> bool {
 /// Attempt to start the native macOS hotkey monitor and report whether the
 /// current process identity can create the CGEventTap successfully.
 pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResult {
-    let accessibility_trusted = is_input_monitoring_granted();
+    let input_monitoring_granted = is_input_monitoring_granted();
     let started_at = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel::<HotkeyMonitorStatus>();
 
@@ -254,7 +254,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
         Err(error) => {
             return HotkeyProbeResult {
                 keycode,
-                accessibility_trusted,
+                input_monitoring_granted,
                 status: "spawn-failed".into(),
                 message: error,
                 elapsed_ms: started_at.elapsed().as_millis(),
@@ -265,7 +265,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
     let deadline = started_at + timeout;
     let mut result = HotkeyProbeResult {
         keycode,
-        accessibility_trusted,
+        input_monitoring_granted,
         status: "timeout".into(),
         message: format!(
             "Timed out after {}ms waiting for the native hotkey monitor to report status.",
@@ -284,7 +284,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Starting) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "starting".into(),
                     message: "Native hotkey monitor thread started and is waiting for CGEventTap activation.".into(),
                     elapsed_ms: started_at.elapsed().as_millis(),
@@ -293,7 +293,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Active) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "active".into(),
                     message: "CGEventTap started successfully for this process identity.".into(),
                     elapsed_ms: started_at.elapsed().as_millis(),
@@ -303,7 +303,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Failed(message)) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "failed".into(),
                     message,
                     elapsed_ms: started_at.elapsed().as_millis(),
@@ -313,7 +313,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Stopped) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "stopped".into(),
                     message: "Native hotkey monitor stopped before it reported active status."
                         .into(),
@@ -327,7 +327,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "disconnected".into(),
                     message: "Native hotkey monitor status channel disconnected unexpectedly."
                         .into(),
@@ -531,6 +531,20 @@ mod tests {
     #[test]
     fn accessibility_check_returns_bool() {
         let _ = is_accessibility_trusted();
+    }
+
+    #[test]
+    fn hotkey_probe_json_names_input_monitoring_not_accessibility() {
+        let probe = HotkeyProbeResult {
+            keycode: KEYCODE_FN,
+            input_monitoring_granted: true,
+            status: "active".into(),
+            message: "test".into(),
+            elapsed_ms: 1,
+        };
+        let json = serde_json::to_value(probe).expect("probe should serialize");
+        assert_eq!(json["input_monitoring_granted"], true);
+        assert!(json.get("accessibility_trusted").is_none());
     }
 
     #[test]

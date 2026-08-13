@@ -41,6 +41,80 @@ INSTALL_DIR="${INSTALL_DIR:-$HOME/Applications}"
 INSTALL_APP="${INSTALL_DIR}/${DEV_PRODUCT_NAME}.app"
 SIGNING_IDENTITY="${MINUTES_DEV_SIGNING_IDENTITY:-${APPLE_SIGNING_IDENTITY:-}}"
 SIGN_MODE="adhoc"
+DEV_BUNDLE_ID="com.useminutes.desktop.dev"
+PREVIOUS_DEV_PIDS=""
+
+installed_dev_pids() {
+  local installed_executable="$INSTALL_APP/Contents/MacOS/minutes-app"
+  ps -axo pid=,command= | awk -v executable="$installed_executable" '
+    {
+      pid = $1
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+      if ($0 == executable) print pid
+    }
+  '
+}
+
+installed_dev_work_is_active() {
+  local installed_cli="$INSTALL_APP/Contents/MacOS/minutes"
+  local status_json=""
+  if [[ ! -x "$installed_cli" ]]; then
+    return 1
+  fi
+  status_json="$("$installed_cli" status 2>/dev/null || true)"
+  grep -Eq '"(recording|processing)"[[:space:]]*:[[:space:]]*true' <<<"$status_json"
+}
+
+stop_idle_installed_dev_app() {
+  PREVIOUS_DEV_PIDS="$(installed_dev_pids)"
+  if [[ -z "$PREVIOUS_DEV_PIDS" ]]; then
+    return
+  fi
+
+  if installed_dev_work_is_active; then
+    echo "Error: ${DEV_PRODUCT_NAME}.app is recording or processing. Stop active work before replacing the installed app." >&2
+    exit 1
+  fi
+
+  echo "=== Stopping idle installed ${DEV_PRODUCT_NAME}.app before replacement ==="
+  if ! osascript -e "tell application id \"$DEV_BUNDLE_ID\" to quit"; then
+    echo "Error: could not ask the installed ${DEV_PRODUCT_NAME}.app to quit." >&2
+    exit 1
+  fi
+
+  for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if [[ -z "$(installed_dev_pids)" ]]; then
+      return
+    fi
+    sleep 1
+  done
+
+  echo "Error: the old ${DEV_PRODUCT_NAME}.app process is still running; refusing to replace its bundle." >&2
+  echo "Running PID(s): $(installed_dev_pids | tr '\n' ' ')" >&2
+  exit 1
+}
+
+verify_fresh_installed_dev_process() {
+  local running_pids=""
+  for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+    running_pids="$(installed_dev_pids)"
+    if [[ -n "$running_pids" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$running_pids" ]]; then
+    echo "Error: ${DEV_PRODUCT_NAME}.app did not launch after installation." >&2
+    exit 1
+  fi
+  for running_pid in $running_pids; do
+    if grep -Eq "(^|[[:space:]])${running_pid}($|[[:space:]])" <<<"$PREVIOUS_DEV_PIDS"; then
+      echo "Error: stale ${DEV_PRODUCT_NAME}.app PID $running_pid survived replacement." >&2
+      exit 1
+    fi
+    echo "Running installed app: PID $running_pid, started $(ps -o lstart= -p "$running_pid" | sed 's/^[[:space:]]*//')"
+  done
+}
 
 run_with_ort_retry() {
   local _build_tmp
@@ -179,6 +253,7 @@ codesign --verify --deep --strict "$BUILD_APP" && echo "  Seal OK"
 if [[ "$INSTALL_AFTER_BUILD" == "1" ]]; then
   echo "=== Installing ${DEV_PRODUCT_NAME}.app to ${INSTALL_DIR} ==="
   mkdir -p "$INSTALL_DIR"
+  stop_idle_installed_dev_app
   rm -rf "$INSTALL_APP"
   cp -rf "$BUILD_APP" "$INSTALL_APP"
 
@@ -223,4 +298,5 @@ if [[ "$OPEN_AFTER_INSTALL" == "1" && "$INSTALL_AFTER_BUILD" == "1" ]]; then
   echo ""
   echo "=== Launching ${DEV_PRODUCT_NAME}.app ==="
   open -a "$INSTALL_APP"
+  verify_fresh_installed_dev_process
 fi
