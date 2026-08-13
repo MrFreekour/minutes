@@ -195,6 +195,78 @@ describe("session reclamation", () => {
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name)).toContain("ping");
   });
+
+  // `isInitializeRequest` validates method and params but not `id`, so an
+  // initialize sent as a JSON-RPC notification passes it. Opening a session for
+  // one strands the slot: the SDK answers 202 with no `Mcp-Session-Id`, so the
+  // client has no handle to use it or to DELETE it, and only the reaper frees
+  // it. Repeat it and the session limit is exhausted by requests that never
+  // produced a usable session.
+  //
+  // Asserting the 400 alone is not enough — a session opened and then refused
+  // would still leak. The session count is the assertion that matters.
+  it("refuses an initialize sent as a notification, without opening a session", async () => {
+    const server = await start();
+
+    const notificationInitialize = {
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "no-id-client", version: "0.0.0" },
+      },
+    };
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const response = await fetch(server.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify(notificationInitialize),
+      });
+      expect(response.status).toBe(400);
+      await response.arrayBuffer();
+    }
+
+    // maxSessions is 2 here, so four attempts would have exhausted it.
+    expect(server.sessionCount()).toBe(0);
+
+    // And the limit was never consumed: a real client still initializes.
+    const client = await connect(server);
+    const tools = await client.listTools();
+    expect(tools.tools.map((t) => t.name)).toContain("ping");
+  });
+
+  // `id: null` is not a valid JSON-RPC request id either, and it takes a
+  // different path through the schema than a missing `id`.
+  it("refuses an initialize whose id is null", async () => {
+    const server = await start();
+
+    const response = await fetch(server.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "null-id-client", version: "0.0.0" },
+        },
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    await response.arrayBuffer();
+    expect(server.sessionCount()).toBe(0);
+  });
 });
 
 describe("oversized request bodies", () => {

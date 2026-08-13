@@ -40,7 +40,10 @@ import type { Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import {
+  isInitializeRequest,
+  isJSONRPCRequest,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 /**
@@ -500,7 +503,18 @@ export async function startMinutesHttpServer(
       return;
     }
 
-    if (req.method === "POST" && isInitializeRequest(body)) {
+    // Both guards are required. `isInitializeRequest` checks the method and
+    // params but not `id`, so an initialize sent as a JSON-RPC *notification*
+    // satisfies it. Opening a session for one strands the slot: the SDK answers
+    // 202 with no `Mcp-Session-Id`, leaving the caller no handle to use it or to
+    // DELETE it, so nothing but the idle reaper frees it. `isJSONRPCRequest`
+    // is what rejects a missing `id`, and a null one, which is not a valid
+    // JSON-RPC request id either.
+    if (
+      req.method === "POST" &&
+      isJSONRPCRequest(body) &&
+      isInitializeRequest(body)
+    ) {
       await openSession(req, res, body);
       return;
     }
