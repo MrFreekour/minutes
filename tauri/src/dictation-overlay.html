@@ -451,7 +451,6 @@
     let modelMissingDetails = null;
     let modelDownloadInProgress = false;
     let overlayRevision = -1;
-    let preparationTimer = null;
 
     Object.assign(cues.start, { volume: 0.18 });
     Object.assign(cues.stop, { volume: 0.16 });
@@ -623,13 +622,6 @@
       }, ms);
     }
 
-    function cancelPreparationTimer() {
-      if (preparationTimer) {
-        clearTimeout(preparationTimer);
-        preparationTimer = null;
-      }
-    }
-
     listen('dictation:model-missing', (e) => {
       modelMissingDetails = e.payload || null;
       if (lastState === 'model-missing') renderModelMissing();
@@ -640,7 +632,6 @@
       if (!Number.isFinite(snapshot.revision) || snapshot.revision <= overlayRevision) return;
       overlayRevision = snapshot.revision;
       const state = snapshot.state;
-      cancelPreparationTimer();
       if (!isTerminalState(state)) {
         cancelDismissTimer();
       }
@@ -692,13 +683,6 @@
           waveform.style.display = 'none';
           timer.style.display = 'none';
           showExpanded(false);
-          const startingRevision = overlayRevision;
-          preparationTimer = setTimeout(() => {
-            preparationTimer = null;
-            if (lastState !== state || overlayRevision !== startingRevision) return;
-            setIndicator('spinner');
-            label.textContent = 'Preparing dictation\u2026';
-          }, 250);
           break;
 
         case 'listening':

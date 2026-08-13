@@ -20038,14 +20038,6 @@ fn start_dictation_session(
     }
     remember_dictation_target_focus(app, &dictation_target_context);
     publish_dictation_overlay_state(app, "starting");
-    show_dictation_overlay(app);
-    dictation_focus_debug(
-        "overlay_shown",
-        dictation_target_context.as_ref(),
-        Some(main_window_hidden),
-        None,
-    );
-    restore_dictation_target_focus(app, &dictation_target_context);
     state.dictation_stop_flag.store(false, Ordering::Relaxed);
     if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
         *released_at = None;
@@ -20275,6 +20267,19 @@ fn start_dictation_session(
             }
         }
     });
+
+    // Start microphone initialization before constructing the overlay and
+    // restoring app focus. The replayable snapshot makes this ordering safe:
+    // if capture becomes ready first, the new WebView paints Listening on its
+    // first reconciled frame instead of exposing internal setup phases.
+    show_dictation_overlay(app);
+    dictation_focus_debug(
+        "overlay_shown",
+        dictation_target_context.as_ref(),
+        Some(main_window_hidden),
+        None,
+    );
+    restore_dictation_target_focus(app, &dictation_target_context);
 
     Ok("Dictation started".into())
 }

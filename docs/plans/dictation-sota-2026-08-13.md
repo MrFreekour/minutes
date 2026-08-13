@@ -75,8 +75,9 @@ The shortcut keeps its efficient dual behavior, but the mode must be visible:
 The overlay renders an authoritative replayable snapshot rather than depending
 on best-effort event timing:
 
-1. `starting` — a neutral, sub-perceptual transition; no model jargon and no
-   claim that the microphone is already active.
+1. `starting` — a neutral, sub-perceptual transition that is normally reconciled
+   away before first paint; no model jargon, progress animation, or claim that
+   the microphone is already active.
 2. `listening` — microphone is active and the user may speak.
 3. `dictating_hold` or `dictating_locked` — speech is being captured and the
    finishing gesture is unambiguous.
@@ -142,9 +143,9 @@ are preferable to clever ambiguity.
 ### Wave 1 — Make the core loop feel instant and unambiguous
 
 **Instant-start truth.** Replace `Loading model...` with the replayable overlay
-state contract. Measure WebView readiness and warm/cold engine paths. Delay
-technical preparation copy until a real wait exceeds 250 ms; never expose
-backend names in the routine HUD.
+state contract. Start microphone initialization concurrently with overlay and
+focus work, then reconcile the first frame to the newest truthful state. Never
+expose technical preparation copy or backend names in the routine HUD.
 
 **Calm capture semantics.** Routine dictation and meeting recording use a
 dedicated cool capture signal rather than error red. Persistent labels, elapsed

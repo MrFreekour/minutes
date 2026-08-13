@@ -236,6 +236,12 @@ fn should_consume_matched_events(keycode: i64) -> bool {
     keycode != KEYCODE_FN
 }
 
+fn input_monitoring_failure(granted: bool) -> Option<&'static str> {
+    (!granted).then_some(
+        "This copy of Minutes cannot detect Fn while another app is active because Input Monitoring is unavailable. Add the installed Minutes app in System Settings > Privacy & Security > Input Monitoring, turn it on, then fully quit and reopen Minutes.",
+    )
+}
+
 /// Attempt to start the native macOS hotkey monitor and report whether the
 /// current process identity can create the CGEventTap successfully.
 pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResult {
@@ -358,6 +364,18 @@ fn run_event_tap(
     status_callback: Box<dyn Fn(HotkeyMonitorStatus) + Send>,
     stop: Arc<AtomicBool>,
 ) {
+    status_callback(HotkeyMonitorStatus::Starting);
+
+    // macOS may still create a process-local event tap when ListenEvent access
+    // is missing. That tap sees keys only while Minutes is frontmost, so
+    // treating creation as success produces a particularly misleading
+    // "active" state. Preflight is the authoritative global-capability gate.
+    if let Some(message) = input_monitoring_failure(is_input_monitoring_granted()) {
+        tracing::error!("{}", message);
+        status_callback(HotkeyMonitorStatus::Failed(message.to_string()));
+        return;
+    }
+
     // `fn`/Globe is safe to observe without suppressing the key itself. Using
     // listen-only keeps it on the Input Monitoring privilege path and avoids
     // the more fragile modifying-tap behavior needed for Caps Lock suppression.
@@ -375,8 +393,6 @@ fn run_event_tap(
         consume_matched_events,
     });
     let context_ptr = Box::into_raw(context) as *mut std::ffi::c_void;
-
-    status_callback(HotkeyMonitorStatus::Starting);
 
     unsafe {
         let tap = ffi::CGEventTapCreate(
@@ -557,5 +573,14 @@ mod tests {
     fn fn_uses_listen_only_event_tap() {
         assert!(!should_consume_matched_events(KEYCODE_FN));
         assert!(should_consume_matched_events(KEYCODE_CAPS_LOCK));
+    }
+
+    #[test]
+    fn missing_input_monitoring_never_reports_a_self_only_tap_as_usable() {
+        assert!(input_monitoring_failure(true).is_none());
+
+        let message = input_monitoring_failure(false).expect("permission should be required");
+        assert!(message.contains("while another app is active"));
+        assert!(message.contains("fully quit and reopen Minutes"));
     }
 }

@@ -3182,9 +3182,9 @@ mod tray_activity_tests {
         );
         assert!(
             overlay.contains(">Starting…</span>")
-                && overlay.contains("'Preparing dictation\\u2026'")
-                && overlay.contains("}, 250);"),
-            "the first frame should be neutral and only reveal preparation after a real wait"
+                && !overlay.contains("Preparing dictation")
+                && !overlay.contains("preparationTimer"),
+            "the first frame may be neutral, but routine startup must not expose internal preparation phases"
         );
         assert!(
             overlay.contains("listen('dictation:overlay'")
@@ -3196,8 +3196,11 @@ mod tray_activity_tests {
             commands_rs.contains("publish_dictation_overlay_state(app, \"starting\")")
                 && commands_rs.contains("snapshot.advance(state)")
                 && commands_rs.contains("app.emit(\"dictation:overlay\", snapshot)")
-                && commands_rs.contains("DictationEvent::PartialText(_) => \"\""),
-            "the backend should own and publish replayable overlay state before creating the WebView"
+                && commands_rs.contains("DictationEvent::PartialText(_) => \"\"")
+                && commands_rs.contains(
+                    "Start microphone initialization before constructing the overlay"
+                ),
+            "the backend should start capture early and own replayable overlay state before creating the WebView"
         );
     }
 
