@@ -39,11 +39,11 @@
       --text-secondary: #6B6760;
       --text-tertiary:  #3D3B38;
       --accent:     #30D158;
+      --capture:    #62BCE9;
+      --capture-ring: rgba(98, 188, 233, 0.16);
       --red:        #FF453A;
       --green:      #30D158;
       --red-border-strong: rgba(255, 69, 58, 0.45);
-      --red-ring: rgba(255, 69, 58, 0.16);
-      --red-glow: rgba(255, 69, 58, 0.28);
       --red-outline: rgba(255, 69, 58, 0.14);
       --red-halo: rgba(255, 69, 58, 0.08);
       --green-ring: rgba(48, 209, 88, 0.18);
@@ -68,11 +68,11 @@
         --text-secondary: #8C8880;
         --text-tertiary:  #BDB9B0;
         --accent:         #C96B4E;
+        --capture:        #2F6F8F;
+        --capture-ring:   rgba(47, 111, 143, 0.13);
         --red:            #C0392B;
         --green:          #2E7D46;
         --red-border-strong: rgba(192, 57, 43, 0.32);
-        --red-ring: rgba(192, 57, 43, 0.12);
-        --red-glow: rgba(192, 57, 43, 0.18);
         --red-outline: rgba(192, 57, 43, 0.12);
         --red-halo: rgba(192, 57, 43, 0.06);
         --green-ring: rgba(46, 125, 70, 0.14);
@@ -158,18 +158,23 @@
 
     /* Status dot */
     .dot {
-      width: 0.875rem;
-      height: 0.875rem;
+      width: 0.625rem;
+      height: 0.625rem;
       border-radius: 50%;
       flex-shrink: 0;
-      background: var(--red);
-      box-shadow:
-        0 0 0 4px var(--red-ring),
-        0 0 16px var(--red-glow);
+      background: var(--text-secondary);
+      opacity: 0.65;
+      box-shadow: none;
+    }
+
+    .dot.capture {
+      background: var(--capture);
+      opacity: 1;
+      box-shadow: 0 0 0 2px var(--capture-ring);
     }
 
     .dot.blink {
-      animation: pulse 1.6s ease-in-out infinite;
+      animation: pulse 1.8s ease-in-out infinite;
     }
 
     .dot.green {
@@ -187,7 +192,7 @@
 
     @keyframes pulse {
       0%, 100% { transform: scale(1); opacity: 1; }
-      50% { transform: scale(0.78); opacity: 0.48; }
+      50% { transform: scale(0.86); opacity: 0.62; }
     }
 
     /* Spinner */
@@ -509,9 +514,12 @@
       const statusRow = document.getElementById('status-row');
 
       if (type === 'dot-blink') {
-        indicator.className = 'dot blink';
+        indicator.className = 'dot capture blink';
         indicator.style.display = '';
       } else if (type === 'dot-solid') {
+        indicator.className = 'dot capture';
+        indicator.style.display = '';
+      } else if (type === 'dot-neutral') {
         indicator.className = 'dot';
         indicator.style.display = '';
       } else if (type === 'spinner') {
@@ -668,7 +676,7 @@
         case 'starting':
         case 'loading':
           resetSessionClock();
-          setIndicator('dot-solid');
+          setIndicator('dot-neutral');
           label.textContent = 'Starting\u2026';
           waveform.style.display = 'none';
           timer.style.display = 'none';

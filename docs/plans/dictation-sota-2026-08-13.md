@@ -146,6 +146,13 @@ state contract. Measure WebView readiness and warm/cold engine paths. Delay
 technical preparation copy until a real wait exceeds 250 ms; never expose
 backend names in the routine HUD.
 
+**Calm capture semantics.** Routine dictation and meeting recording use a
+dedicated cool capture signal rather than error red. Persistent labels, elapsed
+time, waveform activity, tray state, and the stop affordance carry recording
+truth. Red remains reserved for errors, destructive controls, and exceptional
+attention. Avoid redundant pulsing or breathing when the waveform already
+proves that audio is active.
+
 **Gesture and silence correctness.** Carry capture style into the dictation
 runtime and overlay. Separate hold, locked, and automatic-stop semantics. Treat
 ordinary silence as neutral and reserve microphone errors for actual device or

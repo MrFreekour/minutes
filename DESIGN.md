@@ -79,7 +79,8 @@ Two-mode system. Light is the default on the landing site. The Tauri app respect
 --accent:         #C96B4E;   /* coral — CTAs, links, italic heading, speaker labels */
 --accent-hover:   #B85A3E;   /* accent hover state */
 --accent-soft:    rgba(201,107,78,0.10); /* accent background tint */
---red:            #C0392B;   /* recording indicator, errors, destructive */
+--capture:        #2F6F8F;   /* mineral blue — routine active audio capture */
+--red:            #C0392B;   /* errors, destructive, exceptional attention */
 --green:          #2E7D46;   /* success, complete */
 ```
 
@@ -97,7 +98,8 @@ Two-mode system. Light is the default on the landing site. The Tauri app respect
 --accent:         #30D158;   /* green — CTAs, links, speaker labels */
 --accent-hover:   #4ADE70;   /* accent hover state */
 --accent-soft:    rgba(48,209,88,0.10);
---red:            #FF453A;   /* recording indicator, errors, destructive */
+--capture:        #62BCE9;   /* cool blue — routine active audio capture */
+--red:            #FF453A;   /* errors, destructive, exceptional attention */
 --red-bg:         rgba(255,69,58,0.12);
 --green:          #30D158;   /* success (doubles as accent in dark mode) */
 --live:           #30D158;   /* live transcript indicator */
@@ -115,7 +117,7 @@ Two-mode system. Light is the default on the landing site. The Tauri app respect
 
 Never use the accent as a background for large areas or as decoration. It earns its attention by being rare.
 
-**Recording red is separate.** The red (`--red`) is strictly semantic — recording state, errors, destructive actions. Never use it as a general accent.
+**Capture blue and error red are separate.** Cool mineral blue (`--capture`) means audio is actively and normally being captured. It is calm enough for a persistent peripheral desktop state. Red (`--red`) is reserved for errors, destructive actions, and exceptional warnings; routine recording and dictation never borrow its urgency.
 
 ## Spacing
 
@@ -158,7 +160,7 @@ Consistent rounding. Landing is slightly sharper than the app. Never fully squar
 - **Theme toggle:** 0.25s ease on background/color changes — the whole page transitions together
 - **Hover states:** 0.15-0.2s ease
 - **Panel open/close:** 0.2s ease-out
-- **Recording pulse:** 1s ease-in-out, infinite — the only animation that loops
+- **Active capture:** waveform motion carries audio activity; a small listening dot may pulse gently only where no waveform is present
 
 No bounces, no scroll-driven effects, no decorative entrance animations. Utility-grade motion.
 
@@ -230,7 +232,7 @@ Shadow:         0 8px 32px rgba(0,0,0,0.3) — light / 0.5 — dark
 
 ```
 IDLE        → tray icon: default
-RECORDING   → tray icon: red dot, pulsing --red indicator, timer in Geist Mono
+RECORDING   → persistent `Recording` label, --capture indicator, live waveform, timer in Geist Mono
 PROCESSING  → spinner with stage label in --text-secondary
 COMPLETE    → --green check, file path in Geist Mono
 ERROR       → --red indicator, error message, preserved capture path
@@ -241,7 +243,7 @@ Every state must be visible in every surface (tray, app, CLI output).
 ## Iconography
 
 - No custom icon set. System emoji for status indicators.
-- Recording: `●` (--red)
+- Active capture: `●` (--capture)
 - Success: `✓` (--green)
 - Error: `✗` (--red)
 - Voice memo: `📱`
@@ -267,8 +269,9 @@ Every state must be visible in every surface (tray, app, CLI output).
 | 2026-04-08 | Transcript output as hero visual | Real diarized output in Geist Mono replaces the existing DemoPlayer gif. The product's output is the aesthetic. |
 | 2026-04-08 | Warm near-black (#0D0D0B) not pure black | Slightly warm undertone unifies dark mode with the cream light mode surfaces. |
 | 2026-04-08 | No gradients, no glows, no illustration | Information density is the aesthetic. The only decoration is well-set type. |
-| 2026-08-03 | Minutes Archive keeps a deep-green legal palette, not the coral accent | Ratified by the owner. Archive is a separate product surface: a sealed, local-only evidence tool for an attorney's confidential file, not the Minutes meeting product. Coral reads as warm and consumer; the deep green (`--green` #174f3c on `--paper` #f6f4ee) reads as archival and legal, which is the register the interface has to hold when it is quoting privileged text back to counsel. This is a scoped divergence, not a change to the system: the landing site and the Minutes desktop app keep the coral/green accents above. Everything else in this document — Instrument Serif headings, Geist body, the radius scale, no gradients, information density — applies to Archive unchanged, and its app surfaces use the section-heading scale rather than the landing hero scale. |
 | 2026-07-10 | Sanctioned "product-honest reveal" exception to the no-entrance-animation rule | Resolves the tension between "no entrance animations" (Motion) and "show streamed partials, never spinners" (Interaction craft). The hero transcript streams in once to mirror real transcription; reduce-motion renders it static. Reveals that don't demonstrate real product behavior remain banned. |
+| 2026-08-03 | Minutes Archive keeps a deep-green legal palette, not the coral accent | Ratified by the owner. Archive is a separate product surface: a sealed, local-only evidence tool for an attorney's confidential file, not the Minutes meeting product. Coral reads as warm and consumer; the deep green (`--green` #174f3c on `--paper` #f6f4ee) reads as archival and legal, which is the register the interface has to hold when it is quoting privileged text back to counsel. This is a scoped divergence, not a change to the system: the landing site and the Minutes desktop app keep the coral/green accents above. Everything else in this document — Instrument Serif headings, Geist body, the radius scale, no gradients, information density — applies to Archive unchanged, and its app surfaces use the section-heading scale rather than the landing hero scale. |
+| 2026-08-13 | Separate calm capture blue from error/destructive red | Persistent desktop capture is a normal instrument state, not an alarm. Recording truth comes from labels, timers, waveforms, tray state, and stop controls; red retains its urgency for actual problems. |
 
 ## Interaction craft
 

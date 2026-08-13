@@ -83,6 +83,10 @@
       --accent: #30D158;
       --accent-hover: #4ADE70;
       --accent-soft: rgba(48, 209, 88, 0.10);
+      --capture: #62BCE9;
+      --capture-tint: rgba(98, 188, 233, 0.10);
+      --capture-tint-soft: rgba(98, 188, 233, 0.055);
+      --capture-border: rgba(98, 188, 233, 0.16);
       --red: #FF453A;
       --red-bg: rgba(255, 69, 58, 0.12);
       --green: #30D158;
@@ -157,6 +161,10 @@
         --accent: #C96B4E;
         --accent-hover: #B85A3E;
         --accent-soft: rgba(201, 107, 78, 0.10);
+        --capture: #2F6F8F;
+        --capture-tint: rgba(47, 111, 143, 0.10);
+        --capture-tint-soft: rgba(47, 111, 143, 0.05);
+        --capture-border: rgba(47, 111, 143, 0.14);
         --red: #C0392B;
         --red-bg: rgba(192, 57, 43, 0.12);
         --green: #2E7D46;
@@ -402,7 +410,7 @@
     }
 
     .recall-phase-dot.listening {
-      background: var(--red);
+      background: var(--capture);
       animation: recording-glow 1.8s ease-in-out infinite;
     }
 
@@ -426,7 +434,7 @@
     }
 
     .recall-phase-label.listening {
-      color: var(--red);
+      color: var(--capture);
     }
 
     .recall-phase-label.debrief {
@@ -1072,8 +1080,8 @@
       height: auto;
       border-radius: 12px;
       opacity: 1;
-      background: var(--red-tint);
-      color: var(--red);
+      background: var(--capture-tint);
+      color: var(--capture);
       font-weight: 600;
       letter-spacing: 0.3px;
     }
@@ -1155,7 +1163,8 @@
     }
 
     @media (prefers-reduced-motion: reduce) {
-      .live-dot {
+      .live-dot,
+      .recall-phase-dot.listening {
         animation: none;
       }
     }
@@ -1255,38 +1264,24 @@
     .recording-bar {
       display: none;
       padding: 16px;
-      background: var(--red-tint-soft);
-      border-bottom: 1px solid var(--red-border);
-      animation: recording-breathe 3s ease-in-out infinite;
-      box-shadow: inset 0 0 24px var(--red-glow-soft);
+      background: var(--capture-tint-soft);
+      border-bottom: 1px solid var(--capture-border);
     }
 
     .recording-bar.active {
       display: block;
-      animation: recording-enter 0.3s ease-out, recording-breathe 3s ease-in-out 0.3s infinite;
+      animation: recording-enter 160ms ease-out;
     }
 
     @keyframes recording-enter {
       from {
         opacity: 0;
-        transform: translateY(-4px);
+        transform: translateY(-2px);
       }
 
       to {
         opacity: 1;
         transform: translateY(0);
-      }
-    }
-
-    @keyframes recording-breathe {
-
-      0%,
-      100% {
-        background: var(--red-tint-soft);
-      }
-
-      50% {
-        background: var(--red-tint);
       }
     }
 
@@ -1303,17 +1298,15 @@
       gap: 8px;
       font-size: var(--text-meta);
       font-weight: 600;
-      color: var(--red);
-      letter-spacing: 0.3px;
-      text-transform: uppercase;
+      color: var(--capture);
+      letter-spacing: 0.1px;
     }
 
     .recording-dot {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: var(--red);
-      animation: recording-glow 2s ease-in-out infinite;
+      background: var(--capture);
     }
 
     @keyframes blink {
@@ -1358,7 +1351,7 @@
     .audio-viz .bar {
       width: 2px;
       border-radius: 999px;
-      background: var(--red);
+      background: var(--capture);
       opacity: 0.72;
       min-height: 2px;
       transition: height 0.1s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.18s ease;
@@ -1591,6 +1584,10 @@
       font-size: var(--text-body);
       font-weight: 600;
       color: var(--text);
+    }
+
+    html[data-platform="macos"] .header .status-pill.recording {
+      background: var(--capture);
     }
 
     .output-notice-detail {

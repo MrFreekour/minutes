@@ -3197,6 +3197,68 @@ mod tray_activity_tests {
     }
 
     #[test]
+    fn routine_audio_capture_is_calm_and_error_red_stays_exceptional() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let index_html = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read desktop frontend");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+        let design = std::fs::read_to_string(format!("{}/../../DESIGN.md", manifest))
+            .expect("failed to read design system");
+        let recording_css = index_html
+            .split("/* ── Recording bar ── */")
+            .nth(1)
+            .and_then(|tail| tail.split("/* ── Processing bar ── */").next())
+            .expect("recording CSS should be extractable");
+        let overlay_dot_css = overlay
+            .split("/* Status dot */")
+            .nth(1)
+            .and_then(|tail| tail.split("/* Spinner */").next())
+            .expect("dictation status-dot CSS should be extractable");
+
+        assert!(
+            recording_css.contains("var(--capture)")
+                && recording_css.contains("var(--capture-tint-soft)")
+                && recording_css.contains("var(--capture-border)"),
+            "routine meeting capture should use the dedicated calm capture tokens"
+        );
+        assert!(
+            !recording_css.contains("var(--red)") && !recording_css.contains("recording-breathe"),
+            "routine meeting capture should not borrow error red or redundant breathing motion"
+        );
+        assert!(
+            index_html.contains(
+                ".recall-phase-dot.listening {\n      background: var(--capture);",
+            ) && index_html.contains(
+                ".recall-phase-label.listening {\n      color: var(--capture);",
+            ) && index_html.contains(
+                "background: var(--capture-tint);\n      color: var(--capture);",
+            ) && index_html.contains(
+                "html[data-platform=\"macos\"] .header .status-pill.recording {\n      background: var(--capture);",
+            ),
+            "compact recorder states should share the same capture semantics"
+        );
+        assert!(
+            overlay_dot_css.contains(".dot.capture")
+                && overlay_dot_css.contains("var(--capture)")
+                && !overlay_dot_css.contains("var(--red)"),
+            "routine dictation activity should use capture blue, not error red"
+        );
+        assert!(
+            overlay.contains("setIndicator('dot-neutral')")
+                && overlay.contains("indicator.className = 'dot capture blink'")
+                && overlay.contains("indicator.className = 'dot capture'"),
+            "dictation startup should remain neutral until active capture is confirmed"
+        );
+        assert!(
+            design.contains("Capture blue and error red are separate")
+                && design.contains("routine recording and dictation never borrow its urgency"),
+            "the design system should preserve the capture-versus-error semantic split"
+        );
+    }
+
+    #[test]
     fn dictation_overlay_success_is_not_terminal_dismiss() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let overlay =
