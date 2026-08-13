@@ -55,8 +55,10 @@ function parseResources(source) {
     return declaration[1];
   };
 
+  // Two spellings per shape: the direct call on the singleton, and the recording
+  // wrapper that replays the same registration onto a per-session McpServer.
   const appResourcePattern =
-    /registerAppResource\(\s*server,\s*"([^"]+)",\s*([A-Z0-9_":/.{}-]+),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
+    /(?:registerAppResource\(\s*server,|registerAppResourceOnEveryServer\()\s*"([^"]+)",\s*([A-Z0-9_":/.{}-]+),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
   for (const match of source.matchAll(appResourcePattern)) {
     const [, name, rawUri, description] = match;
     const uri = rawUri === "UI_RESOURCE_URI" ? "ui://minutes/dashboard" : resolveUri(rawUri);
@@ -64,14 +66,14 @@ function parseResources(source) {
   }
 
   const directResourcePattern =
-    /server\.resource\(\s*"([^"]+)",\s*("[^"]+"|[A-Z][A-Z0-9_]*),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
+    /(?:server\.resource|registerResource)\(\s*"([^"]+)",\s*("[^"]+"|[A-Z][A-Z0-9_]*),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
   for (const match of source.matchAll(directResourcePattern)) {
     const [, name, rawUri, description] = match;
     resources.push({ name, uri: resolveUri(rawUri), description });
   }
 
   const templateResourcePattern =
-    /server\.resource\(\s*"([^"]+)",\s*new ResourceTemplate\(("[^"]+"|[A-Z][A-Z0-9_]*),[\s\S]*?\),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
+    /(?:server\.resource|registerResource)\(\s*"([^"]+)",\s*new ResourceTemplate\(("[^"]+"|[A-Z][A-Z0-9_]*),[\s\S]*?\),\s*\{\s*description:\s*"([^"]+)"\s*,?\s*\}/gs;
   for (const match of source.matchAll(templateResourcePattern)) {
     const [, name, rawUri, description] = match;
     resources.push({ name, uri: resolveUri(rawUri), description });

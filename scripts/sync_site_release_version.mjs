@@ -39,10 +39,15 @@ const mcpPromptCount = manifest.prompts.length;
 async function countMcpResources() {
   const source = await readFile(mcpSourcePath, "utf8");
   const identities = new Set();
+  // Resources are registered either directly on the singleton (`server.resource`,
+  // `registerAppResource(server, ...)`) or through the recording wrappers that let
+  // the same surface be replayed onto a per-session McpServer (`registerResource`,
+  // `registerAppResourceOnEveryServer`). Both spellings are matched so this stays
+  // correct whichever one a given call site uses.
   const patterns = [
-    /registerAppResource\(\s*server,\s*"([^"]+)",\s*([A-Z0-9_":/.{}-]+),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
-    /server\.resource\(\s*"([^"]+)",\s*("[^"]+"|[A-Z][A-Z0-9_]*),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
-    /server\.resource\(\s*"([^"]+)",\s*new ResourceTemplate\(("[^"]+"|[A-Z][A-Z0-9_]*),[\s\S]*?\),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
+    /(?:registerAppResource\(\s*server,|registerAppResourceOnEveryServer\()\s*"([^"]+)",\s*([A-Z0-9_":/.{}-]+),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
+    /(?:server\.resource|registerResource)\(\s*"([^"]+)",\s*("[^"]+"|[A-Z][A-Z0-9_]*),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
+    /(?:server\.resource|registerResource)\(\s*"([^"]+)",\s*new ResourceTemplate\(("[^"]+"|[A-Z][A-Z0-9_]*),[\s\S]*?\),\s*\{\s*description:\s*"[^"]+"\s*,?\s*\}/gs,
   ];
   for (const pattern of patterns) {
     for (const match of source.matchAll(pattern)) {
