@@ -1148,7 +1148,13 @@ pub struct LiveTranscriptConfig {
     ///   Whisper while signed runtime acceptance remains incomplete
     pub backend: String,
     /// Whisper model to use for live transcription.
-    /// Empty string means "use the dictation model".
+    ///
+    /// Empty (the default) means `dictation.model`, NOT `transcription.model`,
+    /// even though `backend` above defaults to `"inherit"`. Live transcription
+    /// is real-time and wants a small fast model; batch transcription can
+    /// afford a slower, more accurate one, so inheriting it would give anyone
+    /// who chose a large batch model a live sidecar too slow to keep up.
+    /// Set this explicitly to decouple the two (#756).
     pub model: String,
     /// Maximum utterance length in seconds before force-finalizing.
     pub max_utterance_secs: u64,
