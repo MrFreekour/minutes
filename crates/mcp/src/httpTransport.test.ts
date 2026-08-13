@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import {
   HTTP_BIND_HOST,
@@ -6,6 +10,12 @@ import {
   isAllowedContentType,
   isAllowedHostHeader,
   isAllowedOrigin,
+  startMinutesHttpServer,
+} from "./httpTransport.js";
+import type {
+  MinutesHttpServer,
+  MinutesHttpServerOptions,
+  MinutesServerFactory,
 } from "./httpTransport.js";
 
 describe("http transport request guards", () => {
@@ -75,5 +85,112 @@ describe("http transport request guards", () => {
       expect(isAllowedContentType("application/x-www-form-urlencoded")).toBe(false);
       expect(isAllowedContentType(undefined)).toBe(false);
     });
+  });
+});
+
+describe("session reclamation", () => {
+  // A stub server, not the real Minutes one: this exercises the transport's
+  // session bookkeeping, and importing index.ts would drag in the CLI probe.
+  function stubFactory(): ReturnType<MinutesServerFactory> {
+    const server = new McpServer(
+      { name: "reclamation-test", version: "0.0.0" },
+      { capabilities: { tools: {} } }
+    );
+    server.registerTool(
+      "ping",
+      { description: "Test tool", inputSchema: {} },
+      async () => ({ content: [{ type: "text" as const, text: "pong" }] })
+    );
+    return { server, dispose: () => {} };
+  }
+
+  let httpServer: MinutesHttpServer | undefined;
+  const clients: Client[] = [];
+
+  afterEach(async () => {
+    // Without this vitest hangs: the listener and its sockets outlive the test.
+    for (const client of clients.splice(0)) {
+      await client.close().catch(() => {});
+    }
+    await httpServer?.close();
+    httpServer = undefined;
+  });
+
+  async function start(overrides: Partial<MinutesHttpServerOptions> = {}) {
+    httpServer = await startMinutesHttpServer({
+      port: 0,
+      maxSessions: 2,
+      sessionIdleTimeoutMs: 150,
+      createServer: stubFactory,
+      log: () => {},
+      ...overrides,
+    });
+    return httpServer;
+  }
+
+  /** Connect a real SDK client, so the abandonment path is the real one. */
+  async function connect(server: MinutesHttpServer): Promise<Client> {
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+    clients.push(client);
+    return client;
+  }
+
+  async function waitFor(
+    predicate: () => boolean,
+    timeoutMs = 5000
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error("condition never became true");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  it("reclaims a session abandoned without a DELETE", async () => {
+    const server = await start();
+    const client = await connect(server);
+    expect(server.sessionCount()).toBe(1);
+
+    // The SDK's close() aborts its fetches and does NOT send a DELETE, which
+    // is what a crashed or disconnected client looks like to the server.
+    await client.close();
+    clients.length = 0;
+
+    await waitFor(() => server.sessionCount() === 0);
+    expect(server.sessionCount()).toBe(0);
+  });
+
+  // The regression the review reported: not "the count drops" but "the server
+  // stops serving anyone". Every session is abandoned without a DELETE, which
+  // used to fill the map permanently and 503 every later client.
+  it("still accepts a new client after every session was abandoned", async () => {
+    const server = await start({ maxSessions: 2 });
+
+    for (let i = 0; i < 2; i++) {
+      const client = await connect(server);
+      await client.close();
+    }
+    clients.length = 0;
+
+    await waitFor(() => server.sessionCount() === 0);
+
+    const fresh = await connect(server);
+    const tools = await fresh.listTools();
+    expect(tools.tools.map((t) => t.name)).toContain("ping");
+    expect(server.sessionCount()).toBe(1);
+  });
+
+  it("keeps a session that is still holding a stream open", async () => {
+    const server = await start();
+    const client = await connect(server);
+
+    // The SDK client holds a standalone GET SSE stream for the session's life,
+    // so idling well past the timeout must not reclaim it.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    expect(server.sessionCount()).toBe(1);
+    const tools = await client.listTools();
+    expect(tools.tools.map((t) => t.name)).toContain("ping");
   });
 });

@@ -13,6 +13,13 @@
  * The instances share all module-level state in index.ts — only protocol
  * state is per-session.
  *
+ * Session lifetime: a session ends on an explicit DELETE, on server shutdown,
+ * or by idle reclamation. The third one is required, not a nicety. The SDK's
+ * `Client.close()` aborts its fetches without sending a DELETE, and a client
+ * that crashes or loses its network sends nothing at all, so nothing would
+ * ever free those entries and the session limit would fill up with dead
+ * clients. See `reapIdleSessions` for what counts as idle.
+ *
  * Security: always binds 127.0.0.1, with no flag to change it. Binding to
  * loopback alone does not make the endpoint private, since any page in the
  * user's browser can POST to localhost, so requests are additionally checked
@@ -63,6 +70,26 @@ export const DEFAULT_MAX_SESSIONS = 16;
 /** Request bodies are JSON-RPC envelopes, never audio; paths are passed by name. */
 export const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
 
+/**
+ * How long a session with nothing open may sit before it is reclaimed.
+ *
+ * Generous on purpose. Reclaiming is spec-sanctioned — the server MAY end a
+ * session at any time and MUST then answer 404, and the client MUST start a
+ * new one — but the SDK's TypeScript client has no 404 branch, so it will not
+ * re-initialize. A client that is alive and merely quiet therefore pays for
+ * this, and half an hour keeps that to clients that have genuinely stopped
+ * working. Sessions holding an open stream are never reclaimed regardless.
+ */
+export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** Sweep often enough to bound overshoot, without waking up for no reason. */
+function sweepIntervalFor(idleTimeoutMs: number): number {
+  return Math.max(25, Math.min(Math.floor(idleTimeoutMs / 4), 60_000));
+}
+
+/** Probe idle TCP connections so a vanished peer surfaces as a socket close. */
+const SOCKET_KEEPALIVE_DELAY_MS = 60_000;
+
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 export type MinutesServerFactory = () => {
@@ -75,6 +102,11 @@ export type MinutesHttpServerOptions = {
   port?: number;
   /** Reject new sessions past this many concurrent ones. */
   maxSessions?: number;
+  /**
+   * Reclaim a session with nothing open after this long. Exposed for tests,
+   * which cannot wait out the default; there is deliberately no CLI flag.
+   */
+  sessionIdleTimeoutMs?: number;
   /** Builds a fresh McpServer per session. */
   createServer: MinutesServerFactory;
   /** Diagnostics sink. Defaults to stderr. */
@@ -194,6 +226,14 @@ type SessionEntry = {
   server: McpServer;
   dispose: () => void;
   closing: boolean;
+  /** Last time a request for this session arrived or one of its responses ended. */
+  lastActivityAt: number;
+  /**
+   * Responses still open for this session: in-flight requests and long-lived
+   * SSE streams alike. A `Set` rather than a counter so a response closing
+   * after the entry was already removed cannot double-count.
+   */
+  openResponses: Set<ServerResponse>;
 };
 
 /**
@@ -205,10 +245,59 @@ export async function startMinutesHttpServer(
 ): Promise<MinutesHttpServer> {
   const requestedPort = options.port ?? DEFAULT_HTTP_PORT;
   const maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
+  const sessionIdleTimeoutMs =
+    options.sessionIdleTimeoutMs ?? DEFAULT_SESSION_IDLE_TIMEOUT_MS;
   const log = options.log ?? ((message: string) => console.error(message));
 
   const sessions = new Map<string, SessionEntry>();
   const sockets = new Set<Socket>();
+
+  /**
+   * Record a response against its session. Stamping on arrival is not enough
+   * on its own: a session whose only traffic was one hour-long stream would be
+   * instantly reapable the moment that stream ended, so the close stamps too.
+   */
+  function trackResponse(entry: SessionEntry, res: ServerResponse): void {
+    entry.lastActivityAt = Date.now();
+    entry.openResponses.add(res);
+    res.once("close", () => {
+      entry.openResponses.delete(res);
+      entry.lastActivityAt = Date.now();
+    });
+  }
+
+  /**
+   * Close sessions that have been idle past the timeout.
+   *
+   * "Idle" means nothing open at all — no in-flight request and no SSE stream.
+   * An open stream is treated as proof of life rather than as something to
+   * reap: the SDK writes keep-alive frames on it every 15s, so a peer that
+   * died takes its stream down with it once those writes go unacknowledged,
+   * and a client that is merely quiet keeps the session it is still holding.
+   *
+   * The gap this leaves, deliberately: a peer alive at TCP but dead at the
+   * application layer holds its stream open forever and is never reclaimed.
+   * Under pressure the sweep below finds nothing and the 503 stands, which is
+   * the honest answer, because such a session looks alive at every layer that
+   * can be observed from here.
+   */
+  function reapIdleSessions(): void {
+    const cutoff = Date.now() - sessionIdleTimeoutMs;
+    for (const [sessionId, entry] of Array.from(sessions)) {
+      if (entry.closing) continue;
+      if (entry.openResponses.size > 0) continue;
+      if (entry.lastActivityAt > cutoff) continue;
+      log(`[Minutes] MCP HTTP session idle, reclaiming: ${sessionId}`);
+      void closeSession(sessionId);
+    }
+  }
+
+  const reaper = setInterval(
+    reapIdleSessions,
+    sweepIntervalFor(sessionIdleTimeoutMs)
+  );
+  // Never hold the process open on the reaper's account.
+  reaper.unref?.();
 
   async function closeSession(sessionId: string): Promise<void> {
     const entry = sessions.get(sessionId);
@@ -233,6 +322,11 @@ export async function startMinutesHttpServer(
     res: ServerResponse,
     body: unknown
   ): Promise<void> {
+    // Sweep before refusing, so the limit is measured against sessions that
+    // are actually live rather than against ones nobody reclaimed yet. This
+    // makes the 503 correct even if the interval timer were somehow starved.
+    reapIdleSessions();
+
     if (sessions.size >= maxSessions) {
       sendJsonRpcError(
         res,
@@ -247,12 +341,18 @@ export async function startMinutesHttpServer(
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sessionId: string) => {
-        sessions.set(sessionId, {
+        const entry: SessionEntry = {
           transport,
           server: instance.server,
           dispose: instance.dispose,
           closing: false,
-        });
+          lastActivityAt: Date.now(),
+          openResponses: new Set(),
+        };
+        sessions.set(sessionId, entry);
+        // Track here, not around the handleRequest below: this fires *during*
+        // handleRequest, so there is no entry to attach to any earlier.
+        trackResponse(entry, res);
         log(`[Minutes] MCP HTTP session opened: ${sessionId}`);
       },
       onsessionclosed: (sessionId: string) => {
@@ -352,6 +452,7 @@ export async function startMinutesHttpServer(
         sendJsonRpcError(res, 404, -32001, "Session not found");
         return;
       }
+      trackResponse(entry, res);
       await entry.transport.handleRequest(req, res, body);
       return;
     }
@@ -384,6 +485,10 @@ export async function startMinutesHttpServer(
 
   // SSE streams hold connections open; without this, close() never resolves.
   httpServer.on("connection", (socket: Socket) => {
+    // A peer that vanishes without closing its socket (sleep, VPN drop) would
+    // otherwise hold its SSE stream, and so its session, until TCP gave up on
+    // its own schedule. Keep-alive probes bring that forward.
+    socket.setKeepAlive(true, SOCKET_KEEPALIVE_DELAY_MS);
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
@@ -406,6 +511,7 @@ export async function startMinutesHttpServer(
     url: `http://${HTTP_BIND_HOST}:${boundPort}${MCP_HTTP_PATH}`,
     sessionCount: () => sessions.size,
     close: async () => {
+      clearInterval(reaper);
       for (const sessionId of Array.from(sessions.keys())) {
         await closeSession(sessionId);
       }
