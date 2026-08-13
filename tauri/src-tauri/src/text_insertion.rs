@@ -158,17 +158,46 @@ pub fn restore_target_focus(context: &ActiveTargetContext) -> Result<(), String>
 pub fn can_insert_into_apps() -> bool {
     #[cfg(target_os = "macos")]
     {
-        minutes_core::hotkey_macos::is_accessibility_trusted()
+        // The current insertion strategy is System Events paste automation.
+        // AXIsProcessTrusted() describes Minutes' direct AX access, not whether
+        // the child osascript/System Events command can paste. Treating it as a
+        // hard preflight produced false copy-only states even after users had
+        // granted the visible macOS permissions. The attempted operation is the
+        // authoritative capability check; failure still preserves the text.
+        true
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        true
+        linux_x11_paste_available()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
     }
 }
 
-pub fn insertion_permission_fallback_message() -> &'static str {
-    "Accessibility is off; copied dictation instead."
+pub fn insertion_unavailable_message() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macOS paste automation is unavailable; dictation will be copied."
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        "Paste at cursor is unavailable in this Linux session; dictation will be copied."
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        "Type at cursor is not supported on Windows yet; dictation will be copied."
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "Type at cursor is not supported on this platform; dictation will be copied."
+    }
 }
 
 fn copy_only(text: &str, target_context: Option<ActiveTargetContext>) -> TextInsertionResult {
@@ -197,14 +226,6 @@ fn best_effort_verified(
     request: TextInsertionRequest,
     target_context: Option<ActiveTargetContext>,
 ) -> TextInsertionResult {
-    if !minutes_core::hotkey_macos::is_accessibility_trusted() {
-        return copy_after_block(
-            request,
-            target_context,
-            insertion_permission_fallback_message(),
-        );
-    }
-
     if let Err(message) =
         verify_paste_target(request.expected_target.as_ref(), target_context.as_ref())
     {
@@ -1302,6 +1323,12 @@ mod tests {
         };
 
         verify_paste_target(Some(&expected), Some(&actual)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_attempts_system_events_paste_without_ax_trust_preflight() {
+        assert!(can_insert_into_apps());
     }
 
     #[test]

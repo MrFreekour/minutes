@@ -5987,10 +5987,10 @@
           <div class="about-controls-group">
             <div class="about-controls-copy">Where dictated text goes</div>
             <select id="settings-dictation-destination" class="settings-field">
-              <option value="insert">Type at cursor — inserts into the app you're in (needs Accessibility)</option>
+              <option value="insert">Type at cursor — pastes into the app you're in</option>
               <option value="clipboard">Copy to clipboard — paste it yourself</option>
             </select>
-            <div class="about-controls-meta">"Type at cursor" pastes the transcript straight into the focused app. macOS asks for Accessibility permission the first time; until granted it falls back to the clipboard.</div>
+            <div class="about-controls-meta">Minutes verifies that you're still in the same app, then uses the system paste shortcut. If macOS blocks automation or the app changes, your transcript stays on the clipboard.</div>
           </div>
         </div>
         <div class="about-controls">

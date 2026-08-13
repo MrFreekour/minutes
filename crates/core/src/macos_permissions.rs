@@ -286,18 +286,14 @@ pub fn accessibility_row() -> MacPermissionRow {
         label: "Accessibility",
         status,
         optional: true,
-        required_for: &[
-            "typing dictation at the cursor",
-            "desktop window titles",
-            "browser/app context",
-        ],
+        required_for: &["desktop window titles", "browser/app context"],
         detail: match status {
             MacPermissionStatus::Granted => {
-                "Minutes can type dictation at the cursor and use focused app context when enabled."
+                "Minutes can use focused app and window context when those features are enabled."
                     .into()
             }
             MacPermissionStatus::Denied | MacPermissionStatus::NotDetermined => {
-                "Typing dictation at the cursor requires Accessibility. Without it, Minutes safely copies the text instead; meeting recording still works."
+                "Focused app and window context is limited without Accessibility; meeting recording and dictation still work."
                     .into()
             }
             MacPermissionStatus::NotNeeded => {
@@ -627,13 +623,13 @@ mod tests {
     }
 
     #[test]
-    fn accessibility_truth_includes_dictation_insertion_without_blocking_recording() {
+    fn accessibility_truth_does_not_claim_system_events_paste_capability() {
         let row = accessibility_row();
         assert!(
             row.optional,
             "Accessibility is not required for meeting recording"
         );
-        assert!(row
+        assert!(!row
             .required_for
             .iter()
             .any(|feature| feature == "typing dictation at the cursor"));

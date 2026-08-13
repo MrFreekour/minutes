@@ -3259,7 +3259,7 @@ mod tray_activity_tests {
     }
 
     #[test]
-    fn dictation_accessibility_fallback_is_calm_truthful_and_actionable() {
+    fn dictation_insertion_fallback_is_calm_truthful_and_actionable() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let overlay =
             std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
@@ -3274,11 +3274,7 @@ mod tray_activity_tests {
         ))
         .expect("failed to read macOS permission contract");
 
-        assert!(
-            commands_rs.contains("\"activeLabel\": \"copy only\"")
-                && commands_rs.contains("accessibility_settings_url()"),
-            "dictation should disclose copy-only mode with the correct recovery destination"
-        );
+        assert!(commands_rs.contains("\"activeLabel\": \"copy only\""));
         assert!(
             overlay.contains("Listening · ${insertionActiveLabel || 'copy only'}")
                 && overlay.contains("label.textContent = 'Copied · Accessibility off'")
@@ -3292,10 +3288,14 @@ mod tray_activity_tests {
             "only the known safe-copy fallback should avoid true error styling"
         );
         assert!(
-            insertion_rs.contains("Accessibility is off; copied dictation instead.")
-                && permissions_rs.contains("typing dictation at the cursor")
-                && permissions_rs.contains("meeting recording still works"),
-            "permission copy should distinguish insertion from recording and preserve the text"
+            insertion_rs.contains("The attempted operation is the")
+                && !insertion_rs.contains(
+                    "if !minutes_core::hotkey_macos::is_accessibility_trusted()"
+                )
+                && insertion_rs.contains("Type at cursor is not supported on Windows yet")
+                && !permissions_rs.contains("Typing dictation at the cursor requires Accessibility")
+                && permissions_rs.contains("meeting recording and dictation still work"),
+            "insertion should attempt macOS automation without a mismatched AX preflight and keep platform claims honest"
         );
     }
 

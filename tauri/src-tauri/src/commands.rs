@@ -19750,7 +19750,7 @@ fn dictation_should_insert(config: &Config) -> bool {
 
 fn dictation_insert_fallback_message(config: &Config) -> Option<&'static str> {
     if dictation_should_insert(config) && !crate::text_insertion::can_insert_into_apps() {
-        Some(crate::text_insertion::insertion_permission_fallback_message())
+        Some(crate::text_insertion::insertion_unavailable_message())
     } else {
         None
     }
@@ -20102,10 +20102,14 @@ fn start_dictation_session(
                             .emit(
                                 "dictation:insertion",
                                 serde_json::json!({
-                                    "message": "Accessibility is off; dictation will be copied.",
+                                    "message": insert_fallback_message_for_events.as_deref().unwrap_or("Type at cursor is unavailable; dictation will be copied."),
                                     "activeLabel": "copy only",
                                     "earlyFallback": true,
-                                    "settingsUrl": minutes_core::macos_permissions::accessibility_settings_url(),
+                                    "settingsUrl": if cfg!(target_os = "macos") {
+                                        minutes_core::macos_permissions::accessibility_settings_url()
+                                    } else {
+                                        None::<&str>
+                                    },
                                 }),
                             )
                             .ok();
