@@ -168,7 +168,7 @@ pub fn can_insert_into_apps() -> bool {
 }
 
 pub fn insertion_permission_fallback_message() -> &'static str {
-    "needs Accessibility to insert; text will stay on the clipboard"
+    "Accessibility is off; copied dictation instead."
 }
 
 fn copy_only(text: &str, target_context: Option<ActiveTargetContext>) -> TextInsertionResult {

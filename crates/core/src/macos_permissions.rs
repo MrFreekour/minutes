@@ -286,13 +286,19 @@ pub fn accessibility_row() -> MacPermissionRow {
         label: "Accessibility",
         status,
         optional: true,
-        required_for: &["desktop window titles", "browser/app context"],
+        required_for: &[
+            "typing dictation at the cursor",
+            "desktop window titles",
+            "browser/app context",
+        ],
         detail: match status {
             MacPermissionStatus::Granted => {
-                "Minutes can read focused app and window context when enabled.".into()
+                "Minutes can type dictation at the cursor and use focused app context when enabled."
+                    .into()
             }
             MacPermissionStatus::Denied | MacPermissionStatus::NotDetermined => {
-                "Accessibility is not currently available to Minutes.".into()
+                "Typing dictation at the cursor requires Accessibility. Without it, Minutes safely copies the text instead; meeting recording still works."
+                    .into()
             }
             MacPermissionStatus::NotNeeded => {
                 "This platform does not require a separate Accessibility permission.".into()
@@ -310,6 +316,10 @@ pub fn accessibility_row() -> MacPermissionRow {
         settings_url: platform::ACCESSIBILITY_SETTINGS_URL,
         can_request: true,
     })
+}
+
+pub fn accessibility_settings_url() -> Option<&'static str> {
+    platform::ACCESSIBILITY_SETTINGS_URL
 }
 
 pub fn automation_row() -> MacPermissionRow {
@@ -614,6 +624,23 @@ mod tests {
         assert!(kinds.contains(&MacPermissionKind::InputMonitoring));
         assert!(kinds.contains(&MacPermissionKind::Accessibility));
         assert!(kinds.contains(&MacPermissionKind::Automation));
+    }
+
+    #[test]
+    fn accessibility_truth_includes_dictation_insertion_without_blocking_recording() {
+        let row = accessibility_row();
+        assert!(
+            row.optional,
+            "Accessibility is not required for meeting recording"
+        );
+        assert!(row
+            .required_for
+            .iter()
+            .any(|feature| feature == "typing dictation at the cursor"));
+        assert_eq!(
+            accessibility_settings_url(),
+            platform::ACCESSIBILITY_SETTINGS_URL
+        );
     }
 
     #[test]

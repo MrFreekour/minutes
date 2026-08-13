@@ -3259,6 +3259,47 @@ mod tray_activity_tests {
     }
 
     #[test]
+    fn dictation_accessibility_fallback_is_calm_truthful_and_actionable() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read desktop commands");
+        let insertion_rs = std::fs::read_to_string(format!("{}/src/text_insertion.rs", manifest))
+            .expect("failed to read text insertion");
+        let permissions_rs = std::fs::read_to_string(format!(
+            "{}/../../crates/core/src/macos_permissions.rs",
+            manifest
+        ))
+        .expect("failed to read macOS permission contract");
+
+        assert!(
+            commands_rs.contains("\"activeLabel\": \"copy only\"")
+                && commands_rs.contains("accessibility_settings_url()"),
+            "dictation should disclose copy-only mode with the correct recovery destination"
+        );
+        assert!(
+            overlay.contains("Listening · ${insertionActiveLabel || 'copy only'}")
+                && overlay.contains("label.textContent = 'Copied · Accessibility off'")
+                && overlay.contains("permissionButton.classList.remove('hidden')")
+                && overlay.contains("cmd_open_file', { path: insertionSettingsUrl }"),
+            "the overlay should present a calm preserved-copy outcome with direct recovery"
+        );
+        assert!(
+            overlay.contains("if (earlyInsertionFallback && insertionSettingsUrl)")
+                && overlay.contains("pill.classList.add('error');"),
+            "only the known safe-copy fallback should avoid true error styling"
+        );
+        assert!(
+            insertion_rs.contains("Accessibility is off; copied dictation instead.")
+                && permissions_rs.contains("typing dictation at the cursor")
+                && permissions_rs.contains("meeting recording still works"),
+            "permission copy should distinguish insertion from recording and preserve the text"
+        );
+    }
+
+    #[test]
     fn dictation_overlay_success_is_not_terminal_dismiss() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let overlay =

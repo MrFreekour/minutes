@@ -20094,20 +20094,21 @@ fn start_dictation_session(
                         .ok();
                 }
                 if !state_str.is_empty() {
-                    if matches!(&event, DictationEvent::Listening) {
-                        if let Some(message) = insert_fallback_message_for_events.as_ref() {
-                            if !insert_fallback_emitted.swap(true, Ordering::Relaxed) {
-                                app_for_events
-                                    .emit(
-                                        "dictation:insertion",
-                                        serde_json::json!({
-                                            "message": message,
-                                            "earlyFallback": true,
-                                        }),
-                                    )
-                                    .ok();
-                            }
-                        }
+                    if matches!(&event, DictationEvent::Listening)
+                        && insert_fallback_message_for_events.is_some()
+                        && !insert_fallback_emitted.swap(true, Ordering::Relaxed)
+                    {
+                        app_for_events
+                            .emit(
+                                "dictation:insertion",
+                                serde_json::json!({
+                                    "message": "Accessibility is off; dictation will be copied.",
+                                    "activeLabel": "copy only",
+                                    "earlyFallback": true,
+                                    "settingsUrl": minutes_core::macos_permissions::accessibility_settings_url(),
+                                }),
+                            )
+                            .ok();
                     }
                     publish_dictation_overlay_state(&app_for_events, state_str);
                 }

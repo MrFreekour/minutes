@@ -394,6 +394,7 @@
       <div class="dot" id="indicator"></div>
       <span class="label" id="label">Starting…</span>
       <button class="recovery-button hidden" id="download-button" type="button">Download</button>
+      <button class="recovery-button hidden" id="permission-button" type="button">Open Settings</button>
       <div class="waveform" id="waveform" style="display:none">
         <div class="bar" style="height:4px"></div>
         <div class="bar" style="height:4px"></div>
@@ -418,6 +419,7 @@
     const indicator = document.getElementById('indicator');
     const label = document.getElementById('label');
     const downloadButton = document.getElementById('download-button');
+    const permissionButton = document.getElementById('permission-button');
     const waveform = document.getElementById('waveform');
     const timer = document.getElementById('timer');
     const textRow = document.getElementById('text-row');
@@ -443,6 +445,8 @@
     let silentSince = null;
     let insertionMessage = '';
     let earlyInsertionFallback = false;
+    let insertionActiveLabel = '';
+    let insertionSettingsUrl = '';
     let dismissTimer = null;
     let modelMissingDetails = null;
     let modelDownloadInProgress = false;
@@ -671,10 +675,17 @@
       if (state !== 'model-missing') {
         downloadButton.classList.add('hidden');
       }
+      permissionButton.classList.add('hidden');
 
       switch (state) {
         case 'starting':
         case 'loading':
+          insertionMessage = '';
+          earlyInsertionFallback = false;
+          insertionActiveLabel = '';
+          insertionSettingsUrl = '';
+          permissionButton.disabled = false;
+          permissionButton.textContent = 'Open Settings';
           resetSessionClock();
           setIndicator('dot-neutral');
           label.textContent = 'Starting\u2026';
@@ -692,7 +703,9 @@
 
         case 'listening':
           setIndicator('dot-blink');
-          label.textContent = earlyInsertionFallback && insertionMessage ? insertionMessage : 'Listening\u2026';
+          label.textContent = earlyInsertionFallback
+            ? `Listening · ${insertionActiveLabel || 'copy only'}`
+            : 'Listening\u2026';
           waveform.style.display = 'flex';
           timer.style.display = '';
           showExpanded(false);
@@ -703,7 +716,9 @@
 
         case 'accumulating':
           setIndicator('dot-solid');
-          label.textContent = earlyInsertionFallback && insertionMessage ? insertionMessage : 'Dictating';
+          label.textContent = earlyInsertionFallback
+            ? `Dictating · ${insertionActiveLabel || 'copy only'}`
+            : 'Dictating';
           waveform.style.display = 'flex';
           timer.style.display = '';
           // Stay compact during dictation — text appears only on success
@@ -769,13 +784,21 @@
           break;
 
         case 'blocked':
-          pill.classList.add('error');
-          setIndicator('error');
-          label.textContent = insertionMessage || 'needs Accessibility to insert';
           waveform.style.display = 'none';
           timer.style.display = 'none';
-          showExpanded(false);
-          scheduleDismiss(2500);
+          if (earlyInsertionFallback && insertionSettingsUrl) {
+            setIndicator('success');
+            label.textContent = 'Copied · Accessibility off';
+            showExpanded(true);
+            permissionButton.classList.remove('hidden');
+            scheduleDismiss(7000);
+          } else {
+            pill.classList.add('error');
+            setIndicator('error');
+            label.textContent = insertionMessage || 'Could not type at the cursor';
+            showExpanded(false);
+            scheduleDismiss(2500);
+          }
           break;
 
         case 'error':
@@ -877,6 +900,26 @@
       }
     });
 
+    permissionButton.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!insertionSettingsUrl || permissionButton.disabled) return;
+      cancelDismissTimer();
+      permissionButton.disabled = true;
+      permissionButton.textContent = 'Opening…';
+      try {
+        await window.__TAURI__.core.invoke('cmd_open_file', { path: insertionSettingsUrl });
+        label.textContent = 'Enable Minutes Dev in Accessibility';
+        scheduleDismiss(4500);
+      } catch (_) {
+        pill.classList.add('error');
+        setIndicator('error');
+        label.textContent = 'Could not open Accessibility settings';
+        permissionButton.disabled = false;
+        permissionButton.textContent = 'Try Again';
+        scheduleDismiss(4500);
+      }
+    });
+
     // Listen for partial text updates (streaming whisper)
     listen('dictation:partial', (e) => {
       const text = e.payload;
@@ -913,9 +956,10 @@
         silentSince = null;
         if (lastState === 'listening' || lastState === 'accumulating') {
           pill.classList.remove('error');
-          label.textContent = earlyInsertionFallback && insertionMessage
-            ? insertionMessage
-            : (lastState === 'accumulating' ? 'Dictating' : 'Listening\u2026');
+          const activeLabel = lastState === 'accumulating' ? 'Dictating' : 'Listening\u2026';
+          label.textContent = earlyInsertionFallback
+            ? `${lastState === 'accumulating' ? 'Dictating' : 'Listening'} · ${insertionActiveLabel || 'copy only'}`
+            : activeLabel;
         }
       }
       bars.forEach((bar, i) => {
@@ -926,10 +970,15 @@
     });
 
     listen('dictation:insertion', (e) => {
-      insertionMessage = e.payload?.message || '';
-      earlyInsertionFallback = Boolean(e.payload?.earlyFallback);
+      const payload = e.payload || {};
+      insertionMessage = payload.message || insertionMessage;
+      if (Object.prototype.hasOwnProperty.call(payload, 'earlyFallback')) {
+        earlyInsertionFallback = Boolean(payload.earlyFallback);
+      }
+      insertionActiveLabel = payload.activeLabel || insertionActiveLabel;
+      insertionSettingsUrl = payload.settingsUrl || insertionSettingsUrl;
       if (earlyInsertionFallback && (lastState === 'listening' || lastState === 'accumulating')) {
-        label.textContent = insertionMessage;
+        label.textContent = `${lastState === 'accumulating' ? 'Dictating' : 'Listening'} · ${insertionActiveLabel || 'copy only'}`;
       }
     });
 
