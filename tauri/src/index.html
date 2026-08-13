@@ -5736,7 +5736,7 @@
       <div class="readiness-header">
         <div>
           <div class="readiness-title" id="readiness-title">Readiness Center</div>
-          <div class="readiness-sub">This view only reports what Minutes can verify right now. Optional items stay
+          <div class="readiness-sub" id="readiness-sub">This view only reports what Minutes can verify right now. Optional items stay
             optional, and unknown states are never hidden behind fake confidence.</div>
         </div>
         <button class="btn btn-secondary btn-sm" id="btn-readiness-close">Close</button>
@@ -6948,6 +6948,8 @@
     const readinessOverlay = document.getElementById('readiness-overlay');
     const readinessButton = document.getElementById('btn-readiness');
     const readinessScroll = document.getElementById('readiness-scroll');
+    const readinessTitle = document.getElementById('readiness-title');
+    const readinessSub = document.getElementById('readiness-sub');
     const recordingConsentOverlay = document.getElementById('recording-consent-overlay');
     const recordingConsentDisclosure = document.getElementById('recording-consent-disclosure');
     const recordingConsentConfirm = document.getElementById('recording-consent-confirm');
@@ -7031,6 +7033,9 @@
     const RESUMMARIZE_CONFIRM_MS = 6000;
     let processingJobs = [];
     let readinessItems = [];
+    let readinessScope = 'all';
+    let latestSettings = null;
+    let desktopAppVersion = '';
     let recoveryItems = [];
     let recoveryLoadGeneration = 0;
     let recoveryLoadPromise = null;
@@ -8458,16 +8463,46 @@
       }
     }
 
-    function permissionRowToReadinessItem(row, restartSafety) {
-      return {
+    function permissionRowToReadinessItem(row, restartSafety, shortcutSettings, scope) {
+      const item = {
+        kind: row.kind,
         label: `${row.label} permission`,
         state: permissionReadinessState(row),
         detail: permissionReadinessDetail(row),
         optional: !!row.optional,
         settingsUrl: row.settingsUrl || null,
         restartRecommended: !!row.restartRecommended,
-        restartSafety
+        restartSafety,
+        permission: true
       };
+
+      if (scope !== 'dictation') return item;
+
+      if (row.kind === 'microphone') {
+        item.optional = false;
+        item.detail = row.runtimeUsable
+          ? 'Ready to listen when you start dictation.'
+          : 'Needed only when you dictate. macOS asks at first use; no recording starts from this screen.';
+      } else if (row.kind === 'inputMonitoring') {
+        const usesNativeShortcut = shortcutSettings?.enabled && shortcutSettings?.backend === 'native';
+        item.optional = !usesNativeShortcut;
+        item.detail = usesNativeShortcut
+          ? (row.runtimeUsable
+            ? `${shortcutDisplayLabel(shortcutSettings.shortcut, shortcutSettings.keycode)} works while another app is active.`
+            : `${shortcutDisplayLabel(shortcutSettings.shortcut, shortcutSettings.keycode)} needs Input Monitoring to work outside Minutes.`)
+          : 'Only needed for fn or Caps Lock. Standard shortcuts do not use Input Monitoring.';
+      } else if (row.kind === 'accessibility') {
+        item.optional = true;
+        item.detail = row.runtimeUsable
+          ? 'Available for richer focused-app and window context.'
+          : 'Optional for dictation. It improves app and window context, but Minutes still attempts the real paste operation without treating this check as proof.';
+      } else if (row.kind === 'automation') {
+        item.label = 'Paste automation';
+        item.optional = false;
+        item.detail = 'macOS asks when Minutes first sends the paste shortcut to another app. If that operation is declined or blocked, your transcript stays safely on the clipboard.';
+      }
+
+      return item;
     }
 
     function withUiDeadline(promise, label, timeoutMs = 5000) {
@@ -8484,16 +8519,81 @@
       ]);
     }
 
+    function setReadinessScope(scope = 'all') {
+      readinessScope = scope === 'dictation' ? 'dictation' : 'all';
+      if (readinessScope === 'dictation') {
+        readinessTitle.textContent = 'Set up Type at cursor';
+        readinessSub.textContent = 'Four separate capabilities, checked only for dictation. Minutes never asks recording-only users to configure them.';
+      } else {
+        readinessTitle.textContent = 'Readiness Center';
+        readinessSub.textContent = 'This view only reports what Minutes can verify right now. Optional items stay optional, and unknown states are never hidden behind fake confidence.';
+      }
+    }
+
+    async function refreshDictationPermissionNudge({ allowShow = false, force = false } = {}) {
+      if (!latestSettings || !desktopAppVersion) return;
+      const destination = latestSettings?.dictation?.destination || 'insert';
+      if (destination !== 'insert') {
+        if (readinessButton.dataset.scope === 'dictation') {
+          readinessButton.classList.remove('active');
+          readinessButton.textContent = 'Readiness';
+          readinessButton.dataset.scope = 'all';
+        }
+        return;
+      }
+
+      try {
+        const [rows, shortcut] = await Promise.all([
+          invoke('cmd_macos_permission_rows'),
+          invoke('cmd_dictation_shortcut_settings'),
+        ]);
+        const microphone = rows.find(row => row.kind === 'microphone');
+        const inputMonitoring = rows.find(row => row.kind === 'inputMonitoring');
+        const needsInputMonitoring = shortcut?.enabled && shortcut?.backend === 'native';
+        const needsAttention = Boolean(
+          (microphone && !microphone.runtimeUsable)
+          || (needsInputMonitoring && inputMonitoring && !inputMonitoring.runtimeUsable)
+        );
+
+        if (!needsAttention) {
+          if (readinessButton.dataset.scope === 'dictation') {
+            readinessButton.classList.remove('active');
+            readinessButton.textContent = 'Readiness';
+            readinessButton.dataset.scope = 'all';
+          }
+          return;
+        }
+
+        const markerKey = 'minutes.dictationPermissionNudgeVersion';
+        if (!allowShow || (!force && localStorage.getItem(markerKey) === desktopAppVersion)) return;
+        localStorage.setItem(markerKey, desktopAppVersion);
+        readinessButton.textContent = force ? 'Dictation needs setup' : 'Dictation setup';
+        readinessButton.dataset.scope = 'dictation';
+        readinessButton.classList.add('active');
+      } catch (error) {
+        console.error('Dictation permission nudge:', error);
+      }
+    }
+
+    async function openReadiness(scope = 'all') {
+      setReadinessScope(scope);
+      readinessOverlay.classList.add('active');
+      await loadReadinessItems();
+    }
+
     async function loadReadinessItems() {
       readinessScroll.replaceChildren();
       const checking = document.createElement('div');
       checking.className = 'readiness-item-detail';
-      checking.textContent = 'Checking readiness in the background...';
+      checking.textContent = 'Checking now…';
       readinessScroll.appendChild(checking);
-      const [itemsResult, permissionRowsResult, restartSafetyResult] = await Promise.allSettled([
-        withUiDeadline(invoke('cmd_permission_center'), 'Readiness inventory'),
+      const [itemsResult, permissionRowsResult, restartSafetyResult, shortcutResult] = await Promise.allSettled([
+        readinessScope === 'all'
+          ? withUiDeadline(invoke('cmd_permission_center'), 'Readiness inventory')
+          : Promise.resolve([]),
         withUiDeadline(invoke('cmd_macos_permission_rows'), 'macOS permission checks'),
-        invoke('cmd_permission_restart_safety')
+        invoke('cmd_permission_restart_safety'),
+        invoke('cmd_dictation_shortcut_settings')
       ]);
 
       let items = [];
@@ -8518,7 +8618,11 @@
 
       let permissionItems = [];
       if (permissionRowsResult.status === 'fulfilled' && Array.isArray(permissionRowsResult.value)) {
-        permissionItems = permissionRowsResult.value.map(row => permissionRowToReadinessItem(row, restartSafety));
+        const shortcutSettings = shortcutResult.status === 'fulfilled' ? shortcutResult.value : null;
+        const rows = readinessScope === 'dictation'
+          ? permissionRowsResult.value.filter(row => ['microphone', 'inputMonitoring', 'accessibility', 'automation'].includes(row.kind))
+          : permissionRowsResult.value;
+        permissionItems = rows.map(row => permissionRowToReadinessItem(row, restartSafety, shortcutSettings, readinessScope));
       } else if (permissionRowsResult.status === 'rejected') {
         console.error('macOS permission rows:', permissionRowsResult.reason);
         permissionItems.push({
@@ -8567,9 +8671,22 @@
           card.appendChild(optional);
         }
 
-        if (item.settingsUrl || item.restartRecommended) {
+        if (item.permission || item.settingsUrl || item.restartRecommended) {
           const actions = document.createElement('div');
           actions.className = 'readiness-actions';
+          const statusLine = document.createElement('div');
+          statusLine.className = 'readiness-action-status';
+          const recheckButton = document.createElement('button');
+          recheckButton.type = 'button';
+          recheckButton.className = 'btn btn-secondary btn-sm';
+          recheckButton.textContent = 'Recheck';
+          recheckButton.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            recheckButton.disabled = true;
+            recheckButton.textContent = 'Checking…';
+            await loadReadinessItems();
+          });
+          actions.appendChild(recheckButton);
           if (item.settingsUrl) {
             const openSettings = document.createElement('button');
             openSettings.type = 'button';
@@ -8591,8 +8708,6 @@
             actions.appendChild(openSettings);
           }
           if (item.restartRecommended) {
-            const statusLine = document.createElement('div');
-            statusLine.className = 'readiness-action-status';
             const initialStatus = permissionRestartStatusText(item.restartSafety);
             if (initialStatus && item.restartSafety && item.restartSafety.status !== 'allowed') {
               statusLine.textContent = initialStatus;
@@ -8608,8 +8723,8 @@
               restartForPermission(statusLine, restartButton);
             });
             actions.appendChild(restartButton);
-            actions.appendChild(statusLine);
           }
+          actions.appendChild(statusLine);
           card.appendChild(actions);
         }
 
@@ -9533,8 +9648,14 @@
     });
 
     readinessButton.addEventListener('click', () => {
-      loadReadinessItems();
-      readinessOverlay.classList.add('active');
+      const scope = readinessButton.dataset.scope || 'all';
+      if (scope === 'dictation' && desktopAppVersion) {
+        localStorage.setItem('minutes.dictationPermissionNudgeVersion', desktopAppVersion);
+        readinessButton.classList.remove('active');
+        readinessButton.textContent = 'Readiness';
+        readinessButton.dataset.scope = 'all';
+      }
+      openReadiness(scope);
     });
     document.getElementById('btn-readiness-close').addEventListener('click', closeReadiness);
     readinessOverlay.addEventListener('click', (e) => {
@@ -11351,6 +11472,7 @@
           invoke('cmd_get_settings'),
           invoke('cmd_get_coach_settings'),
         ]);
+        latestSettings = s;
         renderCoachSettings(coach);
         document.getElementById('settings-config-path').textContent = s.config_path;
         // Identity — populate name, emails, and aliases. The legacy
@@ -12494,7 +12616,17 @@
         document.getElementById('settings-dictation-shortcut-status').textContent = String(e2);
       }
     });
-    document.getElementById('settings-dictation-destination').addEventListener('change', (e) => invoke('cmd_set_setting', { section: 'dictation', key: 'destination', value: e.target.value }));
+    document.getElementById('settings-dictation-destination').addEventListener('change', async (e) => {
+      const destination = e.target.value;
+      await invoke('cmd_set_setting', { section: 'dictation', key: 'destination', value: destination });
+      if (latestSettings?.dictation) latestSettings.dictation.destination = destination;
+      if (destination === 'insert') {
+        closeSettings();
+        await openReadiness('dictation');
+      } else {
+        refreshDictationPermissionNudge();
+      }
+    });
     // UI language: persist via config + rebuild native shell, then apply to the
     // frontend in place (cmd returns the resolved locale, "en" | "zh-CN").
     document.getElementById('settings-ui-language').addEventListener('change', async (e) => {
@@ -13193,7 +13325,9 @@
     const currentWindow = getCurrentWindow();
 
     window.__TAURI__.app.getVersion?.().then((version) => {
+      desktopAppVersion = version;
       if (aboutVersion) aboutVersion.textContent = `Desktop app v${version}`;
+      refreshDictationPermissionNudge({ allowShow: true });
     }).catch(() => { });
 
     aboutWebsiteButton?.addEventListener('click', () => {
@@ -13230,8 +13364,18 @@
       openSettings();
     });
 
-    currentWindow.listen('permissions:changed', () => {
+    currentWindow.listen('minutes://show-dictation-permissions', () => {
+      closeAbout();
+      closeSettings();
+      openReadiness('dictation');
+    });
+
+    currentWindow.listen('permissions:changed', (event) => {
       loadReadinessItems();
+      refreshDictationPermissionNudge({
+        allowShow: event.payload?.reason === 'permission_loss',
+        force: event.payload?.reason === 'permission_loss',
+      });
     });
 
     const recallPanel = document.getElementById('recall-panel');
@@ -16329,8 +16473,10 @@
       try {
         await legacyConfigMigrationReady;
         const s = await invoke('cmd_get_settings');
+        latestSettings = s;
         setNotificationToggle(s?.notifications?.completion_enabled !== false);
         copilotCriticalAlertsEnabled = s?.notifications?.copilot_critical_enabled === true;
+        refreshDictationPermissionNudge({ allowShow: true });
       } catch (e) {
         console.error('Init notifications from config:', e);
       }

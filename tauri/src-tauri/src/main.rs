@@ -2942,6 +2942,7 @@ fn main() {
             commands::cmd_get_meeting_prompt,
             commands::cmd_close_meeting_prompt,
             commands::cmd_start_dictation,
+            commands::cmd_show_dictation_permission_help,
             commands::cmd_stop_dictation,
             commands::cmd_dismiss_dictation_overlay,
             commands::cmd_dictation_overlay_ready,
@@ -3285,10 +3286,10 @@ mod tray_activity_tests {
         assert!(commands_rs.contains("\"activeLabel\": \"copy only\""));
         assert!(
             overlay.contains("Listening · ${insertionActiveLabel || 'copy only'}")
-                && overlay.contains("label.textContent = 'Copied · Accessibility off'")
+                && overlay.contains("'Copied · typing needs setup'")
                 && overlay.contains("permissionButton.classList.remove('hidden')")
-                && overlay.contains("cmd_open_file', { path: insertionSettingsUrl }"),
-            "the overlay should present a calm preserved-copy outcome with direct recovery"
+                && overlay.contains("cmd_show_dictation_permission_help"),
+            "the overlay should present a calm preserved-copy outcome and return to scoped recovery"
         );
         assert!(
             overlay.contains("if (earlyInsertionFallback && insertionSettingsUrl)")
@@ -3314,6 +3315,18 @@ mod tray_activity_tests {
             insertion_rs.contains("dictation pasted but clipboard restore failed")
                 && insertion_rs.contains("log_error(\"dictation_paste\""),
             "clipboard cleanup must be secondary to delivered paste and real paste failures must be durable"
+        );
+
+        let index_html = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read desktop UI");
+        assert!(
+            index_html.contains("Set up Type at cursor")
+                && index_html.contains("Only needed for fn or Caps Lock")
+                && index_html.contains("Optional for dictation")
+                && index_html.contains("macOS asks when Minutes first sends the paste shortcut")
+                && index_html.contains("recheckButton.textContent = 'Recheck'")
+                && index_html.contains("minutes.dictationPermissionNudgeVersion"),
+            "dictation permission setup must remain contextual, capability-specific, recheckable, and deduplicated"
         );
     }
 

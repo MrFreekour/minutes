@@ -18087,6 +18087,19 @@ pub fn cmd_start_dictation(
 }
 
 #[tauri::command]
+pub fn cmd_show_dictation_permission_help(app: tauri::AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Minutes could not open its dictation setup view.".to_string())?;
+    main.show()
+        .map_err(|error| format!("Minutes could not show its main window: {error}"))?;
+    main.set_focus()
+        .map_err(|error| format!("Minutes could not focus its main window: {error}"))?;
+    main.emit("minutes://show-dictation-permissions", ())
+        .map_err(|error| format!("Minutes could not open dictation setup: {error}"))
+}
+
+#[tauri::command]
 pub fn cmd_recent_dictations(
     limit: Option<usize>,
 ) -> Result<Vec<minutes_core::dictation_memory::DictationMemoryRecord>, String> {

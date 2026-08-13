@@ -447,6 +447,7 @@
     let earlyInsertionFallback = false;
     let insertionActiveLabel = '';
     let insertionSettingsUrl = '';
+    let insertionNeedsHelp = false;
     let dismissTimer = null;
     let modelMissingDetails = null;
     let modelDownloadInProgress = false;
@@ -675,6 +676,7 @@
           earlyInsertionFallback = false;
           insertionActiveLabel = '';
           insertionSettingsUrl = '';
+          insertionNeedsHelp = false;
           permissionButton.disabled = false;
           permissionButton.textContent = 'Open Settings';
           resetSessionClock();
@@ -742,11 +744,18 @@
 
         case 'copied':
           setIndicator('success');
-          label.textContent = 'Copied';
+          label.textContent = insertionNeedsHelp ? 'Copied · typing needs setup' : 'Copied';
           waveform.style.display = 'none';
           timer.style.display = 'none';
           showExpanded(true);
-          scheduleDismiss(400);
+          if (insertionNeedsHelp) {
+            permissionButton.textContent = 'Fix typing';
+            permissionButton.disabled = false;
+            permissionButton.classList.remove('hidden');
+            scheduleDismiss(7000);
+          } else {
+            scheduleDismiss(400);
+          }
           break;
 
         case 'typed':
@@ -886,14 +895,19 @@
 
     permissionButton.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (!insertionSettingsUrl || permissionButton.disabled) return;
+      if ((!insertionSettingsUrl && !insertionNeedsHelp) || permissionButton.disabled) return;
       cancelDismissTimer();
       permissionButton.disabled = true;
       permissionButton.textContent = 'Opening…';
       try {
-        await window.__TAURI__.core.invoke('cmd_open_file', { path: insertionSettingsUrl });
-        label.textContent = 'Enable Minutes Dev in Accessibility';
-        scheduleDismiss(4500);
+        if (insertionNeedsHelp) {
+          await window.__TAURI__.core.invoke('cmd_show_dictation_permission_help');
+          dismiss();
+        } else {
+          await window.__TAURI__.core.invoke('cmd_open_file', { path: insertionSettingsUrl });
+          label.textContent = 'Check Minutes in Accessibility';
+          scheduleDismiss(4500);
+        }
       } catch (_) {
         pill.classList.add('error');
         setIndicator('error');
@@ -961,6 +975,9 @@
       }
       insertionActiveLabel = payload.activeLabel || insertionActiveLabel;
       insertionSettingsUrl = payload.settingsUrl || insertionSettingsUrl;
+      insertionNeedsHelp = payload.outcome === 'copied'
+        && payload.method === 'clipboard_only'
+        && String(payload.message || '').startsWith('Could not type into the active app.');
       if (earlyInsertionFallback && (lastState === 'listening' || lastState === 'accumulating')) {
         label.textContent = `${lastState === 'accumulating' ? 'Dictating' : 'Listening'} · ${insertionActiveLabel || 'copy only'}`;
       }
