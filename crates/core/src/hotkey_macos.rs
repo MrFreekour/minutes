@@ -52,7 +52,6 @@ mod ffi {
     pub const kCGEventKeyUp: u32 = 11;
     pub const kCGEventFlagsChanged: u32 = 12;
     pub const kCGKeyboardEventKeycode: u32 = 9;
-    pub const kCGEventFlagMaskSecondaryFn: u64 = 0x0080_0000;
 
     // CFRunLoop result codes
     pub const kCFRunLoopRunFinished: i32 = 1;
@@ -101,7 +100,6 @@ mod ffi {
         ) -> CFRunLoopSourceRef;
 
         pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
-        pub fn CGEventGetFlags(event: CGEventRef) -> u64;
 
         pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
         pub fn CFRunLoopAddSource(
@@ -474,25 +472,6 @@ unsafe extern "C" fn event_tap_callback(
         return event;
     }
 
-    // Fn/Globe is a modifier, and macOS does not guarantee that every app-facing
-    // flags-changed event retains virtual keycode 63. Core Graphics exposes the
-    // authoritative SecondaryFn flag for exactly this case. Read the flag before
-    // applying the legacy keycode filter so Fn stays global in terminals and
-    // other apps that transform keyboard events.
-    if context.target_keycode == KEYCODE_FN && event_type == ffi::kCGEventFlagsChanged {
-        let flags = ffi::CGEventGetFlags(event);
-        let is_down = flags & ffi::kCGEventFlagMaskSecondaryFn != 0;
-        let was_down = context.key_is_down.swap(is_down, Ordering::Relaxed);
-        if is_down != was_down {
-            (context.callback)(if is_down {
-                HotkeyEvent::Press
-            } else {
-                HotkeyEvent::Release
-            });
-        }
-        return event;
-    }
-
     let keycode = ffi::CGEventGetIntegerValueField(event, ffi::kCGKeyboardEventKeycode);
 
     if keycode != context.target_keycode {
@@ -578,10 +557,5 @@ mod tests {
     fn fn_uses_listen_only_event_tap() {
         assert!(!should_consume_matched_events(KEYCODE_FN));
         assert!(should_consume_matched_events(KEYCODE_CAPS_LOCK));
-    }
-
-    #[test]
-    fn fn_flag_mask_matches_core_graphics_secondary_fn() {
-        assert_eq!(ffi::kCGEventFlagMaskSecondaryFn, 0x0080_0000);
     }
 }
