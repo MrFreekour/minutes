@@ -1969,6 +1969,7 @@ fn main() {
             dictation_focus_guard: Arc::new(Mutex::new(None)),
             pending_dictation_target: Arc::new(Mutex::new(None)),
             dictation_release_started_at: dictation_release_started_at.clone(),
+            dictation_overlay: Arc::new(Mutex::new(commands::DictationOverlaySnapshot::default())),
             live_transcript_active: live_transcript_active.clone(),
             live_transcript_stop_flag: live_transcript_stop_flag.clone(),
             copilot_active: copilot_active.clone(),
@@ -2938,6 +2939,7 @@ fn main() {
             commands::cmd_start_dictation,
             commands::cmd_stop_dictation,
             commands::cmd_dismiss_dictation_overlay,
+            commands::cmd_dictation_overlay_ready,
             commands::cmd_recent_dictations,
             commands::cmd_copy_dictation,
             commands::cmd_repaste_dictation,
@@ -3157,6 +3159,40 @@ mod tray_activity_tests {
         assert!(
             !commands_rs.contains("window.close()"),
             "dictation overlay lifecycle should not queue async WebView close during teardown"
+        );
+    }
+
+    #[test]
+    fn dictation_overlay_first_frame_is_truthful_and_state_is_replayable() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        assert!(
+            !overlay.contains("Loading model"),
+            "routine startup must not imply a warm model is loading"
+        );
+        assert!(
+            overlay.contains(">Starting…</span>")
+                && overlay.contains("'Preparing dictation\\u2026'")
+                && overlay.contains("}, 250);"),
+            "the first frame should be neutral and only reveal preparation after a real wait"
+        );
+        assert!(
+            overlay.contains("listen('dictation:overlay'")
+                && overlay.contains("cmd_dictation_overlay_ready")
+                && overlay.contains("snapshot.revision <= overlayRevision"),
+            "the overlay should reconcile live events with a revisioned ready-time snapshot"
+        );
+        assert!(
+            commands_rs.contains("publish_dictation_overlay_state(app, \"starting\")")
+                && commands_rs.contains("snapshot.advance(state)")
+                && commands_rs.contains("app.emit(\"dictation:overlay\", snapshot)")
+                && commands_rs.contains("DictationEvent::PartialText(_) => \"\""),
+            "the backend should own and publish replayable overlay state before creating the WebView"
         );
     }
 

@@ -57,6 +57,7 @@ pub struct AppState {
     pub dictation_focus_guard: Arc<Mutex<Option<DictationFocusGuard>>>,
     pub pending_dictation_target: Arc<Mutex<Option<PendingDictationTarget>>>,
     pub dictation_release_started_at: Arc<Mutex<Option<Instant>>>,
+    pub dictation_overlay: Arc<Mutex<DictationOverlaySnapshot>>,
     pub dictation_shortcut_enabled: Arc<AtomicBool>,
     pub dictation_shortcut: Arc<Mutex<String>>,
     pub live_transcript_active: Arc<AtomicBool>,
@@ -235,6 +236,36 @@ impl RecallSourceBinding {
 pub struct DictationFocusGuard {
     target_context: Option<crate::text_insertion::ActiveTargetContext>,
     main_window_hidden: bool,
+}
+
+/// Backend-owned presentation state for the short-lived dictation overlay.
+///
+/// The overlay WebView is rebuilt for each session, so an event can arrive
+/// before its JavaScript listener is attached. The revision lets the frontend
+/// combine live events with a ready-time snapshot without an older invoke
+/// response overwriting newer state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationOverlaySnapshot {
+    pub state: String,
+    pub revision: u64,
+}
+
+impl Default for DictationOverlaySnapshot {
+    fn default() -> Self {
+        Self {
+            state: "idle".into(),
+            revision: 0,
+        }
+    }
+}
+
+impl DictationOverlaySnapshot {
+    fn advance(&mut self, state: &str) -> Self {
+        self.state = state.into();
+        self.revision = self.revision.saturating_add(1);
+        self.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -12867,6 +12898,7 @@ mod tests {
             dictation_focus_guard: Arc::new(Mutex::new(None)),
             pending_dictation_target: Arc::new(Mutex::new(None)),
             dictation_release_started_at: Arc::new(Mutex::new(None)),
+            dictation_overlay: Arc::new(Mutex::new(DictationOverlaySnapshot::default())),
             dictation_shortcut_enabled: Arc::new(AtomicBool::new(false)),
             dictation_shortcut: Arc::new(Mutex::new("CmdOrCtrl+Shift+Space".into())),
             live_transcript_active: Arc::new(AtomicBool::new(false)),
@@ -12895,6 +12927,19 @@ mod tests {
             recall_chat_turn: Arc::new(Mutex::new(None)),
             recall_chat_next_turn_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[test]
+    fn dictation_overlay_snapshot_advances_for_replay_ordering() {
+        let mut snapshot = DictationOverlaySnapshot::default();
+
+        let starting = snapshot.advance("starting");
+        let listening = snapshot.advance("listening");
+
+        assert_eq!(starting.state, "starting");
+        assert_eq!(starting.revision, 1);
+        assert_eq!(listening.state, "listening");
+        assert_eq!(listening.revision, 2);
     }
 
     #[test]
@@ -19869,6 +19914,31 @@ fn finish_dictation_overlay_lifecycle(app: &tauri::AppHandle, guard: Option<Dict
     );
 }
 
+fn publish_dictation_overlay_state(app: &tauri::AppHandle, state: &str) {
+    let snapshot = {
+        let app_state = app.state::<AppState>();
+        let mut snapshot = app_state
+            .dictation_overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshot.advance(state)
+    };
+
+    // Keep the existing lightweight event for command-palette refreshes while
+    // the overlay consumes the revisioned, replayable contract.
+    app.emit("dictation:state", state).ok();
+    app.emit("dictation:overlay", snapshot).ok();
+}
+
+#[tauri::command]
+pub fn cmd_dictation_overlay_ready(state: tauri::State<AppState>) -> DictationOverlaySnapshot {
+    state
+        .dictation_overlay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 #[tauri::command]
 pub fn cmd_dismiss_dictation_overlay(
     app: tauri::AppHandle,
@@ -19937,6 +20007,7 @@ fn start_dictation_session(
         Ok(mut guard) => *guard = Some(focus_guard.clone()),
         Err(poisoned) => *poisoned.into_inner() = Some(focus_guard.clone()),
     }
+    publish_dictation_overlay_state(app, "starting");
     show_dictation_overlay(app);
     dictation_focus_debug(
         "overlay_shown",
@@ -19945,8 +20016,6 @@ fn start_dictation_session(
         None,
     );
     restore_dictation_target_focus(&dictation_target_context);
-    app.emit("dictation:state", "loading").ok();
-
     state.dictation_stop_flag.store(false, Ordering::Relaxed);
     if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
         *released_at = None;
@@ -19992,7 +20061,11 @@ fn start_dictation_session(
                     DictationEvent::Listening => "listening",
                     DictationEvent::Accumulating => "accumulating",
                     DictationEvent::Processing => "processing",
-                    DictationEvent::PartialText(_) => "partial",
+                    // Partial text supplements the active capture state; it is
+                    // not independently renderable if a new overlay missed
+                    // the preceding listening/accumulating event. Keep the
+                    // replay snapshot on that durable state instead.
+                    DictationEvent::PartialText(_) => "",
                     DictationEvent::AudioLevel(_) => "",
                     DictationEvent::SilenceCountdown { .. } => "",
                     DictationEvent::Success => "success",
@@ -20036,7 +20109,7 @@ fn start_dictation_session(
                             }
                         }
                     }
-                    app_for_events.emit("dictation:state", state_str).ok();
+                    publish_dictation_overlay_state(&app_for_events, state_str);
                 }
 
                 if let DictationEvent::PartialText(text) = &event {
@@ -20071,7 +20144,7 @@ fn start_dictation_session(
                     .try_state::<AppState>()
                     .and_then(|state| take_dictation_release_started_at(&state));
                 if dictation_should_insert(&config_for_results) && insert_available_at_start {
-                    app_for_results.emit("dictation:state", "inserting").ok();
+                    publish_dictation_overlay_state(&app_for_results, "inserting");
                     dictation_focus_debug(
                         "before_insert_restore",
                         dictation_target_context_for_results.as_ref(),
@@ -20089,9 +20162,7 @@ fn start_dictation_session(
                         },
                     );
                     app_for_results.emit("dictation:insertion", &insertion).ok();
-                    app_for_results
-                        .emit("dictation:state", insertion.overlay_state())
-                        .ok();
+                    publish_dictation_overlay_state(&app_for_results, insertion.overlay_state());
                     log_dictation_insert(
                         &result,
                         &insertion,
@@ -20117,9 +20188,7 @@ fn start_dictation_session(
                         },
                     );
                     app_for_results.emit("dictation:insertion", &insertion).ok();
-                    app_for_results
-                        .emit("dictation:state", insertion.overlay_state())
-                        .ok();
+                    publish_dictation_overlay_state(&app_for_results, insertion.overlay_state());
                     log_dictation_insert(
                         &result,
                         &insertion,
@@ -20140,7 +20209,7 @@ fn start_dictation_session(
                 if !final_output_emitted.load(Ordering::Relaxed)
                     && !model_missing_emitted.load(Ordering::Relaxed)
                 {
-                    app_clone.emit("dictation:state", "cancelled").ok();
+                    publish_dictation_overlay_state(&app_clone, "cancelled");
                     let guard = app_clone
                         .state::<AppState>()
                         .dictation_focus_guard
@@ -20161,7 +20230,7 @@ fn start_dictation_session(
             }
             Err(e) => {
                 eprintln!("[dictation] error: {}", e);
-                app_clone.emit("dictation:state", "error").ok();
+                publish_dictation_overlay_state(&app_clone, "error");
             }
         }
     });
