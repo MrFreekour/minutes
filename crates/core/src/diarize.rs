@@ -173,6 +173,16 @@ pub struct SpeakerSegment {
     pub end: f64,
 }
 
+/// One reliable, normalized segment embedding retained for identity safety.
+///
+/// This stays in memory only. Meeting diagnostics summarize counts and
+/// decisions; they never serialize the embedding itself.
+#[derive(Debug, Clone)]
+pub struct SpeakerEmbeddingSegment {
+    pub embedding: Vec<f32>,
+    pub speech_seconds: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct DiarizationResult {
     pub segments: Vec<SpeakerSegment>,
@@ -191,6 +201,13 @@ pub struct DiarizationResult {
     /// Per-speaker averaged embeddings (for Level 3 confirmed learning).
     /// Empty when using the Python subprocess engine.
     pub speaker_embeddings: std::collections::HashMap<String, Vec<f32>>,
+    /// Reliable segment embeddings grouped by their final speaker label.
+    ///
+    /// A cluster centroid alone cannot establish that every segment in the
+    /// cluster belongs to the same enrolled person (issue #753). Retaining the
+    /// inputs that formed it lets attribution require consistent evidence and
+    /// abstain before a wrong High-confidence rewrite.
+    pub speaker_embedding_segments: std::collections::HashMap<String, Vec<SpeakerEmbeddingSegment>>,
 }
 
 impl Default for DiarizationResult {
@@ -204,6 +221,7 @@ impl Default for DiarizationResult {
             from_stems: false,
             source_aware: false,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         }
     }
 }
@@ -1817,6 +1835,7 @@ fn diarization_from_energy_windows(
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         });
     }
 
@@ -1880,6 +1899,7 @@ fn diarization_from_energy_windows(
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         })
     }
 }
@@ -2080,6 +2100,17 @@ fn remap_diarization_labels(
         }
     }
 
+    let mut speaker_embedding_segments = std::collections::HashMap::new();
+    let mut evidence_keys: Vec<String> =
+        result.speaker_embedding_segments.keys().cloned().collect();
+    evidence_keys.sort();
+    for raw_label in evidence_keys {
+        let remapped_label = remap_label(&raw_label);
+        if let Some(evidence) = result.speaker_embedding_segments.get(&raw_label) {
+            speaker_embedding_segments.insert(remapped_label, evidence.clone());
+        }
+    }
+
     DiarizationResult {
         segments,
         num_speakers: label_map.len(),
@@ -2089,6 +2120,7 @@ fn remap_diarization_labels(
         from_stems: result.from_stems,
         source_aware: result.source_aware,
         speaker_embeddings,
+        speaker_embedding_segments,
     }
 }
 
@@ -2156,6 +2188,12 @@ fn merge_remote_diarization_into_stem_result(
         .filter(|(label, _)| present_labels.contains(*label))
         .map(|(label, embedding)| (label.clone(), embedding.clone()))
         .collect();
+    let speaker_embedding_segments = remote_result
+        .speaker_embedding_segments
+        .iter()
+        .filter(|(label, _)| present_labels.contains(*label))
+        .map(|(label, evidence)| (label.clone(), evidence.clone()))
+        .collect();
 
     DiarizationResult {
         num_speakers: present_labels.len(),
@@ -2166,6 +2204,7 @@ fn merge_remote_diarization_into_stem_result(
         from_stems: false,
         source_aware: true,
         speaker_embeddings,
+        speaker_embedding_segments,
     }
 }
 
@@ -3222,6 +3261,9 @@ fn diarize_with_pyannote_rs(
     let mut speaker_templates: Vec<(Vec<f32>, usize)> = Vec::new();
     // Per-segment: which speaker index was assigned
     let mut seg_speaker_ids: Vec<usize> = Vec::new();
+    // Reliable embeddings parallel to `speech_segments`. Short segments stay
+    // `None` and are never allowed to vote on an identity decision.
+    let mut seg_embeddings: Vec<Option<Vec<f32>>> = Vec::new();
 
     // Minimum samples for reliable embedding extraction (~1.5s at 16kHz).
     // Shorter segments produce unstable embeddings that corrupt clustering.
@@ -3244,6 +3286,7 @@ fn diarize_with_pyannote_rs(
         // transcript but inherit the nearest speaker label.
         if seg_i16.len() < min_embed_samples {
             seg_speaker_ids.push(usize::MAX); // sentinel: inherit later
+            seg_embeddings.push(None);
             continue;
         }
 
@@ -3252,6 +3295,7 @@ fn diarize_with_pyannote_rs(
         // L2-normalize so every segment contributes equally to the
         // average direction, regardless of the model's output magnitude.
         let embedding = l2_normalize(&raw_embedding);
+        seg_embeddings.push(Some(embedding.clone()));
 
         // Find best matching speaker by cosine similarity
         let mut best_id = None;
@@ -3394,6 +3438,23 @@ fn diarize_with_pyannote_rs(
         });
     }
 
+    let mut speaker_embedding_segments: std::collections::HashMap<
+        String,
+        Vec<SpeakerEmbeddingSegment>,
+    > = std::collections::HashMap::new();
+    for (idx, embedding) in seg_embeddings.into_iter().enumerate() {
+        let Some(embedding) = embedding else {
+            continue;
+        };
+        speaker_embedding_segments
+            .entry(final_labels[idx].clone())
+            .or_default()
+            .push(SpeakerEmbeddingSegment {
+                embedding,
+                speech_seconds: (speech_segments[idx].end - speech_segments[idx].start).max(0.0),
+            });
+    }
+
     // Rebuild final speaker embeddings by weighted-averaging merged templates.
     // Each template is weighted by its segment count so a template built from
     // 50 segments contributes proportionally more than one from 2 segments.
@@ -3438,6 +3499,7 @@ fn diarize_with_pyannote_rs(
         from_stems: false,
         source_aware: false,
         speaker_embeddings,
+        speaker_embedding_segments,
     })
 }
 
@@ -3855,6 +3917,7 @@ except Exception as e:
         from_stems: false,
         source_aware: false,
         speaker_embeddings: std::collections::HashMap::new(), // Python path can't extract embeddings
+        speaker_embedding_segments: std::collections::HashMap::new(),
     })
 }
 
@@ -4744,6 +4807,7 @@ mod tests {
             from_stems: false,
             source_aware: false,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
 
         let labeled = apply_speakers(transcript, &result);
@@ -4776,6 +4840,7 @@ mod tests {
             from_stems: false,
             source_aware: false,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
 
         let labeled = apply_speakers(transcript, &result);
@@ -4811,6 +4876,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
 
         let labeled = apply_speakers(transcript, &result);
@@ -4919,6 +4985,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let windows = vec![
             TranscriptWindow {
@@ -4972,6 +5039,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let one_overlapping_window = vec![TranscriptWindow {
             start_secs: 5.5,
@@ -4999,6 +5067,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let windows = vec![TranscriptWindow {
             start_secs: 12.0,
@@ -5064,6 +5133,22 @@ mod tests {
                 ("remote-alex".to_string(), vec![0.1, 0.2]),
                 ("remote-sam".to_string(), vec![0.3, 0.4]),
             ]),
+            speaker_embedding_segments: std::collections::HashMap::from([
+                (
+                    "remote-alex".to_string(),
+                    vec![SpeakerEmbeddingSegment {
+                        embedding: vec![0.1, 0.2],
+                        speech_seconds: 3.0,
+                    }],
+                ),
+                (
+                    "remote-sam".to_string(),
+                    vec![SpeakerEmbeddingSegment {
+                        embedding: vec![0.3, 0.4],
+                        speech_seconds: 3.0,
+                    }],
+                ),
+            ]),
         };
 
         let remapped = remap_diarization_labels(&result, 1);
@@ -5073,6 +5158,12 @@ mod tests {
         assert_eq!(remapped.segments[2].speaker, "SPEAKER_1");
         assert!(remapped.speaker_embeddings.contains_key("SPEAKER_1"));
         assert!(remapped.speaker_embeddings.contains_key("SPEAKER_2"));
+        assert!(remapped
+            .speaker_embedding_segments
+            .contains_key("SPEAKER_1"));
+        assert!(remapped
+            .speaker_embedding_segments
+            .contains_key("SPEAKER_2"));
     }
 
     #[test]
@@ -5107,6 +5198,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let remote_result = DiarizationResult {
             segments: vec![
@@ -5141,6 +5233,22 @@ mod tests {
                 ("SPEAKER_2".to_string(), vec![0.1]),
                 ("SPEAKER_3".to_string(), vec![0.2]),
             ]),
+            speaker_embedding_segments: std::collections::HashMap::from([
+                (
+                    "SPEAKER_2".to_string(),
+                    vec![SpeakerEmbeddingSegment {
+                        embedding: vec![0.1],
+                        speech_seconds: 3.0,
+                    }],
+                ),
+                (
+                    "SPEAKER_3".to_string(),
+                    vec![SpeakerEmbeddingSegment {
+                        embedding: vec![0.2],
+                        speech_seconds: 3.0,
+                    }],
+                ),
+            ]),
         };
 
         let merged = merge_remote_diarization_into_stem_result(&stem_result, &remote_result);
@@ -5168,6 +5276,8 @@ mod tests {
         );
         assert!(merged.speaker_embeddings.contains_key("SPEAKER_2"));
         assert!(merged.speaker_embeddings.contains_key("SPEAKER_3"));
+        assert!(merged.speaker_embedding_segments.contains_key("SPEAKER_2"));
+        assert!(merged.speaker_embedding_segments.contains_key("SPEAKER_3"));
     }
 
     #[test]
@@ -5197,6 +5307,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let single_remote = DiarizationResult {
             segments: vec![SpeakerSegment {
@@ -5211,6 +5322,7 @@ mod tests {
             from_stems: false,
             source_aware: false,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let strong_remote = DiarizationResult {
             segments: vec![
@@ -5237,6 +5349,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
 
         assert!(!has_meaningful_remote_structure(&weak_remote));
@@ -5266,6 +5379,7 @@ mod tests {
             from_stems: true,
             source_aware: true,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let remote_result = DiarizationResult {
             segments: vec![SpeakerSegment {
@@ -5282,6 +5396,13 @@ mod tests {
             speaker_embeddings: std::collections::HashMap::from([(
                 "SPEAKER_2".to_string(),
                 vec![0.2],
+            )]),
+            speaker_embedding_segments: std::collections::HashMap::from([(
+                "SPEAKER_2".to_string(),
+                vec![SpeakerEmbeddingSegment {
+                    embedding: vec![0.2],
+                    speech_seconds: 3.0,
+                }],
             )]),
         };
 
@@ -5514,6 +5635,7 @@ mod tests {
             from_stems: false,
             source_aware: false,
             speaker_embeddings: std::collections::HashMap::new(),
+            speaker_embedding_segments: std::collections::HashMap::new(),
         };
         let mut attempted_paths = Vec::new();
 
@@ -5757,6 +5879,7 @@ mod tests {
                     from_stems: true,
                     source_aware: true,
                     speaker_embeddings: std::collections::HashMap::new(),
+                    speaker_embedding_segments: std::collections::HashMap::new(),
                 })
             },
         )
@@ -5809,6 +5932,7 @@ mod tests {
                     from_stems: true,
                     source_aware: true,
                     speaker_embeddings: std::collections::HashMap::new(),
+                    speaker_embedding_segments: std::collections::HashMap::new(),
                 })
             },
         );

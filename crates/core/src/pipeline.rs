@@ -299,6 +299,35 @@ struct VoiceMatchResult {
     /// Whether the user's own enrolled profile exists in the database
     /// (by `config.identity.name`), regardless of whether it matched a speaker.
     self_profile_exists: bool,
+    /// Privacy-safe aggregate evidence for every centroid considered.
+    diagnostics: Vec<VoiceMatchDiagnostic>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct VoiceMatchDiagnostic {
+    speaker_label: String,
+    model_id: String,
+    accepted: bool,
+    reason: String,
+    winner_name: Option<String>,
+    centroid_similarity: Option<f32>,
+    centroid_runner_up_similarity: Option<f32>,
+    centroid_margin: Option<f32>,
+    threshold: f32,
+    segment_evidence_count: usize,
+    segment_matching_count: usize,
+    segment_rejected_count: usize,
+    segment_conflicting_identity_count: usize,
+    segment_speech_seconds: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ProvisionalVoiceMatch {
+    diagnostic_index: usize,
+    speaker_label: String,
+    winner_slug: String,
+    winner_name: String,
+    similarity: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -370,6 +399,7 @@ struct AttributionDebugInfo {
     raw_diarization_num_speakers: usize,
     effective_transcript_speaker_labels: Vec<String>,
     self_attribution: SelfAttributionDebug,
+    voice_matches: Vec<VoiceMatchDiagnostic>,
     final_speaker_map: Vec<SpeakerAttributionDebug>,
 }
 
@@ -453,69 +483,266 @@ fn voice_stem_fallback_note(
     }
 }
 
-/// Match diarized speaker embeddings against enrolled voice profiles (Level 2).
+fn evidence_has_unique_winner(evidence: &crate::voice::VoiceMatchEvidence) -> bool {
+    evidence.accepted
+        && evidence
+            .runner_up_similarity
+            .is_none_or(|runner_up| runner_up < evidence.threshold)
+}
+
+/// Apply the meeting-level safety policy to structured, model-compatible voice
+/// matches.
 ///
-/// For each speaker label, `match_embedding` returns at most one name — the
-/// profile with the highest cosine similarity above threshold. This means each
-/// label gets at most one attribution, even if multiple profiles exceed the
-/// threshold.
+/// A centroid is only provisional. Every reliable segment that formed the
+/// cluster must independently clear the existing configured identity threshold
+/// for the same unique profile. This is deliberately unanimity, not a new
+/// percentage threshold: any contradictory segment means the cluster cannot
+/// support a High-confidence rewrite. A final pass also keeps the assignment
+/// one-to-one by abstaining on every duplicate claim to one profile.
+fn evaluate_speaker_voice_matches(
+    model_id: &str,
+    profiles: &[crate::voice::ActiveProfile],
+    self_profile_slug: Option<&str>,
+    threshold: f32,
+    diarization_embeddings: &std::collections::HashMap<String, Vec<f32>>,
+    speaker_embedding_segments: &std::collections::HashMap<
+        String,
+        Vec<diarize::SpeakerEmbeddingSegment>,
+    >,
+) -> VoiceMatchResult {
+    let self_profile_exists = self_profile_slug
+        .is_some_and(|slug| profiles.iter().any(|profile| profile.person_slug == slug));
+    let mut diagnostics = Vec::new();
+    let mut provisional = Vec::new();
+    let mut labels: Vec<&String> = diarization_embeddings.keys().collect();
+    labels.sort();
+
+    for label in labels {
+        let centroid = crate::voice::match_active_profiles(
+            &diarization_embeddings[label],
+            model_id,
+            profiles,
+            threshold,
+        );
+        let segment_evidence = speaker_embedding_segments
+            .get(label)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let segment_speech_seconds = segment_evidence
+            .iter()
+            .map(|segment| segment.speech_seconds)
+            .sum();
+        let mut diagnostic = VoiceMatchDiagnostic {
+            speaker_label: label.clone(),
+            model_id: model_id.to_string(),
+            accepted: false,
+            reason: centroid.reason.clone(),
+            winner_name: centroid.winner_name.clone(),
+            centroid_similarity: centroid.similarity,
+            centroid_runner_up_similarity: centroid.runner_up_similarity,
+            centroid_margin: centroid.margin,
+            threshold,
+            segment_evidence_count: segment_evidence.len(),
+            segment_matching_count: 0,
+            segment_rejected_count: 0,
+            segment_conflicting_identity_count: 0,
+            segment_speech_seconds,
+        };
+
+        if centroid
+            .similarity
+            .is_some_and(|similarity| !similarity.is_finite())
+            || centroid
+                .runner_up_similarity
+                .is_some_and(|score| !score.is_finite())
+            || centroid.margin.is_some_and(|margin| !margin.is_finite())
+        {
+            diagnostic.reason = "voice match produced non-finite evidence".to_string();
+            diagnostics.push(diagnostic);
+            continue;
+        }
+
+        if !evidence_has_unique_winner(&centroid) {
+            diagnostic.reason = if centroid.accepted {
+                "multiple compatible profiles cleared the configured threshold".to_string()
+            } else {
+                centroid.reason.clone()
+            };
+            diagnostics.push(diagnostic);
+            continue;
+        }
+        let Some(winner_slug) = centroid.winner_slug.as_deref() else {
+            diagnostic.reason = "accepted centroid had no winning profile".to_string();
+            diagnostics.push(diagnostic);
+            continue;
+        };
+        let Some(winner_name) = centroid.winner_name.as_deref() else {
+            diagnostic.reason = "accepted centroid had no winning profile name".to_string();
+            diagnostics.push(diagnostic);
+            continue;
+        };
+        if segment_evidence.is_empty() {
+            diagnostic.reason =
+                "centroid had no reliable intra-cluster segment evidence".to_string();
+            diagnostics.push(diagnostic);
+            continue;
+        }
+
+        for segment in segment_evidence {
+            if segment.embedding.iter().any(|value| !value.is_finite()) {
+                diagnostic.segment_rejected_count += 1;
+                continue;
+            }
+            let evidence = crate::voice::match_active_profiles(
+                &segment.embedding,
+                model_id,
+                profiles,
+                threshold,
+            );
+            if evidence_has_unique_winner(&evidence)
+                && evidence.winner_slug.as_deref() == Some(winner_slug)
+            {
+                diagnostic.segment_matching_count += 1;
+            } else if evidence_has_unique_winner(&evidence) {
+                diagnostic.segment_conflicting_identity_count += 1;
+            } else {
+                diagnostic.segment_rejected_count += 1;
+            }
+        }
+
+        if diagnostic.segment_matching_count != diagnostic.segment_evidence_count {
+            diagnostic.reason =
+                "intra-cluster segment evidence did not consistently support the centroid winner"
+                    .to_string();
+            diagnostics.push(diagnostic);
+            continue;
+        }
+
+        diagnostic.accepted = true;
+        diagnostic.reason =
+            "centroid and every reliable segment supported one enrolled profile".to_string();
+        let diagnostic_index = diagnostics.len();
+        provisional.push(ProvisionalVoiceMatch {
+            diagnostic_index,
+            speaker_label: label.clone(),
+            winner_slug: winner_slug.to_string(),
+            winner_name: winner_name.to_string(),
+            similarity: centroid.similarity.unwrap_or(f32::MIN),
+        });
+        diagnostics.push(diagnostic);
+    }
+
+    let mut claims_by_profile: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (candidate_index, candidate) in provisional.iter().enumerate() {
+        claims_by_profile
+            .entry(candidate.winner_slug.clone())
+            .or_default()
+            .push(candidate_index);
+    }
+    for candidate_indices in claims_by_profile.values_mut() {
+        if candidate_indices.len() < 2 {
+            continue;
+        }
+        candidate_indices.sort_by(|left, right| {
+            provisional[*right]
+                .similarity
+                .total_cmp(&provisional[*left].similarity)
+                .then_with(|| {
+                    provisional[*left]
+                        .speaker_label
+                        .cmp(&provisional[*right].speaker_label)
+                })
+        });
+        let strongest = provisional[candidate_indices[0]].similarity;
+        let tied = provisional[candidate_indices[1]].similarity == strongest;
+        // One centroid being slightly stronger does not prove that it owns the
+        // profile and the others do not. Multiple clusters claiming one human
+        // means the meeting-level assignment itself is ambiguous, so decline
+        // every claim instead of introducing another uncalibrated margin.
+        let rejected = candidate_indices.as_slice();
+        for candidate_index in rejected {
+            let diagnostic = &mut diagnostics[provisional[*candidate_index].diagnostic_index];
+            diagnostic.accepted = false;
+            diagnostic.reason = if tied {
+                "two speaker clusters tied for the same enrolled profile".to_string()
+            } else {
+                "multiple speaker clusters claimed the same enrolled profile".to_string()
+            };
+        }
+    }
+
+    let attributions = provisional
+        .into_iter()
+        .filter(|candidate| diagnostics[candidate.diagnostic_index].accepted)
+        .map(|candidate| {
+            tracing::info!(
+                speaker = %candidate.speaker_label,
+                name = %candidate.winner_name,
+                threshold,
+                "Level 2: consistent voice enrollment match"
+            );
+            diarize::SpeakerAttribution {
+                speaker_label: candidate.speaker_label,
+                name: candidate.winner_name,
+                confidence: diarize::Confidence::High,
+                source: diarize::AttributionSource::Enrollment,
+            }
+        })
+        .collect();
+
+    VoiceMatchResult {
+        attributions,
+        self_profile_exists,
+        diagnostics,
+    }
+}
+
+/// Match diarized speaker evidence against enrolled voice profiles (Level 2).
 fn match_speakers_by_voice(
     config: &Config,
     diarization_embeddings: &std::collections::HashMap<String, Vec<f32>>,
+    speaker_embedding_segments: &std::collections::HashMap<
+        String,
+        Vec<diarize::SpeakerEmbeddingSegment>,
+    >,
 ) -> VoiceMatchResult {
     if !config.voice.enabled || diarization_embeddings.is_empty() {
         return VoiceMatchResult {
             attributions: Vec::new(),
             self_profile_exists: false,
+            diagnostics: Vec::new(),
         };
     }
 
+    let model_id = crate::voice::model_version(config);
     let profiles = crate::voice::open_db()
         .ok()
-        .and_then(|conn| crate::voice::load_all_with_embeddings(&conn).ok())
+        .and_then(|conn| {
+            if let Err(error) = crate::voice::migrate_legacy_profiles(&conn) {
+                tracing::warn!(%error, "failed to migrate legacy voice profiles before matching");
+            }
+            crate::voice::list_active_profiles(&conn, model_id).ok()
+        })
         .unwrap_or_default();
 
     if profiles.is_empty() {
         return VoiceMatchResult {
             attributions: Vec::new(),
             self_profile_exists: false,
+            diagnostics: Vec::new(),
         };
     }
 
-    let self_profile_exists = config
-        .identity
-        .name
-        .as_ref()
-        .map(|name| {
-            let slug = slugify(name);
-            profiles.iter().any(|p| p.person_slug == slug)
-        })
-        .unwrap_or(false);
-
-    let threshold = config.voice.match_threshold;
-    let mut attributions = Vec::new();
-
-    for (label, emb) in diarization_embeddings {
-        if let Some(name) = crate::voice::match_embedding(emb, &profiles, threshold) {
-            tracing::info!(
-                speaker = %label,
-                name = %name,
-                threshold = threshold,
-                "Level 2: voice enrollment match"
-            );
-            attributions.push(diarize::SpeakerAttribution {
-                speaker_label: label.clone(),
-                name,
-                confidence: diarize::Confidence::High,
-                source: diarize::AttributionSource::Enrollment,
-            });
-        }
-    }
-
-    VoiceMatchResult {
-        attributions,
-        self_profile_exists,
-    }
+    let self_profile_slug = config.identity.name.as_ref().map(|name| slugify(name));
+    evaluate_speaker_voice_matches(
+        model_id,
+        &profiles,
+        self_profile_slug.as_deref(),
+        config.voice.match_threshold,
+        diarization_embeddings,
+        speaker_embedding_segments,
+    )
 }
 
 fn confidence_label(confidence: diarize::Confidence) -> String {
@@ -2387,6 +2614,7 @@ fn log_attribution_decision(
         "raw_diarization_num_speakers": details.raw_diarization_num_speakers,
         "effective_transcript_speaker_labels": details.effective_transcript_speaker_labels,
         "self_attribution": details.self_attribution,
+        "voice_matches": details.voice_matches,
         "speaker_map": details.final_speaker_map,
     });
     logging::log_step(
@@ -2403,6 +2631,7 @@ fn log_attribution_decision(
         raw_diarization_num_speakers = details.raw_diarization_num_speakers,
         effective_transcript_speaker_labels = ?details.effective_transcript_speaker_labels,
         self_attribution = ?details.self_attribution,
+        voice_matches = ?details.voice_matches,
         speaker_map = ?details.final_speaker_map,
         "meeting attribution instrumentation"
     );
@@ -2535,8 +2764,11 @@ fn single_stem_speaker_self_attribution(
         if let Some(source_backed_label) = source_backed_speaker_label.clone() {
             if let Some(voice_stem_result) = diarize::diarize(&stems.voice, config) {
                 let voice_stem_speakers = diarize::attributed_speaker_count(&voice_stem_result);
-                let voice_match =
-                    match_speakers_by_voice(config, &voice_stem_result.speaker_embeddings);
+                let voice_match = match_speakers_by_voice(
+                    config,
+                    &voice_stem_result.speaker_embeddings,
+                    &voice_stem_result.speaker_embedding_segments,
+                );
                 let matched_self = voice_match
                     .attributions
                     .iter()
@@ -2634,6 +2866,10 @@ fn attribute_meeting_speakers(
     diarization_from_stems: bool,
     degraded_ml_fallback: bool,
     diarization_embeddings: &std::collections::HashMap<String, Vec<f32>>,
+    speaker_embedding_segments: &std::collections::HashMap<
+        String,
+        Vec<diarize::SpeakerEmbeddingSegment>,
+    >,
     transcript: String,
 ) -> AttributionProcessingResult {
     let mut transcript = transcript;
@@ -2646,7 +2882,8 @@ fn attribute_meeting_speakers(
     } else if content_type != ContentType::Meeting {
         SelfAttributionOutcome::skipped(SelfAttributionSkippedReason::NoStableLabel)
     } else {
-        let voice_result = match_speakers_by_voice(config, diarization_embeddings);
+        let voice_result =
+            match_speakers_by_voice(config, diarization_embeddings, speaker_embedding_segments);
         speaker_map.extend(voice_result.attributions.clone());
 
         let transcript_labels = crate::summarize::extract_speaker_labels_pub(&transcript);
@@ -2765,6 +3002,7 @@ fn attribute_meeting_speakers(
                 raw_diarization_num_speakers: diarization_num_speakers,
                 effective_transcript_speaker_labels,
                 self_attribution: self_attribution.debug,
+                voice_matches: voice_result.diagnostics,
                 final_speaker_map: debug_speaker_map(&speaker_map),
             },
             transcript,
@@ -2781,6 +3019,7 @@ fn attribute_meeting_speakers(
                 &transcript,
             ),
             self_attribution: self_attribution.debug,
+            voice_matches: Vec::new(),
             final_speaker_map: debug_speaker_map(&speaker_map),
         },
         transcript,
@@ -4752,6 +4991,10 @@ where
     let mut degraded_ml_fallback = false;
     let mut diarization_embeddings: std::collections::HashMap<String, Vec<f32>> =
         std::collections::HashMap::new();
+    let mut speaker_embedding_segments: std::collections::HashMap<
+        String,
+        Vec<diarize::SpeakerEmbeddingSegment>,
+    > = std::collections::HashMap::new();
     let mut recording_health: Option<markdown::RecordingHealth> = None;
     if config.diarization.engine != "none" && artifact.frontmatter.r#type == ContentType::Meeting {
         on_progress(PipelineStage::Diarizing);
@@ -4787,6 +5030,7 @@ where
                     }
                 }
                 diarization_embeddings = result.speaker_embeddings.clone();
+                speaker_embedding_segments = result.speaker_embedding_segments.clone();
                 logging::log_step(
                     "diarize",
                     &diagnostic_audio_target,
@@ -4974,6 +5218,7 @@ where
         diarization_from_stems,
         degraded_ml_fallback,
         &diarization_embeddings,
+        &speaker_embedding_segments,
         transcript,
     );
     let attribution_ms = attribution_start.elapsed().as_millis() as u64;
@@ -5422,6 +5667,10 @@ where
     let mut degraded_ml_fallback = false;
     let mut diarization_embeddings: std::collections::HashMap<String, Vec<f32>> =
         std::collections::HashMap::new();
+    let mut speaker_embedding_segments: std::collections::HashMap<
+        String,
+        Vec<diarize::SpeakerEmbeddingSegment>,
+    > = std::collections::HashMap::new();
     let mut recording_health = prepared_recording_health;
     let diarization_audio_path = diarization_audio_path.as_deref().unwrap_or(audio_path);
     let transcript = if config.diarization.engine != "none" && content_type == ContentType::Meeting
@@ -5461,6 +5710,7 @@ where
                     }
                 }
                 diarization_embeddings = result.speaker_embeddings.clone();
+                speaker_embedding_segments = result.speaker_embedding_segments.clone();
                 let transcript = diarize::apply_speakers(&transcript, &result);
                 log_rendered_label_collapse_diagnostic(diagnostic_audio_path, &result, &transcript);
                 transcript
@@ -5668,6 +5918,7 @@ where
         diarization_from_stems,
         degraded_ml_fallback,
         &diarization_embeddings,
+        &speaker_embedding_segments,
         transcript,
     );
     let attribution_ms = attribution_start.elapsed().as_millis() as u64;
@@ -9094,6 +9345,252 @@ mod tests {
         );
     }
 
+    fn active_voice_profile(
+        slug: &str,
+        name: &str,
+        model_id: &str,
+        embedding: &[f32],
+    ) -> crate::voice::ActiveProfile {
+        crate::voice::ActiveProfile {
+            person_slug: slug.into(),
+            model_id: model_id.into(),
+            name: name.into(),
+            embedding: embedding.to_vec(),
+            embedding_dim: embedding.len(),
+            sample_count: 1,
+        }
+    }
+
+    fn segment_evidence(embedding: &[f32]) -> diarize::SpeakerEmbeddingSegment {
+        diarize::SpeakerEmbeddingSegment {
+            embedding: embedding.to_vec(),
+            speech_seconds: 3.0,
+        }
+    }
+
+    #[test]
+    fn mixed_cluster_centroid_abstains_when_one_segment_rejects_identity() {
+        let profiles = vec![active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0])];
+        let centroids =
+            std::collections::HashMap::from([("SPEAKER_1".to_string(), vec![0.95, 0.20])]);
+        let segments = std::collections::HashMap::from([(
+            "SPEAKER_1".to_string(),
+            vec![segment_evidence(&[1.0, 0.0]), segment_evidence(&[0.0, 1.0])],
+        )]);
+
+        let result = evaluate_speaker_voice_matches(
+            "model-a",
+            &profiles,
+            Some("mat"),
+            0.65,
+            &centroids,
+            &segments,
+        );
+
+        assert!(result.attributions.is_empty());
+        assert!(result.self_profile_exists);
+        assert_eq!(result.diagnostics.len(), 1);
+        let diagnostic = &result.diagnostics[0];
+        assert!(!diagnostic.accepted);
+        assert_eq!(diagnostic.segment_evidence_count, 2);
+        assert_eq!(diagnostic.segment_matching_count, 1);
+        assert_eq!(diagnostic.segment_rejected_count, 1);
+        assert_eq!(diagnostic.segment_conflicting_identity_count, 0);
+    }
+
+    #[test]
+    fn consistently_matching_cluster_keeps_high_confidence_rewrite() {
+        let profiles = vec![active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0])];
+        let centroids =
+            std::collections::HashMap::from([("SPEAKER_1".to_string(), vec![0.99, 0.02])]);
+        let segments = std::collections::HashMap::from([(
+            "SPEAKER_1".to_string(),
+            vec![
+                segment_evidence(&[1.0, 0.0]),
+                segment_evidence(&[0.98, 0.05]),
+            ],
+        )]);
+
+        let result = evaluate_speaker_voice_matches(
+            "model-a",
+            &profiles,
+            Some("mat"),
+            0.65,
+            &centroids,
+            &segments,
+        );
+
+        assert_eq!(result.attributions.len(), 1);
+        assert_eq!(result.attributions[0].confidence, diarize::Confidence::High);
+        assert_eq!(
+            result.attributions[0].source,
+            diarize::AttributionSource::Enrollment
+        );
+        assert_eq!(
+            diarize::apply_confirmed_names(
+                "[SPEAKER_1 0:00] synthetic fixture\n",
+                &result.attributions,
+            ),
+            "[Mat 0:00] synthetic fixture\n"
+        );
+        assert!(result.diagnostics[0].accepted);
+    }
+
+    #[test]
+    fn open_speaker_bleed_on_other_labels_does_not_block_clean_local_match() {
+        let profiles = vec![active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0])];
+        let centroids = std::collections::HashMap::from([
+            ("SPEAKER_0".to_string(), vec![0.99, 0.01]),
+            ("SPEAKER_1".to_string(), vec![0.05, 0.99]),
+            ("SPEAKER_2".to_string(), vec![0.10, 0.95]),
+        ]);
+        let segments = std::collections::HashMap::from([
+            (
+                "SPEAKER_0".to_string(),
+                vec![
+                    segment_evidence(&[1.0, 0.0]),
+                    segment_evidence(&[0.98, 0.03]),
+                ],
+            ),
+            ("SPEAKER_1".to_string(), vec![segment_evidence(&[0.0, 1.0])]),
+            (
+                "SPEAKER_2".to_string(),
+                vec![segment_evidence(&[0.1, 0.99])],
+            ),
+        ]);
+
+        let result = evaluate_speaker_voice_matches(
+            "model-a",
+            &profiles,
+            Some("mat"),
+            0.65,
+            &centroids,
+            &segments,
+        );
+
+        assert_eq!(result.attributions.len(), 1);
+        assert_eq!(result.attributions[0].speaker_label, "SPEAKER_0");
+        assert_eq!(result.attributions[0].name, "Mat");
+    }
+
+    #[test]
+    fn voice_match_requires_segment_evidence_and_model_compatibility() {
+        let profiles = vec![active_voice_profile("mat", "Mat", "model-b", &[1.0, 0.0])];
+        let centroids =
+            std::collections::HashMap::from([("SPEAKER_1".to_string(), vec![1.0, 0.0])]);
+        let no_segments = std::collections::HashMap::new();
+
+        let model_mismatch = evaluate_speaker_voice_matches(
+            "model-a",
+            &profiles,
+            None,
+            0.65,
+            &centroids,
+            &no_segments,
+        );
+        assert!(model_mismatch.attributions.is_empty());
+        assert_eq!(
+            model_mismatch.diagnostics[0].reason,
+            "no compatible active voice profiles"
+        );
+
+        let compatible = vec![active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0])];
+        let missing_segments = evaluate_speaker_voice_matches(
+            "model-a",
+            &compatible,
+            Some("mat"),
+            0.65,
+            &centroids,
+            &no_segments,
+        );
+        assert!(missing_segments.attributions.is_empty());
+        assert_eq!(
+            missing_segments.diagnostics[0].reason,
+            "centroid had no reliable intra-cluster segment evidence"
+        );
+    }
+
+    #[test]
+    fn one_to_one_voice_matching_abstains_on_all_duplicate_profile_claims() {
+        let profiles = vec![active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0])];
+        let centroids = std::collections::HashMap::from([
+            ("SPEAKER_1".to_string(), vec![1.0, 0.0]),
+            ("SPEAKER_2".to_string(), vec![0.90, 0.10]),
+        ]);
+        let segments = std::collections::HashMap::from([
+            ("SPEAKER_1".to_string(), vec![segment_evidence(&[1.0, 0.0])]),
+            (
+                "SPEAKER_2".to_string(),
+                vec![segment_evidence(&[0.90, 0.10])],
+            ),
+        ]);
+
+        let result = evaluate_speaker_voice_matches(
+            "model-a",
+            &profiles,
+            Some("mat"),
+            0.65,
+            &centroids,
+            &segments,
+        );
+
+        assert!(result.attributions.is_empty());
+        assert!(result.diagnostics.iter().all(|diagnostic| {
+            !diagnostic.accepted
+                && diagnostic.reason
+                    == "multiple speaker clusters claimed the same enrolled profile"
+        }));
+    }
+
+    #[test]
+    fn two_profiles_above_threshold_are_ambiguous_without_a_new_margin_constant() {
+        let profiles = vec![
+            active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0]),
+            active_voice_profile("alex", "Alex", "model-a", &[0.8, 0.6]),
+        ];
+        let centroids =
+            std::collections::HashMap::from([("SPEAKER_1".to_string(), vec![0.9, 0.4])]);
+        let segments = std::collections::HashMap::from([(
+            "SPEAKER_1".to_string(),
+            vec![segment_evidence(&[0.9, 0.4])],
+        )]);
+
+        let result =
+            evaluate_speaker_voice_matches("model-a", &profiles, None, 0.65, &centroids, &segments);
+
+        assert!(result.attributions.is_empty());
+        assert_eq!(
+            result.diagnostics[0].reason,
+            "multiple compatible profiles cleared the configured threshold"
+        );
+    }
+
+    #[test]
+    fn non_finite_voice_evidence_fails_closed() {
+        let profiles = vec![active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0])];
+        let centroids =
+            std::collections::HashMap::from([("SPEAKER_1".to_string(), vec![f32::NAN, 0.0])]);
+        let segments = std::collections::HashMap::from([(
+            "SPEAKER_1".to_string(),
+            vec![segment_evidence(&[f32::INFINITY, 0.0])],
+        )]);
+
+        let result = evaluate_speaker_voice_matches(
+            "model-a",
+            &profiles,
+            Some("mat"),
+            0.65,
+            &centroids,
+            &segments,
+        );
+
+        assert!(result.attributions.is_empty());
+        assert_eq!(
+            result.diagnostics[0].reason,
+            "voice match produced non-finite evidence"
+        );
+    }
+
     #[test]
     fn single_stem_speaker_self_attribution_maps_to_identity() {
         let mut config = Config::default();
@@ -9102,6 +9599,7 @@ mod tests {
         let voice_result = VoiceMatchResult {
             attributions: vec![],
             self_profile_exists: true,
+            diagnostics: vec![],
         };
         let labels = vec!["SPEAKER_0".to_string()];
         let l2_labels = std::collections::HashSet::new();
@@ -9140,6 +9638,7 @@ mod tests {
         let voice_result = VoiceMatchResult {
             attributions: vec![],
             self_profile_exists: false,
+            diagnostics: vec![],
         };
         let labels = vec!["SPEAKER_2".to_string()];
         let l2_labels = std::collections::HashSet::new();
@@ -9198,6 +9697,7 @@ mod tests {
         let voice_result = VoiceMatchResult {
             attributions: vec![],
             self_profile_exists: true,
+            diagnostics: vec![],
         };
 
         let outcome = single_stem_speaker_self_attribution(
@@ -9229,6 +9729,7 @@ mod tests {
         let voice_result = VoiceMatchResult {
             attributions: vec![],
             self_profile_exists: true,
+            diagnostics: vec![],
         };
 
         let outcome = single_stem_speaker_self_attribution(
@@ -9289,6 +9790,7 @@ mod tests {
             true,
             false,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
             "[SPEAKER_0 0:00] hello\n[SPEAKER_1 0:01] hi\n".into(),
         );
 
@@ -9316,6 +9818,7 @@ mod tests {
             2,
             false,
             true,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             "[SPEAKER_0 0:00] hello\n[SPEAKER_1 0:01] hi\n".into(),
         );
@@ -9455,6 +9958,7 @@ mod tests {
             2,
             true,
             false,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             "[SPEAKER_1 0:00] hi\n[SPEAKER_0 0:01] hello\n".into(),
         );
