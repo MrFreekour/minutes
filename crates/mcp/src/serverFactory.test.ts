@@ -44,11 +44,20 @@ describe("createMinutesServer", () => {
 describe("parseTransportConfig", () => {
   const noEnv = {} as NodeJS.ProcessEnv;
 
-  it("defaults to stdio on loopback", () => {
+  it("defaults to stdio", () => {
     const config = parseTransportConfig([], noEnv);
     expect(config.transport).toBe("stdio");
-    expect(config.host).toBe("127.0.0.1");
     expect(config.help).toBe(false);
+  });
+
+  // The bind address is not configurable, so --host and MINUTES_MCP_HOST fall
+  // through to the unknown-flag path instead of moving the server off loopback.
+  it("does not accept a bind address", () => {
+    const config = parseTransportConfig(["--transport", "http", "--host", "0.0.0.0"], {
+      MINUTES_MCP_HOST: "0.0.0.0",
+    } as NodeJS.ProcessEnv);
+    expect(config).not.toHaveProperty("host");
+    expect(config.transport).toBe("http");
   });
 
   it("ignores arguments it does not own", () => {
@@ -59,13 +68,13 @@ describe("parseTransportConfig", () => {
 
   it("accepts space- and equals-separated values", () => {
     const spaced = parseTransportConfig(
-      ["--transport", "http", "--port", "9001", "--host", "0.0.0.0"],
+      ["--transport", "http", "--port", "9001", "--max-sessions", "3"],
       noEnv
     );
     expect(spaced).toMatchObject({
       transport: "http",
       port: 9001,
-      host: "0.0.0.0",
+      maxSessions: 3,
     });
     const inline = parseTransportConfig(
       ["--transport=http", "--port=9001", "--max-sessions=3"],

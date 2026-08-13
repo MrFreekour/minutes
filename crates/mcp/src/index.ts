@@ -105,7 +105,7 @@ import {
   type StableCorpusSnapshot,
 } from "./corpus-lease.js";
 import {
-  DEFAULT_HTTP_HOST,
+  HTTP_BIND_HOST,
   DEFAULT_HTTP_PORT,
   DEFAULT_MAX_SESSIONS,
   startMinutesHttpServer,
@@ -9053,7 +9053,6 @@ registerTool(
 
 export type MinutesTransportConfig = {
   transport: "stdio" | "http";
-  host: string;
   port: number;
   maxSessions: number;
   help: boolean;
@@ -9081,7 +9080,6 @@ export function parseTransportConfig(
 ): MinutesTransportConfig {
   const config: MinutesTransportConfig = {
     transport: "stdio",
-    host: DEFAULT_HTTP_HOST,
     port: DEFAULT_HTTP_PORT,
     maxSessions: DEFAULT_MAX_SESSIONS,
     help: false,
@@ -9095,9 +9093,6 @@ export function parseTransportConfig(
       );
     }
     config.transport = envTransport;
-  }
-  if (env.MINUTES_MCP_HOST?.trim()) {
-    config.host = env.MINUTES_MCP_HOST.trim();
   }
   if (env.MINUTES_MCP_PORT?.trim()) {
     config.port = parsePositiveInt(
@@ -9146,10 +9141,6 @@ export function parseTransportConfig(
         if (inline === null) i++;
         break;
       }
-      case "--host":
-        config.host = valueOf(i, flag, inline).trim();
-        if (inline === null) i++;
-        break;
       case "--port":
         config.port = parsePositiveInt(valueOf(i, flag, inline), flag, 65535);
         if (inline === null) i++;
@@ -9180,18 +9171,18 @@ function printUsage(): void {
       "",
       "Options:",
       "  --transport <stdio|http>  Transport to serve on (default: stdio)",
-      `  --host <address>          HTTP bind address (default: ${DEFAULT_HTTP_HOST})`,
       `  --port <number>           HTTP port, 0 for an OS-assigned port (default: ${DEFAULT_HTTP_PORT})`,
       `  --max-sessions <number>   Concurrent HTTP sessions (default: ${DEFAULT_MAX_SESSIONS})`,
       "  --demo                    Install the bundled demo corpus and exit",
       "  --help                    Show this message",
       "",
-      "Environment: MINUTES_MCP_TRANSPORT, MINUTES_MCP_HOST, MINUTES_MCP_PORT,",
+      "Environment: MINUTES_MCP_TRANSPORT, MINUTES_MCP_PORT,",
       "             MINUTES_MCP_MAX_SESSIONS",
       "",
-      "HTTP mode serves Streamable HTTP at /mcp and has no authentication. It",
-      "binds 127.0.0.1 so only this machine can reach it — do not bind a public",
-      "address or forward the port.",
+      "HTTP mode serves Streamable HTTP at /mcp and has no authentication. The",
+      `bind address is always ${HTTP_BIND_HOST}, so only this machine can reach it.`,
+      "To expose it beyond this machine, put a reverse proxy in front and add",
+      "authentication there.",
     ].join("\n")
   );
 }
@@ -9208,11 +9199,10 @@ async function main() {
   }
 
   if (config.transport === "http") {
-    crashTrace("main-transport-http", { host: config.host, port: config.port });
+    crashTrace("main-transport-http", { port: config.port });
     await afterRequiredCli(async () => {
       crashTrace("required-cli-ready");
       const httpServer = await startMinutesHttpServer({
-        host: config.host,
         port: config.port,
         maxSessions: config.maxSessions,
         createServer: createMinutesServer,

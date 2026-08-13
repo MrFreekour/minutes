@@ -13,11 +13,14 @@
  * The instances share all module-level state in index.ts — only protocol
  * state is per-session.
  *
- * Security: binds 127.0.0.1 by default. Binding to loopback alone does not
- * make the endpoint private — any page in the user's browser can POST to
- * localhost — so requests are additionally checked for a loopback `Host`, a
- * loopback-or-absent `Origin`, and a JSON content type. There is no
- * authentication; do not expose this port beyond the local machine.
+ * Security: always binds 127.0.0.1, with no flag to change it. Binding to
+ * loopback alone does not make the endpoint private, since any page in the
+ * user's browser can POST to localhost, so requests are additionally checked
+ * for a loopback `Host`, a loopback-or-absent `Origin`, and a JSON content
+ * type. There is no authentication. Reaching the endpoint from another machine
+ * is a reverse-proxy job: point one at 127.0.0.1, rewrite `Host` to the
+ * upstream address so the header check passes, and put authentication on the
+ * proxy.
  */
 
 import { createServer as createNodeHttpServer } from "node:http";
@@ -33,8 +36,14 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-/** Loopback-only by default; see the module docstring before changing. */
-export const DEFAULT_HTTP_HOST = "127.0.0.1";
+/**
+ * The bind address, not a default: there is no flag or environment variable to
+ * change it. HTTP mode has no authentication, so a non-loopback bind would hand
+ * the whole tool surface (transcripts, recording control) to anything that can
+ * route to this machine. Exposing the endpoint deliberately is a reverse-proxy
+ * job, where authentication can be added in front of it.
+ */
+export const HTTP_BIND_HOST = "127.0.0.1";
 
 /**
  * Unassigned by IANA and outside the ranges dev servers habitually grab
@@ -62,8 +71,6 @@ export type MinutesServerFactory = () => {
 };
 
 export type MinutesHttpServerOptions = {
-  /** Interface to bind. Defaults to 127.0.0.1. */
-  host?: string;
   /** Port to bind. 0 asks the OS for a free port; read it back from `port`. */
   port?: number;
   /** Reject new sessions past this many concurrent ones. */
@@ -98,18 +105,15 @@ function hostnameOf(authority: string): string | null {
 
 /**
  * DNS-rebinding defense: a hostile name resolved to 127.0.0.1 still sends its
- * own name in `Host`, so only the bound address and loopback names pass.
+ * own name in `Host`, so only loopback names pass. A reverse proxy fronting
+ * this endpoint has to rewrite `Host` to the upstream address, which is the
+ * point — reaching it under any other name is the attack.
  */
-export function isAllowedHostHeader(
-  hostHeader: string | undefined,
-  bindHost: string
-): boolean {
+export function isAllowedHostHeader(hostHeader: string | undefined): boolean {
   if (!hostHeader) return false;
   const hostname = hostnameOf(hostHeader);
   if (!hostname) return false;
-  return (
-    LOOPBACK_HOSTNAMES.has(hostname) || hostname === bindHost.toLowerCase()
-  );
+  return LOOPBACK_HOSTNAMES.has(hostname);
 }
 
 /**
@@ -199,7 +203,6 @@ type SessionEntry = {
 export async function startMinutesHttpServer(
   options: MinutesHttpServerOptions
 ): Promise<MinutesHttpServer> {
-  const host = options.host ?? DEFAULT_HTTP_HOST;
   const requestedPort = options.port ?? DEFAULT_HTTP_PORT;
   const maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
   const log = options.log ?? ((message: string) => console.error(message));
@@ -276,7 +279,7 @@ export async function startMinutesHttpServer(
     req: IncomingMessage,
     res: ServerResponse
   ): Promise<void> {
-    if (!isAllowedHostHeader(headerValue(req, "host"), host)) {
+    if (!isAllowedHostHeader(headerValue(req, "host"))) {
       sendJsonRpcError(res, 403, -32000, "Forbidden: unrecognized Host header");
       return;
     }
@@ -388,7 +391,7 @@ export async function startMinutesHttpServer(
   await new Promise<void>((resolvePromise, rejectPromise) => {
     const onError = (error: Error) => rejectPromise(error);
     httpServer.once("error", onError);
-    httpServer.listen(requestedPort, host, () => {
+    httpServer.listen(requestedPort, HTTP_BIND_HOST, () => {
       httpServer.removeListener("error", onError);
       resolvePromise();
     });
@@ -397,12 +400,10 @@ export async function startMinutesHttpServer(
   const address = httpServer.address();
   const boundPort =
     typeof address === "object" && address !== null ? address.port : requestedPort;
-  const displayHost = host.includes(":") ? `[${host}]` : host;
-
   return {
-    host,
+    host: HTTP_BIND_HOST,
     port: boundPort,
-    url: `http://${displayHost}:${boundPort}${MCP_HTTP_PATH}`,
+    url: `http://${HTTP_BIND_HOST}:${boundPort}${MCP_HTTP_PATH}`,
     sessionCount: () => sessions.size,
     close: async () => {
       for (const sessionId of Array.from(sessions.keys())) {

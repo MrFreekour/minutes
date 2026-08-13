@@ -430,9 +430,13 @@ try {
       child.once("exit", (exitCode) => resolvePromise({ code: exitCode, stdout: out }));
     });
     assertEqual(code, 0, "--help should exit 0");
-    for (const fragment of ["--transport <stdio|http>", "--port", "--host", "127.0.0.1"]) {
+    for (const fragment of ["--transport <stdio|http>", "--port", "127.0.0.1"]) {
       assert(stdout.includes(fragment), `--help output should mention ${fragment}`);
     }
+    assert(
+      !stdout.includes("--host"),
+      "--help should not advertise a bind-address flag"
+    );
   });
 
   await runTests();

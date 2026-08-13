@@ -517,9 +517,19 @@ Then point clients at the endpoint:
 }
 ```
 
-Flags: `--host` (default `127.0.0.1`), `--port` (default `7373`; `0` asks the OS for a free port and the chosen one is printed to stderr), `--max-sessions` (default 16). Each accepts an environment variable instead: `MINUTES_MCP_TRANSPORT`, `MINUTES_MCP_HOST`, `MINUTES_MCP_PORT`, `MINUTES_MCP_MAX_SESSIONS`. `GET /health` reports live session count.
+Flags: `--port` (default `7373`; `0` asks the OS for a free port and the chosen one is printed to stderr), `--max-sessions` (default 16). Each accepts an environment variable instead: `MINUTES_MCP_TRANSPORT`, `MINUTES_MCP_PORT`, `MINUTES_MCP_MAX_SESSIONS`. `GET /health` reports live session count.
 
-HTTP mode has no authentication. It binds `127.0.0.1`, so only this machine can reach it, and it rejects requests whose `Host` or `Origin` is not loopback. That second check matters: binding to loopback does not by itself stop a web page you have open from POSTing to a local port. Do not bind a public address or forward the port.
+HTTP mode has no authentication, so the bind address is always `127.0.0.1` and there is no flag to change it. Only this machine can reach the endpoint, and it rejects requests whose `Host` or `Origin` is not loopback. That second check matters: binding to loopback does not by itself stop a web page you have open from POSTing to a local port.
+
+To reach it from another machine, front it with a reverse proxy and put authentication there. The proxy has to rewrite `Host` to the upstream address, since the original name would fail the loopback check. In Caddy:
+
+```
+reverse_proxy 127.0.0.1:7373 {
+  header_up Host {upstream_hostport}
+}
+```
+
+Native MCP clients send no `Origin`, so nothing else is needed for them. A browser-based client would also need its `Origin` handled at the proxy, which gives up the CSRF defense described above.
 
 Canonical MCP reference now lives at:
 

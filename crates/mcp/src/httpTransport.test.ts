@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_HTTP_HOST,
+  HTTP_BIND_HOST,
   DEFAULT_HTTP_PORT,
   isAllowedContentType,
   isAllowedHostHeader,
@@ -9,36 +9,38 @@ import {
 } from "./httpTransport.js";
 
 describe("http transport request guards", () => {
-  it("binds loopback by default", () => {
-    expect(DEFAULT_HTTP_HOST).toBe("127.0.0.1");
+  it("binds loopback, with nothing to override it", () => {
+    expect(HTTP_BIND_HOST).toBe("127.0.0.1");
     expect(DEFAULT_HTTP_PORT).toBeGreaterThan(1024);
   });
 
   describe("Host header", () => {
-    it("accepts loopback names and the bound address", () => {
+    it("accepts loopback names", () => {
       for (const host of [
         "127.0.0.1:7373",
         "localhost:7373",
         "localhost",
         "[::1]:7373",
       ]) {
-        expect(isAllowedHostHeader(host, "127.0.0.1")).toBe(true);
+        expect(isAllowedHostHeader(host)).toBe(true);
       }
     });
 
-    it("accepts the explicitly bound non-loopback address", () => {
-      expect(isAllowedHostHeader("192.168.1.10:7373", "192.168.1.10")).toBe(true);
+    // The allowlist is fixed, so a LAN address never passes. Before --host was
+    // removed, binding one added it here, which is the hole that removal closed.
+    it("rejects a non-loopback address", () => {
+      expect(isAllowedHostHeader("192.168.1.10:7373")).toBe(false);
+      expect(isAllowedHostHeader("0.0.0.0:7373")).toBe(false);
     });
 
     // A rebound hostname resolves to 127.0.0.1 but still sends its own name.
     it("rejects a rebound hostname", () => {
-      expect(isAllowedHostHeader("attacker.example:7373", "127.0.0.1")).toBe(false);
-      expect(isAllowedHostHeader("192.168.1.10:7373", "127.0.0.1")).toBe(false);
+      expect(isAllowedHostHeader("attacker.example:7373")).toBe(false);
     });
 
     it("rejects a missing Host header", () => {
-      expect(isAllowedHostHeader(undefined, "127.0.0.1")).toBe(false);
-      expect(isAllowedHostHeader("", "127.0.0.1")).toBe(false);
+      expect(isAllowedHostHeader(undefined)).toBe(false);
+      expect(isAllowedHostHeader("")).toBe(false);
     });
   });
 
