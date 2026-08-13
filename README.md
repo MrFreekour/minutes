@@ -519,6 +519,8 @@ Then point clients at the endpoint:
 
 Flags: `--port` (default `7373`; `0` asks the OS for a free port and the chosen one is printed to stderr), `--max-sessions` (default 16). Each accepts an environment variable instead: `MINUTES_MCP_TRANSPORT`, `MINUTES_MCP_PORT`, `MINUTES_MCP_MAX_SESSIONS`. `GET /health` reports live session count.
 
+Request bodies are JSON-RPC envelopes, so they are capped at 4 MiB; anything larger gets a JSON-RPC error with HTTP 413. A client that disconnects without sending `DELETE /mcp` leaves its session behind, so a session with no request in flight and no open stream is reclaimed after 30 minutes idle and answers 404 after that. A client holding an open stream is never reclaimed, however quiet it is.
+
 HTTP mode has no authentication, so the bind address is always `127.0.0.1` and there is no flag to change it. Only this machine can reach the endpoint, and it rejects requests whose `Host` or `Origin` is not loopback. That second check matters: binding to loopback does not by itself stop a web page you have open from POSTing to a local port.
 
 To reach it from another machine, front it with a reverse proxy and put authentication there. The proxy has to rewrite `Host` to the upstream address, since the original name would fail the loopback check. In Caddy:

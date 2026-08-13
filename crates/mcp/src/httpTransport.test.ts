@@ -11,6 +11,8 @@ import {
   isAllowedHostHeader,
   isAllowedOrigin,
   startMinutesHttpServer,
+  HEALTH_HTTP_PATH,
+  MAX_REQUEST_BODY_BYTES,
 } from "./httpTransport.js";
 import type {
   MinutesHttpServer,
@@ -192,5 +194,92 @@ describe("session reclamation", () => {
     expect(server.sessionCount()).toBe(1);
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name)).toContain("ping");
+  });
+});
+
+describe("oversized request bodies", () => {
+  function stubFactory(): ReturnType<MinutesServerFactory> {
+    const server = new McpServer(
+      { name: "oversize-test", version: "0.0.0" },
+      { capabilities: { tools: {} } }
+    );
+    return { server, dispose: () => {} };
+  }
+
+  let httpServer: MinutesHttpServer | undefined;
+
+  afterEach(async () => {
+    await httpServer?.close();
+    httpServer = undefined;
+  });
+
+  // The whole point of the finding: the documented 413 has to arrive. Reading
+  // the JSON body is the assertion — a resolved fetch alone would also be
+  // satisfied by a response that never carried the error.
+  it("answers an oversized body with a readable JSON-RPC 413", async () => {
+    httpServer = await startMinutesHttpServer({
+      port: 0,
+      createServer: stubFactory,
+      log: () => {},
+    });
+
+    const oversized = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { pad: "x".repeat(MAX_REQUEST_BODY_BYTES + 1024) },
+    });
+
+    const response = await fetch(httpServer.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: oversized,
+    });
+
+    expect(response.status).toBe(413);
+    const payload = (await response.json()) as {
+      jsonrpc: string;
+      error: { code: number; message: string };
+    };
+    expect(payload.jsonrpc).toBe("2.0");
+    expect(payload.error.message).toMatch(/too large/i);
+    expect(payload.error.code).toBe(-32000);
+
+    // The listener survives it, rather than the refusal taking the server down.
+    const health = await fetch(
+      `http://${httpServer.host}:${httpServer.port}${HEALTH_HTTP_PATH}`
+    );
+    expect(health.status).toBe(200);
+  });
+
+  it("still accepts a body just under the limit", async () => {
+    httpServer = await startMinutesHttpServer({
+      port: 0,
+      createServer: stubFactory,
+      log: () => {},
+    });
+
+    // Not an initialize, so this is refused on its merits (400) rather than on
+    // size — which is what distinguishes "under the limit" from "rejected".
+    const response = await fetch(httpServer.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: { pad: "x".repeat(1024) },
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    const payload = (await response.json()) as { error: { message: string } };
+    expect(payload.error.message).not.toMatch(/too large/i);
   });
 });

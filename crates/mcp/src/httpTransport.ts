@@ -71,6 +71,14 @@ export const DEFAULT_MAX_SESSIONS = 16;
 export const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
 
 /**
+ * How much of an oversized body to read and throw away before giving up on the
+ * client. Reading past the limit is what lets the 413 be delivered at all, but
+ * it is not open-ended: a client that ignores the response and keeps streaming
+ * gets its socket cut once it has spent this much.
+ */
+export const OVERSIZE_DRAIN_BUDGET_BYTES = 1024 * 1024;
+
+/**
  * How long a session with nothing open may sit before it is reclaimed.
  *
  * Generous on purpose. Reclaiming is spec-sanctioned — the server MAY end a
@@ -180,12 +188,21 @@ function headerValue(
   return raw ?? undefined;
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  closeConnection = false
+): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, {
+  const headers: Record<string, string | number> = {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(payload),
-  });
+  };
+  // Used when the request body was refused part-read: the rest of it is of no
+  // interest, and keeping the connection alive would only invite more of it.
+  if (closeConnection) headers.Connection = "close";
+  res.writeHead(status, headers);
   res.end(payload);
 }
 
@@ -193,31 +210,57 @@ function sendJsonRpcError(
   res: ServerResponse,
   status: number,
   code: number,
-  message: string
+  message: string,
+  closeConnection = false
 ): void {
-  sendJson(res, status, {
-    jsonrpc: "2.0",
-    error: { code, message },
-    id: null,
-  });
+  sendJson(
+    res,
+    status,
+    {
+      jsonrpc: "2.0",
+      error: { code, message },
+      id: null,
+    },
+    closeConnection
+  );
 }
 
-/** Read a bounded request body. Rejects (rather than buffers) oversized posts. */
+/**
+ * Read a bounded request body. Rejects (rather than buffers) oversized posts.
+ *
+ * Once the limit is crossed the buffered chunks are dropped, but the stream is
+ * left flowing and discarded rather than destroyed. Destroying the request here
+ * tears down the socket, and the 413 the caller then writes goes nowhere — the
+ * client sees a connection reset instead of the error. Draining costs at most
+ * OVERSIZE_DRAIN_BUDGET_BYTES, after which the socket does go.
+ */
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolvePromise, rejectPromise) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let overflowed = false;
     req.on("data", (chunk: Buffer) => {
       total += chunk.length;
-      if (total > MAX_REQUEST_BODY_BYTES) {
+      if (!overflowed && total > MAX_REQUEST_BODY_BYTES) {
+        overflowed = true;
+        chunks.length = 0;
         rejectPromise(new Error("Request body too large"));
-        req.destroy();
+      }
+      if (!overflowed) {
+        chunks.push(chunk);
         return;
       }
-      chunks.push(chunk);
+      if (total > MAX_REQUEST_BODY_BYTES + OVERSIZE_DRAIN_BUDGET_BYTES) {
+        req.destroy();
+      }
     });
-    req.on("end", () => resolvePromise(Buffer.concat(chunks)));
-    req.on("error", rejectPromise);
+    req.on("end", () => {
+      if (!overflowed) resolvePromise(Buffer.concat(chunks));
+    });
+    req.on("error", (error) => {
+      // Already rejected on overflow; a reset while draining is expected.
+      if (!overflowed) rejectPromise(error);
+    });
   });
 }
 
@@ -434,7 +477,7 @@ export async function startMinutesHttpServer(
       try {
         raw = await readBody(req);
       } catch {
-        sendJsonRpcError(res, 413, -32000, "Request body too large");
+        sendJsonRpcError(res, 413, -32000, "Request body too large", true);
         return;
       }
       try {
