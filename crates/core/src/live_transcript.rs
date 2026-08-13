@@ -2021,12 +2021,44 @@ fn transcribe_utterance_for_sidecar(
 }
 
 #[cfg(feature = "whisper")]
+/// Resolve the Whisper model for live transcription.
+///
+/// An empty `live_transcript.model` falls back to `dictation.model`, NOT to
+/// `transcription.model`. That is deliberate: live transcription runs in real
+/// time against a streaming utterance and wants a small fast model, while batch
+/// transcription can afford a slower, more accurate one. Inheriting the batch
+/// model would hand anyone who chose a large model for quality a live sidecar
+/// too slow to keep up, trading a clear error for a vague performance problem.
+///
+/// The raw resolver error names a missing file but not the setting that chose
+/// it, which left a reporter reading our source to solve their own config
+/// problem (#756). The message is rewritten here to name the whole chain and
+/// both ways out, since `backend = "inherit"` sitting directly above `model`
+/// makes inheriting the natural assumption.
+fn resolve_live_model_path(config: &Config) -> Result<std::path::PathBuf, MinutesError> {
+    if !config.live_transcript.model.is_empty() {
+        return Ok(crate::transcribe::resolve_model_path_by_name(
+            &config.live_transcript.model,
+            config,
+        )?);
+    }
+    crate::transcribe::resolve_model_path_for_dictation(config).map_err(|error| match error {
+        TranscribeError::ModelNotFound(detail) => TranscribeError::ModelNotFound(format!(
+            "live transcript resolved to the dictation model \"{}\" because \
+             live_transcript.model is empty. Note that it does NOT inherit \
+             transcription.model (currently \"{}\"): live transcription is \
+             real-time and wants a small fast model.\n\n{}\nAlternatively set \
+             live_transcript.model to a model you already have.",
+            config.dictation.model, config.transcription.model, detail
+        ))
+        .into(),
+        other => other.into(),
+    })
+}
+
+#[cfg(feature = "whisper")]
 fn load_sidecar_whisper_ctx(config: &Config) -> Result<whisper_rs::WhisperContext, MinutesError> {
-    let model_path = if config.live_transcript.model.is_empty() {
-        crate::transcribe::resolve_model_path_for_dictation(config)?
-    } else {
-        crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config)?
-    };
+    let model_path = resolve_live_model_path(config)?;
     tracing::info!(model = %model_path.display(), "loading whisper model for recording sidecar");
     Ok(whisper_rs::WhisperContext::new_with_params(
         model_path
@@ -2131,11 +2163,7 @@ fn ensure_live_whisper_ctx<'a>(
     config: &Config,
 ) -> Result<&'a whisper_rs::WhisperContext, MinutesError> {
     if whisper_ctx.is_none() {
-        let model_path = if config.live_transcript.model.is_empty() {
-            crate::transcribe::resolve_model_path_for_dictation(config)?
-        } else {
-            crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config)?
-        };
+        let model_path = resolve_live_model_path(config)?;
         tracing::info!(
             model = %model_path.display(),
             "loading whisper model for live transcript fallback"
@@ -4281,6 +4309,51 @@ mod tests {
         let diagnostic = diagnostic.expect("fallback reason must remain visible");
         assert!(diagnostic.contains("retained parakeet"));
         assert!(diagnostic.contains("secure private audio"));
+    }
+
+    #[test]
+    fn empty_live_model_error_names_the_setting_that_chose_it() {
+        // #756: the reporter had to read our source to learn that a blank
+        // live_transcript.model routes to dictation.model rather than
+        // transcription.model. The message must close that gap by itself.
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model: "small".into(),
+                model_path: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            dictation: crate::config::DictationConfig {
+                model: "base".into(),
+                ..Default::default()
+            },
+            live_transcript: crate::config::LiveTranscriptConfig {
+                model: String::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = resolve_live_model_path(&config)
+            .expect_err("no model file exists in the temp dir")
+            .to_string();
+
+        assert!(
+            error.contains("live_transcript.model is empty"),
+            "must name the setting that is empty: {error}"
+        );
+        assert!(
+            error.contains("dictation model \"base\""),
+            "must name where it actually resolved: {error}"
+        );
+        assert!(
+            error.contains("transcription.model"),
+            "must correct the natural assumption: {error}"
+        );
+        assert!(
+            error.contains("small"),
+            "must show the batch model it did NOT use: {error}"
+        );
     }
 
     #[test]

@@ -324,7 +324,7 @@ Dictation clipboard behavior is platform-specific:
 
 | key | default | meaning |
 |---|---|---|
-| `model` | inherits dictation model | Whisper model for live mode |
+| `model` | empty, meaning `dictation.model` | Whisper model for live mode. An empty value uses `dictation.model`, **not** `transcription.model`: live transcription is real-time and wants a small fast model, while batch transcription can afford a slower, more accurate one. Set this explicitly to decouple them. |
 | `max_utterance_secs` | `30` | Force-finalize an utterance at this length |
 | `save_wav` | `true` | Save raw WAV so the stopped session can be preserved or processed |
 | `promote_on_stop` | `"process"` | `"process"` creates a normal meeting; `"preserve"` keeps a timestamped WAV/JSONL pair only; `"off"` leaves the overwrite-prone fixed slot unchanged |
