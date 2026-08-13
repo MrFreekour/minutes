@@ -9058,11 +9058,24 @@ export type MinutesTransportConfig = {
   help: boolean;
 };
 
-function parsePositiveInt(raw: string, flag: string, max: number): number {
+/**
+ * `min` defaults to 0 because `--port 0` is meaningful: it asks the OS for a
+ * free port. A count like `--max-sessions` has no such reading, and zero there
+ * starts a server that refuses every client, so those pass `min: 1`.
+ */
+function parsePositiveInt(
+  raw: string,
+  flag: string,
+  max: number,
+  min = 0
+): number {
   if (!/^\d+$/.test(raw.trim())) {
     throw new Error(`${flag} expects a number, got "${raw}"`);
   }
   const value = Number(raw.trim());
+  if (value < min) {
+    throw new Error(`${flag} must be >= ${min}, got ${value}`);
+  }
   if (value > max) {
     throw new Error(`${flag} must be <= ${max}, got ${value}`);
   }
@@ -9105,7 +9118,8 @@ export function parseTransportConfig(
     config.maxSessions = parsePositiveInt(
       env.MINUTES_MCP_MAX_SESSIONS,
       "MINUTES_MCP_MAX_SESSIONS",
-      1024
+      1024,
+      1
     );
   }
 
@@ -9149,7 +9163,8 @@ export function parseTransportConfig(
         config.maxSessions = parsePositiveInt(
           valueOf(i, flag, inline),
           flag,
-          1024
+          1024,
+          1
         );
         if (inline === null) i++;
         break;

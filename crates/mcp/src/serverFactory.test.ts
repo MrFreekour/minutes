@@ -87,6 +87,23 @@ describe("parseTransportConfig", () => {
     expect(parseTransportConfig(["--port", "0"], noEnv).port).toBe(0);
   });
 
+  // A zero session limit starts a server that refuses every initialize, since
+  // the limit check is `sessions.size >= maxSessions`. Port 0 stays legal.
+  it("rejects a zero session limit, from the flag and the environment alike", () => {
+    expect(() => parseTransportConfig(["--max-sessions", "0"], noEnv)).toThrow(
+      /--max-sessions must be >= 1/
+    );
+    expect(() => parseTransportConfig(["--max-sessions=0"], noEnv)).toThrow(
+      /--max-sessions must be >= 1/
+    );
+    expect(() =>
+      parseTransportConfig([], {
+        MINUTES_MCP_MAX_SESSIONS: "0",
+      } as NodeJS.ProcessEnv)
+    ).toThrow(/MINUTES_MCP_MAX_SESSIONS must be >= 1/);
+    expect(parseTransportConfig(["--max-sessions", "1"], noEnv).maxSessions).toBe(1);
+  });
+
   it("reads environment defaults, with flags winning", () => {
     const env = {
       MINUTES_MCP_TRANSPORT: "http",
