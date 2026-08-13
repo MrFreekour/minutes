@@ -19794,7 +19794,27 @@ fn log_dictation_insert(
     );
 }
 
+fn remember_dictation_target_focus(
+    app: &tauri::AppHandle,
+    target_context: &Option<crate::text_insertion::ActiveTargetContext>,
+) {
+    let is_minutes = target_context
+        .as_ref()
+        .and_then(|context| context.bundle_id.as_deref())
+        == Some(app.config().identifier.as_str());
+    if !is_minutes {
+        return;
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        // Creating the non-focused overlay can still make WebKit blur the active
+        // DOM control. Retain the exact in-app target before the overlay exists.
+        let _ = window.eval("window.__minutesDictationFocusTarget = document.activeElement;");
+    }
+}
+
 fn restore_dictation_target_focus(
+    app: &tauri::AppHandle,
     target_context: &Option<crate::text_insertion::ActiveTargetContext>,
 ) {
     let Some(context) = target_context else {
@@ -19815,6 +19835,15 @@ fn restore_dictation_target_focus(
             Some(error.as_str()),
         );
         return;
+    }
+
+    let is_minutes = context.bundle_id.as_deref() == Some(app.config().identifier.as_str());
+    if is_minutes {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.eval(
+                "(() => { const target = window.__minutesDictationFocusTarget; if (target?.isConnected && typeof target.focus === 'function') target.focus({ preventScroll: true }); })();",
+            );
+        }
     }
 
     // Give the window server a beat before clipboard paste automation or overlay
@@ -19905,7 +19934,7 @@ fn finish_dictation_overlay_lifecycle(app: &tauri::AppHandle, guard: Option<Dict
         );
     }
 
-    restore_dictation_target_focus(&guard.target_context);
+    restore_dictation_target_focus(app, &guard.target_context);
     dictation_focus_debug(
         "finish_overlay_lifecycle_done",
         guard.target_context.as_ref(),
@@ -20007,6 +20036,7 @@ fn start_dictation_session(
         Ok(mut guard) => *guard = Some(focus_guard.clone()),
         Err(poisoned) => *poisoned.into_inner() = Some(focus_guard.clone()),
     }
+    remember_dictation_target_focus(app, &dictation_target_context);
     publish_dictation_overlay_state(app, "starting");
     show_dictation_overlay(app);
     dictation_focus_debug(
@@ -20015,7 +20045,7 @@ fn start_dictation_session(
         Some(main_window_hidden),
         None,
     );
-    restore_dictation_target_focus(&dictation_target_context);
+    restore_dictation_target_focus(app, &dictation_target_context);
     state.dictation_stop_flag.store(false, Ordering::Relaxed);
     if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
         *released_at = None;
@@ -20156,7 +20186,10 @@ fn start_dictation_session(
                         None,
                         None,
                     );
-                    restore_dictation_target_focus(&dictation_target_context_for_results);
+                    restore_dictation_target_focus(
+                        &app_for_results,
+                        &dictation_target_context_for_results,
+                    );
                     let insertion = crate::text_insertion::insert_text(
                         crate::text_insertion::TextInsertionRequest {
                             text: result.text.clone(),
@@ -20182,7 +20215,10 @@ fn start_dictation_session(
                         None,
                         None,
                     );
-                    restore_dictation_target_focus(&dictation_target_context_for_results);
+                    restore_dictation_target_focus(
+                        &app_for_results,
+                        &dictation_target_context_for_results,
+                    );
                     let insertion = crate::text_insertion::insert_text(
                         crate::text_insertion::TextInsertionRequest {
                             text: result.text.clone(),

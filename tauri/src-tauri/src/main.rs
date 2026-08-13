@@ -195,7 +195,12 @@ fn maybe_run_hotkey_diagnostic() -> Option<i32> {
         return None;
     }
 
-    let mut keycode = minutes_core::hotkey_macos::KEYCODE_CAPS_LOCK;
+    let config = minutes_core::Config::load();
+    let mut keycode = if config.dictation.hotkey_enabled {
+        config.dictation.hotkey_keycode
+    } else {
+        minutes_core::hotkey_macos::KEYCODE_FN
+    };
     let mut output_path: Option<std::path::PathBuf> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -3297,6 +3302,16 @@ mod tray_activity_tests {
                 && permissions_rs.contains("meeting recording and dictation still work"),
             "insertion should attempt macOS automation without a mismatched AX preflight and keep platform claims honest"
         );
+        assert!(
+            commands_rs.contains("window.__minutesDictationFocusTarget = document.activeElement")
+                && commands_rs.contains("target.focus({ preventScroll: true })"),
+            "self-app dictation must restore the exact focused DOM control, not only the Minutes process"
+        );
+        assert!(
+            insertion_rs.contains("dictation pasted but clipboard restore failed")
+                && insertion_rs.contains("log_error(\"dictation_paste\""),
+            "clipboard cleanup must be secondary to delivered paste and real paste failures must be durable"
+        );
     }
 
     #[test]
@@ -3310,6 +3325,8 @@ mod tray_activity_tests {
             manifest
         ))
         .expect("failed to read desktop hotkey diagnostic");
+        let main_rs = std::fs::read_to_string(format!("{}/src/main.rs", manifest))
+            .expect("failed to read desktop main source");
 
         assert!(
             installer.contains("stop_idle_installed_dev_app\n  rm -rf \"$INSTALL_APP\""),
@@ -3331,9 +3348,15 @@ mod tray_activity_tests {
         );
         assert!(
             diagnostic.contains("APP_EXECUTABLE=\"$APP_PATH/Contents/MacOS/minutes-app\"")
-                && diagnostic.contains("\"$APP_EXECUTABLE\" \\")
+                && diagnostic.contains("\"$APP_EXECUTABLE\" \"${DIAGNOSTIC_ARGS[@]}\"")
                 && !diagnostic.contains("open -n"),
             "the diagnostic must execute the installed signed binary directly instead of creating a misleading LaunchServices process"
+        );
+        assert!(
+            diagnostic.contains("KEYCODE=\"${2:-}\"")
+                && diagnostic.contains("if [[ -n \"$KEYCODE\" ]]")
+                && main_rs.contains("config.dictation.hotkey_keycode"),
+            "the installed diagnostic must probe the configured native shortcut instead of silently defaulting to Caps Lock"
         );
     }
 

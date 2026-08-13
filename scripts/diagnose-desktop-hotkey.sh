@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_PATH="${1:-/Applications/Minutes Dev.app}"
-KEYCODE="${2:-57}"
+KEYCODE="${2:-}"
 OUTPUT_PATH="${3:-/tmp/minutes-hotkey-diagnostic.json}"
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -19,11 +19,16 @@ if [[ ! -x "$APP_EXECUTABLE" ]]; then
   exit 1
 fi
 
-set +e
-"$APP_EXECUTABLE" \
-  --diagnose-hotkey \
-  --diagnose-hotkey-keycode "$KEYCODE" \
+DIAGNOSTIC_ARGS=(
+  --diagnose-hotkey
   --diagnose-hotkey-output "$OUTPUT_PATH"
+)
+if [[ -n "$KEYCODE" ]]; then
+  DIAGNOSTIC_ARGS+=(--diagnose-hotkey-keycode "$KEYCODE")
+fi
+
+set +e
+"$APP_EXECUTABLE" "${DIAGNOSTIC_ARGS[@]}"
 DIAGNOSTIC_EXIT=$?
 set -e
 

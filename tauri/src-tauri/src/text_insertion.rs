@@ -262,6 +262,7 @@ fn best_effort_verified(
         }
         Err(error) => {
             tracing::warn!(error = %error, "dictation paste automation failed");
+            minutes_core::logging::log_error("dictation_paste", "", &error);
             TextInsertionResult {
                 outcome: InsertOutcome::Copied,
                 method: InsertMethod::ClipboardOnly,
@@ -481,7 +482,16 @@ fn paste_via_clipboard_restoring(
     let Some(snapshot) = snapshot_before_write else {
         return Ok(false);
     };
-    restore_macos_clipboard_after_paste(snapshot, after_write_change_count)
+    match restore_macos_clipboard_after_paste(snapshot, after_write_change_count) {
+        Ok(restored) => Ok(restored),
+        Err(error) => {
+            // The paste event has already been accepted at this point. Clipboard
+            // cleanup is deliberately secondary: a restore failure must not turn
+            // a delivered paste into a false copy-only result.
+            tracing::warn!(error = %error, "dictation pasted but clipboard restore failed");
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1287,6 +1297,15 @@ mod tests {
             operations.into_inner(),
             vec!["write:dictated text", "paste"]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_paste_restore_failure_is_secondary_to_delivery() {
+        let source = include_str!("text_insertion.rs");
+        assert!(source.contains("dictation pasted but clipboard restore failed"));
+        assert!(source
+            .contains("Err(error) => {\n            // The paste event has already been accepted"));
     }
 
     #[cfg(target_os = "macos")]
