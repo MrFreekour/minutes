@@ -78,6 +78,39 @@ export type BoundTextFileRead = {
   revision: BoundFileRevision;
 };
 
+/**
+ * Absorbed once, then never again: an 'error' event on stderr with no listener
+ * is fatal to the host process.
+ */
+let stderrErrorsAbsorbed = false;
+
+/**
+ * Write one operator-visible diagnostic line, without letting a broken stderr
+ * become fatal.
+ *
+ * A try/catch around the write is not sufficient. When the consumer of the
+ * pipe has gone, the write fails with an asynchronous EPIPE delivered as an
+ * 'error' event on a later tick, which no surrounding catch can see, and an
+ * 'error' event with no listener kills the process. Absorbing it is the same
+ * call corpus-lease.ts already makes for a killed worker's stdin, for the same
+ * reason: a diagnostic that cannot be delivered must never escalate into a
+ * failure of the thing it was describing.
+ *
+ * Callers defer this themselves so a blocked TTY or file cannot delay a
+ * refusal that has already been decided.
+ */
+export function writeOperatorDiagnostic(line: string): void {
+  try {
+    if (!stderrErrorsAbsorbed) {
+      stderrErrorsAbsorbed = true;
+      process.stderr.on("error", () => {});
+    }
+    process.stderr.write(line);
+  } catch {
+    // A synchronous failure is equally non-fatal here.
+  }
+}
+
 export function boundReadIdentity(info: BigIntStats): string {
   return `${info.dev}:${info.ino}`;
 }
@@ -458,14 +491,33 @@ class BoundParentReader {
     const reservedBytes = returnContent
       ? maxBytes * BOUND_READER_CONTENT_AMPLIFICATION
       : Math.max(1024 * 1024, Math.min(maxBytes, 64 * 1024));
-    if (
-      !Number.isSafeInteger(reservedBytes) ||
-      reservedBytes < 0 ||
-      this.pending.size >= maxInFlightPerReader ||
-      globalInFlightReads >= maxInFlightGlobal ||
-      globalReaderProcessBytes + globalReservedReadBytes >
-        maxReservedBytes - reservedBytes
-    ) {
+    // Which of these tripped is the whole diagnosis, and the thrown message
+    // deliberately does not say: callers must not learn why a read was
+    // refused. The reason goes to stderr, which is operator-visible only, the
+    // same split corpus-lease.ts uses for authorization denials.
+    //
+    // Worth the detail because this refusal is reachable from process-global
+    // counters, so the read that gets refused is often not the one at fault.
+    // A CI failure here previously gave no way to tell an exhausted byte
+    // reservation from an in-flight cap (#617).
+    const refusal =
+      !Number.isSafeInteger(reservedBytes) || reservedBytes < 0
+        ? `implausible reservation ${reservedBytes}`
+        : this.pending.size >= maxInFlightPerReader
+          ? `reader in-flight ${this.pending.size}/${maxInFlightPerReader}`
+          : globalInFlightReads >= maxInFlightGlobal
+            ? `global in-flight ${globalInFlightReads}/${maxInFlightGlobal}`
+            : globalReaderProcessBytes + globalReservedReadBytes >
+                maxReservedBytes - reservedBytes
+              ? `global bytes ${globalReaderProcessBytes + globalReservedReadBytes} + ` +
+                `${reservedBytes} requested > ${maxReservedBytes}`
+              : null;
+    if (refusal !== null) {
+      // Never inside the throw path's critical section, and never allowed to
+      // turn a clean refusal into a crash.
+      setImmediate(() => {
+        writeOperatorDiagnostic(`[bound-reader] refused: ${refusal}\n`);
+      });
       throw new Error("Access denied: bound reader capacity exceeded");
     }
 

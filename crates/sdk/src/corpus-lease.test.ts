@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
@@ -21,8 +21,30 @@ import { realpath } from "node:fs/promises";
 
 import {
   DEFAULT_CORPUS_READ_BUDGETS,
+  awaitDeferredCorpusReleasesForTests,
   withStableCorpusLease,
 } from "./corpus-lease.js";
+
+// A lease that leaves an unconfirmed hazard behind defers its memory release
+// until that hazard settles, which is correct: a child that may still be alive
+// may still hold corpus data. The charge is process-global though, so a case
+// whose hazard has not settled *yet* leaves it standing and later cases fail on
+// the retained-snapshot budget rather than on anything they did. That is the
+// flake that has been reported three times on three platforms, each time naming
+// an innocent test.
+//
+// Waiting for our own cleanup makes the boundary between cases real, so a case
+// is charged for what it did rather than for what the previous one had not
+// finished undoing.
+//
+// Deliberately no "charge is back to zero" assertion. Poisoning is expressed AS
+// a permanently retained charge, not as a flag, so "poisons admission when an
+// asynchronous projection ignores cancellation" is supposed to end holding one.
+// An unconditional assertion fails that test for doing its job, which is how
+// this version of the hook was caught on its first run.
+afterEach(async () => {
+  await awaitDeferredCorpusReleasesForTests();
+});
 import {
   readTextFileFromBoundParent,
   retireBoundReadersForProcessShutdown,
@@ -110,7 +132,12 @@ describe("stable corpus lease", () => {
             },
           })
         );
-        await didStart;
+        // Racing the read surfaces its rejection. Awaiting `didStart` alone
+        // hangs to the suite timeout whenever the first read is refused,
+        // because `markStarted` runs inside the read that just failed. That
+        // turned a named capacity refusal into an anonymous 15s timeout on
+        // Windows, which is what made #617 undiagnosable from CI logs.
+        await Promise.race([didStart, activeReads[activeReads.length - 1]]);
       }
 
       const thirdParent = join(root, "active-1");

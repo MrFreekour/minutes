@@ -82,7 +82,28 @@ const version = /^version\\s*=\\s*"([^"]+)"/m.exec(manifest)?.[1];
 if (!version) throw new Error("fixture workspace version not found");
 const lockPath = "Cargo.lock";
 let lock = await readFile(lockPath, "utf8");
-for (const name of ["minutes-core", "minutes-cli", "minutes-reader"]) {
+// Faithful to real cargo: every workspace member inheriting the workspace
+// version moves, whatever -p asks for. A shim that only touched the -p list
+// agreed with any caller and so could not catch a caller naming too few
+// packages, which is the bug this suite exists to hold down.
+const workspace = await readFile("Cargo.toml", "utf8");
+const memberDirs = [...(/members\\s*=\\s*\\[([\\s\\S]*?)\\]/.exec(workspace)?.[1] ?? "")
+  .matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+const inheriting = [];
+for (const dir of memberDirs) {
+  const memberManifest = await readFile(dir + "/Cargo.toml", "utf8").catch(() => "");
+  const name = /^name\\s*=\\s*"([^"]+)"/m.exec(memberManifest)?.[1];
+  if (name && /^version\\s*\\.\\s*workspace\\s*=\\s*true/m.test(memberManifest)) inheriting.push(name);
+}
+if (inheriting.length === 0) throw new Error("fixture workspace has no inheriting members");
+const requested = [];
+for (let i = 0; i < process.argv.length; i += 1) {
+  if (process.argv[i] === "-p") requested.push(process.argv[i + 1]);
+}
+for (const name of requested) {
+  if (!inheriting.includes(name)) throw new Error("cargo update named a non-inheriting package: " + name);
+}
+for (const name of inheriting) {
   const pattern = new RegExp('(name = "' + name + '"\\nversion = ")[^"]+(")');
   if (!pattern.test(lock)) throw new Error("fixture lock package not found: " + name);
   lock = lock.replace(pattern, (_match, prefix, suffix = "") => prefix + version + suffix);
@@ -102,13 +123,27 @@ async function makeRepo(t) {
   await writeFixture(
     root,
     "Cargo.toml",
-    `[workspace]\nmembers = []\n\n[workspace.package]\nversion = "${initialVersion}"\nedition = "2021"\n`,
+    `[workspace]\nmembers = [\n  "crates/core",\n  "crates/cli",\n  "crates/reader",\n  "crates/archive-core",\n  "crates/whisper-guard",\n  "tauri/src-tauri",\n]\n\n[workspace.package]\nversion = "${initialVersion}"\nedition = "2021"\n`,
   );
   await writeFixture(
     root,
     "crates/cli/Cargo.toml",
     `[package]\nname = "minutes-cli"\nversion.workspace = true\n\n[dependencies]\nminutes-core = { path = "../core", version = "${initialVersion}", default-features = false }\n`,
   );
+  for (const [directory, name] of [
+    ["core", "minutes-core"],
+    ["reader", "minutes-reader"],
+    // Inherits the workspace version without being one of the three the
+    // script used to hardcode. Real archive crates are shaped exactly like
+    // this, and are why a bump stopped being possible at all.
+    ["archive-core", "minutes-archive-core"],
+  ]) {
+    await writeFixture(
+      root,
+      `crates/${directory}/Cargo.toml`,
+      `[package]\nname = "${name}"\nversion.workspace = true\n`,
+    );
+  }
   await writeJson(root, "tauri/src-tauri/tauri.conf.json", { version: initialVersion });
   await writeJson(root, "crates/mcp/package.json", {
     name: "minutes-mcp",
@@ -139,7 +174,7 @@ async function makeRepo(t) {
   await writeFixture(
     root,
     "Cargo.lock",
-    ["minutes-core", "minutes-cli", "minutes-reader", "whisper-guard"]
+    ["minutes-core", "minutes-cli", "minutes-reader", "minutes-archive-core", "whisper-guard"]
       .map(
         (name) =>
           `[[package]]\nname = "${name}"\nversion = "${name === "whisper-guard" ? "77.0.0" : initialVersion}"\n`,

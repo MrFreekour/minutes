@@ -1216,12 +1216,19 @@ pub fn delete_all_voice_data(config: &Config) -> Result<DeleteVoiceDataReport, V
     delete_all_voice_data_at(&db_path(), std::slice::from_ref(&config.output_dir))
 }
 
+const LEGACY_PROFILE_MIGRATION_QUALITY_JSON: &str = "{\"migration\":\"legacy-profile-sync-v1\"}";
+
 /// Import legacy mutable profiles as manual immutable samples without creating duplicates.
+///
+/// Legacy `minutes enroll` updates one mutable centroid while retaining its
+/// original enrollment timestamp. If that centroid changes, revoke the prior
+/// imported snapshot and insert an immutable replacement so matching observes
+/// the enrollment the CLI says it saved.
 pub fn migrate_legacy_profiles(conn: &Connection) -> Result<usize, VoiceError> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let legacy_profiles = {
         let mut stmt = transaction.prepare(
-            "SELECT person_slug, name, embedding, enrolled_at, source, model_version
+            "SELECT person_slug, name, embedding, enrolled_at, updated_at, source, model_version
              FROM voice_profiles
              ORDER BY id ASC",
         )?;
@@ -1233,33 +1240,64 @@ pub fn migrate_legacy_profiles(conn: &Connection) -> Result<usize, VoiceError> {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
     let mut migrated = 0;
-    for (slug, name, embedding, enrolled_at, source, legacy_model_id) in legacy_profiles {
+    for (slug, name, embedding, enrolled_at, updated_at, source, legacy_model_id) in legacy_profiles
+    {
         let model_id = if embedding.len() % std::mem::size_of::<f32>() == 0 {
             legacy_model_id
         } else {
             "unknown".to_string()
         };
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM voice_samples
-                WHERE person_slug = ?1 AND model_id = ?2 AND created_at = ?3
-                    AND trust_class = 'manual'
-             )",
-            params![slug, model_id, enrolled_at],
-            |row| row.get(0),
-        )?;
-        if !exists {
+
+        let migrated_samples = {
+            let mut stmt = transaction.prepare(
+                "SELECT id, name, embedding, model_id, capture_source
+                 FROM voice_samples
+                 WHERE person_slug = ?1 AND trust_class = 'manual' AND revoked_at IS NULL
+                   AND (quality_json = ?2 OR (created_at = ?3 AND quality_json IS NULL))
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(
+                params![slug, LEGACY_PROFILE_MIGRATION_QUALITY_JSON, enrolled_at],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let current_sample_matches = migrated_samples.len() == 1
+            && migrated_samples[0].1 == name
+            && migrated_samples[0].2 == embedding
+            && migrated_samples[0].3 == model_id
+            && migrated_samples[0].4.as_deref() == Some(source.as_str());
+
+        if !current_sample_matches {
+            let revoked_at = now_timestamp();
+            let mut affected_models = std::collections::BTreeSet::new();
+            for (id, _, _, migrated_model_id, _) in &migrated_samples {
+                transaction.execute(
+                    "UPDATE voice_samples SET revoked_at = ?1 WHERE id = ?2",
+                    params![revoked_at, id],
+                )?;
+                affected_models.insert(migrated_model_id.clone());
+            }
             transaction.execute(
                 "INSERT INTO voice_samples (
                     person_slug, name, embedding, embedding_dim, model_id, normalization,
-                    trust_class, capture_source, sensitivity, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'l2', 'manual', ?6, 'normal', ?7)",
+                    trust_class, capture_source, quality_json, sensitivity, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'l2', 'manual', ?6, ?7, 'normal', ?8)",
                 params![
                     slug,
                     name,
@@ -1267,9 +1305,13 @@ pub fn migrate_legacy_profiles(conn: &Connection) -> Result<usize, VoiceError> {
                     embedding.len() / std::mem::size_of::<f32>(),
                     model_id,
                     source,
-                    enrolled_at,
+                    LEGACY_PROFILE_MIGRATION_QUALITY_JSON,
+                    updated_at,
                 ],
             )?;
+            for affected_model in affected_models {
+                rebuild_active_profile_in_transaction(&transaction, &slug, &affected_model)?;
+            }
             migrated += 1;
         }
         rebuild_active_profile_in_transaction(&transaction, &slug, &model_id)?;
@@ -1380,10 +1422,7 @@ pub fn load_all_with_embeddings(
 }
 
 pub fn delete_profile(conn: &Connection, slug: &str) -> Result<bool, VoiceError> {
-    Ok(conn.execute(
-        "DELETE FROM voice_profiles WHERE person_slug = ?1",
-        params![slug],
-    )? > 0)
+    Ok(revoke_voice_person(conn, slug)? > 0)
 }
 
 pub fn match_embedding(
@@ -1693,6 +1732,53 @@ mod tests {
     }
 
     #[test]
+    fn voice_samples_migration_replaces_changed_legacy_centroid() {
+        let (conn, _tmp) = test_db();
+        conn.execute(
+            "INSERT INTO voice_profiles (
+                person_slug, name, embedding, enrolled_at, updated_at,
+                sample_count, source, model_version
+             ) VALUES ('mat', 'Mat', ?1, ?2, ?2, 1, 'legacy', 'model-a')",
+            params![embedding_to_bytes(&[1.0, 0.0]), "2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+
+        assert_eq!(migrate_legacy_profiles(&conn).unwrap(), 1);
+        assert_embedding_close(
+            &active_profile(&conn, "mat", "model-a")
+                .unwrap()
+                .unwrap()
+                .embedding,
+            &[1.0, 0.0],
+        );
+
+        conn.execute(
+            "UPDATE voice_profiles
+             SET embedding = ?1, updated_at = ?2, sample_count = 2
+             WHERE person_slug = 'mat'",
+            params![embedding_to_bytes(&[0.8, 0.2]), "2026-01-02T00:00:00Z"],
+        )
+        .unwrap();
+
+        assert_eq!(migrate_legacy_profiles(&conn).unwrap(), 1);
+        assert_eq!(migrate_legacy_profiles(&conn).unwrap(), 0);
+        let profile = active_profile(&conn, "mat", "model-a").unwrap().unwrap();
+        assert_eq!(profile.sample_count, 1);
+        assert_embedding_close(&profile.embedding, &[0.8, 0.2]);
+        let (active, revoked): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM voice_samples WHERE person_slug = 'mat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, revoked), (1, 1));
+    }
+
+    #[test]
     fn voice_samples_migrate_malformed_legacy_blob_as_unknown() {
         let (conn, _tmp) = test_db();
         conn.execute(
@@ -1835,6 +1921,41 @@ mod tests {
         .unwrap();
         assert!(delete_profile(&conn, "mat").unwrap());
         assert!(list_profiles(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_profile_revokes_migrated_samples_and_removes_active_profile() {
+        let (conn, _tmp) = test_db();
+        save_profile(
+            &conn,
+            "mat",
+            "Mat",
+            &[0.1f32; 4],
+            "self-enrollment",
+            TEST_MODEL_VERSION,
+        )
+        .unwrap();
+        assert_eq!(migrate_legacy_profiles(&conn).unwrap(), 1);
+        assert!(active_profile(&conn, "mat", TEST_MODEL_VERSION)
+            .unwrap()
+            .is_some());
+
+        assert!(delete_profile(&conn, "mat").unwrap());
+        assert!(list_profiles(&conn).unwrap().is_empty());
+        assert!(active_profile(&conn, "mat", TEST_MODEL_VERSION)
+            .unwrap()
+            .is_none());
+        let (active, revoked): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM voice_samples WHERE person_slug = 'mat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, revoked), (0, 1));
     }
 
     #[test]

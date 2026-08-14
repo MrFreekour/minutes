@@ -23,6 +23,7 @@ import {
   fingerprintTextFileFromBoundParent,
   readTextFileWithRevisionFromBoundParent,
   type BoundFileRevision,
+  writeOperatorDiagnostic,
 } from "./secure-read.js";
 
 const MAX_AUTHORIZATION_ATTEMPTS = 2;
@@ -292,6 +293,64 @@ function reserveCorpusMemory(
   // charge, even when several MCP handlers begin in the same event-loop turn.
   reservedCorpusMemoryBytes += bytes;
   return { bytes, released: false };
+}
+
+/**
+ * Deferred releases that have been scheduled but not yet completed.
+ *
+ * A lease that leaves unconfirmed hazards behind must not release its memory
+ * charge until every hazard settles, because a child that may still be alive
+ * may still hold corpus data. That is correct, and production wants exactly it.
+ *
+ * The charge is process-global, though, so in a test process the delay is
+ * visible to whatever runs next: an early case whose hazard has not settled yet
+ * leaves the charge standing, and later cases fail on the retained-snapshot
+ * budget instead of on anything they did. That is one flake reported three
+ * times on three platforms, always naming an innocent test.
+ *
+ * Tracking the deferrals lets a test await its own cleanup rather than race it.
+ * Deliberately not a reset: resetting the counter would hide a real leak, while
+ * awaiting the actual settlement proves the release happened.
+ */
+const pendingDeferredReleases = new Set<Promise<unknown>>();
+
+/**
+ * Test-only: give this process's deferred releases a chance to settle.
+ *
+ * Best-effort and bounded, deliberately. The flake this exists for is a release
+ * that has not settled YET: a killed child whose termination lands as soon as
+ * the event loop breathes. Awaiting gives it that chance, so the next case
+ * starts from a clean charge instead of inheriting one.
+ *
+ * It does NOT throw on an unsettled deferral, because "never settles" is a
+ * supported end state, not a defect: a projection that ignores cancellation
+ * poisons admission permanently and by design, and the test covering that would
+ * fail a stricter hook for doing its job. Returns whether everything settled,
+ * for a caller that wants to know.
+ *
+ * Measured, so the budget is not a guess: one stranded child holds 15,335,424
+ * bytes against MAX_RETAINED_CORPUS_MEMORY_BYTES, awaiting while the child is
+ * still unreaped clears nothing, and awaiting after the reap lands clears it to
+ * zero. The bound only has to cover the gap between a case ending and its
+ * child's reap arriving, which is milliseconds unless the machine is saturated,
+ * so it is set well above that and still far below vitest's hook timeout.
+ */
+export async function awaitDeferredCorpusReleasesForTests(
+  timeoutMs = 8_000
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (pendingDeferredReleases.size > 0 && Date.now() < deadline) {
+    await Promise.race([
+      Promise.allSettled([...pendingDeferredReleases]),
+      new Promise((resolve) => setTimeout(resolve, 25)),
+    ]);
+  }
+  return pendingDeferredReleases.size === 0;
+}
+
+/** Test-only: the live retained-corpus charge, for leak assertions. */
+export function reservedCorpusMemoryBytesForTests(): number {
+  return reservedCorpusMemoryBytes;
 }
 
 function releaseCorpusMemory(reservation: CorpusMemoryReservation): void {
@@ -1960,7 +2019,11 @@ async function dispatchStableCorpusLease<T>(
             const budget = overran
               ? `authorization budget overrun by ${magnitudeMs}ms`
               : `${magnitudeMs}ms of authorization budget remained`;
-            process.stderr.write(`[corpus-lease] denied: ${message} (${budget})\n`);
+            // Shared with the bound-reader refusal path, because a plain
+            // try/catch here never covered an asynchronous EPIPE: that
+            // arrives as an 'error' event on a later tick and is fatal
+            // without a listener.
+            writeOperatorDiagnostic(`[corpus-lease] denied: ${message} (${budget})\n`);
           } catch {
             // A broken stderr must never turn a clean denial into a crash.
           }
@@ -2379,12 +2442,18 @@ async function dispatchStableCorpusLease<T>(
       //
       // allSettled, not all: a hazard that rejects is still a hazard that
       // finished, and a rejection here must not strand the process closed.
-      void Promise.allSettled(unconfirmedHazards).then(() => {
+      const deferred = Promise.allSettled(unconfirmedHazards).then(() => {
         releaseUnconfirmedCorpusWorker();
         releaseCorpusMemory(reservation);
         if (workerAdmissionReleased) return;
         workerAdmissionReleased = true;
         activeCorpusWorkerCount = Math.max(0, activeCorpusWorkerCount - 1);
+      });
+      // Registered before the removal is attached, so the set can never be
+      // observed empty while this release is still outstanding.
+      pendingDeferredReleases.add(deferred);
+      void deferred.finally(() => {
+        pendingDeferredReleases.delete(deferred);
       });
     }
     if (releaseWorkerAdmission && !workerAdmissionReleased) {
