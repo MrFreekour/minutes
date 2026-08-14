@@ -333,6 +333,7 @@ jobs:
 
       - name: Create DMG
         env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
@@ -343,6 +344,12 @@ jobs:
             --app target/release/bundle/macos/Minutes.app \
             --version "$VERSION" \
             --output "$dmg"
+          # Notarization and stapling validate the contents but do not give the
+          # disk image its own primary signature. Gatekeeper's `--type open`
+          # assessment requires that outer Developer ID signature.
+          codesign --force --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          codesign --verify --strict --verbose=4 "$dmg"
           xcrun notarytool submit "$dmg" \
             --key "$APPLE_API_KEY_PATH" \
             --key-id "$APPLE_API_KEY" \
