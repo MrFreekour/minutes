@@ -102,6 +102,9 @@ notes-release-v*.md
 tmp/
 docs/assets/demo*
 .agents/napkin.md
+# Local dev tooling, installed per-machine via `npx impeccable install`.
+# Not product surface — must not ship in the assistant skill bundle.
+.agents/skills/impeccable/
 .claude/scheduled_tasks.lock
 
 # Local maintainer scratch (never commit)
