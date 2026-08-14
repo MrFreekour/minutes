@@ -132,7 +132,12 @@ describe("stable corpus lease", () => {
             },
           })
         );
-        await didStart;
+        // Racing the read surfaces its rejection. Awaiting `didStart` alone
+        // hangs to the suite timeout whenever the first read is refused,
+        // because `markStarted` runs inside the read that just failed. That
+        // turned a named capacity refusal into an anonymous 15s timeout on
+        // Windows, which is what made #617 undiagnosable from CI logs.
+        await Promise.race([didStart, activeReads[activeReads.length - 1]]);
       }
 
       const thirdParent = join(root, "active-1");
