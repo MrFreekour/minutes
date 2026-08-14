@@ -33,6 +33,7 @@
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use sherpa_rs::sherpa_rs_sys as sys;
 use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 
 /// Version of the C surface below.
@@ -44,7 +45,7 @@ use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 ///
 /// Bump on any change to a signature, to the ownership rules, or to the
 /// meaning of a return value.
-pub const MINUTES_SHERPA_ABI_VERSION: u32 = 1;
+pub const MINUTES_SHERPA_ABI_VERSION: u32 = 2;
 
 /// Report the ABI version this plugin implements.
 #[no_mangle]
@@ -54,6 +55,98 @@ pub extern "C" fn minutes_sherpa_abi_version() -> u32 {
 
 struct Recognizer {
     inner: TransducerRecognizer,
+}
+
+/// A genuinely incremental, fully local recognizer. Unlike the offline
+/// `TransducerRecognizer` above, this owns sherpa's online model state and one
+/// resettable stream. Audio is accepted once and decoded forward; no previous
+/// audio is re-run to produce a partial.
+struct StreamingRecognizer {
+    recognizer: *const sys::SherpaOnnxOnlineRecognizer,
+    stream: *const sys::SherpaOnnxOnlineStream,
+}
+
+impl Drop for StreamingRecognizer {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.stream.is_null() {
+                sys::SherpaOnnxDestroyOnlineStream(self.stream);
+                self.stream = std::ptr::null();
+            }
+            if !self.recognizer.is_null() {
+                sys::SherpaOnnxDestroyOnlineRecognizer(self.recognizer);
+                self.recognizer = std::ptr::null();
+            }
+        }
+    }
+}
+
+fn streaming_recognizer(model_dir: &str) -> Result<StreamingRecognizer, String> {
+    let path = |candidates: &[&str]| {
+        let file = candidates
+            .iter()
+            .map(|file| std::path::Path::new(model_dir).join(file))
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                format!(
+                    "streaming model in {model_dir} is missing one of: {}",
+                    candidates.join(", ")
+                )
+            })?;
+        CString::new(file.to_string_lossy().as_ref())
+            .map_err(|_| "sherpa model path contained an interior null".to_string())
+    };
+    let encoder = path(&["encoder.int8.onnx", "encoder-epoch-99-avg-1.int8.onnx"])?;
+    let decoder = path(&["decoder.int8.onnx", "decoder-epoch-99-avg-1.onnx"])?;
+    let joiner = path(&["joiner.int8.onnx", "joiner-epoch-99-avg-1.int8.onnx"])?;
+    let tokens = path(&["tokens.txt"])?;
+    let provider = CString::new("cpu").expect("static string has no null");
+    let model_type = CString::new("").expect("static string has no null");
+    let decoding_method = CString::new("greedy_search").expect("static string has no null");
+
+    // The sherpa C API intentionally treats a zero-initialized config as its
+    // baseline. Set every field that is load-bearing for an online transducer;
+    // unused model families remain null.
+    let mut config: sys::SherpaOnnxOnlineRecognizerConfig = unsafe { std::mem::zeroed() };
+    config.feat_config.sample_rate = 16_000;
+    config.feat_config.feature_dim = 80;
+    config.model_config.transducer.encoder = encoder.as_ptr();
+    config.model_config.transducer.decoder = decoder.as_ptr();
+    config.model_config.transducer.joiner = joiner.as_ptr();
+    config.model_config.tokens = tokens.as_ptr();
+    config.model_config.num_threads = 4;
+    config.model_config.provider = provider.as_ptr();
+    config.model_config.debug = 0;
+    // Empty asks sherpa to auto-detect the supported online transducer family.
+    config.model_config.model_type = model_type.as_ptr();
+    config.decoding_method = decoding_method.as_ptr();
+    config.max_active_paths = 4;
+    config.enable_endpoint = 0;
+
+    let recognizer = unsafe { sys::SherpaOnnxCreateOnlineRecognizer(&config) };
+    if recognizer.is_null() {
+        return Err("failed to load sherpa streaming model".to_string());
+    }
+    let stream = unsafe { sys::SherpaOnnxCreateOnlineStream(recognizer) };
+    if stream.is_null() {
+        unsafe { sys::SherpaOnnxDestroyOnlineRecognizer(recognizer) };
+        return Err("failed to create sherpa streaming session".to_string());
+    }
+    Ok(StreamingRecognizer { recognizer, stream })
+}
+
+unsafe fn streaming_text(recognizer: &StreamingRecognizer) -> Option<CString> {
+    let result = sys::SherpaOnnxGetOnlineStreamResult(recognizer.recognizer, recognizer.stream);
+    if result.is_null() {
+        return None;
+    }
+    let text = if (*result).text.is_null() {
+        None
+    } else {
+        CString::new(CStr::from_ptr((*result).text).to_bytes()).ok()
+    };
+    sys::SherpaOnnxDestroyOnlineRecognizerResult(result);
+    text
 }
 
 /// Write a message into the host's error buffer, always null-terminated.
@@ -139,6 +232,127 @@ pub unsafe extern "C" fn minutes_sherpa_create(
             std::ptr::null_mut()
         }
     }
+}
+
+/// Load a true streaming transducer recognizer and create its first stream.
+///
+/// This is deliberately a separate handle from the offline recognizer: a
+/// caller that only performs batch transcription does not pay for a second
+/// model, while dictation can retain this handle across sessions and reset its
+/// small stream state without reloading model weights.
+#[no_mangle]
+pub unsafe extern "C" fn minutes_sherpa_stream_create(
+    model_dir: *const c_char,
+    err: *mut c_char,
+    err_len: usize,
+) -> *mut std::ffi::c_void {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if model_dir.is_null() {
+            return Err("model_dir was null".to_string());
+        }
+        let dir = CStr::from_ptr(model_dir)
+            .to_str()
+            .map_err(|_| "model_dir was not valid UTF-8".to_string())?;
+        streaming_recognizer(dir).map(Box::new)
+    }));
+    let report = |message: &str| {
+        let _ = catch_unwind(AssertUnwindSafe(|| write_error(err, err_len, message)));
+    };
+    match result {
+        Ok(Ok(recognizer)) => Box::into_raw(recognizer) as *mut std::ffi::c_void,
+        Ok(Err(message)) => {
+            report(&message);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            report("sherpa plugin panicked while loading the streaming model");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Accept one audio chunk, decode every newly-ready frame, and return the
+/// current provisional text. The result is an owned plugin string; an empty
+/// string means the decoder does not yet have a useful token.
+#[no_mangle]
+pub unsafe extern "C" fn minutes_sherpa_stream_feed(
+    handle: *mut std::ffi::c_void,
+    sample_rate: u32,
+    samples: *const f32,
+    len: usize,
+) -> *mut c_char {
+    if handle.is_null() || (samples.is_null() && len != 0) || len > i32::MAX as usize {
+        return std::ptr::null_mut();
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let recognizer = &mut *(handle as *mut StreamingRecognizer);
+        sys::SherpaOnnxOnlineStreamAcceptWaveform(
+            recognizer.stream,
+            sample_rate as i32,
+            samples,
+            len as i32,
+        );
+        while sys::SherpaOnnxIsOnlineStreamReady(recognizer.recognizer, recognizer.stream) != 0 {
+            sys::SherpaOnnxDecodeOnlineStream(recognizer.recognizer, recognizer.stream);
+        }
+        streaming_text(recognizer).unwrap_or_else(|| CString::new("").unwrap())
+    }));
+    match result {
+        Ok(text) => text.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Flush the final decoder frames and return the final online hypothesis.
+#[no_mangle]
+pub unsafe extern "C" fn minutes_sherpa_stream_finish(
+    handle: *mut std::ffi::c_void,
+) -> *mut c_char {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let recognizer = &mut *(handle as *mut StreamingRecognizer);
+        sys::SherpaOnnxOnlineStreamInputFinished(recognizer.stream);
+        while sys::SherpaOnnxIsOnlineStreamReady(recognizer.recognizer, recognizer.stream) != 0 {
+            sys::SherpaOnnxDecodeOnlineStream(recognizer.recognizer, recognizer.stream);
+        }
+        streaming_text(recognizer).unwrap_or_else(|| CString::new("").unwrap())
+    }));
+    match result {
+        Ok(text) => text.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Replace the finished stream while retaining the expensive model.
+#[no_mangle]
+pub unsafe extern "C" fn minutes_sherpa_stream_reset(handle: *mut std::ffi::c_void) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let recognizer = &mut *(handle as *mut StreamingRecognizer);
+        let replacement = sys::SherpaOnnxCreateOnlineStream(recognizer.recognizer);
+        if replacement.is_null() {
+            return false;
+        }
+        sys::SherpaOnnxDestroyOnlineStream(recognizer.stream);
+        recognizer.stream = replacement;
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// Release the retained streaming model and its current stream.
+#[no_mangle]
+pub unsafe extern "C" fn minutes_sherpa_stream_destroy(handle: *mut std::ffi::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        drop(Box::from_raw(handle as *mut StreamingRecognizer));
+    }));
 }
 
 #[cfg(test)]

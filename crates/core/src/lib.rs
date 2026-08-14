@@ -72,6 +72,7 @@ pub mod overlays;
 pub mod palette;
 pub mod parakeet;
 pub mod parakeet_sidecar;
+pub mod partial_quality;
 pub(crate) mod person_identity;
 pub mod pid;
 pub mod pipeline;

@@ -29,6 +29,7 @@ use crate::vad::VadEngine;
 /// The default sherpa parakeet-v3 model variant directory name (under the
 /// models base). `minutes setup` installs the int8 export here.
 pub const DEFAULT_SHERPA_MODEL: &str = "parakeet-tdt-0.6b-v3-int8";
+pub const DEFAULT_SHERPA_STREAMING_MODEL: &str = "streaming-zipformer-en-20M-2023-02-17";
 
 /// Base directory under which sherpa engine models are installed:
 /// `<model_path>/sherpa/`. Mirrors the parakeet `installs_root` convention.
@@ -56,6 +57,20 @@ pub fn model_dir(config: &Config) -> PathBuf {
     installs_root(config).join(DEFAULT_SHERPA_MODEL)
 }
 
+/// Resolve the dedicated true-streaming first-pass model. It is intentionally
+/// separate from the excellent but offline Parakeet final model: pointing the
+/// online C API at Parakeet v3 aborts inside sherpa because that export has no
+/// streaming window metadata.
+pub fn streaming_model_dir(config: &Config) -> PathBuf {
+    if let Ok(dir) = std::env::var("MINUTES_SHERPA_STREAMING_MODEL_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    installs_root(config).join(DEFAULT_SHERPA_STREAMING_MODEL)
+}
+
 /// Required model files with a conservative minimum byte size. The size floor
 /// rejects zero-byte / truncated downloads that a plain existence check would
 /// accept (and would then fail at model load).
@@ -66,11 +81,26 @@ pub const MODEL_FILES: [(&str, u64); 4] = [
     ("tokens.txt", 10_000),
 ];
 
+pub const STREAMING_MODEL_FILES: [(&str, u64); 4] = [
+    ("encoder-epoch-99-avg-1.int8.onnx", 40_000_000),
+    ("decoder-epoch-99-avg-1.onnx", 2_000_000),
+    ("joiner-epoch-99-avg-1.int8.onnx", 200_000),
+    ("tokens.txt", 4_000),
+];
+
 /// True when every required model file exists in `dir` and meets its size floor.
 pub fn model_files_present(dir: &std::path::Path) -> bool {
     MODEL_FILES.iter().all(|(name, min)| {
         std::fs::metadata(dir.join(name))
             .map(|m| m.is_file() && m.len() >= *min)
+            .unwrap_or(false)
+    })
+}
+
+pub fn streaming_model_files_present(dir: &std::path::Path) -> bool {
+    STREAMING_MODEL_FILES.iter().all(|(name, min)| {
+        std::fs::metadata(dir.join(name))
+            .map(|metadata| metadata.is_file() && metadata.len() >= *min)
             .unwrap_or(false)
     })
 }
