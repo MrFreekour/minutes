@@ -494,6 +494,45 @@ Minutes exposes a standard MCP server. Point any MCP-compatible client at it:
 }
 ```
 
+#### Transports
+
+`minutes-mcp` speaks stdio by default, which is what the config above uses: the client spawns the server as a subprocess and owns its lifetime. Nothing changes for existing setups.
+
+Pass `--transport http` to run one long-lived Streamable HTTP server instead, so several clients share a single process rather than each spawning their own:
+
+```bash
+minutes-mcp --transport http --port 7373
+```
+
+Then point clients at the endpoint:
+
+```json
+{
+  "mcpServers": {
+    "minutes": {
+      "type": "http",
+      "url": "http://127.0.0.1:7373/mcp"
+    }
+  }
+}
+```
+
+Flags: `--port` (default `7373`; `0` asks the OS for a free port and the chosen one is printed to stderr), `--max-sessions` (default 16). Each accepts an environment variable instead: `MINUTES_MCP_TRANSPORT`, `MINUTES_MCP_PORT`, `MINUTES_MCP_MAX_SESSIONS`. `GET /health` reports live session count.
+
+Request bodies are JSON-RPC envelopes, so they are capped at 4 MiB; anything larger gets a JSON-RPC error with HTTP 413. A client that disconnects without sending `DELETE /mcp` leaves its session behind, so a session with no request in flight and no open stream is reclaimed after 30 minutes idle and answers 404 after that. A client holding an open stream is never reclaimed, however quiet it is.
+
+HTTP mode has no authentication, so the bind address is always `127.0.0.1` and there is no flag to change it. Only this machine can reach the endpoint, and it rejects requests whose `Host` or `Origin` is not loopback. That second check matters: binding to loopback does not by itself stop a web page you have open from POSTing to a local port.
+
+To reach it from another machine, front it with a reverse proxy and put authentication there. The proxy has to rewrite `Host` to the upstream address, since the original name would fail the loopback check. In Caddy:
+
+```
+reverse_proxy 127.0.0.1:7373 {
+  header_up Host {upstream_hostport}
+}
+```
+
+Native MCP clients send no `Origin`, so nothing else is needed for them. A browser-based client would also need its `Origin` handled at the proxy, which gives up the CSRF defense described above.
+
 Canonical MCP reference now lives at:
 
 - <https://useminutes.app/docs/mcp/tools>
