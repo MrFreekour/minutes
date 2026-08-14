@@ -308,6 +308,48 @@ pub fn preflight_model(config: &Config) -> Result<(), DictationEvent> {
 pub fn run<F, G>(
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    on_event: F,
+    on_result: G,
+) -> Result<(), MinutesError>
+where
+    F: FnMut(DictationEvent),
+    G: FnMut(DictationResult),
+{
+    run_with_options(
+        stop_flag,
+        config,
+        DictationRunOptions::default(),
+        on_event,
+        on_result,
+    )
+}
+
+/// Session behavior that differs between autonomous CLI capture and an
+/// explicitly controlled desktop shortcut gesture.
+#[derive(Debug, Clone)]
+pub struct DictationRunOptions {
+    /// End the session after the configured post-speech silence interval.
+    /// Desktop hold/locked gestures disable this because the gesture owns the
+    /// end of the session; command-line capture retains the legacy timeout.
+    pub auto_stop_on_silence: bool,
+    /// When set at the same time as `stop_flag`, discard the entire session:
+    /// do not finalize audio, write history/files, or deliver text.
+    pub cancel_flag: Option<Arc<AtomicBool>>,
+}
+
+impl Default for DictationRunOptions {
+    fn default() -> Self {
+        Self {
+            auto_stop_on_silence: true,
+            cancel_flag: None,
+        }
+    }
+}
+
+pub fn run_with_options<F, G>(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    options: DictationRunOptions,
     mut on_event: F,
     mut on_result: G,
 ) -> Result<(), MinutesError>
@@ -342,7 +384,7 @@ where
     pid::create_pid_file(&dict_pid)?;
 
     // Ensure cleanup on all exit paths
-    let result = run_inner(stop_flag, config, &mut on_event, &mut on_result);
+    let result = run_inner(stop_flag, config, &options, &mut on_event, &mut on_result);
 
     // Release PID
     pid::remove_pid_file(&dict_pid).ok();
@@ -353,6 +395,7 @@ where
 fn run_inner<F, G>(
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    options: &DictationRunOptions,
     on_event: &mut F,
     on_result: &mut G,
 ) -> Result<(), MinutesError>
@@ -507,6 +550,19 @@ where
         loop {
             // Check stop flag (Esc / Ctrl-C / MCP stop)
             if stop_flag.load(Ordering::Relaxed) {
+                if options
+                    .cancel_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    // Cancellation is a true discard boundary. In particular,
+                    // do not flush accumulated results: that path writes the
+                    // dictation file and daily note before delivering text.
+                    final_utterance_samples.clear();
+                    discard_accumulated_results(&mut accumulated_results);
+                    on_event(DictationEvent::Cancelled);
+                    break;
+                }
                 // Finalize any in-progress transcription before exiting
                 if utterance_samples > 0 {
                     on_event(DictationEvent::Processing);
@@ -531,7 +587,6 @@ where
                     final_utterance_samples.clear();
                 }
                 flush_accumulated_results(config, &mut accumulated_results, on_event, on_result);
-                on_event(DictationEvent::Cancelled);
                 break;
             }
 
@@ -696,8 +751,11 @@ where
                     on_event(DictationEvent::Listening);
                 }
 
-                total_silence_ms += 100;
-                if has_spoken
+                if options.auto_stop_on_silence {
+                    total_silence_ms += 100;
+                }
+                if options.auto_stop_on_silence
+                    && has_spoken
                     && !was_speaking
                     && total_silence_ms < config.dictation.silence_timeout_ms
                 {
@@ -707,10 +765,13 @@ where
                         remaining_ms: remaining,
                     });
                 }
-                if has_spoken
-                    && !was_speaking
-                    && total_silence_ms >= config.dictation.silence_timeout_ms
-                {
+                if should_end_after_silence(
+                    options,
+                    has_spoken,
+                    was_speaking,
+                    total_silence_ms,
+                    config.dictation.silence_timeout_ms,
+                ) {
                     tracing::info!(
                         silence_ms = total_silence_ms,
                         "silence timeout — ending dictation"
@@ -733,6 +794,20 @@ where
 
         Ok(())
     }
+}
+
+fn should_end_after_silence(
+    options: &DictationRunOptions,
+    has_spoken: bool,
+    is_speaking: bool,
+    silence_ms: u64,
+    timeout_ms: u64,
+) -> bool {
+    options.auto_stop_on_silence && has_spoken && !is_speaking && silence_ms >= timeout_ms
+}
+
+fn discard_accumulated_results(accumulated_results: &mut Vec<DictationResult>) {
+    accumulated_results.clear();
 }
 
 fn dictation_final_backend(config: &Config) -> DictationFinalBackend {
@@ -1499,6 +1574,51 @@ mod tests {
             },
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn shortcut_owned_sessions_ignore_silence_timeout() {
+        let shortcut_options = DictationRunOptions {
+            auto_stop_on_silence: false,
+            cancel_flag: None,
+        };
+        assert!(!should_end_after_silence(
+            &shortcut_options,
+            true,
+            false,
+            10_000,
+            2_000,
+        ));
+
+        assert!(should_end_after_silence(
+            &DictationRunOptions::default(),
+            true,
+            false,
+            2_000,
+            2_000,
+        ));
+    }
+
+    #[test]
+    fn cancellation_discards_accumulated_text_without_writing_history() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let mut accumulated = vec![DictationResult {
+            raw_text: "this must disappear".into(),
+            text: "This must disappear.".into(),
+            duration_secs: 1.0,
+            destination: "daily_note".into(),
+            file_path: None,
+            daily_note_appended: false,
+            engine_id: "whisper:small".into(),
+            engine_descriptor_version: Some("small".into()),
+        }];
+
+        discard_accumulated_results(&mut accumulated);
+
+        assert!(accumulated.is_empty());
+        assert!(!config.daily_notes.path.exists());
+        assert!(!config.output_dir.exists());
     }
 
     #[test]

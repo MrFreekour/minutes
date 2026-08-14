@@ -1709,6 +1709,8 @@ fn main() {
     let discard_short_hotkey_capture = Arc::new(AtomicBool::new(false));
     let dictation_active = Arc::new(AtomicBool::new(false));
     let dictation_stop_flag = Arc::new(AtomicBool::new(false));
+    let dictation_cancel_flag = Arc::new(AtomicBool::new(false));
+    let dictation_capture_style = Arc::new(Mutex::new(None));
     let dictation_release_started_at = Arc::new(Mutex::new(None));
     let live_transcript_active = Arc::new(AtomicBool::new(false));
     let live_transcript_stop_flag = Arc::new(AtomicBool::new(false));
@@ -1971,6 +1973,8 @@ fn main() {
             pty_manager: Arc::new(Mutex::new(pty::PtyManager::default())),
             dictation_active: dictation_active.clone(),
             dictation_stop_flag: dictation_stop_flag.clone(),
+            dictation_cancel_flag: dictation_cancel_flag.clone(),
+            dictation_capture_style: dictation_capture_style.clone(),
             dictation_focus_guard: Arc::new(Mutex::new(None)),
             pending_dictation_target: Arc::new(Mutex::new(None)),
             dictation_release_started_at: dictation_release_started_at.clone(),
@@ -2944,6 +2948,7 @@ fn main() {
             commands::cmd_start_dictation,
             commands::cmd_show_dictation_permission_help,
             commands::cmd_stop_dictation,
+            commands::cmd_cancel_dictation,
             commands::cmd_dismiss_dictation_overlay,
             commands::cmd_dictation_overlay_ready,
             commands::cmd_recent_dictations,
@@ -3195,13 +3200,48 @@ mod tray_activity_tests {
         );
         assert!(
             commands_rs.contains("publish_dictation_overlay_state(app, \"starting\")")
-                && commands_rs.contains("snapshot.advance(state)")
+                && commands_rs.contains("snapshot.advance(state, capture_style)")
                 && commands_rs.contains("app.emit(\"dictation:overlay\", snapshot)")
                 && commands_rs.contains("DictationEvent::PartialText(_) => \"\"")
                 && commands_rs.contains(
                     "Start microphone initialization before constructing the overlay"
                 ),
             "the backend should start capture early and own replayable overlay state before creating the WebView"
+        );
+    }
+
+    #[test]
+    fn dictation_gestures_silence_and_cancel_have_distinct_contracts() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let shortcuts_rs = std::fs::read_to_string(format!("{}/src/shortcut_manager.rs", manifest))
+            .expect("failed to read shortcut_manager.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        assert!(
+            shortcuts_rs.contains("StateMachineAction::Lock")
+                && commands_rs.contains("lock_active_dictation_capture")
+                && overlay.contains("Release to finish")
+                && overlay.contains("Tap again to finish"),
+            "a quick release must visibly latch the running hold capture into locked mode"
+        );
+        assert!(
+            commands_rs.contains("auto_stop_on_silence: capture_style.is_none()"),
+            "shortcut-owned hold and locked sessions must end by gesture, not ordinary silence"
+        );
+        assert!(
+            commands_rs.contains("config.dictation.accumulate = true")
+                && overlay.contains("cmd_cancel_dictation")
+                && !overlay.contains("mic silent, check input device"),
+            "desktop results must remain buffered for Escape discard, while low audio stays neutral"
+        );
+        assert!(
+            shortcuts_rs.contains("HotkeyEvent::Cancel")
+                && shortcuts_rs.contains("dictation_cancel_flag.store(true"),
+            "the native macOS event tap should route cross-app Escape into true cancellation"
         );
     }
 
@@ -3285,7 +3325,8 @@ mod tray_activity_tests {
 
         assert!(commands_rs.contains("\"activeLabel\": \"copy only\""));
         assert!(
-            overlay.contains("Listening · ${insertionActiveLabel || 'copy only'}")
+            overlay.contains("const destinationHint = earlyInsertionFallback")
+                && overlay.contains("insertionActiveLabel || 'copy only'")
                 && overlay.contains("'Copied · typing needs setup'")
                 && overlay.contains("permissionButton.classList.remove('hidden')")
                 && overlay.contains("cmd_show_dictation_permission_help"),

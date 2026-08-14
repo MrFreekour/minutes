@@ -54,6 +54,8 @@ pub struct AppState {
     pub pty_manager: Arc<Mutex<crate::pty::PtyManager>>,
     pub dictation_active: Arc<AtomicBool>,
     pub dictation_stop_flag: Arc<AtomicBool>,
+    pub dictation_cancel_flag: Arc<AtomicBool>,
+    pub dictation_capture_style: Arc<Mutex<Option<HotkeyCaptureStyle>>>,
     pub dictation_focus_guard: Arc<Mutex<Option<DictationFocusGuard>>>,
     pub pending_dictation_target: Arc<Mutex<Option<PendingDictationTarget>>>,
     pub dictation_release_started_at: Arc<Mutex<Option<Instant>>>,
@@ -249,6 +251,7 @@ pub struct DictationFocusGuard {
 pub struct DictationOverlaySnapshot {
     pub state: String,
     pub revision: u64,
+    pub capture_style: Option<HotkeyCaptureStyle>,
 }
 
 impl Default for DictationOverlaySnapshot {
@@ -256,13 +259,15 @@ impl Default for DictationOverlaySnapshot {
         Self {
             state: "idle".into(),
             revision: 0,
+            capture_style: None,
         }
     }
 }
 
 impl DictationOverlaySnapshot {
-    fn advance(&mut self, state: &str) -> Self {
+    fn advance(&mut self, state: &str, capture_style: Option<HotkeyCaptureStyle>) -> Self {
         self.state = state.into();
+        self.capture_style = capture_style;
         self.revision = self.revision.saturating_add(1);
         self.clone()
     }
@@ -2620,7 +2625,8 @@ pub struct TerminalInfo {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HotkeyCaptureStyle {
     Hold,
     Locked,
@@ -12926,6 +12932,8 @@ mod tests {
             pty_manager: Arc::new(Mutex::new(crate::pty::PtyManager::default())),
             dictation_active: Arc::new(AtomicBool::new(false)),
             dictation_stop_flag: Arc::new(AtomicBool::new(false)),
+            dictation_cancel_flag: Arc::new(AtomicBool::new(false)),
+            dictation_capture_style: Arc::new(Mutex::new(None)),
             dictation_focus_guard: Arc::new(Mutex::new(None)),
             pending_dictation_target: Arc::new(Mutex::new(None)),
             dictation_release_started_at: Arc::new(Mutex::new(None)),
@@ -12964,13 +12972,15 @@ mod tests {
     fn dictation_overlay_snapshot_advances_for_replay_ordering() {
         let mut snapshot = DictationOverlaySnapshot::default();
 
-        let starting = snapshot.advance("starting");
-        let listening = snapshot.advance("listening");
+        let starting = snapshot.advance("starting", Some(HotkeyCaptureStyle::Hold));
+        let listening = snapshot.advance("listening", Some(HotkeyCaptureStyle::Locked));
 
         assert_eq!(starting.state, "starting");
         assert_eq!(starting.revision, 1);
+        assert_eq!(starting.capture_style, Some(HotkeyCaptureStyle::Hold));
         assert_eq!(listening.state, "listening");
         assert_eq!(listening.revision, 2);
+        assert_eq!(listening.capture_style, Some(HotkeyCaptureStyle::Locked));
     }
 
     #[test]
@@ -18195,6 +18205,19 @@ pub fn cmd_stop_dictation(state: tauri::State<AppState>) -> Result<String, Strin
     Err("Dictation is not active".into())
 }
 
+#[tauri::command]
+pub fn cmd_cancel_dictation(state: tauri::State<AppState>) -> Result<String, String> {
+    if state.dictation_active.load(Ordering::Relaxed) {
+        state.dictation_cancel_flag.store(true, Ordering::Relaxed);
+        state.dictation_stop_flag.store(true, Ordering::Relaxed);
+        return Ok("Dictation cancellation requested".into());
+    }
+    if dictation_pid_active() {
+        return Err("Dictation is running in another Minutes process.".into());
+    }
+    Err("Dictation is not active".into())
+}
+
 fn show_dictation_overlay(app: &tauri::AppHandle) {
     use tauri::WebviewUrl;
 
@@ -19109,6 +19132,13 @@ struct DictationActiveGuard {
 impl Drop for DictationActiveGuard {
     fn drop(&mut self) {
         self.active.store(false, Ordering::SeqCst);
+        if let Some(state) = self.app.try_state::<AppState>() {
+            state.dictation_cancel_flag.store(false, Ordering::Relaxed);
+            match state.dictation_capture_style.lock() {
+                Ok(mut style) => *style = None,
+                Err(poisoned) => *poisoned.into_inner() = None,
+            }
+        }
         crate::sync_tray_state(&self.app);
     }
 }
@@ -20153,17 +20183,38 @@ fn finish_dictation_overlay_lifecycle(app: &tauri::AppHandle, guard: Option<Dict
 fn publish_dictation_overlay_state(app: &tauri::AppHandle, state: &str) {
     let snapshot = {
         let app_state = app.state::<AppState>();
+        let capture_style = *app_state
+            .dictation_capture_style
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut snapshot = app_state
             .dictation_overlay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        snapshot.advance(state)
+        snapshot.advance(state, capture_style)
     };
 
     // Keep the existing lightweight event for command-palette refreshes while
     // the overlay consumes the revisioned, replayable contract.
     app.emit("dictation:state", state).ok();
     app.emit("dictation:overlay", snapshot).ok();
+}
+
+/// Latch an already-running hold gesture into tap-to-lock mode and publish a
+/// fresh snapshot even though the underlying capture state did not change.
+pub fn lock_active_dictation_capture(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    match state.dictation_capture_style.lock() {
+        Ok(mut style) => *style = Some(HotkeyCaptureStyle::Locked),
+        Err(poisoned) => *poisoned.into_inner() = Some(HotkeyCaptureStyle::Locked),
+    }
+    let current = state
+        .dictation_overlay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .state
+        .clone();
+    publish_dictation_overlay_state(app, &current);
 }
 
 #[tauri::command]
@@ -20252,8 +20303,13 @@ fn start_dictation_session(
         Err(poisoned) => *poisoned.into_inner() = Some(focus_guard.clone()),
     }
     remember_dictation_target_focus(app, &dictation_target_context);
+    match state.dictation_capture_style.lock() {
+        Ok(mut style) => *style = capture_style,
+        Err(poisoned) => *poisoned.into_inner() = capture_style,
+    }
     publish_dictation_overlay_state(app, "starting");
     state.dictation_stop_flag.store(false, Ordering::Relaxed);
+    state.dictation_cancel_flag.store(false, Ordering::Relaxed);
     if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
         *released_at = None;
     }
@@ -20261,10 +20317,9 @@ fn start_dictation_session(
     // tray so the menu reflects the just-started session.
     crate::sync_tray_state(app);
 
-    let _ = capture_style;
-
     let app_clone = app.clone();
     let stop_flag = Arc::clone(&state.dictation_stop_flag);
+    let cancel_flag = Arc::clone(&state.dictation_cancel_flag);
     let final_output_emitted = Arc::new(AtomicBool::new(false));
     let model_missing_emitted = Arc::new(AtomicBool::new(false));
     let dictation_target_context_for_thread = dictation_target_context.clone();
@@ -20275,6 +20330,10 @@ fn start_dictation_session(
         // `dictation_active = false` and re-syncs the tray (idle).
         let _tray_guard = tray_guard;
         let mut config = Config::load();
+        // Desktop dictation is delivered atomically at the user's finishing
+        // gesture. Buffer utterances so Escape can still discard the whole
+        // session even after an ordinary thinking pause finalized one segment.
+        config.dictation.accumulate = true;
         // Re-validate the pinned input device for mid-session
         // disconnects (#189). In-memory only; startup-side persistence
         // is in main.rs.
@@ -20292,9 +20351,13 @@ fn start_dictation_session(
         let latency_trace_for_events = Arc::clone(&latency_trace_for_thread);
         let latency_trace_for_results = Arc::clone(&latency_trace_for_thread);
 
-        let result = minutes_core::dictation::run(
+        let result = minutes_core::dictation::run_with_options(
             stop_flag,
             &config,
+            minutes_core::dictation::DictationRunOptions {
+                auto_stop_on_silence: capture_style.is_none(),
+                cancel_flag: Some(cancel_flag),
+            },
             move |event| {
                 use minutes_core::dictation::DictationEvent;
                 mark_dictation_latency_event(&latency_trace_for_events, &event);

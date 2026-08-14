@@ -159,6 +159,9 @@ pub fn prompt_accessibility_permission() {
 pub enum HotkeyEvent {
     Press,
     Release,
+    /// Escape key-down observed by the same global event tap. The caller
+    /// decides whether an active capture should treat it as cancellation.
+    Cancel,
 }
 
 /// Lifecycle updates emitted by the native hotkey monitor thread.
@@ -234,6 +237,11 @@ impl Drop for HotkeyMonitor {
 
 fn should_consume_matched_events(keycode: i64) -> bool {
     keycode != KEYCODE_FN
+}
+
+fn is_cancel_key_down(keycode: i64, event_type: ffi::CGEventType) -> bool {
+    const KEYCODE_ESCAPE: i64 = 53;
+    keycode == KEYCODE_ESCAPE && event_type == ffi::kCGEventKeyDown
 }
 
 fn input_monitoring_failure(granted: bool) -> Option<&'static str> {
@@ -483,15 +491,32 @@ unsafe extern "C" fn event_tap_callback(
     user_info: *mut std::ffi::c_void,
 ) -> ffi::CGEventRef {
     let context = &*(user_info as *const TapContext);
-
-    if context.stop.load(Ordering::Relaxed) {
-        return event;
-    }
-
     let keycode = ffi::CGEventGetIntegerValueField(event, ffi::kCGKeyboardEventKeycode);
 
+    if dispatch_hotkey_event(context, event_type, keycode) {
+        std::ptr::null_mut()
+    } else {
+        event
+    }
+}
+
+/// Dispatch one decoded event-tap input. Returns whether the matched event
+/// should be consumed rather than passed through to the foreground app.
+fn dispatch_hotkey_event(context: &TapContext, event_type: ffi::CGEventType, keycode: i64) -> bool {
+    if context.stop.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    // Modifier-less Escape is not a reliable Carbon/global-shortcut
+    // registration on macOS. Observe it through the already-authorized HID
+    // event tap instead and leave the event untouched for the foreground app.
+    if is_cancel_key_down(keycode, event_type) {
+        (context.callback)(HotkeyEvent::Cancel);
+        return false;
+    }
+
     if keycode != context.target_keycode {
-        return event; // Not our key — pass through
+        return false; // Not our key — pass through
     }
 
     match event_type {
@@ -499,20 +524,12 @@ unsafe extern "C" fn event_tap_callback(
             if !context.key_is_down.swap(true, Ordering::Relaxed) {
                 (context.callback)(HotkeyEvent::Press);
             }
-            if context.consume_matched_events {
-                std::ptr::null_mut()
-            } else {
-                event
-            }
+            context.consume_matched_events
         }
         ffi::kCGEventKeyUp => {
             context.key_is_down.store(false, Ordering::Relaxed);
             (context.callback)(HotkeyEvent::Release);
-            if context.consume_matched_events {
-                std::ptr::null_mut()
-            } else {
-                event
-            }
+            context.consume_matched_events
         }
         ffi::kCGEventFlagsChanged => {
             // Modifier keys (Caps Lock, fn) use FlagsChanged instead of keyDown/keyUp.
@@ -525,13 +542,9 @@ unsafe extern "C" fn event_tap_callback(
                 context.key_is_down.store(true, Ordering::Relaxed);
                 (context.callback)(HotkeyEvent::Press);
             }
-            if context.consume_matched_events {
-                std::ptr::null_mut() // Consume — prevent Caps Lock toggle.
-            } else {
-                event
-            }
+            context.consume_matched_events // Consume Caps Lock; observe Fn.
         }
-        _ => event, // Unknown — pass through
+        _ => false, // Unknown — pass through
     }
 }
 
@@ -573,6 +586,34 @@ mod tests {
     fn fn_uses_listen_only_event_tap() {
         assert!(!should_consume_matched_events(KEYCODE_FN));
         assert!(should_consume_matched_events(KEYCODE_CAPS_LOCK));
+    }
+
+    #[test]
+    fn escape_key_down_is_the_only_native_cancel_event() {
+        assert!(is_cancel_key_down(53, ffi::kCGEventKeyDown));
+        assert!(!is_cancel_key_down(53, ffi::kCGEventKeyUp));
+        assert!(!is_cancel_key_down(KEYCODE_FN, ffi::kCGEventKeyDown));
+    }
+
+    #[test]
+    fn native_escape_dispatches_cancel_without_consuming_the_foreground_event() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        let context = TapContext {
+            target_keycode: KEYCODE_FN,
+            callback: Box::new(move |event| {
+                callback_observed.lock().expect("event lock").push(event);
+            }),
+            stop: Arc::new(AtomicBool::new(false)),
+            key_is_down: AtomicBool::new(false),
+            consume_matched_events: false,
+        };
+
+        assert!(!dispatch_hotkey_event(&context, ffi::kCGEventKeyDown, 53));
+        assert_eq!(
+            *observed.lock().expect("event lock"),
+            vec![HotkeyEvent::Cancel]
+        );
     }
 
     #[test]

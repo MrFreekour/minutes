@@ -442,7 +442,7 @@
     let partialDebounce = null;
     let silenceTimeout = null;
     let silenceStartTime = null;
-    let silentSince = null;
+    let activeCaptureStyle = null;
     let insertionMessage = '';
     let earlyInsertionFallback = false;
     let insertionActiveLabel = '';
@@ -632,6 +632,7 @@
       if (!snapshot || typeof snapshot.state !== 'string') return;
       if (!Number.isFinite(snapshot.revision) || snapshot.revision <= overlayRevision) return;
       overlayRevision = snapshot.revision;
+      activeCaptureStyle = snapshot.captureStyle || null;
       const state = snapshot.state;
       if (!isTerminalState(state)) {
         cancelDismissTimer();
@@ -661,7 +662,6 @@
       pill.classList.remove('error');
       stopTimer();
       hideSilenceBar();
-      silentSince = null;
       soften(label);
       setWaveformProcessing(false);
       if (state !== 'model-missing') {
@@ -689,9 +689,7 @@
 
         case 'listening':
           setIndicator('dot-blink');
-          label.textContent = earlyInsertionFallback
-            ? `Listening · ${insertionActiveLabel || 'copy only'}`
-            : 'Listening\u2026';
+          label.textContent = captureLabel('Listening');
           waveform.style.display = 'flex';
           timer.style.display = '';
           showExpanded(false);
@@ -702,9 +700,7 @@
 
         case 'accumulating':
           setIndicator('dot-solid');
-          label.textContent = earlyInsertionFallback
-            ? `Dictating · ${insertionActiveLabel || 'copy only'}`
-            : 'Dictating';
+          label.textContent = captureLabel('Dictating');
           waveform.style.display = 'flex';
           timer.style.display = '';
           // Stay compact during dictation — text appears only on success
@@ -797,7 +793,7 @@
         case 'error':
           pill.classList.add('error');
           setIndicator('error');
-          label.textContent = 'mic silent, check input device';
+          label.textContent = 'Microphone unavailable';
           waveform.style.display = 'none';
           timer.style.display = 'none';
           showExpanded(false);
@@ -813,6 +809,18 @@
           dismiss();
           break;
       }
+    }
+
+    function captureLabel(activity) {
+      const finishHint = activeCaptureStyle === 'hold'
+        ? 'Release to finish'
+        : activeCaptureStyle === 'locked'
+          ? 'Tap again to finish'
+          : '';
+      const destinationHint = earlyInsertionFallback
+        ? insertionActiveLabel || 'copy only'
+        : '';
+      return [activity, finishHint, destinationHint].filter(Boolean).join(' · ');
     }
 
     // Subscribe first, then request the backend snapshot. Revisions make this
@@ -944,22 +952,6 @@
     listen('dictation:level', (e) => {
       const level = e.payload; // 0-100
       const normalized = level / 100;
-      if ((lastState === 'listening' || lastState === 'accumulating') && level <= 1) {
-        silentSince = silentSince || Date.now();
-        if (Date.now() - silentSince > 1000) {
-          pill.classList.add('error');
-          label.textContent = 'mic silent, check input device';
-        }
-      } else if (level > 1) {
-        silentSince = null;
-        if (lastState === 'listening' || lastState === 'accumulating') {
-          pill.classList.remove('error');
-          const activeLabel = lastState === 'accumulating' ? 'Dictating' : 'Listening\u2026';
-          label.textContent = earlyInsertionFallback
-            ? `${lastState === 'accumulating' ? 'Dictating' : 'Listening'} · ${insertionActiveLabel || 'copy only'}`
-            : activeLabel;
-        }
-      }
       bars.forEach((bar, i) => {
         const variance = Math.sin((i / bars.length) * Math.PI + Date.now() / 200) * 0.3 + 0.7;
         const h = 4 + normalized * 12 * variance;
@@ -979,7 +971,7 @@
         && payload.method === 'clipboard_only'
         && String(payload.message || '').startsWith('Could not type into the active app.');
       if (earlyInsertionFallback && (lastState === 'listening' || lastState === 'accumulating')) {
-        label.textContent = `${lastState === 'accumulating' ? 'Dictating' : 'Listening'} · ${insertionActiveLabel || 'copy only'}`;
+        label.textContent = captureLabel(lastState === 'accumulating' ? 'Dictating' : 'Listening');
       }
     });
 
@@ -1020,8 +1012,7 @@
     // Esc key cancels
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
-        window.__TAURI__.core.invoke('cmd_stop_dictation').catch(() => {});
-        dismiss();
+        window.__TAURI__.core.invoke('cmd_cancel_dictation').catch(() => {});
       }
     });
   </script>
