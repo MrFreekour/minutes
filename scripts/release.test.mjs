@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmod,
@@ -9,8 +8,6 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -37,14 +34,6 @@ async function writeFixture(root, file, contents) {
 
 async function writeJson(root, file, value) {
   await writeFixture(root, file, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-function packageBytes(name, packageVersion, variant = "original") {
-  return Buffer.from(`${name}:${packageVersion}:${variant}\n`);
-}
-
-function integrityFor(name, packageVersion, variant = "original") {
-  return `sha512-${createHash("sha512").update(packageBytes(name, packageVersion, variant)).digest("base64")}`;
 }
 
 async function installToolShims(root) {
@@ -117,54 +106,7 @@ console.log(JSON.stringify([{
   return tools;
 }
 
-async function startRegistry(t, root, config) {
-  const markers = path.join(root, ".release-markers");
-  await mkdir(markers, { recursive: true });
-  const server = http.createServer((request, response) => {
-    const segments = new URL(request.url, "http://fixture.invalid").pathname
-      .split("/")
-      .filter(Boolean)
-      .map(decodeURIComponent);
-    const packageName = segments[0];
-    const packageVersion = segments[1];
-    if (!packageName || packageVersion !== version) {
-      response.writeHead(404).end(JSON.stringify({ error: "not found" }));
-      return;
-    }
-
-    const sequence = config.sequences?.[packageName];
-    if (sequence?.length) {
-      const status = sequence.shift();
-      if (status !== 200) {
-        response.writeHead(status).end(JSON.stringify({ error: `fixture ${status}` }));
-        return;
-      }
-    }
-
-    let packageIntegrity = config.integrities?.[packageName];
-    if (packageIntegrity === undefined && existsSync(path.join(markers, `published-${packageName}`))) {
-      const remainingLag = config.visibilityLag?.[packageName] ?? 0;
-      if (remainingLag > 0) {
-        config.visibilityLag[packageName] = remainingLag - 1;
-        response.writeHead(404).end(JSON.stringify({ error: "not visible yet" }));
-        return;
-      }
-      packageIntegrity = config.expected[packageName];
-    }
-    if (packageIntegrity === undefined) {
-      response.writeHead(404).end(JSON.stringify({ error: "not found" }));
-      return;
-    }
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ name: packageName, version, dist: { integrity: packageIntegrity } }));
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
-  const address = server.address();
-  return { markers, url: `http://127.0.0.1:${address.port}/` };
-}
-
-async function makeRepo(t, registryConfig = {}) {
+async function makeRepo(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "minutes-release-fixture-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const remote = `${root}-remote.git`;
@@ -231,22 +173,10 @@ console.log("site release constants already match.");
 
   const tools = await installToolShims(root);
   const log = path.join(root, ".release-shim.log");
+  const markers = path.join(root, ".release-markers");
   await writeFile(log, "");
-  const expected = {
-    "minutes-sdk": integrityFor("minutes-sdk", version),
-    "minutes-mcp": integrityFor("minutes-mcp", version),
-  };
-  const config = {
-    expected,
-    integrities: {},
-    visibilityLag: {},
-    ...registryConfig,
-  };
-  config.expected = { ...expected, ...(registryConfig.expected ?? {}) };
-  config.integrities = { ...(registryConfig.integrities ?? {}) };
-  config.visibilityLag = { ...(registryConfig.visibilityLag ?? {}) };
-  const registry = await startRegistry(t, root, config);
-  return { root, tools, log, config, registry };
+  await mkdir(markers, { recursive: true });
+  return { root, tools, log, markers };
 }
 
 function runRelease(fixture, args, extraEnvironment = {}) {
@@ -254,14 +184,12 @@ function runRelease(fixture, args, extraEnvironment = {}) {
     const child = spawn(process.execPath, [releaseScript, ...args], {
       cwd: fixture.root,
       env: {
-      ...process.env,
-      RELEASE_TOOL_PATH: fixture.tools,
-      RELEASE_REAL_GIT: run("which", ["git"]).stdout.trim(),
-      RELEASE_REGISTRY_URL: fixture.registry.url,
-      RELEASE_POLL_DELAYS_MS: "1,1,1",
-      RELEASE_SHIM_LOG: fixture.log,
-      RELEASE_SHIM_MARKERS: fixture.registry.markers,
-      ...extraEnvironment,
+        ...process.env,
+        RELEASE_TOOL_PATH: fixture.tools,
+        RELEASE_REAL_GIT: run("which", ["git"]).stdout.trim(),
+        RELEASE_SHIM_LOG: fixture.log,
+        RELEASE_SHIM_MARKERS: fixture.markers,
+        ...extraEnvironment,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -281,7 +209,7 @@ function assertSucceeded(result) {
 }
 
 async function completePhase1(fixture, extraEnvironment = {}) {
-  const result = await runRelease(fixture, ["phase1", version], extraEnvironment);
+  const result = await runRelease(fixture, ["phase1", version, "--dry-run"], extraEnvironment);
   assertSucceeded(result);
   return result;
 }
@@ -292,10 +220,11 @@ async function completePhase2(fixture) {
   return result;
 }
 
-test("happy path completes phase1, phase2, and tag with resumable state", async (t) => {
+test("happy path preflights, pins, and tags without publishing before the tag push", async (t) => {
   const fixture = await makeRepo(t);
   const phase1 = await completePhase1(fixture);
-  assert.match(phase1.stdout, /Phase 1 complete/);
+  assert.match(phase1.stdout, /Credential-free SDK preflight complete/);
+  assert.match(phase1.stdout, /No package was published/);
   const phase2 = await completePhase2(fixture);
   assert.match(phase2.stdout, /Committed exact minutes-sdk 1\.2\.3 pin/);
   assert.equal(git(fixture.root, "push", "-q", "origin", "main").status, 0);
@@ -308,55 +237,44 @@ test("happy path completes phase1, phase2, and tag with resumable state", async 
 
   const mcpPackage = JSON.parse(await readFile(path.join(fixture.root, "crates/mcp/package.json"), "utf8"));
   assert.equal(mcpPackage.dependencies["minutes-sdk"], version);
-  const state = JSON.parse(await readFile(path.join(fixture.root, ".minutes-release-state.json"), "utf8"));
-  assert.equal(state.phase, "tag-complete");
-  assert.equal(state.sdkPublished, true);
-  assert.equal(state.sdkIntegrity, integrityFor("minutes-sdk", version));
   const log = await readFile(fixture.log, "utf8");
-  assert.match(log, /npm publish .*crates\/sdk/);
-  assert.match(log, /npm publish .*crates\/mcp/);
-});
-
-test("phase1 polls through registry 404 responses until the SDK is visible", async (t) => {
-  const fixture = await makeRepo(t, { visibilityLag: { "minutes-sdk": 2 } });
-  const result = await completePhase1(fixture);
-  assert.match(result.stdout, /404 \(not visible yet\)/);
-  assert.match(result.stdout, /Registry confirms minutes-sdk@1\.2\.3/);
-});
-
-test("phase1 polling timeout fails with the npm lag-pattern explanation", async (t) => {
-  const fixture = await makeRepo(t, { visibilityLag: { "minutes-sdk": 99 } });
-  const result = await runRelease(fixture, ["phase1", version], { RELEASE_POLL_DELAYS_MS: "1,1" });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /registry lag pattern/);
-  const state = JSON.parse(await readFile(path.join(fixture.root, ".minutes-release-state.json"), "utf8"));
-  assert.equal(state.sdkPublished, true);
-  assert.equal(state.phase, "phase1-started");
-});
-
-test("phase1 skips an existing SDK version with matching integrity", async (t) => {
-  const fixture = await makeRepo(t, {
-    integrities: { "minutes-sdk": integrityFor("minutes-sdk", version) },
-  });
-  const result = await completePhase1(fixture);
-  assert.match(result.stdout, /already published with matching integrity; skipping npm publish/);
-  const log = await readFile(fixture.log, "utf8");
+  assert.match(log, /npm pack .*crates\/sdk/);
+  assert.match(log, /npm pack .*crates\/mcp/);
   assert.doesNotMatch(log, /npm publish/);
 });
 
-test("phase1 aborts when an existing SDK version has different integrity", async (t) => {
-  const fixture = await makeRepo(t, {
-    integrities: { "minutes-sdk": "sha512-not-the-local-package" },
-  });
+test("phase1 refuses to run without the explicit dry-run flag", async (t) => {
+  const fixture = await makeRepo(t);
   const result = await runRelease(fixture, ["phase1", version]);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /already exists with different integrity/);
-  assert.match(result.stderr, /Refusing to replace published provenance/);
+  assert.match(result.stderr, /preflight-only command; pass --dry-run/);
+  const log = await readFile(fixture.log, "utf8");
+  assert.doesNotMatch(log, /npm (?:pack|publish)/);
+});
+
+test("status reports committed release inputs without legacy publish state", async (t) => {
+  const fixture = await makeRepo(t);
+  const result = await runRelease(fixture, ["status"]);
+  assertSucceeded(result);
+  assert.match(result.stdout, /release inputs: minutes-sdk 1\.2\.3; minutes-mcp 1\.2\.3/);
+  assert.match(result.stdout, /MCP SDK pin: \^1\.0\.0/);
+  assert.match(result.stdout, /registry publishing: tag-triggered workflow only/);
+});
+
+test("phase1 dry-run tests MCP against the packed SDK and restores dependencies", async (t) => {
+  const fixture = await makeRepo(t);
+  await completePhase1(fixture);
+  const log = await readFile(fixture.log, "utf8");
+  assert.match(log, /npm pack .*crates\/sdk/);
+  assert.match(log, /npm install .*\.tgz --no-save --package-lock=false .*crates\/mcp/);
+  assert.match(log, /npm run build .*crates\/mcp/);
+  assert.match(log, /npx tsc --noEmit .*crates\/mcp/);
+  assert.match(log, /npm ci .*crates\/mcp/);
+  assert.doesNotMatch(log, /npm publish/);
 });
 
 test("phase2 diff restriction aborts when another tracked file is dirty", async (t) => {
   const fixture = await makeRepo(t);
-  await completePhase1(fixture);
   await writeFile(path.join(fixture.root, "extra.txt"), "modified\n");
   const result = await runRelease(fixture, ["phase2", version]);
   assert.equal(result.status, 1);
@@ -364,20 +282,20 @@ test("phase2 diff restriction aborts when another tracked file is dirty", async 
   assert.match(result.stderr, /extra\.txt/);
 });
 
-test("tag aborts when SDK tarball provenance no longer matches phase1", async (t) => {
+test("phase1 is optional and tag packs current inputs without publishing", async (t) => {
   const fixture = await makeRepo(t);
-  await completePhase1(fixture);
   await completePhase2(fixture);
   assert.equal(git(fixture.root, "push", "-q", "origin", "main").status, 0);
-  const result = await runRelease(fixture, ["tag", version], { RELEASE_SHIM_SDK_VARIANT: "changed" });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /SDK provenance mismatch/);
-  assert.equal(git(fixture.root, "tag", "--list", `v${version}`).stdout.trim(), "");
+  const result = await runRelease(fixture, ["tag", version]);
+  assertSucceeded(result);
+  assert.match(result.stdout, /Packed minutes-sdk .* and minutes-mcp .* without publishing/);
+  assert.equal(git(fixture.root, "tag", "--list", `v${version}`).stdout.trim(), `v${version}`);
+  const log = await readFile(fixture.log, "utf8");
+  assert.doesNotMatch(log, /npm publish/);
 });
 
 test("tag aborts when the --release version policy check fails", async (t) => {
   const fixture = await makeRepo(t);
-  await completePhase1(fixture);
   await completePhase2(fixture);
   assert.equal(git(fixture.root, "push", "-q", "origin", "main").status, 0);
   const result = await runRelease(fixture, ["tag", version], { RELEASE_CHECK_FAIL: "release" });
@@ -393,7 +311,6 @@ test("tag aborts when the site release constants are stale", async (t) => {
   // exists: release-cli.yml runs the same check, but only on the tag push, and
   // by then the immutable-tag policy rules out simply retagging.
   const fixture = await makeRepo(t);
-  await completePhase1(fixture);
   await completePhase2(fixture);
   assert.equal(git(fixture.root, "push", "-q", "origin", "main").status, 0);
   const result = await runRelease(fixture, ["tag", version], { RELEASE_SITE_CHECK_FAIL: "1" });
