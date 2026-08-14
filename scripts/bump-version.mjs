@@ -193,8 +193,45 @@ function updateMcpServerVersion(text, version) {
   return text.slice(0, declaration.index) + replacement + text.slice(declaration.index + declaration[0].length);
 }
 
-function updateCargoLockVersions(text, version) {
-  const packageNames = new Set(["minutes-core", "minutes-cli", "minutes-reader"]);
+/**
+ * Workspace members whose version is the workspace version.
+ *
+ * Derived rather than listed. It was a hardcoded trio, and when the archive
+ * crates arrived they inherited the workspace version too, so `cargo update`
+ * moved eight packages while the expectation still described three. The bump
+ * then failed its own equality check and no release could be cut until someone
+ * worked out why. A list that has to be edited whenever a crate is added is a
+ * list that will be out of date the next time it matters.
+ *
+ * `version.workspace = true` is exactly the property that makes a member track
+ * the workspace version, so members with their own version (whisper-guard, the
+ * Tauri apps) are correctly excluded.
+ */
+async function workspaceVersionMembers(root) {
+  const manifest = await readText(root, "Cargo.toml");
+  const membersBlock = /members\s*=\s*\[([\s\S]*?)\]/.exec(manifest);
+  if (!membersBlock) throw new Error("Cargo.toml has no [workspace] members list");
+  const members = [...membersBlock[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+  if (members.length === 0) throw new Error("Cargo.toml [workspace] members is empty");
+
+  const names = [];
+  for (const member of members) {
+    const memberManifest = await readText(root, path.join(member, "Cargo.toml"));
+    const name = /^name\s*=\s*"([^"]+)"/m.exec(memberManifest)?.[1];
+    if (!name) throw new Error(`workspace member ${member} has no package name`);
+    const inherits =
+      /^version\s*\.\s*workspace\s*=\s*true/m.test(memberManifest) ||
+      /^version\s*=\s*\{[^}]*workspace\s*=\s*true/m.test(memberManifest);
+    if (inherits) names.push(name);
+  }
+  if (names.length === 0) {
+    throw new Error("no workspace member inherits the workspace version");
+  }
+  return names;
+}
+
+function updateCargoLockVersions(text, version, memberNames) {
+  const packageNames = new Set(memberNames);
   const updated = new Set();
   const sections = text.split(/(?=^\[\[package\]\][\t ]*$)/m);
   const nextSections = sections.map((section) => {
@@ -264,17 +301,18 @@ async function applyDomainOneWrites(root, version) {
   await exec("npm", ["install", "--package-lock-only"], { cwd: path.join(root, "crates/mcp") });
   await exec("npm", ["install", "--package-lock-only"], { cwd: path.join(root, "crates/sdk") });
 
+  const memberNames = await workspaceVersionMembers(root);
   const cargoLockBefore = await readText(root, "Cargo.lock");
-  const expectedCargoLock = updateCargoLockVersions(cargoLockBefore, version);
+  const expectedCargoLock = updateCargoLockVersions(cargoLockBefore, version, memberNames);
   await exec(
     "cargo",
-    ["update", "-p", "minutes-core", "-p", "minutes-cli", "-p", "minutes-reader"],
+    ["update", ...memberNames.flatMap((name) => ["-p", name])],
     { cwd: root },
   );
   const cargoLockAfter = await readText(root, "Cargo.lock");
   if (cargoLockAfter !== expectedCargoLock) {
     throw new Error(
-      "cargo update changed Cargo.lock beyond the version fields for minutes-core, minutes-cli, and minutes-reader",
+      `cargo update changed Cargo.lock beyond the version fields for ${memberNames.join(", ")}`,
     );
   }
 
