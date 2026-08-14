@@ -256,6 +256,17 @@ retention, nothing is deleted automatically unless `auto_cleanup` is enabled.
 | `cleanup_remove_fillers` | `true` | Remove conservative filler words ("um", "uh") |
 | `cleanup_spoken_punctuation` | `false` | Convert spoken commands ("period", "new line") to punctuation. Opt-in: collides with those words used as content |
 | `cleanup_apply_vocabulary` | `false` | Apply your vocabulary store (Term/Acronym entries) as casing/replacement fixes (e.g. "gpt" → "GPT") |
+| `voice_commands_enabled` | `true` | Apply only exact whole-utterance commands such as `scratch that`, `new line`, `new paragraph`, and `bullet`. Set to `false` to keep every phrase literal |
+| `voice_snippets` | `{}` | Explicit local snippet map used only by `insert snippet <name>`, for example `voice_snippets = { "sign off" = "Best,\\nMat" }` |
+| `history_policy` | `"recent"` | Keep successful dictations in recent history, or set `"off"` to retain only recoverable failures until they are resolved |
+
+Voice edits are deliberately strict. Formatting commands require a separate
+following utterance and are disabled for terminal/code and unknown targets.
+`scratch that` removes one complete prior utterance only when other output will
+remain. Confirmed spelling uses the full form `spell last word as capital m i n
+u t e s confirm`. Applied edits retain the raw transcript, the cleaned text from
+before commands, and local provenance in Dictation history. Bare `actually` is
+always ordinary content.
 
 Dictation clipboard behavior is platform-specific:
 

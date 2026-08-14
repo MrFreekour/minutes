@@ -20,6 +20,12 @@ pub struct DictationMemoryRecord {
     pub captured_at: DateTime<Local>,
     pub raw_text: String,
     pub cleaned_text: String,
+    /// Cleaned text before explicit voice commands changed the output.
+    #[serde(default)]
+    pub pre_command_text: Option<String>,
+    /// Local, content-minimal provenance for applied voice edits.
+    #[serde(default)]
+    pub commands_applied: Vec<crate::dictation_commands::DictationCommandProvenance>,
     pub duration_secs: f64,
     pub engine_id: String,
     pub engine_descriptor_version: Option<String>,
@@ -57,6 +63,8 @@ pub struct DictationTargetContext {
 pub struct DictationMemoryInput {
     pub raw_text: String,
     pub cleaned_text: String,
+    pub pre_command_text: Option<String>,
+    pub commands_applied: Vec<crate::dictation_commands::DictationCommandProvenance>,
     pub duration_secs: f64,
     pub engine_id: String,
     pub engine_descriptor_version: Option<String>,
@@ -89,6 +97,8 @@ impl DictationMemoryRecord {
             captured_at,
             raw_text: input.raw_text,
             cleaned_text: input.cleaned_text,
+            pre_command_text: input.pre_command_text,
+            commands_applied: input.commands_applied,
             duration_secs: input.duration_secs,
             engine_id: input.engine_id,
             engine_descriptor_version: input.engine_descriptor_version,
@@ -459,6 +469,8 @@ mod tests {
             DictationMemoryInput {
                 raw_text: text.into(),
                 cleaned_text: text.into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
                 duration_secs: 1.5,
                 engine_id: "whisper:base".into(),
                 engine_descriptor_version: Some("base".into()),
@@ -496,6 +508,19 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].cleaned_text, "new");
         assert_eq!(records[1].cleaned_text, "middle");
+    }
+
+    #[test]
+    fn legacy_record_without_voice_edit_fields_still_deserializes() {
+        let record = sample_record(0, "hello");
+        let mut value = serde_json::to_value(record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("preCommandText");
+        object.remove("commandsApplied");
+
+        let decoded: DictationMemoryRecord = serde_json::from_value(value).unwrap();
+        assert!(decoded.pre_command_text.is_none());
+        assert!(decoded.commands_applied.is_empty());
     }
 
     #[test]

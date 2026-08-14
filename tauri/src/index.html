@@ -273,6 +273,41 @@
       flex: 0 0 0;
       width: 0;
       min-width: 0;
+      /* The expand control is fixed to the window edge. Keep it reachable even
+         though the pane itself has no width; otherwise a persisted collapse
+         can strand the app on an empty canvas when Recall is closed. */
+      overflow: visible;
+    }
+
+    body.sidebar-collapsed .app-left > * {
+      visibility: hidden;
+    }
+
+    body.sidebar-collapsed .app-left .sidebar-collapse-btn {
+      visibility: visible;
+    }
+
+    .sidebar-expand-rail {
+      display: none;
+    }
+
+    body.sidebar-collapsed .sidebar-expand-rail {
+      position: fixed;
+      left: 16px;
+      top: 88px;
+      z-index: 41;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg);
+      color: var(--text-muted);
+      font: inherit;
+      cursor: pointer;
+      display: inline-flex;
     }
 
     body.sidebar-collapsed .split-handle {
@@ -285,23 +320,6 @@
     body.sidebar-collapsed .recall-panel.expanded {
       width: auto;
       flex: 1 1 auto;
-    }
-
-    @media (max-width: 720px) {
-      body:not(.sidebar-expanded-session) .app-left {
-        flex: 0 0 0;
-        width: 0;
-        min-width: 0;
-      }
-
-      body:not(.sidebar-expanded-session) .split-handle {
-        display: none;
-      }
-
-      body:not(.sidebar-expanded-session) .recall-panel.expanded {
-        width: auto;
-        flex: 1 1 auto;
-      }
     }
 
     .window-drag-strip {
@@ -5215,6 +5233,27 @@
       overflow-wrap: anywhere;
     }
 
+    .settings-advanced {
+      margin-top: 10px;
+      border-top: 1px solid var(--neutral-border);
+      color: var(--text-secondary);
+    }
+
+    .settings-advanced > summary {
+      width: fit-content;
+      padding: 14px 0 6px;
+      cursor: pointer;
+      font-size: var(--text-xs);
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .settings-advanced > summary:focus-visible {
+      outline: 2px solid var(--info-ring);
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
     #coach-onboarding-overlay {
       z-index: 155;
     }
@@ -5612,6 +5651,11 @@
     </div>
   </div><!-- end .app-left -->
 
+  <!-- Kept outside the zero-width pane so a persisted collapse can always be
+       reversed, including at the default narrow startup size. -->
+  <button class="sidebar-expand-rail" id="btn-sidebar-expand" type="button"
+    aria-label="Expand list pane" title="Expand list pane">›</button>
+
   <!-- ── Draggable split handle ── -->
   <div class="split-handle" id="split-handle"></div>
 
@@ -5987,37 +6031,39 @@
           <div class="about-controls-group">
             <div class="about-controls-copy">Where dictated text goes</div>
             <select id="settings-dictation-destination" class="settings-field">
-              <option value="insert">Type at cursor — pastes into the app you're in</option>
+              <option id="settings-dictation-destination-insert" value="insert">Type at cursor — inserts into the app you're in</option>
               <option value="clipboard">Copy to clipboard — paste it yourself</option>
             </select>
-            <div class="about-controls-meta">Minutes verifies that you're still in the same app, then uses the system paste shortcut. If macOS blocks automation or the app changes, your transcript stays on the clipboard.</div>
+            <div class="about-controls-meta" id="settings-dictation-destination-detail">Minutes verifies the target before inserting. If typing is unavailable or the app changes, your transcript stays on the clipboard.</div>
           </div>
         </div>
         <div class="about-controls">
           <div class="about-controls-group">
-            <div class="about-controls-copy">Dictation whisper model</div>
-            <select id="settings-dictation-model" class="settings-field">
-              <option value="tiny">tiny — fastest, lower quality</option>
-              <option value="base">base — fast, decent quality (default)</option>
-              <option value="small">small — good quality, slower</option>
+            <div class="about-controls-copy">Writing style</div>
+            <select id="settings-dictation-writing-style" class="settings-field">
+              <option value="natural">Natural — light formatting and filler cleanup</option>
+              <option value="literal">Literal — keep the transcript as spoken</option>
             </select>
-            <div class="about-controls-meta">Smaller models = faster dictation. "base" is recommended.</div>
+            <div class="about-controls-meta">Natural formatting is deterministic and stays on this device. It does not rewrite meaning.</div>
           </div>
         </div>
         <div class="about-controls">
-          <div class="about-controls-copy">Log dictations to daily note</div>
-          <button class="btn btn-secondary btn-sm toggle-btn" id="settings-dictation-daily-note">On</button>
+          <div class="about-controls-group">
+            <div class="about-controls-copy">Microphone</div>
+            <select id="settings-dictation-microphone" class="settings-field" title="Select dictation microphone">
+              <option value="">System Default</option>
+            </select>
+            <div class="about-controls-meta">Uses the same microphone as recordings. The list refreshes when opened.</div>
+          </div>
         </div>
         <div class="about-controls">
           <div class="about-controls-group">
-            <div class="about-controls-copy">Silence timeout</div>
-            <div class="about-controls-meta">Used for dictation started from inside Minutes. Hold and locked shortcuts end with their shortcut gesture.</div>
-            <select id="settings-dictation-silence" class="settings-field">
-              <option value="1000">1 second</option>
-              <option value="2000">2 seconds (default)</option>
-              <option value="3000">3 seconds</option>
-              <option value="5000">5 seconds</option>
+            <div class="about-controls-copy">History</div>
+            <select id="settings-dictation-history-policy" class="settings-field">
+              <option value="recent">Keep recent transcripts</option>
+              <option value="off">Off — keep only recoverable failures</option>
             </select>
+            <div class="about-controls-meta">Turning history off never discards audio from a failed or interrupted capture.</div>
           </div>
         </div>
         <div class="about-controls">
@@ -6029,6 +6075,40 @@
             <div class="about-controls-meta" id="settings-dictation-recents-status"></div>
           </div>
         </div>
+        <details class="settings-advanced">
+          <summary>Advanced</summary>
+          <div class="about-controls">
+            <div class="about-controls-group">
+              <div class="about-controls-copy">Dictation whisper model</div>
+              <select id="settings-dictation-model" class="settings-field">
+                <option value="tiny">tiny — fastest, lower quality</option>
+                <option value="base">base — fast, decent quality (default)</option>
+                <option value="small">small — good quality, slower</option>
+              </select>
+              <div class="about-controls-meta">Smaller models are faster. Base is recommended.</div>
+            </div>
+          </div>
+          <div class="about-controls">
+            <div class="about-controls-copy">Exact voice-edit commands</div>
+            <button class="btn btn-secondary btn-sm toggle-btn" id="settings-dictation-voice-commands">On</button>
+          </div>
+          <div class="about-controls">
+            <div class="about-controls-copy">Log dictations to daily note</div>
+            <button class="btn btn-secondary btn-sm toggle-btn" id="settings-dictation-daily-note">On</button>
+          </div>
+          <div class="about-controls">
+            <div class="about-controls-group">
+              <div class="about-controls-copy">Silence timeout</div>
+              <div class="about-controls-meta">Used only for dictation started inside Minutes. Shortcut gestures finish shortcut dictation.</div>
+              <select id="settings-dictation-silence" class="settings-field">
+                <option value="1000">1 second</option>
+                <option value="2000">2 seconds (default)</option>
+                <option value="3000">3 seconds</option>
+                <option value="5000">5 seconds</option>
+              </select>
+            </div>
+          </div>
+        </details>
       </div>
 
       <!-- Live Transcript -->
@@ -6918,6 +6998,7 @@
     const meetingsScroll = document.getElementById('meetings-scroll');
     const documentsToggle = document.getElementById('btn-documents-toggle');
     const sidebarCollapseButton = document.getElementById('btn-sidebar-collapse');
+    const sidebarExpandRail = document.getElementById('btn-sidebar-expand');
     const searchInput = document.getElementById('search-input');
     const detailOverlay = document.getElementById('detail-overlay');
     const detailTitle = document.getElementById('detail-title');
@@ -8900,40 +8981,43 @@
 
     // ── Device picker ──
     const devicePicker = document.getElementById('device-picker');
+    const dictationMicrophonePicker = document.getElementById('settings-dictation-microphone');
+    function populateDevicePicker(picker, result) {
+      if (!picker) return;
+      picker.replaceChildren();
+      const defaultOpt = document.createElement('option');
+      defaultOpt.value = '';
+      defaultOpt.textContent = 'System Default';
+      picker.appendChild(defaultOpt);
+      const configured = result.configured_device || '';
+      if (Array.isArray(result.entries) && result.entries.length > 0) {
+        for (const entry of result.entries) {
+          const opt = document.createElement('option');
+          opt.value = entry.name;
+          opt.textContent = entry.label;
+          if (configured && (entry.name === configured || entry.label === configured)) {
+            opt.selected = true;
+          }
+          picker.appendChild(opt);
+        }
+      } else {
+        for (const fullName of result.devices || []) {
+          const opt = document.createElement('option');
+          opt.value = fullName;
+          opt.textContent = fullName;
+          if (configured && fullName === configured) opt.selected = true;
+          picker.appendChild(opt);
+        }
+      }
+    }
+
     async function loadDevices() {
       try {
         const result = await invoke('cmd_list_devices');
-        devicePicker.replaceChildren();
-        const defaultOpt = document.createElement('option');
-        defaultOpt.value = '';
-        defaultOpt.textContent = 'System Default';
-        devicePicker.appendChild(defaultOpt);
-        // Prefer structured entries so we store the canonical CPAL name
-        // in config. Older hosts only return the decorated `devices` list,
-        // in which case we fall back and let the backend's suffix stripper
-        // resolve the selection at capture time.
-        const configured = result.configured_device || '';
-        if (Array.isArray(result.entries) && result.entries.length > 0) {
-          for (const entry of result.entries) {
-            const opt = document.createElement('option');
-            opt.value = entry.name;
-            opt.textContent = entry.label;
-            if (configured && (entry.name === configured || entry.label === configured)) {
-              opt.selected = true;
-            }
-            devicePicker.appendChild(opt);
-          }
-        } else {
-          for (const fullName of result.devices || []) {
-            const opt = document.createElement('option');
-            opt.value = fullName;
-            opt.textContent = fullName;
-            if (configured && fullName === configured) {
-              opt.selected = true;
-            }
-            devicePicker.appendChild(opt);
-          }
-        }
+        // Prefer structured entries so we persist canonical CPAL names. Both
+        // pickers share one setting and therefore always render the same value.
+        populateDevicePicker(devicePicker, result);
+        populateDevicePicker(dictationMicrophonePicker, result);
       } catch (e) {
         console.error('Load devices:', e);
       }
@@ -8941,6 +9025,7 @@
     loadDevices();
     // Re-scan devices when the picker is focused (handles hotplug)
     devicePicker.addEventListener('focus', loadDevices);
+    dictationMicrophonePicker?.addEventListener('focus', loadDevices);
 
     // Persist device choice to config — recording reads config.recording.device at capture time
     devicePicker.addEventListener('change', async () => {
@@ -8952,6 +9037,18 @@
         });
       } catch (e) {
         console.error('Set device:', e);
+      }
+    });
+    dictationMicrophonePicker?.addEventListener('change', async () => {
+      try {
+        await invoke('cmd_set_setting', {
+          section: 'recording',
+          key: 'device',
+          value: dictationMicrophonePicker.value || '',
+        });
+        devicePicker.value = dictationMicrophonePicker.value;
+      } catch (e) {
+        console.error('Set dictation device:', e);
       }
     });
 
@@ -11692,7 +11789,28 @@
           // Empty/unset destination means the compiled default (insert).
           document.getElementById('settings-dictation-destination').value =
             (s.dictation.destination && s.dictation.destination !== '') ? s.dictation.destination : 'insert';
+          const insertOption = document.getElementById('settings-dictation-destination-insert');
+          const destinationDetail = document.getElementById('settings-dictation-destination-detail');
+          const insertionCapability = s.dictation.insert_capability || 'unavailable';
+          if (insertionCapability === 'macos_native_or_paste') {
+            insertOption.textContent = "Type at cursor — inserts into the app you're in";
+            destinationDetail.textContent = 'Minutes prefers native text insertion, with a verified paste fallback. If the target changes or macOS blocks insertion, your transcript stays on the clipboard.';
+          } else if (insertionCapability === 'linux_x11_paste') {
+            insertOption.textContent = "Type at cursor — inserts into the app you're in";
+            destinationDetail.textContent = 'On X11, Minutes uses the clipboard and xdotool after verifying the target. If insertion is unavailable, your transcript stays on the clipboard.';
+          } else if (insertionCapability === 'clipboard_only') {
+            insertOption.textContent = 'Type at cursor — unavailable here; copies instead';
+            destinationDetail.textContent = 'This platform supports clipboard delivery, not verified active-app insertion. Minutes will preserve the transcript on the clipboard.';
+          } else {
+            insertOption.textContent = 'Type at cursor — unavailable here';
+            destinationDetail.textContent = 'Active-app insertion is unavailable in this session. Choose clipboard delivery so your transcript remains accessible.';
+          }
           document.getElementById('settings-dictation-model').value = s.dictation.model || 'base';
+          document.getElementById('settings-dictation-writing-style').value =
+            ['none', 'off'].includes(s.dictation.cleanup_engine) ? 'literal' : 'natural';
+          document.getElementById('settings-dictation-history-policy').value =
+            s.dictation.history_policy === 'off' ? 'off' : 'recent';
+          setSettingsToggle('settings-dictation-voice-commands', s.dictation.voice_commands_enabled !== false);
           setSettingsToggle('settings-dictation-daily-note', s.dictation.daily_note_log !== false);
           document.getElementById('settings-dictation-silence').value = String(s.dictation.silence_timeout_ms || 2000);
         }
@@ -11722,6 +11840,12 @@
       if (record.engineId) parts.push(record.engineId);
       if (record.insertion?.outcome) parts.push(record.insertion.outcome.replaceAll('_', ' '));
       if (record.targetContext?.appName) parts.push(record.targetContext.appName);
+      if (record.commandsApplied?.length) {
+        const edits = record.commandsApplied
+          .map((command) => String(command.kind || 'edit').replaceAll('_', ' '))
+          .join(', ');
+        parts.push('voice edits: ' + edits);
+      }
       return parts.join(' · ');
     }
 
@@ -11730,7 +11854,11 @@
       const status = document.getElementById('settings-dictation-recents-status');
       if (!root) return;
       root.innerHTML = '<div class="about-controls-meta">Loading...</div>';
-      if (status) status.textContent = '';
+      if (status) {
+        status.textContent = latestSettings?.dictation?.history_policy === 'off'
+          ? 'Routine history is off. Recoverable captures will still appear here.'
+          : '';
+      }
       try {
         const records = await invoke('cmd_recent_dictations', { limit: 5 });
         renderRecentDictations(records || []);
@@ -11764,6 +11892,9 @@
         const rawButton = hasRaw
           ? `<button class="btn btn-secondary btn-sm" data-dictation-action="raw" data-dictation-id="${escapeHtml(record.id)}">Copy raw</button>`
           : '';
+        const undoVoiceEditButton = record.preCommandText && record.commandsApplied?.length
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="before-edits" data-dictation-id="${escapeHtml(record.id)}">Copy before edits</button>`
+          : '';
         const recoveryButtons = record.recoveryAudioPath
           ? `<button class="btn btn-secondary btn-sm" data-dictation-action="reprocess" data-dictation-id="${escapeHtml(record.id)}">Reprocess</button>
              <button class="btn btn-secondary btn-sm" data-dictation-action="delete-audio" data-dictation-id="${escapeHtml(record.id)}">Delete audio</button>`
@@ -11777,6 +11908,7 @@
             <div class="dictation-recent-actions">
               ${textButtons}
               ${rawButton}
+              ${undoVoiceEditButton}
               ${recoveryButtons}
               ${openButton}
             </div>
@@ -11808,6 +11940,9 @@
         } else if (action === 'raw') {
           const result = await invoke('cmd_copy_raw_dictation', { id });
           if (status) status.textContent = result?.message || 'Copied raw dictation.';
+        } else if (action === 'before-edits') {
+          const result = await invoke('cmd_copy_pre_command_dictation', { id });
+          if (status) status.textContent = result?.message || 'Copied the text from before voice edits.';
         } else if (action === 'reprocess') {
           const result = await invoke('cmd_reprocess_dictation', { id });
           await loadRecentDictations();
@@ -12664,7 +12799,25 @@
       } catch (err) { console.error('set ui language:', err); }
     });
     document.getElementById('settings-dictation-model').addEventListener('change', (e) => invoke('cmd_set_setting', { section: 'dictation', key: 'model', value: e.target.value }));
+    document.getElementById('settings-dictation-writing-style').addEventListener('change', (e) => invoke('cmd_set_setting', {
+      section: 'dictation',
+      key: 'cleanup_engine',
+      value: e.target.value === 'literal' ? 'none' : 'rules',
+    }));
+    document.getElementById('settings-dictation-history-policy').addEventListener('change', async (e) => {
+      await invoke('cmd_set_setting', { section: 'dictation', key: 'history_policy', value: e.target.value });
+      if (latestSettings?.dictation) latestSettings.dictation.history_policy = e.target.value;
+      document.getElementById('settings-dictation-recents-status').textContent = e.target.value === 'off'
+        ? 'Routine history is off. Recoverable captures will still appear here.'
+        : '';
+    });
     document.getElementById('settings-dictation-silence').addEventListener('change', (e) => invoke('cmd_set_setting', { section: 'dictation', key: 'silence_timeout_ms', value: e.target.value }));
+    document.getElementById('settings-dictation-voice-commands').addEventListener('click', async () => {
+      const btn = document.getElementById('settings-dictation-voice-commands');
+      const next = btn.textContent !== 'On';
+      await invoke('cmd_set_setting', { section: 'dictation', key: 'voice_commands_enabled', value: String(next) });
+      setSettingsToggle('settings-dictation-voice-commands', next);
+    });
     document.getElementById('settings-dictation-daily-note').addEventListener('click', async () => {
       const btn = document.getElementById('settings-dictation-daily-note');
       const next = btn.textContent !== 'On';
@@ -13565,6 +13718,9 @@
       sidebarCollapseButton.classList.add('is-collapsed');
     }
     sidebarCollapseButton.addEventListener('click', toggleSidebarCollapsed);
+    sidebarExpandRail.addEventListener('click', () => {
+      applySidebarCollapsed(false, { explicit: true });
+    });
     window.addEventListener('resize', () => {
       if (window.innerWidth < 720 && !userExpandedSidebarThisSession && localStorage.getItem('minutes.sidebarCollapsed') !== 'true') {
         sidebarAutoCollapsed = true;

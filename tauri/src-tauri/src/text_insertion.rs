@@ -58,6 +58,32 @@ impl InsertMethod {
     }
 }
 
+/// Honest active-app insertion capability for the current desktop session.
+/// Clipboard support is separate from type/paste-at-cursor support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextInsertionCapability {
+    MacosNativeOrPaste,
+    LinuxX11Paste,
+    ClipboardOnly,
+    Unavailable,
+}
+
+impl TextInsertionCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MacosNativeOrPaste => "macos_native_or_paste",
+            Self::LinuxX11Paste => "linux_x11_paste",
+            Self::ClipboardOnly => "clipboard_only",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn supports_active_app_insertion(self) -> bool {
+        matches!(self, Self::MacosNativeOrPaste | Self::LinuxX11Paste)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveTargetContext {
@@ -175,6 +201,10 @@ pub fn restore_target_focus(context: &ActiveTargetContext) -> Result<(), String>
 }
 
 pub fn can_insert_into_apps() -> bool {
+    current_insertion_capability().supports_active_app_insertion()
+}
+
+pub fn current_insertion_capability() -> TextInsertionCapability {
     #[cfg(target_os = "macos")]
     {
         // The current insertion strategy is System Events paste automation.
@@ -183,17 +213,44 @@ pub fn can_insert_into_apps() -> bool {
         // hard preflight produced false copy-only states even after users had
         // granted the visible macOS permissions. The attempted operation is the
         // authoritative capability check; failure still preserves the text.
-        true
+        insertion_capability_for("macos", false, false, false)
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux_x11_paste_available()
+        insertion_capability_for(
+            "linux",
+            linux_wayland_session(),
+            linux_x11_session(),
+            linux_command_available("xdotool"),
+        )
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        false
+        insertion_capability_for("windows", false, false, false)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        insertion_capability_for(std::env::consts::OS, false, false, false)
+    }
+}
+
+fn insertion_capability_for(
+    platform: &str,
+    wayland_session: bool,
+    x11_session: bool,
+    xdotool_available: bool,
+) -> TextInsertionCapability {
+    match platform {
+        "macos" => TextInsertionCapability::MacosNativeOrPaste,
+        "windows" => TextInsertionCapability::ClipboardOnly,
+        "linux" if x11_session && !wayland_session && xdotool_available => {
+            TextInsertionCapability::LinuxX11Paste
+        }
+        "linux" if wayland_session || x11_session => TextInsertionCapability::ClipboardOnly,
+        _ => TextInsertionCapability::Unavailable,
     }
 }
 
@@ -413,11 +470,7 @@ fn best_effort_verified(
     request: TextInsertionRequest,
     target_context: Option<ActiveTargetContext>,
 ) -> TextInsertionResult {
-    copy_after_block(
-        request,
-        target_context,
-        "Typing into apps is not implemented on this platform. Copied dictation instead.",
-    )
+    copy_after_block(request, target_context, insertion_unavailable_message())
 }
 
 fn copy_after_block(
@@ -1388,6 +1441,61 @@ mod tests {
     #[test]
     fn native_accessibility_method_has_an_honest_stable_label() {
         assert_eq!(InsertMethod::NativeAx.as_str(), "native_ax");
+    }
+
+    #[test]
+    fn insertion_capability_matrix_is_honest_on_every_build_host() {
+        let cases = [
+            (
+                ("macos", false, false, false),
+                TextInsertionCapability::MacosNativeOrPaste,
+            ),
+            (
+                ("windows", false, false, false),
+                TextInsertionCapability::ClipboardOnly,
+            ),
+            (
+                ("linux", false, true, true),
+                TextInsertionCapability::LinuxX11Paste,
+            ),
+            (
+                ("linux", false, true, false),
+                TextInsertionCapability::ClipboardOnly,
+            ),
+            (
+                ("linux", true, true, true),
+                TextInsertionCapability::ClipboardOnly,
+            ),
+            (
+                ("linux", true, false, false),
+                TextInsertionCapability::ClipboardOnly,
+            ),
+            (
+                ("linux", false, false, true),
+                TextInsertionCapability::Unavailable,
+            ),
+            (
+                ("freebsd", false, false, false),
+                TextInsertionCapability::Unavailable,
+            ),
+        ];
+
+        for ((platform, wayland, x11, xdotool), expected) in cases {
+            let actual = insertion_capability_for(platform, wayland, x11, xdotool);
+            assert_eq!(actual, expected, "platform={platform}");
+        }
+    }
+
+    #[test]
+    fn only_proven_capabilities_claim_active_app_insertion() {
+        assert!(TextInsertionCapability::MacosNativeOrPaste.supports_active_app_insertion());
+        assert!(TextInsertionCapability::LinuxX11Paste.supports_active_app_insertion());
+        assert!(!TextInsertionCapability::ClipboardOnly.supports_active_app_insertion());
+        assert!(!TextInsertionCapability::Unavailable.supports_active_app_insertion());
+        assert_eq!(
+            TextInsertionCapability::ClipboardOnly.as_str(),
+            "clipboard_only"
+        );
     }
 
     #[test]

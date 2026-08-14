@@ -2991,6 +2991,7 @@ fn main() {
             commands::cmd_weekly_summary,
             commands::cmd_proactive_context_bundle,
             commands::cmd_list_devices,
+            commands::cmd_remember_dictation_hud_position,
             commands::cmd_delete_meeting,
             commands::cmd_get_meeting_detail,
             commands::cmd_resummarize_meeting,
@@ -3044,6 +3045,7 @@ fn main() {
             commands::cmd_dictation_overlay_ready,
             commands::cmd_recent_dictations,
             commands::cmd_copy_dictation,
+            commands::cmd_copy_pre_command_dictation,
             commands::cmd_copy_raw_dictation,
             commands::cmd_repaste_dictation,
             commands::cmd_copy_last_dictation,
@@ -3174,6 +3176,28 @@ mod tray_activity_tests {
         assert!(
             restore_idx < focus_idx,
             "main-window reveal should unminimize before requesting focus"
+        );
+    }
+
+    #[test]
+    fn collapsed_sidebar_always_leaves_a_reachable_expand_control() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let index_html = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read index.html");
+
+        assert!(
+            index_html
+                .contains("body.sidebar-collapsed .sidebar-expand-rail {\n      position: fixed;"),
+            "the expand control must live outside and remain visible beside the zero-width pane"
+        );
+        assert!(
+            index_html.contains("id=\"btn-sidebar-expand\"")
+                && index_html.contains("sidebarExpandRail.addEventListener('click'"),
+            "the out-of-pane expand control must be wired to restore the sidebar"
+        );
+        assert!(
+            !index_html.contains("body:not(.sidebar-expanded-session) .app-left"),
+            "responsive CSS must not blank the initial frame before JS installs a reachable collapsed state"
         );
     }
 
@@ -3618,6 +3642,75 @@ mod tray_activity_tests {
                 && overlay.contains("transition: none !important"),
             "reduced-motion block should effectively disable animation and transition effects"
         );
+    }
+
+    #[test]
+    fn dictation_hud_is_movable_quiet_and_respects_sound_preference() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        for contract in [
+            ".focusable(false)",
+            "dictation_hud_anchor_position",
+            "cmd_remember_dictation_hud_position",
+            "startDragging()",
+        ] {
+            assert!(
+                commands_rs.contains(contract) || overlay.contains(contract),
+                "dictation HUD must preserve movable non-activating contract: {contract}"
+            );
+        }
+        assert!(overlay.contains("role=\"group\"") && overlay.contains("id=\"announcement\""));
+        assert!(overlay.contains("function announceState(state)"));
+        assert!(
+            !overlay.contains("id=\"pill\" role=\"status\""),
+            "rapid visual updates must not all be exposed as live announcements"
+        );
+        assert!(
+            overlay.contains("minutes.playCaptureCues")
+                && overlay.contains("if (!cuesEnabled) return"),
+            "the overlay must honor the shared sound-cue preference"
+        );
+    }
+
+    #[test]
+    fn dictation_settings_keep_routine_choices_out_of_advanced() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let index = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read index.html");
+        let dictation = index
+            .split("<!-- Dictation -->")
+            .nth(1)
+            .and_then(|tail| tail.split("<!-- Live Transcript -->").next())
+            .expect("dictation settings section should be extractable");
+        let (routine, advanced) = dictation
+            .split_once("<details class=\"settings-advanced\">")
+            .expect("dictation settings should have an Advanced disclosure");
+
+        for id in [
+            "settings-dictation-destination",
+            "settings-dictation-writing-style",
+            "settings-dictation-microphone",
+            "settings-dictation-history-policy",
+            "settings-dictation-recents",
+        ] {
+            assert!(routine.contains(id), "routine settings should contain {id}");
+        }
+        for id in [
+            "settings-dictation-model",
+            "settings-dictation-voice-commands",
+            "settings-dictation-daily-note",
+            "settings-dictation-silence",
+        ] {
+            assert!(
+                advanced.contains(id),
+                "Advanced settings should contain {id}"
+            );
+        }
     }
 
     #[test]

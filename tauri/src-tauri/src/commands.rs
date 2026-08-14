@@ -11887,6 +11887,11 @@ pub fn cmd_get_settings() -> serde_json::Value {
             "accumulate": config.dictation.accumulate,
             "daily_note_log": config.dictation.daily_note_log,
             "cleanup_engine": config.dictation.cleanup_engine,
+            "voice_commands_enabled": config.dictation.voice_commands_enabled,
+            "voice_snippets": config.dictation.voice_snippets,
+            "history_policy": config.dictation.history_policy,
+            "insert_capability": crate::text_insertion::current_insertion_capability().as_str(),
+            "active_app_insertion_supported": crate::text_insertion::can_insert_into_apps(),
             "auto_paste": config.dictation.auto_paste,
             "silence_timeout_ms": config.dictation.silence_timeout_ms,
             "max_utterance_secs": config.dictation.max_utterance_secs,
@@ -11925,6 +11930,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
         },
         "ui": {
             "language": config.ui.language,
+            "dictation_hud_anchor": config.ui.dictation_hud_anchor,
         },
     })
 }
@@ -12251,6 +12257,15 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
             config.dictation.auto_paste = value == "true";
         }
         ("dictation", "cleanup_engine") => config.dictation.cleanup_engine = value.clone(),
+        ("dictation", "voice_commands_enabled") => {
+            config.dictation.voice_commands_enabled = value == "true";
+        }
+        ("dictation", "history_policy") => {
+            if !["recent", "off"].contains(&value.as_str()) {
+                return Err("history_policy must be recent or off".into());
+            }
+            config.dictation.history_policy = value.clone();
+        }
         ("dictation", "shortcut_enabled") => {
             config.dictation.shortcut_enabled = value == "true";
         }
@@ -14079,7 +14094,6 @@ mod tests {
         // future UI row.
         ("dictation", "accumulate"),
         ("dictation", "auto_paste"),
-        ("dictation", "cleanup_engine"),
         // NOTE: ("dictation", "shortcut_enabled") used to live here as a
         // vestigial arm (cmd_set_shortcut writes the field directly). It now
         // has a real caller via the central path — the round-trip persistence
@@ -18188,6 +18202,28 @@ pub fn cmd_copy_raw_dictation(
 }
 
 #[tauri::command]
+pub fn cmd_copy_pre_command_dictation(
+    id: String,
+) -> Result<crate::text_insertion::TextInsertionResult, String> {
+    let record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    let text = record
+        .pre_command_text
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| "This dictation has no voice edit to undo.".to_string())?;
+    Ok(crate::text_insertion::insert_text(
+        crate::text_insertion::TextInsertionRequest {
+            text,
+            mode: crate::text_insertion::TextInsertionMode::CopyOnly,
+            restore_clipboard: false,
+            clipboard_snapshot: None,
+            expected_target: None,
+        },
+    ))
+}
+
+#[tauri::command]
 pub fn cmd_repaste_dictation(
     id: String,
 ) -> Result<crate::text_insertion::TextInsertionResult, String> {
@@ -18289,6 +18325,8 @@ pub fn cmd_reprocess_dictation(
         (!dictation_delivery_succeeded(&insertion, insert_requested)).then_some(recovery_path);
     record.raw_text = result.raw_text;
     record.cleaned_text = result.text;
+    record.pre_command_text = result.pre_command_text;
+    record.commands_applied = result.commands_applied;
     record.duration_secs = result.duration_secs;
     record.engine_id = result.engine_id;
     record.engine_descriptor_version = result.engine_descriptor_version;
@@ -18365,10 +18403,11 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         win.destroy().ok();
     }
 
-    // Position: bottom-center HUD, anchored to the current monitor work area.
+    // Position from a remembered edge anchor. Top-center is the default so
+    // the HUD avoids the Dock, terminal prompt, and common send controls.
     let width = 320.0;
     let height = 88.0;
-    let inset_y = 16.0;
+    let anchor = Config::load().ui.dictation_hud_anchor;
 
     let monitor = app
         .get_webview_window("main")
@@ -18385,12 +18424,17 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         let work_y = work_area.position.y as f64 / scale;
         let work_width = work_area.size.width as f64 / scale;
         let work_height = work_area.size.height as f64 / scale;
-        (
-            work_x + (work_width - width) / 2.0,
-            work_y + work_height - height - inset_y,
+        dictation_hud_anchor_position(
+            &anchor,
+            work_x,
+            work_y,
+            work_width,
+            work_height,
+            width,
+            height,
         )
     } else {
-        ((1440.0 - width) / 2.0, 900.0 - height - inset_y)
+        dictation_hud_anchor_position(&anchor, 0.0, 0.0, 1440.0, 900.0, width, height)
     };
 
     match tauri::WebviewWindowBuilder::new(
@@ -18408,12 +18452,87 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
     .content_protected(Config::load().privacy.hide_from_screen_share)
     .always_on_top(true)
     .focused(false)
+    .focusable(false)
     .skip_taskbar(true)
     .build()
     {
         Ok(_) => eprintln!("[dictation] overlay shown"),
         Err(e) => eprintln!("[dictation] overlay failed: {}", e),
     }
+}
+
+fn dictation_hud_anchor_position(
+    anchor: &str,
+    work_x: f64,
+    work_y: f64,
+    work_width: f64,
+    work_height: f64,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let inset = 16.0;
+    let x = match anchor {
+        "top_left" | "bottom_left" => work_x + inset,
+        "top_right" | "bottom_right" => work_x + work_width - width - inset,
+        _ => work_x + (work_width - width) / 2.0,
+    };
+    let y = if anchor.starts_with("bottom_") {
+        work_y + work_height - height - inset
+    } else {
+        work_y + inset
+    };
+    (
+        x.clamp(work_x, work_x + (work_width - width).max(0.0)),
+        y.clamp(work_y, work_y + (work_height - height).max(0.0)),
+    )
+}
+
+fn nearest_dictation_hud_anchor(
+    center_x: f64,
+    center_y: f64,
+    work_x: f64,
+    work_y: f64,
+    work_width: f64,
+    work_height: f64,
+) -> &'static str {
+    let horizontal = ((center_x - work_x) / work_width.max(1.0)).clamp(0.0, 1.0);
+    let vertical = ((center_y - work_y) / work_height.max(1.0)).clamp(0.0, 1.0);
+    match (vertical >= 0.5, horizontal) {
+        (false, x) if x < 1.0 / 3.0 => "top_left",
+        (false, x) if x > 2.0 / 3.0 => "top_right",
+        (false, _) => "top_center",
+        (true, x) if x < 1.0 / 3.0 => "bottom_left",
+        (true, x) if x > 2.0 / 3.0 => "bottom_right",
+        (true, _) => "bottom_center",
+    }
+}
+
+#[tauri::command]
+pub fn cmd_remember_dictation_hud_position(app: tauri::AppHandle) -> Result<String, String> {
+    let window = app
+        .get_webview_window("dictation-overlay")
+        .ok_or_else(|| "Dictation HUD is not open".to_string())?;
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or_else(|| "Could not identify the Dictation HUD monitor".to_string())?;
+    let scale = monitor.scale_factor();
+    let work_area = monitor.work_area();
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let work_x = work_area.position.x as f64 / scale;
+    let work_y = work_area.position.y as f64 / scale;
+    let work_width = work_area.size.width as f64 / scale;
+    let work_height = work_area.size.height as f64 / scale;
+    let center_x = position.x as f64 / scale + size.width as f64 / scale / 2.0;
+    let center_y = position.y as f64 / scale + size.height as f64 / scale / 2.0;
+    let anchor =
+        nearest_dictation_hud_anchor(center_x, center_y, work_x, work_y, work_width, work_height);
+    let mut config = Config::load();
+    config.ui.dictation_hud_anchor = anchor.into();
+    config.save().map_err(|error| error.to_string())?;
+    Ok(anchor.into())
 }
 
 // ── Copilot Coach HUD commands ──────────────────────────────
@@ -19931,10 +20050,17 @@ fn record_dictation_memory(
     insertion: &crate::text_insertion::TextInsertionResult,
     recovery_audio_path: Option<PathBuf>,
 ) {
+    // Disabling routine history must never hide a failed capture. Recoverable
+    // audio remains listed until the user resolves or deletes it explicitly.
+    if Config::load().dictation.history_policy == "off" && recovery_audio_path.is_none() {
+        return;
+    }
     let record = minutes_core::dictation_memory::DictationMemoryRecord::new(
         minutes_core::dictation_memory::DictationMemoryInput {
             raw_text: result.raw_text.clone(),
             cleaned_text: result.text.clone(),
+            pre_command_text: result.pre_command_text.clone(),
+            commands_applied: result.commands_applied.clone(),
             duration_secs: result.duration_secs,
             engine_id: result.engine_id.clone(),
             engine_descriptor_version: result.engine_descriptor_version.clone(),
@@ -20004,6 +20130,8 @@ fn record_recoverable_dictation_audio(
         minutes_core::dictation_memory::DictationMemoryInput {
             raw_text: String::new(),
             cleaned_text: String::new(),
+            pre_command_text: None,
+            commands_applied: Vec::new(),
             duration_secs,
             engine_id: format!("{}:{}", config.dictation.backend, config.dictation.model),
             engine_descriptor_version: Some(config.dictation.model.clone()),
@@ -21957,5 +22085,46 @@ mod update_ui_tests {
         assert_eq!(failed.error_message.as_deref(), Some("network stalled"));
         assert!(failed.recoverable);
         assert!(!failed.can_cancel);
+    }
+}
+
+#[cfg(test)]
+mod dictation_hud_position_tests {
+    use super::*;
+
+    #[test]
+    fn default_top_center_avoids_bottom_edge_controls() {
+        assert_eq!(
+            dictation_hud_anchor_position("top_center", 0.0, 24.0, 1440.0, 876.0, 320.0, 88.0,),
+            (560.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn edge_positions_are_inset_and_clamped() {
+        assert_eq!(
+            dictation_hud_anchor_position("bottom_right", 100.0, 50.0, 800.0, 600.0, 320.0, 88.0,),
+            (564.0, 546.0)
+        );
+        assert_eq!(
+            dictation_hud_anchor_position("top_left", 0.0, 0.0, 200.0, 60.0, 320.0, 88.0,),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn drag_location_snaps_to_nearest_edge_region() {
+        assert_eq!(
+            nearest_dictation_hud_anchor(100.0, 100.0, 0.0, 0.0, 1200.0, 800.0),
+            "top_left"
+        );
+        assert_eq!(
+            nearest_dictation_hud_anchor(600.0, 700.0, 0.0, 0.0, 1200.0, 800.0),
+            "bottom_center"
+        );
+        assert_eq!(
+            nearest_dictation_hud_anchor(1100.0, 100.0, 0.0, 0.0, 1200.0, 800.0),
+            "top_right"
+        );
     }
 }

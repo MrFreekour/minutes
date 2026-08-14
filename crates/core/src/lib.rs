@@ -34,6 +34,7 @@ pub mod desktop_control;
 pub mod device_monitor;
 pub mod diarize;
 pub mod dictation_cleanup;
+pub mod dictation_commands;
 pub mod dictation_context;
 pub mod dictation_memory;
 pub(crate) mod engine_process;

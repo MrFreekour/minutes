@@ -1,6 +1,9 @@
 use crate::apple_speech_session::AppleSpeechSession;
 use crate::config::Config;
 use crate::dictation_cleanup::{clean_dictation_text, CleanupEngine, CleanupOptions};
+use crate::dictation_commands::{
+    apply_explicit_voice_commands, DictationCommandProvenance, DictationCommandUtterance,
+};
 use crate::dictation_context::DictationTextMode;
 use crate::error::{DictationError, MinutesError, TranscribeError};
 use crate::markdown::{ContentType, Frontmatter, OutputStatus};
@@ -176,6 +179,12 @@ fn return_model_to_cache(ctx: whisper_rs::WhisperContext, model_name: String) {
 pub struct DictationResult {
     pub raw_text: String,
     pub text: String,
+    /// Cleaned text before any explicit voice editing commands were applied.
+    /// Present only when at least one command changed the output.
+    pub pre_command_text: Option<String>,
+    /// Local provenance for reversible, deterministic voice edits.
+    pub commands_applied: Vec<DictationCommandProvenance>,
+    pub text_mode: DictationTextMode,
     pub duration_secs: f64,
     pub destination: String,
     pub file_path: Option<PathBuf>,
@@ -1250,6 +1259,9 @@ fn prepare_result(
     Some(DictationResult {
         raw_text,
         text,
+        pre_command_text: None,
+        commands_applied: Vec::new(),
+        text_mode,
         duration_secs,
         destination: config.dictation.destination.clone(),
         file_path: None,
@@ -1312,6 +1324,7 @@ fn load_vocab_replacements() -> Vec<(String, String)> {
 }
 
 fn write_result_outputs(mut result: DictationResult, config: &Config) -> Option<DictationResult> {
+    apply_voice_commands_to_result(&mut result, config);
     let destination = result.destination.as_str();
     if destination == "clipboard" || destination.is_empty() {
         if let Err(e) = write_to_clipboard(&result.text) {
@@ -1376,9 +1389,28 @@ fn combine_results(results: &[DictationResult], config: &Config) -> Option<Dicta
         .iter()
         .all(|result| result.engine_descriptor_version == first_descriptor);
 
+    let mode = results
+        .first()
+        .map_or(DictationTextMode::Unknown, |result| result.text_mode);
+    let command_output = apply_explicit_voice_commands(
+        &results
+            .iter()
+            .map(|result| DictationCommandUtterance {
+                raw: result.raw_text.as_str(),
+                cleaned: result.text.as_str(),
+            })
+            .collect::<Vec<_>>(),
+        mode,
+        voice_commands_enabled(config),
+        &config.dictation.voice_snippets,
+    );
+
     Some(DictationResult {
         raw_text: raw_parts.join(" "),
-        text: parts.join(" "),
+        text: command_output.text,
+        pre_command_text: command_output.pre_command_text,
+        commands_applied: command_output.commands_applied,
+        text_mode: mode,
         duration_secs: results.iter().map(|result| result.duration_secs).sum(),
         destination: config.dictation.destination.clone(),
         file_path: None,
@@ -1394,6 +1426,25 @@ fn combine_results(results: &[DictationResult], config: &Config) -> Option<Dicta
             None
         },
     })
+}
+
+fn apply_voice_commands_to_result(result: &mut DictationResult, config: &Config) {
+    let output = apply_explicit_voice_commands(
+        &[DictationCommandUtterance {
+            raw: result.raw_text.as_str(),
+            cleaned: result.text.as_str(),
+        }],
+        result.text_mode,
+        voice_commands_enabled(config),
+        &config.dictation.voice_snippets,
+    );
+    result.text = output.text;
+    result.pre_command_text = output.pre_command_text;
+    result.commands_applied = output.commands_applied;
+}
+
+fn voice_commands_enabled(config: &Config) -> bool {
+    config.dictation.voice_commands_enabled && config.dictation.destination != "stdout"
 }
 
 /// Legacy batch process: transcribe → output. Kept for fallback/testing.
@@ -1748,6 +1799,9 @@ mod tests {
         let mut accumulated = vec![DictationResult {
             raw_text: "this must disappear".into(),
             text: "This must disappear.".into(),
+            pre_command_text: None,
+            commands_applied: Vec::new(),
+            text_mode: DictationTextMode::Unknown,
             duration_secs: 1.0,
             destination: "daily_note".into(),
             file_path: None,
@@ -1927,6 +1981,9 @@ mod tests {
             DictationResult {
                 raw_text: "first sentence.".into(),
                 text: "first sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 1.25,
                 destination: "clipboard".into(),
                 file_path: None,
@@ -1937,6 +1994,9 @@ mod tests {
             DictationResult {
                 raw_text: "second sentence.".into(),
                 text: "second sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 2.75,
                 destination: "clipboard".into(),
                 file_path: None,
@@ -1951,6 +2011,81 @@ mod tests {
         assert!((combined.duration_secs - 4.0).abs() < f64::EPSILON);
         assert_eq!(combined.destination, "clipboard");
         assert!(combined.file_path.is_none());
+    }
+
+    #[test]
+    fn combine_results_applies_and_records_explicit_voice_edits() {
+        let mut config = Config::default();
+        config.dictation.destination = "clipboard".into();
+        let result = |raw: &str, text: &str| DictationResult {
+            raw_text: raw.into(),
+            text: text.into(),
+            pre_command_text: None,
+            commands_applied: Vec::new(),
+            text_mode: DictationTextMode::Chat,
+            duration_secs: 1.0,
+            destination: "clipboard".into(),
+            file_path: None,
+            daily_note_appended: false,
+            engine_id: "whisper:small".into(),
+            engine_descriptor_version: Some("small".into()),
+        };
+        let combined = combine_results(
+            &[
+                result("keep", "Keep"),
+                result("remove", "Remove"),
+                result("scratch that", "Scratch that"),
+                result("new line", "New line"),
+                result("continue", "Continue"),
+            ],
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(combined.text, "Keep\nContinue");
+        assert_eq!(combined.commands_applied.len(), 2);
+        assert_eq!(
+            combined.pre_command_text.as_deref(),
+            Some("Keep Remove Scratch that New line Continue")
+        );
+    }
+
+    #[test]
+    fn irreversible_stdout_stream_keeps_voice_commands_literal() {
+        let mut config = Config::default();
+        config.dictation.destination = "stdout".into();
+        let results = vec![
+            DictationResult {
+                raw_text: "keep".into(),
+                text: "Keep".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Chat,
+                duration_secs: 1.0,
+                destination: "stdout".into(),
+                file_path: None,
+                daily_note_appended: false,
+                engine_id: "whisper:small".into(),
+                engine_descriptor_version: Some("small".into()),
+            },
+            DictationResult {
+                raw_text: "scratch that".into(),
+                text: "Scratch that".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Chat,
+                duration_secs: 1.0,
+                destination: "stdout".into(),
+                file_path: None,
+                daily_note_appended: false,
+                engine_id: "whisper:small".into(),
+                engine_descriptor_version: Some("small".into()),
+            },
+        ];
+
+        let combined = combine_results(&results, &config).unwrap();
+        assert_eq!(combined.text, "Keep Scratch that");
+        assert!(combined.commands_applied.is_empty());
     }
 
     #[test]
@@ -1972,6 +2107,9 @@ mod tests {
             DictationResult {
                 raw_text: "first sentence.".into(),
                 text: "first sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 1.0,
                 destination: "daily_note".into(),
                 file_path: None,
@@ -1982,6 +2120,9 @@ mod tests {
             DictationResult {
                 raw_text: "second sentence.".into(),
                 text: "second sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 2.0,
                 destination: "daily_note".into(),
                 file_path: None,

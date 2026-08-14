@@ -68,12 +68,15 @@ pub struct Config {
 pub struct UiConfig {
     /// Display language: `"auto"`, `"en"`, or `"zh-CN"`.
     pub language: String,
+    /// Remembered edge anchor for the movable dictation HUD.
+    pub dictation_hud_anchor: String,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             language: "auto".into(),
+            dictation_hud_anchor: "top_center".into(),
         }
     }
 }
@@ -956,6 +959,13 @@ pub struct DictationConfig {
     /// Apply the vocabulary store (Term/Acronym entries) as casing/replacement fixes
     /// during cleanup. Off by default to avoid surprising substitutions.
     pub cleanup_apply_vocabulary: bool,
+    /// Apply only whole-utterance, deterministic voice editing commands.
+    pub voice_commands_enabled: bool,
+    /// User-authored snippets addressed by `insert snippet <name>`.
+    pub voice_snippets: std::collections::BTreeMap<String, String>,
+    /// Successful transcript history policy: `"recent"` or `"off"`.
+    /// Recoverable failures are always retained until explicitly resolved.
+    pub history_policy: String,
     pub auto_paste: bool,
     pub auto_paste_restore: bool,
     pub silence_timeout_ms: u64,
@@ -992,6 +1002,9 @@ impl Default for DictationConfig {
             cleanup_remove_fillers: true,
             cleanup_spoken_punctuation: false,
             cleanup_apply_vocabulary: false,
+            voice_commands_enabled: true,
+            voice_snippets: std::collections::BTreeMap::new(),
+            history_policy: "recent".into(),
             auto_paste: false,
             auto_paste_restore: true,
             silence_timeout_ms: 2000,
@@ -2455,6 +2468,34 @@ accumulate = false
     }
 
     #[test]
+    fn dictation_voice_commands_and_explicit_snippets_load_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[dictation]
+voice_commands_enabled = false
+voice_snippets = { "sign off" = "Best,\nMat" }
+history_policy = "off"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert!(!config.dictation.voice_commands_enabled);
+        assert_eq!(config.dictation.history_policy, "off");
+        assert_eq!(
+            config
+                .dictation
+                .voice_snippets
+                .get("sign off")
+                .map(String::as_str),
+            Some("Best,\nMat")
+        );
+    }
+
+    #[test]
     fn dictation_backend_can_be_selected_from_toml() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -3037,6 +3078,8 @@ mod dictation_destination_tests {
     fn dictation_destination_defaults_to_insert() {
         let config = Config::default();
         assert_eq!(config.dictation.destination, "insert");
+        assert_eq!(config.dictation.history_policy, "recent");
+        assert_eq!(config.ui.dictation_hud_anchor, "top_center");
     }
 
     #[test]
