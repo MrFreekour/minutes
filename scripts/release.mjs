@@ -172,6 +172,7 @@ async function assertTreeVersion(root, version) {
 async function withPackedPackage(root, directory, callback) {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "minutes-release-pack-"));
   try {
+    await exec("npm", ["ci"], { cwd: path.join(root, directory) });
     // minutes-sdk builds in prepublishOnly, a lifecycle that npm pack does not
     // run. Build explicitly so the provenance tarball contains the same dist/
     // payload that npm publish will pack. This is also harmlessly idempotent for
@@ -282,15 +283,52 @@ async function phase2(root, version) {
   if (!packageJson.dependencies || typeof packageJson.dependencies["minutes-sdk"] !== "string") {
     throw new Error('crates/mcp/package.json is missing dependencies["minutes-sdk"]');
   }
+  const dependencyText = `"minutes-sdk": ${JSON.stringify(packageJson.dependencies["minutes-sdk"])}`;
+  const pinnedPackageText = originalPackageText.replace(
+    dependencyText,
+    `"minutes-sdk": ${JSON.stringify(version)}`,
+  );
+  if (pinnedPackageText === originalPackageText) {
+    throw new Error("could not locate the minutes-sdk dependency text in crates/mcp/package.json");
+  }
   let committed = false;
   try {
-    packageJson.dependencies["minutes-sdk"] = version;
-    await writeFile(packageFile, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
-    await exec("npm", ["install", "--package-lock-only"], { cwd: path.join(root, MCP_DIRECTORY) });
+    await withPackedPackage(root, SDK_DIRECTORY, async ({ tarball, integrity }) => {
+      packageJson.dependencies["minutes-sdk"] = version;
+      await writeFile(packageFile, pinnedPackageText, "utf8");
+
+      // Let npm derive the lock entry from the exact local SDK artifact. Then
+      // replace only the temporary file reference with the registry URL that
+      // will become valid after the trusted tag workflow publishes the same
+      // tarball. This keeps Phase 2 credential-free and registry-independent.
+      await exec(
+        "npm",
+        [
+          "install",
+          "--package-lock-only",
+          "--ignore-scripts",
+          "--no-audit",
+          "--no-fund",
+          "--save-exact",
+          tarball,
+        ],
+        { cwd: path.join(root, MCP_DIRECTORY) },
+      );
+
+      const resultingLock = await readJson(lockFile);
+      const lockedSdk = resultingLock.packages?.["node_modules/minutes-sdk"];
+      if (lockedSdk?.version !== version || lockedSdk.integrity !== integrity) {
+        throw new Error(`npm did not lock the exact local minutes-sdk ${version} artifact`);
+      }
+      resultingLock.packages[""].dependencies["minutes-sdk"] = version;
+      lockedSdk.resolved = `https://registry.npmjs.org/minutes-sdk/-/minutes-sdk-${version}.tgz`;
+      await writeFile(packageFile, pinnedPackageText, "utf8");
+      await writeFile(lockFile, `${JSON.stringify(resultingLock, null, 2)}\n`, "utf8");
+    });
 
     const resultingLock = await readJson(lockFile);
     if (resultingLock.packages?.[""]?.dependencies?.["minutes-sdk"] !== version) {
-      throw new Error(`npm did not regenerate package-lock.json with exact minutes-sdk ${version}`);
+      throw new Error(`package-lock.json does not contain exact minutes-sdk ${version}`);
     }
     const changed = await changedFilesFromHead(root);
     assertOnlyPhase2Files(changed, "after pinning");
