@@ -170,10 +170,21 @@ async function assertTreeVersion(root, version) {
   }
 }
 
-async function withPackedPackage(root, directory, callback) {
+async function withPackedPackage(root, directory, callback, { localSdkTarball } = {}) {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "minutes-release-pack-"));
   try {
-    await exec("npm", ["ci"], { cwd: path.join(root, directory) });
+    if (localSdkTarball === undefined) {
+      await exec("npm", ["ci"], { cwd: path.join(root, directory) });
+    } else {
+      if (directory !== MCP_DIRECTORY) {
+        throw new Error("a local SDK tarball may only be used while packing minutes-mcp");
+      }
+      await exec(
+        "npm",
+        ["install", localSdkTarball, "--no-save", "--package-lock=false"],
+        { cwd: path.join(root, directory) },
+      );
+    }
     // minutes-sdk builds in prepublishOnly, a lifecycle that npm pack does not
     // run. Build explicitly so the provenance tarball contains the same dist/
     // payload that npm publish will pack. This is also harmlessly idempotent for
@@ -196,8 +207,8 @@ async function withPackedPackage(root, directory, callback) {
   }
 }
 
-async function packPackage(root, directory) {
-  return withPackedPackage(root, directory, ({ integrity }) => integrity);
+async function packPackage(root, directory, options) {
+  return withPackedPackage(root, directory, ({ integrity }) => integrity, options);
 }
 
 async function testMcpAgainstSdkTarball(root, tarball, sdkIntegrity) {
@@ -424,11 +435,16 @@ async function tagRelease(root, version, skipCiCheck) {
   await assertCiGreen(root, head, skipCiCheck);
   await runVersionCheck(root, true);
   await assertTreeVersion(root, version);
-  const sdkIntegrity = await packPackage(root, SDK_DIRECTORY);
+  let sdkIntegrity;
+  let mcpIntegrity;
+  await withPackedPackage(root, SDK_DIRECTORY, async ({ tarball, integrity }) => {
+    sdkIntegrity = integrity;
 
-  // Build and pack MCP before creating the tag. npm publish has no MCP build
-  // lifecycle, so prove both registry inputs pack before freezing the tag.
-  const mcpIntegrity = await packPackage(root, MCP_DIRECTORY);
+    // Build and pack MCP against this exact, still-unpublished SDK artifact
+    // before creating the tag. The trusted workflow publishes SDK first, but
+    // the pre-tag proof cannot depend on a registry version that does not exist.
+    mcpIntegrity = await packPackage(root, MCP_DIRECTORY, { localSdkTarball: tarball });
+  });
 
   const tag = await ensureAnnotatedTag(root, version, head);
   console.log(`Push it only after the draft GitHub release is ready:\n  git push origin ${tag}`);

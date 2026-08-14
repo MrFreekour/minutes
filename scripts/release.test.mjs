@@ -251,6 +251,7 @@ test("happy path preflights, pins, and tags without publishing before the tag pu
   assert.equal(mcpPackage.dependencies["minutes-sdk"], version);
   const log = await readFile(fixture.log, "utf8");
   assert.match(log, /npm pack .*crates\/sdk/);
+  assert.match(log, /npm install .*minutes-sdk-1\.2\.3\.tgz --no-save --package-lock=false .*crates\/mcp/);
   assert.match(log, /npm pack .*crates\/mcp/);
   assert.doesNotMatch(log, /npm publish/);
 });
@@ -303,6 +304,7 @@ test("phase1 is optional and tag packs current inputs without publishing", async
   assert.match(result.stdout, /Packed minutes-sdk .* and minutes-mcp .* without publishing/);
   assert.equal(git(fixture.root, "tag", "--list", `v${version}`).stdout.trim(), `v${version}`);
   const log = await readFile(fixture.log, "utf8");
+  assert.match(log, /npm install .*minutes-sdk-1\.2\.3\.tgz --no-save --package-lock=false .*crates\/mcp/);
   assert.doesNotMatch(log, /npm publish/);
 });
 
