@@ -12,12 +12,9 @@ import {
 import os from "node:os";
 import path from "node:path";
 
-const STATE_FILE = ".minutes-release-state.json";
 const SDK_DIRECTORY = "crates/sdk";
 const MCP_DIRECTORY = "crates/mcp";
 const PHASE2_FILES = ["crates/mcp/package.json", "crates/mcp/package-lock.json"];
-const DEFAULT_REGISTRY_URL = "https://registry.npmjs.org/";
-const DEFAULT_POLL_DELAYS_MS = [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000, 45_000];
 const exactVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/;
 
 const toolPath = process.env.RELEASE_TOOL_PATH;
@@ -61,7 +58,7 @@ function exec(command, args, { cwd, input, env = childEnvironment } = {}) {
 function usage() {
   return [
     "Usage:",
-    "  node scripts/release.mjs phase1 <version>",
+    "  node scripts/release.mjs phase1 <version> --dry-run",
     "  node scripts/release.mjs phase2 <version>",
     "  node scripts/release.mjs tag <version> [--skip-ci-check]",
     "  node scripts/release.mjs status",
@@ -80,8 +77,13 @@ function parseArgs(argv) {
 
   let version;
   let skipCiCheck = false;
+  let dryRun = false;
   for (const argument of rest) {
-    if (argument === "--skip-ci-check") {
+    if (argument === "--dry-run") {
+      if (command !== "phase1") throw new Error("--dry-run is only valid with phase1");
+      if (dryRun) throw new Error("--dry-run may only be specified once");
+      dryRun = true;
+    } else if (argument === "--skip-ci-check") {
       if (command !== "tag") throw new Error("--skip-ci-check is only valid with tag");
       if (skipCiCheck) throw new Error("--skip-ci-check may only be specified once");
       skipCiCheck = true;
@@ -97,7 +99,7 @@ function parseArgs(argv) {
   if (!exactVersionPattern.test(version)) {
     throw new Error(`invalid version ${JSON.stringify(version)}; expected x.y.z or x.y.z-prerelease`);
   }
-  return { command, version, skipCiCheck };
+  return { command, version, skipCiCheck, dryRun };
 }
 
 async function repositoryRoot() {
@@ -107,41 +109,6 @@ async function repositoryRoot() {
 
 async function readJson(file) {
   return JSON.parse(await readFile(file, "utf8"));
-}
-
-async function readState(root) {
-  try {
-    return await readJson(path.join(root, STATE_FILE));
-  } catch (error) {
-    if (error && error.code === "ENOENT") return null;
-    throw new Error(`cannot read ${STATE_FILE}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-async function writeState(root, state) {
-  await writeFile(path.join(root, STATE_FILE), `${JSON.stringify(state, null, 2)}\n`, "utf8");
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
-function requireStateVersion(state, version) {
-  if (state === null) {
-    throw new Error(`phase1 state is missing for ${version}; run node scripts/release.mjs phase1 ${version}`);
-  }
-  if (state.version !== version) {
-    throw new Error(
-      `${STATE_FILE} belongs to ${state.version ?? "an unknown version"}, not ${version}; finish or remove that state deliberately`,
-    );
-  }
-  if (typeof state.sdkIntegrity !== "string" || !state.sdkIntegrity.startsWith("sha512-")) {
-    throw new Error(`${STATE_FILE} has no valid sdkIntegrity`);
-  }
-}
-
-function phase1Complete(state) {
-  return ["phase1-complete", "phase2-complete", "tag-complete"].includes(state?.phase);
 }
 
 async function assertCleanAndPushed(root, { requireMain = false } = {}) {
@@ -230,132 +197,6 @@ async function packPackage(root, directory) {
   return withPackedPackage(root, directory, ({ integrity }) => integrity);
 }
 
-function registryUrl() {
-  const configured = process.env.RELEASE_REGISTRY_URL ?? DEFAULT_REGISTRY_URL;
-  return configured.endsWith("/") ? configured : `${configured}/`;
-}
-
-async function registryLookup(packageName, version) {
-  const url = new URL(`${encodeURIComponent(packageName)}/${encodeURIComponent(version)}`, registryUrl());
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-  let response;
-  try {
-    response = await fetch(url, {
-      headers: { accept: "application/json" },
-      signal: controller.signal,
-    });
-  } catch (error) {
-    return { kind: "server-error", detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (response.status === 404) return { kind: "missing" };
-  if (response.status >= 500 && response.status <= 599) {
-    return { kind: "server-error", detail: `HTTP ${response.status}` };
-  }
-  if (!response.ok) {
-    throw new Error(`registry lookup for ${packageName}@${version} failed with HTTP ${response.status}`);
-  }
-  let metadata;
-  try {
-    metadata = await response.json();
-  } catch (error) {
-    throw new Error(
-      `registry returned invalid JSON for ${packageName}@${version}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  return { kind: "found", integrity: metadata?.dist?.integrity };
-}
-
-function assertRegistryIntegrity(packageName, version, actual, expected) {
-  if (typeof actual !== "string") {
-    throw new Error(`registry metadata for ${packageName}@${version} has no dist.integrity`);
-  }
-  if (actual !== expected) {
-    throw new Error(
-      `${packageName}@${version} already exists with different integrity\n` +
-        `  registry: ${actual}\n  local:    ${expected}\nRefusing to replace published provenance.`,
-    );
-  }
-}
-
-function pollDelays() {
-  const configured = process.env.RELEASE_POLL_DELAYS_MS;
-  if (configured === undefined) return DEFAULT_POLL_DELAYS_MS;
-  const delays = configured.split(",").map((value) => Number(value));
-  if (delays.length === 0 || delays.some((value) => !Number.isFinite(value) || value < 0)) {
-    throw new Error("RELEASE_POLL_DELAYS_MS must be a comma-separated list of non-negative numbers");
-  }
-  return delays;
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function pollForPackage(packageName, version, integrity) {
-  const delays = pollDelays();
-  let lastResult;
-  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
-    lastResult = await registryLookup(packageName, version);
-    if (lastResult.kind === "found") {
-      assertRegistryIntegrity(packageName, version, lastResult.integrity, integrity);
-      console.log(`Registry confirms ${packageName}@${version} (${integrity}).`);
-      return;
-    }
-    if (attempt < delays.length) {
-      const description = lastResult.kind === "missing" ? "404 (not visible yet)" : lastResult.detail;
-      console.log(`Registry poll ${attempt + 1}: ${description}; retrying in ${delays[attempt]}ms.`);
-      await sleep(delays[attempt]);
-    }
-  }
-  const lastDescription = lastResult?.kind === "missing" ? "404" : lastResult?.detail ?? "unknown error";
-  throw new Error(
-    `${packageName}@${version} did not become visible before the registry polling timeout (last result: ${lastDescription}). ` +
-      "This is the npm registry lag pattern that can leave minutes-mcp depending on an SDK version the registry cannot resolve; stop and retry phase1 later.",
-  );
-}
-
-async function publishPackage(root, directory, packageName, version, integrity, { poll = false } = {}) {
-  const firstLookup = await registryLookup(packageName, version);
-  if (firstLookup.kind === "found") {
-    assertRegistryIntegrity(packageName, version, firstLookup.integrity, integrity);
-    console.log(`${packageName}@${version} is already published with matching integrity; skipping npm publish.`);
-    if (poll) await pollForPackage(packageName, version, integrity);
-    return false;
-  }
-  if (firstLookup.kind === "server-error") {
-    throw new Error(
-      `cannot safely determine whether ${packageName}@${version} already exists (${firstLookup.detail}); refusing to publish`,
-    );
-  }
-
-  try {
-    await exec(
-      "npm",
-      ["publish", "--access", "public", "--registry", registryUrl()],
-      { cwd: path.join(root, directory) },
-    );
-  } catch (error) {
-    // A concurrent publisher can win after our 404. Verify provenance before
-    // deciding whether the failed publish is nevertheless an idempotent success.
-    const afterFailure = await registryLookup(packageName, version);
-    if (afterFailure.kind === "found") {
-      assertRegistryIntegrity(packageName, version, afterFailure.integrity, integrity);
-      console.log(`${packageName}@${version} appeared concurrently with matching integrity; continuing.`);
-      if (poll) await pollForPackage(packageName, version, integrity);
-      return false;
-    }
-    throw error;
-  }
-
-  console.log(`Published ${packageName}@${version}.`);
-  if (poll) await pollForPackage(packageName, version, integrity);
-  return true;
-}
-
 async function testMcpAgainstSdkTarball(root, tarball, sdkIntegrity) {
   let primaryError;
   try {
@@ -381,62 +222,23 @@ async function testMcpAgainstSdkTarball(root, tarball, sdkIntegrity) {
   if (primaryError !== undefined) throw primaryError;
 }
 
-async function phase1(root, version) {
+async function phase1(root, version, dryRun) {
+  if (!dryRun) {
+    throw new Error(
+      "phase1 is a preflight-only command; pass --dry-run (registry publishing begins only after the release tag is pushed)",
+    );
+  }
   await assertCleanAndPushed(root, { requireMain: true });
   await runVersionCheck(root);
   await assertTreeVersion(root, version);
 
-  let existingState = await readState(root);
-  if (existingState !== null && existingState.version !== version && existingState.phase === "tag-complete") {
-    console.log(`Previous release ${existingState.version} is complete; starting release ${version}.`);
-    existingState = null;
-  }
-  if (existingState !== null) requireStateVersion(existingState, version);
-
-  const sdkPackage = await readJson(path.join(root, SDK_DIRECTORY, "package.json"));
-  let state;
   const integrity = await withPackedPackage(root, SDK_DIRECTORY, async ({ tarball, integrity: packedIntegrity }) => {
-    if (existingState?.sdkIntegrity && existingState.sdkIntegrity !== packedIntegrity) {
-      throw new Error(
-        `SDK provenance changed since phase1 began\n  state: ${existingState.sdkIntegrity}\n  local: ${packedIntegrity}`,
-      );
-    }
-    state = {
-      version,
-      phase: phase1Complete(existingState) ? existingState.phase : "phase1-started",
-      sdkPublished: existingState?.sdkPublished === true,
-      sdkIntegrity: packedIntegrity,
-      timestamps: {
-        ...(existingState?.timestamps ?? {}),
-        phase1StartedAt: existingState?.timestamps?.phase1StartedAt ?? now(),
-      },
-    };
-    await writeState(root, state);
-    if (!phase1Complete(existingState)) {
-      await testMcpAgainstSdkTarball(root, tarball, packedIntegrity);
-    }
+    await testMcpAgainstSdkTarball(root, tarball, packedIntegrity);
     return packedIntegrity;
   });
 
-  const publishedNow = await publishPackage(
-    root,
-    SDK_DIRECTORY,
-    sdkPackage.name,
-    version,
-    integrity,
-    { poll: false },
-  );
-  state.sdkPublished = true;
-  state.timestamps.sdkPublishedAt = state.timestamps.sdkPublishedAt ?? now();
-  if (publishedNow) state.timestamps.sdkPublishCommandCompletedAt = now();
-  await writeState(root, state);
-
-  await pollForPackage(sdkPackage.name, version, integrity);
-  state.phase = phase1Complete(existingState) ? existingState.phase : "phase1-complete";
-  state.timestamps.phase1CompletedAt = state.timestamps.phase1CompletedAt ?? now();
-  await writeState(root, state);
-
-  console.log("\nPhase 1 complete. Run Phase 2 from this checkout:");
+  console.log(`Credential-free SDK preflight complete (${integrity}). No package was published.`);
+  console.log("\nRun Phase 2 from this checkout:");
   console.log(`  node scripts/release.mjs phase2 ${version}`);
 }
 
@@ -452,22 +254,9 @@ function assertOnlyPhase2Files(files, context) {
   }
 }
 
-async function verifySdkStateOnRegistry(state) {
-  const lookup = await registryLookup("minutes-sdk", state.version);
-  if (lookup.kind !== "found") {
-    const detail = lookup.kind === "missing" ? "404 (missing)" : lookup.detail;
-    throw new Error(`minutes-sdk@${state.version} is not currently visible on the registry (${detail})`);
-  }
-  assertRegistryIntegrity("minutes-sdk", state.version, lookup.integrity, state.sdkIntegrity);
-}
-
 async function phase2(root, version) {
-  const state = await readState(root);
-  requireStateVersion(state, version);
-  if (!phase1Complete(state)) {
-    throw new Error(`phase1 is not complete for ${version} (current state: ${state.phase ?? "unknown"})`);
-  }
-  await verifySdkStateOnRegistry(state);
+  await runVersionCheck(root);
+  await assertTreeVersion(root, version);
 
   const preexisting = await changedFilesFromHead(root);
   assertOnlyPhase2Files(preexisting, "before pinning");
@@ -486,9 +275,6 @@ async function phase2(root, version) {
     lockJson.packages?.[""]?.dependencies?.["minutes-sdk"] === version
   ) {
     await runVersionCheck(root, true);
-    if (state.phase !== "tag-complete") state.phase = "phase2-complete";
-    state.timestamps = { ...(state.timestamps ?? {}), phase2CompletedAt: state.timestamps?.phase2CompletedAt ?? now() };
-    await writeState(root, state);
     console.log(`Phase 2 is already committed for ${version}; nothing to change.`);
     printPhase3Instructions(version);
     return;
@@ -529,9 +315,6 @@ async function phase2(root, version) {
     throw error;
   }
 
-  state.phase = "phase2-complete";
-  state.timestamps = { ...(state.timestamps ?? {}), phase2CompletedAt: now() };
-  await writeState(root, state);
   console.log(`Committed exact minutes-sdk ${version} pin for MCP.`);
   printPhase3Instructions(version);
 }
@@ -597,52 +380,28 @@ async function ensureAnnotatedTag(root, version, head) {
 }
 
 async function tagRelease(root, version, skipCiCheck) {
-  const state = await readState(root);
-  requireStateVersion(state, version);
-  if (!["phase2-complete", "tag-complete"].includes(state.phase)) {
-    throw new Error(`phase2 is not complete for ${version} (current state: ${state.phase ?? "unknown"})`);
-  }
-  await verifySdkStateOnRegistry(state);
-
   const head = await assertCleanAndPushed(root);
   await assertCiGreen(root, head, skipCiCheck);
   await runVersionCheck(root, true);
+  await assertTreeVersion(root, version);
   const sdkIntegrity = await packPackage(root, SDK_DIRECTORY);
-  if (sdkIntegrity !== state.sdkIntegrity) {
-    throw new Error(
-      `SDK provenance mismatch: npm pack from HEAD no longer reproduces phase1\n` +
-        `  phase1: ${state.sdkIntegrity}\n  HEAD:   ${sdkIntegrity}`,
-    );
-  }
 
   // Build and pack MCP before creating the tag. npm publish has no MCP build
-  // lifecycle, so from the annotated tag onward every publish input is frozen.
-  const mcpPackage = await readJson(path.join(root, MCP_DIRECTORY, "package.json"));
+  // lifecycle, so prove both registry inputs pack before freezing the tag.
   const mcpIntegrity = await packPackage(root, MCP_DIRECTORY);
 
   const tag = await ensureAnnotatedTag(root, version, head);
   console.log(`Push it only after the draft GitHub release is ready:\n  git push origin ${tag}`);
-
-  await publishPackage(root, MCP_DIRECTORY, mcpPackage.name, version, mcpIntegrity);
-
-  state.phase = "tag-complete";
-  state.timestamps = { ...(state.timestamps ?? {}), tagCompletedAt: now() };
-  await writeState(root, state);
-  console.log(`\nRelease command flow complete for ${tag}. The local tag has not been pushed.`);
+  console.log(`Packed minutes-sdk (${sdkIntegrity}) and minutes-mcp (${mcpIntegrity}) without publishing.`);
+  console.log(`\nLocal tag ${tag} is ready. Registry publishing begins only in the tag-triggered workflow.`);
 }
 
 async function printStatus(root) {
-  const state = await readState(root);
-  if (state === null) {
-    console.log("no release in progress");
-    return;
-  }
-  console.log(`release ${state.version ?? "<unknown>"}: ${state.phase ?? "<unknown phase>"}`);
-  console.log(`sdk published: ${state.sdkPublished === true ? "yes" : "no"}`);
-  if (state.sdkIntegrity) console.log(`sdk integrity: ${state.sdkIntegrity}`);
-  if (state.timestamps && typeof state.timestamps === "object") {
-    for (const [name, value] of Object.entries(state.timestamps)) console.log(`${name}: ${value}`);
-  }
+  const sdkPackage = await readJson(path.join(root, SDK_DIRECTORY, "package.json"));
+  const mcpPackage = await readJson(path.join(root, MCP_DIRECTORY, "package.json"));
+  console.log(`release inputs: minutes-sdk ${sdkPackage.version}; minutes-mcp ${mcpPackage.version}`);
+  console.log(`MCP SDK pin: ${mcpPackage.dependencies?.["minutes-sdk"] ?? "missing"}`);
+  console.log("registry publishing: tag-triggered workflow only");
 }
 
 let options;
@@ -650,7 +409,7 @@ try {
   options = parseArgs(process.argv.slice(2));
   const root = await repositoryRoot();
   if (options.command === "status") await printStatus(root);
-  else if (options.command === "phase1") await phase1(root, options.version);
+  else if (options.command === "phase1") await phase1(root, options.version, options.dryRun);
   else if (options.command === "phase2") await phase2(root, options.version);
   else await tagRelease(root, options.version, options.skipCiCheck);
 } catch (error) {
