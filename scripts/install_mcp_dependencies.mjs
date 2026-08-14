@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { normalizeNpmPackPermissions } from "./normalize_npm_pack_permissions.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sdkDirectory = path.join(root, "crates", "sdk");
 const mcpDirectory = path.join(root, "crates", "mcp");
+const mcpLockFile = path.join(mcpDirectory, "package-lock.json");
 const npmCommand = "npm";
 
 function runNpm(args, cwd, { capture = false } = {}) {
@@ -37,7 +39,8 @@ if (args.some((argument) => argument !== "--sdk-ready")) {
 
 const sdkPackage = await readJson(path.join(sdkDirectory, "package.json"));
 const mcpPackage = await readJson(path.join(mcpDirectory, "package.json"));
-const mcpLock = await readJson(path.join(mcpDirectory, "package-lock.json"));
+const originalMcpLockText = await readFile(mcpLockFile, "utf8");
+const mcpLock = JSON.parse(originalMcpLockText);
 const pinnedVersion = mcpPackage.dependencies?.["minutes-sdk"];
 
 if (pinnedVersion !== sdkPackage.version) {
@@ -64,6 +67,7 @@ try {
     runNpm(["ci"], sdkDirectory);
     runNpm(["run", "build"], sdkDirectory);
   }
+  await normalizeNpmPackPermissions(sdkDirectory);
 
   const packOutput = runNpm(
     ["pack", "--json", "--pack-destination", temporaryDirectory],
@@ -72,7 +76,8 @@ try {
   );
   const [packed] = JSON.parse(packOutput);
   if (!packed?.filename || !packed?.integrity) throw new Error("npm pack returned no filename or integrity");
-  if (packed.integrity !== lockedSdk.integrity) {
+  const hasCanonicalIntegrity = packed.integrity === lockedSdk.integrity;
+  if (!hasCanonicalIntegrity && process.platform !== "win32") {
     throw new Error(
       `local minutes-sdk ${sdkPackage.version} integrity does not match the MCP lockfile\n` +
         `  lockfile: ${lockedSdk.integrity}\n  local:    ${packed.integrity}`,
@@ -81,8 +86,22 @@ try {
 
   const tarball = path.join(temporaryDirectory, packed.filename);
   const cacheDirectory = path.join(temporaryDirectory, "npm-cache");
-  runNpm(["cache", "add", tarball, "--cache", cacheDirectory], root);
-  runNpm(["ci", "--cache", cacheDirectory], mcpDirectory);
+  try {
+    if (!hasCanonicalIntegrity) {
+      // npm's Windows tar writer emits different archive metadata even after
+      // payload file modes are normalized. The trusted release workflow packs
+      // and publishes on Ubuntu, so the committed lock retains that canonical
+      // registry integrity. Patch only the disposable checkout lock long enough
+      // to prove the same local SDK source installs and builds on Windows.
+      mcpLock.packages["node_modules/minutes-sdk"].integrity = packed.integrity;
+      await writeFile(mcpLockFile, `${JSON.stringify(mcpLock, null, 2)}\n`, "utf8");
+      console.log("Using Windows-local SDK archive integrity for this CI install only.");
+    }
+    runNpm(["cache", "add", tarball, "--cache", cacheDirectory], root);
+    runNpm(["ci", "--cache", cacheDirectory], mcpDirectory);
+  } finally {
+    if (!hasCanonicalIntegrity) await writeFile(mcpLockFile, originalMcpLockText, "utf8");
+  }
   console.log(`Installed MCP dependencies from the exact local minutes-sdk ${sdkPackage.version} tarball.`);
 } finally {
   await rm(temporaryDirectory, { recursive: true, force: true });

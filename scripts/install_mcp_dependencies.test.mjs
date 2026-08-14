@@ -7,6 +7,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const sourceScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "install_mcp_dependencies.mjs");
+const permissionsScript = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "normalize_npm_pack_permissions.mjs",
+);
 
 async function writeJson(root, file, value) {
   const target = path.join(root, file);
@@ -19,6 +23,7 @@ async function makeFixture(t, dependency, integrity = "sha512-fixture") {
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(path.join(root, "scripts"), { recursive: true });
   await cp(sourceScript, path.join(root, "scripts", "install_mcp_dependencies.mjs"));
+  await cp(permissionsScript, path.join(root, "scripts", "normalize_npm_pack_permissions.mjs"));
   await writeJson(root, "crates/sdk/package.json", { name: "minutes-sdk", version: "1.2.3" });
   await writeJson(root, "crates/mcp/package.json", {
     name: "minutes-mcp",

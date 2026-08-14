@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { normalizeNpmPackPermissions } from "./normalize_npm_pack_permissions.mjs";
 
 const SDK_DIRECTORY = "crates/sdk";
 const MCP_DIRECTORY = "crates/mcp";
@@ -178,6 +179,7 @@ async function withPackedPackage(root, directory, callback) {
     // payload that npm publish will pack. This is also harmlessly idempotent for
     // minutes-mcp and makes its publish artifact independent of an old dist/.
     await exec("npm", ["run", "build"], { cwd: path.join(root, directory) });
+    await normalizeNpmPackPermissions(path.join(root, directory));
     await exec("npm", ["pack", "--json", "--pack-destination", temporaryDirectory], {
       cwd: path.join(root, directory),
     });
