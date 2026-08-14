@@ -50,6 +50,11 @@ jobs:
           python3 scripts/check_sherpa_packaging.py
           python3 scripts/check_sherpa_packaging.py --self-test
 
+      - name: Check release uploads preserve drafts
+        run: |
+          python3 scripts/check_release_upload_drafts.py
+          python3 scripts/check_release_upload_drafts.py --self-test
+
       - name: Verify broken workflow is rejected
         run: |
           if docker run --rm \
