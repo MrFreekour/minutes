@@ -78,6 +78,39 @@ export type BoundTextFileRead = {
   revision: BoundFileRevision;
 };
 
+/**
+ * Absorbed once, then never again: an 'error' event on stderr with no listener
+ * is fatal to the host process.
+ */
+let stderrErrorsAbsorbed = false;
+
+/**
+ * Write one operator-visible diagnostic line, without letting a broken stderr
+ * become fatal.
+ *
+ * A try/catch around the write is not sufficient. When the consumer of the
+ * pipe has gone, the write fails with an asynchronous EPIPE delivered as an
+ * 'error' event on a later tick, which no surrounding catch can see, and an
+ * 'error' event with no listener kills the process. Absorbing it is the same
+ * call corpus-lease.ts already makes for a killed worker's stdin, for the same
+ * reason: a diagnostic that cannot be delivered must never escalate into a
+ * failure of the thing it was describing.
+ *
+ * Callers defer this themselves so a blocked TTY or file cannot delay a
+ * refusal that has already been decided.
+ */
+export function writeOperatorDiagnostic(line: string): void {
+  try {
+    if (!stderrErrorsAbsorbed) {
+      stderrErrorsAbsorbed = true;
+      process.stderr.on("error", () => {});
+    }
+    process.stderr.write(line);
+  } catch {
+    // A synchronous failure is equally non-fatal here.
+  }
+}
+
 export function boundReadIdentity(info: BigIntStats): string {
   return `${info.dev}:${info.ino}`;
 }
@@ -483,11 +516,7 @@ class BoundParentReader {
       // Never inside the throw path's critical section, and never allowed to
       // turn a clean refusal into a crash.
       setImmediate(() => {
-        try {
-          process.stderr.write(`[bound-reader] refused: ${refusal}\n`);
-        } catch {
-          // A broken stderr must not escalate a refusal into a failure.
-        }
+        writeOperatorDiagnostic(`[bound-reader] refused: ${refusal}\n`);
       });
       throw new Error("Access denied: bound reader capacity exceeded");
     }

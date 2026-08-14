@@ -23,6 +23,7 @@ import {
   fingerprintTextFileFromBoundParent,
   readTextFileWithRevisionFromBoundParent,
   type BoundFileRevision,
+  writeOperatorDiagnostic,
 } from "./secure-read.js";
 
 const MAX_AUTHORIZATION_ATTEMPTS = 2;
@@ -2018,7 +2019,11 @@ async function dispatchStableCorpusLease<T>(
             const budget = overran
               ? `authorization budget overrun by ${magnitudeMs}ms`
               : `${magnitudeMs}ms of authorization budget remained`;
-            process.stderr.write(`[corpus-lease] denied: ${message} (${budget})\n`);
+            // Shared with the bound-reader refusal path, because a plain
+            // try/catch here never covered an asynchronous EPIPE: that
+            // arrives as an 'error' event on a later tick and is fatal
+            // without a listener.
+            writeOperatorDiagnostic(`[corpus-lease] denied: ${message} (${budget})\n`);
           } catch {
             // A broken stderr must never turn a clean denial into a crash.
           }
