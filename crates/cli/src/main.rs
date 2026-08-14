@@ -16660,6 +16660,7 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
         |event| {
             use minutes_core::dictation::DictationEvent;
             match event {
+                DictationEvent::EngineReady { .. } => {}
                 DictationEvent::Listening => eprintln!("[minutes] Listening..."),
                 DictationEvent::Accumulating => eprintln!("[minutes] Speaking detected..."),
                 DictationEvent::Processing => eprintln!("[minutes] Transcribing..."),

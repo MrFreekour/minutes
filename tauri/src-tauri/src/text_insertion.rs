@@ -41,6 +41,7 @@ impl InsertOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InsertMethod {
+    NativeAx,
     ClipboardOnly,
     ClipboardPaste,
     Unsupported,
@@ -49,6 +50,7 @@ pub enum InsertMethod {
 impl InsertMethod {
     pub fn as_str(self) -> &'static str {
         match self {
+            InsertMethod::NativeAx => "native_ax",
             InsertMethod::ClipboardOnly => "clipboard_only",
             InsertMethod::ClipboardPaste => "clipboard_paste",
             InsertMethod::Unsupported => "unsupported",
@@ -73,6 +75,22 @@ pub struct TextInsertionResult {
     pub clipboard_restored: bool,
     pub target_context: Option<ActiveTargetContext>,
     pub message: String,
+    #[serde(skip)]
+    pub timing: TextInsertionTiming,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TextInsertionTiming {
+    /// Time from entering insertion until the target app has accepted the
+    /// native typing or paste operation. This deliberately excludes clipboard
+    /// restoration and verification bookkeeping.
+    pub visible_ms: Option<u64>,
+    pub clipboard_restore_ms: Option<u64>,
+    pub verification_ms: Option<u64>,
+    pub total_ms: u64,
+    /// Privacy-safe local diagnostic for why a faster insertion path fell
+    /// through. The insertion code never includes dictated text in errors.
+    pub diagnostic: Option<String>,
 }
 
 impl TextInsertionResult {
@@ -129,6 +147,7 @@ pub fn insert_text(request: TextInsertionRequest) -> TextInsertionResult {
             clipboard_restored: false,
             target_context,
             message: "Dictation produced no text to insert.".into(),
+            timing: TextInsertionTiming::default(),
         };
     }
 
@@ -209,6 +228,7 @@ fn copy_only(text: &str, target_context: Option<ActiveTargetContext>) -> TextIns
             clipboard_restored: false,
             target_context,
             message: "Copied dictation to the clipboard.".into(),
+            timing: TextInsertionTiming::default(),
         },
         Err(error) => TextInsertionResult {
             outcome: InsertOutcome::Failed,
@@ -217,6 +237,7 @@ fn copy_only(text: &str, target_context: Option<ActiveTargetContext>) -> TextIns
             clipboard_restored: false,
             target_context,
             message: error,
+            timing: TextInsertionTiming::default(),
         },
     }
 }
@@ -226,6 +247,7 @@ fn best_effort_verified(
     request: TextInsertionRequest,
     target_context: Option<ActiveTargetContext>,
 ) -> TextInsertionResult {
+    let operation_started = std::time::Instant::now();
     if let Err(message) =
         verify_paste_target(request.expected_target.as_ref(), target_context.as_ref())
     {
@@ -234,15 +256,49 @@ fn best_effort_verified(
 
     let before_value = focused_ax_value().ok();
 
+    // Prefer the focused control's selected-text range. This commits directly
+    // at the caret without touching the clipboard or launching a subprocess.
+    // Many native controls support it; browsers, terminals, and custom editors
+    // may not, so failure falls through to the proven clipboard paste path.
+    let native_ax_error = match macos_ax::insert_selected_text(&request.text) {
+        Ok(()) => {
+            let visible_ms = operation_started.elapsed().as_millis() as u64;
+            let verification_started = std::time::Instant::now();
+            let verified = focused_ax_value().ok().is_some_and(|after| {
+                before_value.as_ref() != Some(&after) && after.contains(&request.text)
+            });
+            let verification_ms = verification_started.elapsed().as_millis() as u64;
+            return TextInsertionResult {
+                outcome: InsertOutcome::Typed,
+                method: InsertMethod::NativeAx,
+                verified,
+                clipboard_restored: false,
+                target_context,
+                message: "Typed dictation into the active app.".into(),
+                timing: TextInsertionTiming {
+                    visible_ms: Some(visible_ms),
+                    clipboard_restore_ms: None,
+                    verification_ms: Some(verification_ms),
+                    total_ms: operation_started.elapsed().as_millis() as u64,
+                    diagnostic: None,
+                },
+            };
+        }
+        Err(error) => error,
+    };
+
+    let paste_started_ms = operation_started.elapsed().as_millis() as u64;
     match paste_via_clipboard_restoring(
         &request.text,
         request.restore_clipboard,
         request.clipboard_snapshot.as_deref(),
     ) {
-        Ok(restored) => {
+        Ok(paste) => {
+            let verification_started = std::time::Instant::now();
             let verified = focused_ax_value().ok().is_some_and(|after| {
                 before_value.as_ref() != Some(&after) && after.contains(&request.text)
             });
+            let verification_ms = verification_started.elapsed().as_millis() as u64;
             TextInsertionResult {
                 outcome: if verified {
                     InsertOutcome::Typed
@@ -251,12 +307,19 @@ fn best_effort_verified(
                 },
                 method: InsertMethod::ClipboardPaste,
                 verified,
-                clipboard_restored: restored,
+                clipboard_restored: paste.restored,
                 target_context,
                 message: if verified {
                     "Typed dictation into the active app.".into()
                 } else {
                     "Pasted dictation into the active app.".into()
+                },
+                timing: TextInsertionTiming {
+                    visible_ms: Some(paste_started_ms + paste.visible_ms),
+                    clipboard_restore_ms: paste.clipboard_restore_ms,
+                    verification_ms: Some(verification_ms),
+                    total_ms: operation_started.elapsed().as_millis() as u64,
+                    diagnostic: Some(format!("native_ax: {native_ax_error}")),
                 },
             }
         }
@@ -270,6 +333,13 @@ fn best_effort_verified(
                 clipboard_restored: false,
                 target_context,
                 message: "Could not type into the active app. Copied dictation instead.".into(),
+                timing: TextInsertionTiming {
+                    total_ms: operation_started.elapsed().as_millis() as u64,
+                    diagnostic: Some(format!(
+                        "native_ax: {native_ax_error}; clipboard_paste: {error}"
+                    )),
+                    ..TextInsertionTiming::default()
+                },
             }
         }
     }
@@ -296,6 +366,7 @@ fn best_effort_verified(
                             clipboard_restored: restored,
                             target_context,
                             message: "Pasted dictation into the active X11 app.".into(),
+                            timing: TextInsertionTiming::default(),
                         };
                     }
                     Err(error) => {
@@ -309,6 +380,7 @@ fn best_effort_verified(
                             message:
                                 "Could not paste into the focused X11 app. Copied dictation instead."
                                     .into(),
+                            timing: TextInsertionTiming::default(),
                         };
                     }
                 }
@@ -321,6 +393,7 @@ fn best_effort_verified(
                 clipboard_restored: false,
                 target_context,
                 message: linux_copy_fallback_message(),
+                timing: TextInsertionTiming::default(),
             }
         }
         Err(error) => TextInsertionResult {
@@ -330,6 +403,7 @@ fn best_effort_verified(
             clipboard_restored: false,
             target_context,
             message: error,
+            timing: TextInsertionTiming::default(),
         },
     }
 }
@@ -359,6 +433,7 @@ fn copy_after_block(
             clipboard_restored: false,
             target_context,
             message: message.into(),
+            timing: TextInsertionTiming::default(),
         },
         Err(error) => TextInsertionResult {
             outcome: InsertOutcome::Failed,
@@ -367,6 +442,7 @@ fn copy_after_block(
             clipboard_restored: false,
             target_context,
             message: error,
+            timing: TextInsertionTiming::default(),
         },
     }
 }
@@ -457,11 +533,19 @@ fn write_clipboard(text: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+struct MacosPasteTiming {
+    restored: bool,
+    visible_ms: u64,
+    clipboard_restore_ms: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
 fn paste_via_clipboard_restoring(
     text: &str,
     restore: bool,
     snapshot: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<MacosPasteTiming, String> {
+    let operation_started = std::time::Instant::now();
     let snapshot_before_write = if restore {
         match macos_clipboard_snapshot() {
             Ok(snapshot) => Some(snapshot),
@@ -478,18 +562,32 @@ fn paste_via_clipboard_restoring(
     write_clipboard(text)?;
     let after_write_change_count = macos_clipboard_change_count().ok();
     simulate_macos_paste()?;
+    let visible_ms = operation_started.elapsed().as_millis() as u64;
 
     let Some(snapshot) = snapshot_before_write else {
-        return Ok(false);
+        return Ok(MacosPasteTiming {
+            restored: false,
+            visible_ms,
+            clipboard_restore_ms: None,
+        });
     };
+    let restore_started = std::time::Instant::now();
     match restore_macos_clipboard_after_paste(snapshot, after_write_change_count) {
-        Ok(restored) => Ok(restored),
+        Ok(restored) => Ok(MacosPasteTiming {
+            restored,
+            visible_ms,
+            clipboard_restore_ms: Some(restore_started.elapsed().as_millis() as u64),
+        }),
         Err(error) => {
             // The paste event has already been accepted at this point. Clipboard
             // cleanup is deliberately secondary: a restore failure must not turn
             // a delivered paste into a false copy-only result.
             tracing::warn!(error = %error, "dictation pasted but clipboard restore failed");
-            Ok(false)
+            Ok(MacosPasteTiming {
+                restored: false,
+                visible_ms,
+                clipboard_restore_ms: Some(restore_started.elapsed().as_millis() as u64),
+            })
         }
     }
 }
@@ -1119,6 +1217,11 @@ mod macos_ax {
             attribute: CFStringRef,
             value: *mut CFTypeRef,
         ) -> AXError;
+        fn AXUIElementSetAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: CFTypeRef,
+        ) -> AXError;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -1138,25 +1241,77 @@ mod macos_ax {
     }
 
     pub fn focused_value() -> Result<String, String> {
+        let focused = focused_element()?;
+        let value = copy_string_attribute(focused.cast(), "AXValue");
+        unsafe { CFRelease(focused) };
+        value
+    }
+
+    pub fn insert_selected_text(text: &str) -> Result<(), String> {
+        let focused = focused_element()?;
+        let selected_text_attr = match cfstring("AXSelectedText") {
+            Ok(attribute) => attribute,
+            Err(error) => {
+                unsafe { CFRelease(focused) };
+                return Err(error);
+            }
+        };
+        let value = match cfstring(text) {
+            Ok(value) => value,
+            Err(error) => {
+                unsafe {
+                    CFRelease(selected_text_attr);
+                    CFRelease(focused);
+                }
+                return Err(error);
+            }
+        };
+        let set_err = unsafe {
+            AXUIElementSetAttributeValue(focused.cast(), selected_text_attr, value.cast())
+        };
+        unsafe {
+            CFRelease(value);
+            CFRelease(selected_text_attr);
+            CFRelease(focused);
+        }
+        if set_err == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Focused control does not accept selected text (AX error {set_err})."
+            ))
+        }
+    }
+
+    fn focused_element() -> Result<AXUIElementRef, String> {
         let system = unsafe { AXUIElementCreateSystemWide() };
         if system.is_null() {
             return Err("Could not create system accessibility element.".into());
         }
 
-        let focused_attr = cfstring("AXFocusedUIElement")?;
+        let focused_attr = match cfstring("AXFocusedUIElement") {
+            Ok(attribute) => attribute,
+            Err(error) => {
+                unsafe { CFRelease(system) };
+                return Err(error);
+            }
+        };
         let mut focused: CFTypeRef = ptr::null();
         let focused_err =
             unsafe { AXUIElementCopyAttributeValue(system, focused_attr, &mut focused) };
-        unsafe { CFRelease(focused_attr) };
+        unsafe {
+            CFRelease(focused_attr);
+            CFRelease(system);
+        }
         if focused_err != 0 || focused.is_null() {
+            if !focused.is_null() {
+                unsafe { CFRelease(focused) };
+            }
             return Err(format!(
                 "Could not read focused accessibility element (AX error {focused_err})."
             ));
         }
-
-        let value = copy_string_attribute(focused.cast(), "AXValue");
-        unsafe { CFRelease(focused) };
-        value
+        Ok(focused.cast())
     }
 
     fn copy_string_attribute(element: AXUIElementRef, name: &str) -> Result<String, String> {
@@ -1225,8 +1380,14 @@ mod tests {
             clipboard_restored: true,
             target_context: None,
             message: String::new(),
+            timing: TextInsertionTiming::default(),
         };
         assert_eq!(result.overlay_state(), "typed");
+    }
+
+    #[test]
+    fn native_accessibility_method_has_an_honest_stable_label() {
+        assert_eq!(InsertMethod::NativeAx.as_str(), "native_ax");
     }
 
     #[test]
@@ -1238,6 +1399,7 @@ mod tests {
             clipboard_restored: false,
             target_context: None,
             message: String::new(),
+            timing: TextInsertionTiming::default(),
         };
         assert_eq!(result.overlay_state(), "error");
     }

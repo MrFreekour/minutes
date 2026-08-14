@@ -187,6 +187,12 @@ pub struct DictationResult {
 /// Callback for dictation events (used by Tauri UI).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DictationEvent {
+    /// The local transcription engine is available. `warm` means the model
+    /// came from the in-process preload cache rather than being loaded on the
+    /// dictation critical path.
+    EngineReady {
+        warm: bool,
+    },
     Listening,
     Accumulating,
     Processing,
@@ -369,7 +375,7 @@ where
     #[cfg(feature = "whisper")]
     let model_name = config.dictation.model.clone();
     #[cfg(feature = "whisper")]
-    let whisper_ctx = if let Some(ctx) = take_cached_model(&model_name) {
+    let (whisper_ctx, engine_warm) = if let Some(ctx) = take_cached_model(&model_name) {
         tracing::info!(model = %model_name, "using preloaded whisper model");
         startup_debug(
             "model_cache_hit",
@@ -377,7 +383,7 @@ where
             Some(run_start.elapsed().as_millis()),
             None,
         );
-        Some(ctx)
+        (Some(ctx), true)
     } else {
         let load_start = Instant::now();
         startup_debug(
@@ -404,14 +410,14 @@ where
                             Some(load_start.elapsed().as_millis()),
                             None,
                         );
-                        Some(context)
+                        (Some(context), false)
                     }
                     Err(error) if final_backend == DictationFinalBackend::Parakeet => {
                         tracing::warn!(
                             error = %error,
                             "whisper partial model could not load; continuing with configured Parakeet dictation"
                         );
-                        None
+                        (None, false)
                     }
                     Err(error) => {
                         return Err(TranscribeError::ModelLoadError(error.to_string()).into())
@@ -423,7 +429,7 @@ where
                     error = %error,
                     "whisper partials unavailable; continuing with configured Parakeet dictation"
                 );
-                None
+                (None, false)
             }
             Err(error) => return Err(error.into()),
         }
@@ -433,6 +439,8 @@ where
     return Err(
         TranscribeError::ModelLoadError("dictation requires the whisper feature".into()).into(),
     );
+
+    on_event(DictationEvent::EngineReady { warm: engine_warm });
 
     // Start audio stream
     #[cfg(feature = "whisper")]

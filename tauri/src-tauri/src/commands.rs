@@ -12408,6 +12408,37 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
 
+    #[test]
+    fn dictation_latency_target_classes_are_coarse() {
+        let target = |bundle_id: &str| crate::text_insertion::ActiveTargetContext {
+            platform: "macos".into(),
+            app_name: Some("private app name".into()),
+            bundle_id: Some(bundle_id.into()),
+        };
+        assert_eq!(
+            dictation_target_class(Some(&target("com.mitchellh.ghostty")), "minutes.dev"),
+            "terminal"
+        );
+        assert_eq!(
+            dictation_target_class(Some(&target("com.apple.TextEdit")), "minutes.dev"),
+            "document"
+        );
+        assert_eq!(
+            dictation_target_class(Some(&target("private.unknown.bundle")), "minutes.dev"),
+            "other_app"
+        );
+        assert_eq!(dictation_target_class(None, "minutes.dev"), "unknown");
+    }
+
+    #[test]
+    fn dictation_latency_rejects_reversed_phase_order() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(25);
+        assert_eq!(duration_between_ms(Some(now), Some(later)), Some(25));
+        assert_eq!(duration_between_ms(Some(later), Some(now)), None);
+        assert_eq!(duration_between_ms(None, Some(later)), None);
+    }
+
     /// Loopback enforcement must judge the destination, not the spelling.
     ///
     /// Both Recall chat guards previously accepted the literal string
@@ -19777,6 +19808,174 @@ fn take_dictation_release_started_at(state: &AppState) -> Option<Instant> {
         .and_then(|mut released_at| released_at.take())
 }
 
+#[derive(Debug)]
+struct DictationLatencyTrace {
+    started_at: Instant,
+    target_class: &'static str,
+    overlay_at: Option<Instant>,
+    engine_warm: Option<bool>,
+    engine_ready_at: Option<Instant>,
+    listening_at: Option<Instant>,
+    speech_started_at: Option<Instant>,
+    speech_ended_at: Option<Instant>,
+    first_partial_at: Option<Instant>,
+    final_ready_at: Option<Instant>,
+}
+
+impl DictationLatencyTrace {
+    fn new(started_at: Instant, target_class: &'static str) -> Self {
+        Self {
+            started_at,
+            target_class,
+            overlay_at: None,
+            engine_warm: None,
+            engine_ready_at: None,
+            listening_at: None,
+            speech_started_at: None,
+            speech_ended_at: None,
+            first_partial_at: None,
+            final_ready_at: None,
+        }
+    }
+
+    fn elapsed_ms(&self, at: Option<Instant>) -> Option<u64> {
+        at.and_then(|at| at.checked_duration_since(self.started_at))
+            .map(|duration| duration.as_millis() as u64)
+    }
+}
+
+fn dictation_target_class(
+    target: Option<&crate::text_insertion::ActiveTargetContext>,
+    minutes_bundle_id: &str,
+) -> &'static str {
+    let bundle_id = target.and_then(|target| target.bundle_id.as_deref());
+    if bundle_id == Some(minutes_bundle_id) {
+        "minutes"
+    } else if bundle_id.is_some_and(|bundle| {
+        bundle.contains("ghostty")
+            || bundle.contains("Terminal")
+            || bundle.contains("terminal")
+            || bundle.contains("iterm")
+    }) {
+        "terminal"
+    } else if bundle_id.is_some_and(|bundle| {
+        bundle.contains("TextEdit")
+            || bundle.contains("Pages")
+            || bundle.contains("word")
+            || bundle.contains("notion")
+    }) {
+        "document"
+    } else if bundle_id.is_some_and(|bundle| {
+        bundle.contains("Chrome")
+            || bundle.contains("Safari")
+            || bundle.contains("firefox")
+            || bundle.contains("arc")
+    }) {
+        "browser"
+    } else if bundle_id.is_some() {
+        "other_app"
+    } else {
+        "unknown"
+    }
+}
+
+fn duration_between_ms(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    let (Some(start), Some(end)) = (start, end) else {
+        return None;
+    };
+    end.checked_duration_since(start)
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn mark_dictation_latency_event(
+    trace: &Arc<Mutex<DictationLatencyTrace>>,
+    event: &minutes_core::dictation::DictationEvent,
+) {
+    let Ok(mut trace) = trace.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    use minutes_core::dictation::DictationEvent;
+    match event {
+        DictationEvent::EngineReady { warm } => {
+            trace.engine_warm = Some(*warm);
+            trace.engine_ready_at.get_or_insert(now);
+        }
+        DictationEvent::Listening => {
+            trace.listening_at.get_or_insert(now);
+        }
+        DictationEvent::Accumulating => {
+            trace.speech_started_at.get_or_insert(now);
+        }
+        DictationEvent::Processing => {
+            trace.speech_ended_at.get_or_insert(now);
+        }
+        DictationEvent::PartialText(_) => {
+            trace.first_partial_at.get_or_insert(now);
+        }
+        DictationEvent::Success => {
+            trace.final_ready_at.get_or_insert(now);
+        }
+        DictationEvent::AudioLevel(_)
+        | DictationEvent::SilenceCountdown { .. }
+        | DictationEvent::Error
+        | DictationEvent::ModelMissing { .. }
+        | DictationEvent::Cancelled
+        | DictationEvent::Yielded => {}
+    }
+}
+
+fn log_dictation_latency(
+    trace: &Arc<Mutex<DictationLatencyTrace>>,
+    insertion: &crate::text_insertion::TextInsertionResult,
+    release_started_at: Option<Instant>,
+    insert_started_at: Instant,
+) {
+    let Ok(trace) = trace.lock() else {
+        return;
+    };
+    let visible_at = insertion
+        .timing
+        .visible_ms
+        .map(|visible_ms| insert_started_at + Duration::from_millis(visible_ms));
+    let verification_at =
+        Some(insert_started_at + Duration::from_millis(insertion.timing.total_ms));
+    let total_ms = verification_at
+        .and_then(|at| at.checked_duration_since(trace.started_at))
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+
+    minutes_core::logging::log_step(
+        "dictation_latency",
+        "dictation",
+        total_ms,
+        serde_json::json!({
+            "press_to_hud_ms": trace.elapsed_ms(trace.overlay_at),
+            "press_to_engine_ready_ms": trace.elapsed_ms(trace.engine_ready_at),
+            "press_to_listening_ms": trace.elapsed_ms(trace.listening_at),
+            "speech_to_first_partial_ms": duration_between_ms(trace.speech_started_at, trace.first_partial_at),
+            "speech_end_to_final_ms": duration_between_ms(trace.speech_ended_at, trace.final_ready_at),
+            "speech_end_to_visible_ms": duration_between_ms(trace.speech_ended_at, visible_at),
+            "release_to_final_ms": duration_between_ms(release_started_at, trace.final_ready_at),
+            "release_to_visible_ms": duration_between_ms(release_started_at, visible_at),
+            "final_to_visible_ms": duration_between_ms(trace.final_ready_at, visible_at),
+            "final_to_verification_complete_ms": duration_between_ms(trace.final_ready_at, verification_at),
+            "visible_insert_operation_ms": insertion.timing.visible_ms,
+            "clipboard_restore_ms": insertion.timing.clipboard_restore_ms,
+            "verification_ms": insertion.timing.verification_ms,
+            "insertion_total_ms": insertion.timing.total_ms,
+            "insertion_diagnostic": insertion.timing.diagnostic,
+            "session_total_ms": total_ms,
+            "engine_warm": trace.engine_warm,
+            "target_class": trace.target_class,
+            "outcome": insertion.outcome.as_str(),
+            "method": insertion.method.as_str(),
+            "verified": insertion.verified,
+            "clipboard_restored": insertion.clipboard_restored,
+        }),
+    );
+}
+
 fn log_dictation_insert(
     result: &minutes_core::dictation::DictationResult,
     insertion: &crate::text_insertion::TextInsertionResult,
@@ -19786,14 +19985,9 @@ fn log_dictation_insert(
     let release_to_inserted_ms = release_started_at.map(|started| started.elapsed().as_millis());
     let duration_ms =
         release_to_inserted_ms.unwrap_or_else(|| insert_started_at.elapsed().as_millis());
-    let file_label = result
-        .file_path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
     minutes_core::logging::log_step(
         "dictation_insert",
-        &file_label,
+        "dictation",
         duration_ms as u64,
         serde_json::json!({
             "release_to_inserted_ms": release_to_inserted_ms,
@@ -20006,6 +20200,7 @@ fn start_dictation_session(
     app: &tauri::AppHandle,
     capture_style: Option<HotkeyCaptureStyle>,
 ) -> Result<String, String> {
+    let dictation_pressed_at = Instant::now();
     let state = app.state::<AppState>();
 
     // Acquire BEFORE any side effects (overlay, focus capture, emits). The
@@ -20033,6 +20228,13 @@ fn start_dictation_session(
 
     let dictation_target_context = take_pending_dictation_target(&state)
         .or_else(crate::text_insertion::capture_active_target_context);
+    let latency_trace = Arc::new(Mutex::new(DictationLatencyTrace::new(
+        dictation_pressed_at,
+        dictation_target_class(
+            dictation_target_context.as_ref(),
+            app.config().identifier.as_str(),
+        ),
+    )));
     dictation_focus_debug(
         "session_start_target_captured",
         dictation_target_context.as_ref(),
@@ -20066,6 +20268,7 @@ fn start_dictation_session(
     let final_output_emitted = Arc::new(AtomicBool::new(false));
     let model_missing_emitted = Arc::new(AtomicBool::new(false));
     let dictation_target_context_for_thread = dictation_target_context.clone();
+    let latency_trace_for_thread = Arc::clone(&latency_trace);
     std::thread::spawn(move || {
         // Move the tray guard into the thread. When this closure exits
         // (normal return, error, or panic) the guard drops, which stores
@@ -20086,13 +20289,17 @@ fn start_dictation_session(
         let final_output_for_results = Arc::clone(&final_output_emitted);
         let model_missing_for_events = Arc::clone(&model_missing_emitted);
         let dictation_target_context_for_results = dictation_target_context_for_thread.clone();
+        let latency_trace_for_events = Arc::clone(&latency_trace_for_thread);
+        let latency_trace_for_results = Arc::clone(&latency_trace_for_thread);
 
         let result = minutes_core::dictation::run(
             stop_flag,
             &config,
             move |event| {
                 use minutes_core::dictation::DictationEvent;
+                mark_dictation_latency_event(&latency_trace_for_events, &event);
                 let state_str = match &event {
+                    DictationEvent::EngineReady { .. } => "",
                     DictationEvent::Listening => "listening",
                     DictationEvent::Accumulating => "accumulating",
                     DictationEvent::Processing => "processing",
@@ -20212,6 +20419,12 @@ fn start_dictation_session(
                         release_started_at,
                         insert_started_at,
                     );
+                    log_dictation_latency(
+                        &latency_trace_for_results,
+                        &insertion,
+                        release_started_at,
+                        insert_started_at,
+                    );
                     record_dictation_memory(&result, &insertion);
                 } else {
                     dictation_focus_debug(
@@ -20237,6 +20450,12 @@ fn start_dictation_session(
                     publish_dictation_overlay_state(&app_for_results, insertion.overlay_state());
                     log_dictation_insert(
                         &result,
+                        &insertion,
+                        release_started_at,
+                        insert_started_at,
+                    );
+                    log_dictation_latency(
+                        &latency_trace_for_results,
                         &insertion,
                         release_started_at,
                         insert_started_at,
@@ -20286,6 +20505,9 @@ fn start_dictation_session(
     // if capture becomes ready first, the new WebView paints Listening on its
     // first reconciled frame instead of exposing internal setup phases.
     show_dictation_overlay(app);
+    if let Ok(mut trace) = latency_trace.lock() {
+        trace.overlay_at = Some(Instant::now());
+    }
     dictation_focus_debug(
         "overlay_shown",
         dictation_target_context.as_ref(),
