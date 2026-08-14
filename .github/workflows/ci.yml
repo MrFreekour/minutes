@@ -537,8 +537,7 @@ jobs:
           node-version: '22'
 
       - name: Install MCP dependencies
-        working-directory: crates/mcp
-        run: npm ci
+        run: node scripts/install_mcp_dependencies.mjs
 
       - name: TypeScript check
         working-directory: crates/mcp
@@ -609,8 +608,7 @@ jobs:
         run: node scripts/check_corpus_watch_fence.mjs crates/sdk/dist/corpus-lease.js
 
       - name: Install MCP dependencies
-        working-directory: crates/mcp
-        run: npm ci
+        run: node scripts/install_mcp_dependencies.mjs --sdk-ready
 
       - name: TypeScript check
         working-directory: crates/mcp

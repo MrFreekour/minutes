@@ -55,6 +55,7 @@ process.exit(result.status ?? 1);
     "npm",
     `#!/usr/bin/env node
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 const args = process.argv.slice(2);
 await appendFile(process.env.RELEASE_SHIM_LOG, "npm " + args.join(" ") + " @ " + process.cwd() + "\\n");
@@ -73,7 +74,18 @@ if (args[0] === "pack") {
 } else if (args[0] === "install" && args.includes("--package-lock-only")) {
   const lockFile = path.join(process.cwd(), "package-lock.json");
   const lock = JSON.parse(await readFile(lockFile, "utf8"));
-  lock.packages[""].dependencies["minutes-sdk"] = packageJson.dependencies["minutes-sdk"];
+  const tarball = args.find((argument) => argument.endsWith(".tgz"));
+  if (tarball) {
+    const version = path.basename(tarball).match(/^minutes-sdk-(.+)\\.tgz$/)?.[1];
+    const integrity = "sha512-" + createHash("sha512").update(await readFile(tarball)).digest("base64");
+    const fileDependency = "file:" + tarball;
+    packageJson.dependencies["minutes-sdk"] = fileDependency;
+    await writeFile(path.join(process.cwd(), "package.json"), JSON.stringify(packageJson, null, 2) + "\\n");
+    lock.packages[""].dependencies["minutes-sdk"] = fileDependency;
+    lock.packages["node_modules/minutes-sdk"] = { version, resolved: fileDependency, integrity, license: "MIT" };
+  } else {
+    lock.packages[""].dependencies["minutes-sdk"] = packageJson.dependencies["minutes-sdk"];
+  }
   await writeFile(lockFile, JSON.stringify(lock, null, 2) + "\\n");
 }
 `,
