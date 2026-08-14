@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Best MCP meeting memory tools",
@@ -229,6 +230,8 @@ export default function BestMcpMeetingMemoryToolsPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="best-mcp-meeting-memory-tools" />
 
       <PublicFooter />
     </div>

@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "The best local speech-to-text apps (2026)",
@@ -222,6 +223,8 @@ export default function BestLocalSpeechToTextPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="best-local-speech-to-text" />
 
       <PublicFooter />
     </div>

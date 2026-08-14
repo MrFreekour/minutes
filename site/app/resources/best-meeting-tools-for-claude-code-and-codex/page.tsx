@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Best meeting tools for Claude Code and Codex",
@@ -277,6 +278,8 @@ export default function BestMeetingToolsPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="best-meeting-tools-for-claude-code-and-codex" />
 
       <PublicFooter />
     </div>

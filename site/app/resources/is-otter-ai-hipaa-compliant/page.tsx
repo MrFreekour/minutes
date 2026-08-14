@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Is Otter.ai HIPAA compliant?",
@@ -278,6 +279,8 @@ export default function IsOtterAiHipaaCompliantPage() {
           Otter and your compliance counsel before recording PHI with any tool.
         </p>
       </section>
+
+      <RelatedResources slug="is-otter-ai-hipaa-compliant" />
 
       <PublicFooter />
     </div>

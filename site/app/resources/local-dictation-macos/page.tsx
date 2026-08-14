@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Local dictation on macOS: the complete guide",
@@ -211,6 +212,8 @@ export default function LocalDictationMacosPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="local-dictation-macos" />
 
       <PublicFooter />
     </div>

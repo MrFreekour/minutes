@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "How to remove AI notetaker bots from your meetings",
@@ -270,6 +271,8 @@ export default function RemoveNotetakerBotsPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="remove-ai-notetaker-bots-from-meetings" />
 
       <PublicFooter />
     </div>

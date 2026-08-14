@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "HIPAA-compliant transcription: what the rule actually requires",
@@ -520,6 +521,8 @@ export default function HipaaTranscriptionPage() {
           than a substitute for it.
         </p>
       </section>
+
+      <RelatedResources slug="hipaa-compliant-transcription" />
 
       <PublicFooter />
     </div>

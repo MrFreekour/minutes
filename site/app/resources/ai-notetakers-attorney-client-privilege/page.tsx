@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "AI notetakers and attorney–client privilege",
@@ -240,6 +241,8 @@ export default function AiNotetakersPrivilegePage() {
           recording tool for client work.
         </p>
       </section>
+
+      <RelatedResources slug="ai-notetakers-attorney-client-privilege" />
 
       <PublicFooter />
     </div>
