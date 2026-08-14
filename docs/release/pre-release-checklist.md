@@ -1,5 +1,12 @@
 # Pre-release checklist
 
+> **Full binary releases:** [`procedure.md`](./procedure.md) is the sole
+> executable release procedure. Do not publish npm packages, create a `v*`
+> GitHub release, or create/push a release tag from this checklist. Registry
+> publishing starts only after the reviewed tag is pushed and is owned by
+> `release-publish.yml`. This document retains background checks and the
+> separate plugin-only path.
+
 Use this before cutting any `vX.Y.Z` tag. Companion to [`channels.md`](./channels.md), [`platform-macos.md`](./platform-macos.md), and [`platform-windows.md`](./platform-windows.md).
 
 > **Plugin-only releases follow a different path.** If the only thing you're
@@ -48,42 +55,18 @@ The MCP server and SDK are real npm packages. They have their own build steps an
 (cd crates/mcp && npm install --dry-run)   # surfaces unresolved versions early
 ```
 
-`npm install --dry-run` is the step that would have caught the v0.10.3 npm publish ordering bug. If it complains about a version that does not exist on the registry, you have an ordering problem and you must publish the missing dep first.
+`npm install --dry-run` is historical evidence for the v0.10.3 ordering bug.
+The current procedure avoids that failure mode by testing MCP against the
+locally packed SDK, committing the exact SDK pin, and letting the trusted
+tag-triggered workflow publish SDK before MCP. Do not manually publish a
+missing dependency to make this check pass.
 
-## Phase 3: Version bump (in this exact order)
+## Phase 3 and later: follow the canonical procedure
 
-The trap here is that the MCP package depends on the SDK by published version, not by relative path. If you bump the MCP dep before publishing the SDK, CI breaks.
-
-1. Bump the SDK in `crates/sdk/package.json` only. Commit (do not push yet).
-2. Build and publish the SDK to npm:
-   ```bash
-   (cd crates/sdk && npm run build && npm publish --registry https://registry.npmjs.org/)
-   ```
-   The local `npm config get registry` may point at `registry.yarnpkg.com` (read-only). Always pass the explicit `--registry` flag.
-3. Verify the SDK is live:
-   ```bash
-   npm view minutes-sdk@<new-version> version --registry https://registry.npmjs.org/
-   ```
-4. Now bump everything else in a single commit:
-   - `Cargo.toml` (workspace `version`)
-   - `tauri/src-tauri/tauri.conf.json`
-   - `crates/cli/Cargo.toml` (the `minutes-core` path-dep `version` field)
-   - `crates/mcp/package.json` (own version + `minutes-sdk` dep)
-   - `crates/mcp/src/index.ts` (the `MCP_SERVER_VERSION` constant)
-   - `manifest.json`
-5. Run `cargo check -p minutes-core -p minutes-app -p minutes-cli` to refresh `Cargo.lock`.
-6. Stage the bumped files explicitly (do not `git add -A`, the worktree may have unrelated untracked files).
-7. Commit, push to main.
-
-## Phase 4: Publish MCP and verify
-
-After the version-bump commit lands on main:
-
-```bash
-(cd crates/mcp && npm install)   # picks up the just-published SDK
-(cd crates/mcp && npm publish --registry https://registry.npmjs.org/)
-npm view minutes-mcp@<new-version> version --registry https://registry.npmjs.org/
-```
+Continue with [`procedure.md`](./procedure.md), starting at its version-sync
+step. Its committed flow handles the exact SDK pin, draft release, local tag,
+trusted tag-triggered package publishing, artifacts, and post-release
+verification in the required order. There are no manual pre-tag npm publishes.
 
 ## Phase 5: Release notes (must match the policy)
 
@@ -116,23 +99,17 @@ the whole major-release narrative into the patch body.
 
 ## Phase 6: Cut the release
 
-Per [`platform-macos.md`](./platform-macos.md), the convention is "create the GitHub Release first, let that create the tag", which then triggers the build workflows:
-
-```bash
-gh release create vX.Y.Z \
-  --target main \
-  --title "vX.Y.Z: Short descriptive subtitle" \
-  --notes-file notes.md
-```
-
-For preview releases, add `--prerelease` and use a `-alpha.N` / `-beta.N` / `-rc.N` suffix.
+Use [`procedure.md`](./procedure.md). The safe sequence is a draft GitHub
+release, then a locally created annotated tag, then an explicit tag push after
+all immutable-tag gates pass. Do not let `gh release create` implicitly create
+the release tag.
 
 ## Phase 6.5: Build and upload the .mcpb bundle
 
 The `minutes.mcpb` Claude Desktop marketplace bundle is NOT built by any release workflow. It is built locally with `scripts/pack_mcpb.sh` and uploaded by hand. Forgetting this step means the Claude Desktop marketplace surface is missing from the release, which will block users who install Minutes through that channel.
 
 ```bash
-# From the repo root, after Phase 4 has completed (MCP and SDK already published).
+# From the repo root, at the post-tag MCPB step in procedure.md.
 (cd crates/mcp && npm run build)   # ensures dist/ and dist-ui/ are fresh
 ./scripts/pack_mcpb.sh minutes.mcpb  # writes minutes.mcpb at repo root
 ./scripts/check_mcpb_bundle.sh minutes.mcpb
