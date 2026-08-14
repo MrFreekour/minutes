@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -138,6 +139,25 @@ def cask_sha256(content: str) -> str | None:
 def formula_version(content: str) -> str | None:
     match = re.search(r'tag:\s*"v([^"]+)"', content)
     return match.group(1) if match else None
+
+
+def tap_mismatches(
+    formula: str, cask: str, version: str, expected_sha256: str | None
+) -> list[str]:
+    """Describe any tap fields that do not match a released version."""
+    mismatches: list[str] = []
+    if formula_version(formula) != version:
+        mismatches.append(
+            f"formula is {formula_version(formula) or 'unparseable'}, expected {version}"
+        )
+    if expected_sha256 is not None:
+        if cask_version(cask) != version:
+            mismatches.append(
+                f"cask is {cask_version(cask) or 'unparseable'}, expected {version}"
+            )
+        if cask_sha256(cask) != expected_sha256:
+            mismatches.append("cask sha256 does not match the release DMG")
+    return mismatches
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +328,51 @@ def dmg_digest(version: str, token: str) -> str | None:
     return computed
 
 
+def wait_until_current(
+    version: str, token: str, attempts: int = 8, delay_seconds: float = 2
+) -> int:
+    """Wait for GitHub's branch-content reads to converge after the tap write.
+
+    The Git Data API ref update is atomic, but the Contents API can briefly
+    return files from different branch generations. The v0.25.0 release saw
+    the new cask and old formula in the same verification pass. Re-derive the
+    expected DMG hash once, then retry only the cheap tap reads for a bounded
+    window. A real mismatch still fails the workflow.
+    """
+    version = version.lstrip("v")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise BumpError(f"refusing to verify non-release version {version!r}")
+    if attempts < 1:
+        raise BumpError("verification attempts must be at least 1")
+
+    expected = dmg_digest(version, token)
+    if expected is None:
+        raise BumpError(
+            f"release v{version} has no Minutes_{version}_aarch64.dmg; "
+            "cannot verify the cask"
+        )
+
+    mismatches: list[str] = []
+    for attempt in range(1, attempts + 1):
+        formula = read_tap_file(FORMULA_PATH, token)
+        cask = read_tap_file(CASK_PATH, token)
+        mismatches = tap_mismatches(formula, cask, version, expected)
+        if not mismatches:
+            print(f"tap verified at {version} with matching DMG hash")
+            return 0
+        if attempt < attempts:
+            print(
+                f"::notice::tap verification attempt {attempt}/{attempts} "
+                f"has not converged yet: {'; '.join(mismatches)}"
+            )
+            time.sleep(delay_seconds)
+
+    raise BumpError(
+        f"tap does not match release {version} after {attempts} attempts: "
+        + "; ".join(mismatches)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -406,6 +471,16 @@ def self_test() -> int:
     check(
         formula_version(bump_formula(FIXTURE_FORMULA, "0.25.0")) == "0.25.0",
         "formula bump rewrites the tag",
+    )
+    current_formula = bump_formula(FIXTURE_FORMULA, "0.25.0")
+    current_cask = bump_cask(FIXTURE_CASK, "0.25.0", new_sha)
+    check(
+        tap_mismatches(current_formula, current_cask, "0.25.0", new_sha) == [],
+        "tap verification accepts matching formula, cask, and DMG hash",
+    )
+    check(
+        len(tap_mismatches(FIXTURE_FORMULA, current_cask, "0.25.0", new_sha)) == 1,
+        "tap verification rejects a stale formula even when the cask is current",
     )
     check(
         bump_cask(updated, "0.24.0", new_sha) == updated,
@@ -508,6 +583,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", help="release version, with or without a leading v")
     parser.add_argument("--dry-run", action="store_true", help="report without writing")
+    parser.add_argument(
+        "--wait-current",
+        action="store_true",
+        help="wait boundedly until the tap matches the released version and DMG hash",
+    )
     parser.add_argument("--self-test", action="store_true", help="exercise the logic")
     parser.add_argument(
         "--check-access",
@@ -532,6 +612,10 @@ def main() -> int:
             "no token in HOMEBREW_TAP_TOKEN or GITHUB_TOKEN; the default "
             "workflow token cannot write to another repository"
         )
+    if args.wait_current:
+        if args.dry_run:
+            parser.error("--wait-current and --dry-run are mutually exclusive")
+        return wait_until_current(args.version, token)
     return run(args.version, token, args.dry_run)
 
 
