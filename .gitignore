@@ -105,6 +105,14 @@ docs/assets/demo*
 # Local dev tooling, installed per-machine via `npx impeccable install`.
 # Not product surface — must not ship in the assistant skill bundle.
 .agents/skills/impeccable/
+# Internal maintainer workflow. Keep private installs outside this repository.
+tooling/skills/sources/minutes-seo-wave/
+.agents/skills/minutes/minutes-seo-wave/
+.claude/plugins/minutes/skills/minutes-seo-wave/
+.opencode/skills/minutes-seo-wave/
+.opencode/commands/minutes-seo-wave.md
+tooling/skills/goldens/*/minutes-seo-wave/
+tooling/skills/goldens/commands/minutes-seo-wave.md
 .claude/scheduled_tasks.lock
 
 # Local maintainer scratch (never commit)
