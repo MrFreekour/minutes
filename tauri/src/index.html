@@ -11705,7 +11705,10 @@
 
     function dictationRecentPreview(record) {
       const text = (record.cleanedText || record.rawText || '').trim();
-      return text || '(empty dictation)';
+      if (text) return text;
+      return record.recoveryAudioPath
+        ? 'Captured audio — ready to reprocess'
+        : '(empty dictation)';
     }
 
     function dictationRecentMeta(record) {
@@ -11752,6 +11755,19 @@
         const openButton = record.filePath
           ? `<button class="btn btn-secondary btn-sm" data-dictation-action="open" data-dictation-id="${escapeHtml(record.id)}">Open</button>`
           : '';
+        const hasText = Boolean((record.cleanedText || '').trim());
+        const hasRaw = Boolean((record.rawText || '').trim());
+        const textButtons = hasText
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="copy" data-dictation-id="${escapeHtml(record.id)}">Copy</button>
+             <button class="btn btn-secondary btn-sm" data-dictation-action="paste" data-dictation-id="${escapeHtml(record.id)}">Paste</button>`
+          : '';
+        const rawButton = hasRaw
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="raw" data-dictation-id="${escapeHtml(record.id)}">Copy raw</button>`
+          : '';
+        const recoveryButtons = record.recoveryAudioPath
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="reprocess" data-dictation-id="${escapeHtml(record.id)}">Reprocess</button>
+             <button class="btn btn-secondary btn-sm" data-dictation-action="delete-audio" data-dictation-id="${escapeHtml(record.id)}">Delete audio</button>`
+          : '';
         return `
           <div class="dictation-recent-item" data-dictation-id="${escapeHtml(record.id)}">
             <div>
@@ -11759,8 +11775,9 @@
               <div class="dictation-recent-meta">${meta}</div>
             </div>
             <div class="dictation-recent-actions">
-              <button class="btn btn-secondary btn-sm" data-dictation-action="copy" data-dictation-id="${escapeHtml(record.id)}">Copy</button>
-              <button class="btn btn-secondary btn-sm" data-dictation-action="paste" data-dictation-id="${escapeHtml(record.id)}">Paste</button>
+              ${textButtons}
+              ${rawButton}
+              ${recoveryButtons}
               ${openButton}
             </div>
           </div>
@@ -11788,6 +11805,17 @@
         } else if (action === 'paste') {
           const result = await invoke('cmd_repaste_dictation', { id });
           if (status) status.textContent = result?.message || 'Pasted.';
+        } else if (action === 'raw') {
+          const result = await invoke('cmd_copy_raw_dictation', { id });
+          if (status) status.textContent = result?.message || 'Copied raw dictation.';
+        } else if (action === 'reprocess') {
+          const result = await invoke('cmd_reprocess_dictation', { id });
+          await loadRecentDictations();
+          if (status) status.textContent = result?.message || 'Recovered dictation.';
+        } else if (action === 'delete-audio') {
+          const result = await invoke('cmd_delete_dictation_audio', { id });
+          await loadRecentDictations();
+          if (status) status.textContent = result || 'Deleted saved audio.';
         } else if (action === 'open' && record.filePath) {
           await invoke('cmd_open_file', { path: record.filePath });
           if (status) status.textContent = 'Opened dictation file.';

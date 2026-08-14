@@ -394,6 +394,7 @@
       <div class="dot" id="indicator"></div>
       <span class="label" id="label">Starting…</span>
       <button class="recovery-button hidden" id="download-button" type="button">Download</button>
+      <button class="recovery-button hidden" id="reprocess-button" type="button">Reprocess</button>
       <button class="recovery-button hidden" id="permission-button" type="button">Open Settings</button>
       <div class="waveform" id="waveform" style="display:none">
         <div class="bar" style="height:4px"></div>
@@ -419,6 +420,7 @@
     const indicator = document.getElementById('indicator');
     const label = document.getElementById('label');
     const downloadButton = document.getElementById('download-button');
+    const reprocessButton = document.getElementById('reprocess-button');
     const permissionButton = document.getElementById('permission-button');
     const waveform = document.getElementById('waveform');
     const timer = document.getElementById('timer');
@@ -451,6 +453,7 @@
     let dismissTimer = null;
     let modelMissingDetails = null;
     let modelDownloadInProgress = false;
+    let recoveryId = null;
     let overlayRevision = -1;
 
     Object.assign(cues.start, { volume: 0.18 });
@@ -604,6 +607,7 @@
         || state === 'copied'
         || state === 'blocked'
         || state === 'error'
+        || state === 'recoverable'
         || state === 'cancelled'
         || state === 'yielded';
     }
@@ -626,6 +630,10 @@
     listen('dictation:model-missing', (e) => {
       modelMissingDetails = e.payload || null;
       if (lastState === 'model-missing') renderModelMissing();
+    });
+
+    listen('dictation:recovery', (e) => {
+      recoveryId = e.payload?.id || null;
     });
 
     function renderOverlaySnapshot(snapshot) {
@@ -667,6 +675,7 @@
       if (state !== 'model-missing') {
         downloadButton.classList.add('hidden');
       }
+      reprocessButton.classList.add('hidden');
       permissionButton.classList.add('hidden');
 
       switch (state) {
@@ -804,6 +813,18 @@
           renderModelMissing();
           break;
 
+        case 'recoverable':
+          setIndicator('dot-solid');
+          label.textContent = 'Audio saved';
+          waveform.style.display = 'none';
+          timer.style.display = 'none';
+          showExpanded(true);
+          setTextContent('Your words are safe. Reprocess when you’re ready.', false);
+          reprocessButton.disabled = false;
+          reprocessButton.textContent = 'Reprocess';
+          reprocessButton.classList.remove('hidden');
+          break;
+
         case 'cancelled':
         case 'yielded':
           dismiss();
@@ -923,6 +944,32 @@
         permissionButton.disabled = false;
         permissionButton.textContent = 'Try Again';
         scheduleDismiss(4500);
+      }
+    });
+
+    reprocessButton.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      cancelDismissTimer();
+      reprocessButton.disabled = true;
+      reprocessButton.textContent = 'Reprocessing…';
+      label.textContent = 'Recovering dictation';
+      setIndicator('spinner');
+      try {
+        const result = recoveryId
+          ? await window.__TAURI__.core.invoke('cmd_reprocess_dictation', { id: recoveryId })
+          : await window.__TAURI__.core.invoke('cmd_reprocess_last_dictation');
+        setIndicator('success');
+        label.textContent = result?.outcome === 'copied' ? 'Recovered · copied' : 'Recovered';
+        setTextContent(result?.message || 'Recovered dictation from saved audio.', false);
+        reprocessButton.classList.add('hidden');
+        scheduleDismiss(1800);
+      } catch (error) {
+        pill.classList.add('error');
+        setIndicator('error');
+        label.textContent = 'Audio is still safe';
+        setTextContent(String(error), false);
+        reprocessButton.disabled = false;
+        reprocessButton.textContent = 'Try again';
       }
     });
 

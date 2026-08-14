@@ -18167,6 +18167,27 @@ pub fn cmd_copy_dictation(
 }
 
 #[tauri::command]
+pub fn cmd_copy_raw_dictation(
+    id: String,
+) -> Result<crate::text_insertion::TextInsertionResult, String> {
+    let record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    if record.raw_text.trim().is_empty() {
+        return Err("Raw text is not available yet. Reprocess the saved audio first.".into());
+    }
+    Ok(crate::text_insertion::insert_text(
+        crate::text_insertion::TextInsertionRequest {
+            text: record.raw_text,
+            mode: crate::text_insertion::TextInsertionMode::CopyOnly,
+            restore_clipboard: false,
+            clipboard_snapshot: None,
+            expected_target: None,
+        },
+    ))
+}
+
+#[tauri::command]
 pub fn cmd_repaste_dictation(
     id: String,
 ) -> Result<crate::text_insertion::TextInsertionResult, String> {
@@ -18188,6 +18209,110 @@ pub fn cmd_repaste_dictation(
             expected_target: None,
         },
     ))
+}
+
+fn latest_dictation_record() -> Result<minutes_core::dictation_memory::DictationMemoryRecord, String>
+{
+    minutes_core::dictation_memory::load_recent(1)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "There is no recent dictation yet.".to_string())
+}
+
+#[tauri::command]
+pub fn cmd_copy_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String> {
+    cmd_copy_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_restore_raw_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String>
+{
+    cmd_copy_raw_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_paste_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String> {
+    cmd_repaste_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_reprocess_dictation(
+    id: String,
+) -> Result<crate::text_insertion::TextInsertionResult, String> {
+    let mut record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    let recovery_path = record
+        .recovery_audio_path
+        .clone()
+        .ok_or_else(|| "This dictation has no saved recovery audio.".to_string())?;
+    let config = Config::load();
+    let expected_target = crate::text_insertion::capture_active_target_context();
+    let result = minutes_core::dictation::reprocess_recovery_audio(&recovery_path, &config)
+        .map_err(|error| format!("Could not reprocess saved dictation audio: {error}"))?;
+    let insert_requested = dictation_should_insert(&config);
+    let clipboard_snapshot = if insert_requested && config.dictation.auto_paste_restore {
+        crate::text_insertion::read_clipboard().ok()
+    } else {
+        None
+    };
+    let insertion =
+        crate::text_insertion::insert_text(crate::text_insertion::TextInsertionRequest {
+            text: result.text.clone(),
+            mode: if insert_requested {
+                crate::text_insertion::TextInsertionMode::BestEffortVerified
+            } else {
+                crate::text_insertion::TextInsertionMode::CopyOnly
+            },
+            restore_clipboard: insert_requested && config.dictation.auto_paste_restore,
+            clipboard_snapshot,
+            expected_target: if insert_requested {
+                expected_target
+            } else {
+                None
+            },
+        });
+    let retained =
+        (!dictation_delivery_succeeded(&insertion, insert_requested)).then_some(recovery_path);
+    record.raw_text = result.raw_text;
+    record.cleaned_text = result.text;
+    record.duration_secs = result.duration_secs;
+    record.engine_id = result.engine_id;
+    record.engine_descriptor_version = result.engine_descriptor_version;
+    record.destination = result.destination;
+    record.insertion = dictation_insertion_memory(&insertion);
+    record.target_context = dictation_target_context(&insertion);
+    record.recovery_audio_path = retained;
+    minutes_core::dictation_memory::append_record(record)
+        .map_err(|error| format!("Could not update dictation history: {error}"))?;
+    Ok(insertion)
+}
+
+#[tauri::command]
+pub fn cmd_reprocess_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String>
+{
+    cmd_reprocess_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_delete_dictation_audio(id: String) -> Result<String, String> {
+    let mut record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    let path = record
+        .recovery_audio_path
+        .take()
+        .ok_or_else(|| "This dictation has no saved recovery audio.".to_string())?;
+    minutes_core::dictation_memory::append_record(record)
+        .map_err(|error| format!("Could not update dictation history: {error}"))?;
+    if path.exists() {
+        return Err(
+            "The history was updated, but Minutes could not delete the saved audio. It will be offered for recovery again on the next launch."
+                .into(),
+        );
+    }
+    Ok("Deleted the saved recovery audio. Text history was kept.".into())
 }
 
 #[tauri::command]
@@ -19792,6 +19917,7 @@ fn dictation_target_context(
 fn record_dictation_memory(
     result: &minutes_core::dictation::DictationResult,
     insertion: &crate::text_insertion::TextInsertionResult,
+    recovery_audio_path: Option<PathBuf>,
 ) {
     let record = minutes_core::dictation_memory::DictationMemoryRecord::new(
         minutes_core::dictation_memory::DictationMemoryInput {
@@ -19807,11 +19933,129 @@ fn record_dictation_memory(
             target_context: dictation_target_context(insertion),
             file_path: result.file_path.clone(),
             daily_note_appended: result.daily_note_appended,
+            recovery_audio_path,
         },
     );
     if let Err(error) = minutes_core::dictation_memory::append_record(record) {
         tracing::warn!(error = %error, "failed to persist dictation memory record");
     }
+}
+
+fn retained_recovery_audio_after_delivery(
+    path: Option<PathBuf>,
+    insertion: &crate::text_insertion::TextInsertionResult,
+    insert_requested: bool,
+) -> Option<PathBuf> {
+    let delivered = dictation_delivery_succeeded(insertion, insert_requested);
+    let path = path?;
+    if !delivered {
+        return Some(path);
+    }
+    match minutes_core::dictation_memory::retire_recovery_audio(&path) {
+        Ok(()) => None,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not retire delivered dictation recovery audio");
+            Some(path)
+        }
+    }
+}
+
+fn dictation_delivery_succeeded(
+    insertion: &crate::text_insertion::TextInsertionResult,
+    insert_requested: bool,
+) -> bool {
+    if insert_requested {
+        matches!(
+            insertion.outcome,
+            crate::text_insertion::InsertOutcome::Typed
+                | crate::text_insertion::InsertOutcome::Pasted
+        )
+    } else {
+        insertion.outcome == crate::text_insertion::InsertOutcome::Copied
+    }
+}
+
+fn record_recoverable_dictation_audio(
+    path: PathBuf,
+    config: &Config,
+    target: Option<&crate::text_insertion::ActiveTargetContext>,
+    message: String,
+) -> Option<minutes_core::dictation_memory::DictationMemoryRecord> {
+    let duration_secs = minutes_core::dictation_memory::recovery_audio_duration_secs(&path).ok()?;
+    if duration_secs < 0.1 {
+        if let Err(error) = minutes_core::dictation_memory::retire_recovery_audio(&path) {
+            tracing::warn!(error = %error, "could not retire empty dictation recovery audio");
+        }
+        return None;
+    }
+    let record = minutes_core::dictation_memory::DictationMemoryRecord::new(
+        minutes_core::dictation_memory::DictationMemoryInput {
+            raw_text: String::new(),
+            cleaned_text: String::new(),
+            duration_secs,
+            engine_id: format!("{}:{}", config.dictation.backend, config.dictation.model),
+            engine_descriptor_version: Some(config.dictation.model.clone()),
+            vocabulary_mode: None,
+            vocabulary_used: Vec::new(),
+            destination: config.dictation.destination.clone(),
+            insertion: minutes_core::dictation_memory::DictationInsertionMemory {
+                outcome: "recoverable".into(),
+                method: "recovery_audio".into(),
+                verified: false,
+                clipboard_restored: false,
+                message,
+            },
+            target_context: target.map(|context| {
+                minutes_core::dictation_memory::DictationTargetContext {
+                    platform: context.platform.clone(),
+                    app_name: context.app_name.clone(),
+                }
+            }),
+            file_path: None,
+            daily_note_appended: false,
+            recovery_audio_path: Some(path),
+        },
+    );
+    if let Err(error) = minutes_core::dictation_memory::append_record(record.clone()) {
+        tracing::warn!(error = %error, "failed to persist recoverable dictation record");
+        return None;
+    }
+    Some(record)
+}
+
+/// Adopt crash-left recovery WAVs into the visible dictation history. This is
+/// deliberately run at desktop startup, before a new dictation can create an
+/// active file, so an in-progress capture is never mistaken for an orphan.
+pub fn adopt_orphaned_dictation_audio() -> usize {
+    if dictation_pid_active() {
+        // Another Minutes process owns the capture lease; its recovery WAV is
+        // live, not orphaned. The next clean launch will adopt it if needed.
+        return 0;
+    }
+    let paths = match minutes_core::dictation_memory::orphaned_recovery_audio() {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not scan for orphaned dictation recovery audio");
+            return 0;
+        }
+    };
+    if paths.is_empty() {
+        return 0;
+    }
+    let config = Config::load();
+    paths
+        .into_iter()
+        .filter(|path| {
+            record_recoverable_dictation_audio(
+                path.clone(),
+                &config,
+                None,
+                "Minutes closed before this dictation finished. Its private audio is ready to reprocess."
+                    .into(),
+            )
+            .is_some()
+        })
+        .count()
 }
 
 fn dictation_should_insert(config: &Config) -> bool {
@@ -20322,6 +20566,7 @@ fn start_dictation_session(
     let cancel_flag = Arc::clone(&state.dictation_cancel_flag);
     let final_output_emitted = Arc::new(AtomicBool::new(false));
     let model_missing_emitted = Arc::new(AtomicBool::new(false));
+    let recovery_audio_path = Arc::new(Mutex::new(None::<PathBuf>));
     let dictation_target_context_for_thread = dictation_target_context.clone();
     let latency_trace_for_thread = Arc::clone(&latency_trace);
     std::thread::spawn(move || {
@@ -20350,6 +20595,8 @@ fn start_dictation_session(
         let dictation_target_context_for_results = dictation_target_context_for_thread.clone();
         let latency_trace_for_events = Arc::clone(&latency_trace_for_thread);
         let latency_trace_for_results = Arc::clone(&latency_trace_for_thread);
+        let recovery_audio_for_run = Arc::clone(&recovery_audio_path);
+        let recovery_audio_for_results = Arc::clone(&recovery_audio_path);
 
         let result = minutes_core::dictation::run_with_options(
             stop_flag,
@@ -20357,6 +20604,7 @@ fn start_dictation_session(
             minutes_core::dictation::DictationRunOptions {
                 auto_stop_on_silence: capture_style.is_none(),
                 cancel_flag: Some(cancel_flag),
+                recovery_audio_path: Some(recovery_audio_for_run),
             },
             move |event| {
                 use minutes_core::dictation::DictationEvent;
@@ -20488,7 +20736,13 @@ fn start_dictation_session(
                         release_started_at,
                         insert_started_at,
                     );
-                    record_dictation_memory(&result, &insertion);
+                    let recovery_path = recovery_audio_for_results
+                        .lock()
+                        .map(|path| path.clone())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                    let retained =
+                        retained_recovery_audio_after_delivery(recovery_path, &insertion, true);
+                    record_dictation_memory(&result, &insertion, retained);
                 } else {
                     dictation_focus_debug(
                         "before_copy_restore",
@@ -20523,15 +20777,52 @@ fn start_dictation_session(
                         release_started_at,
                         insert_started_at,
                     );
-                    record_dictation_memory(&result, &insertion);
+                    let recovery_path = recovery_audio_for_results
+                        .lock()
+                        .map(|path| path.clone())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                    let retained =
+                        retained_recovery_audio_after_delivery(recovery_path, &insertion, false);
+                    record_dictation_memory(&result, &insertion, retained);
                 }
             },
         );
+
+        let recovery_path = recovery_audio_path
+            .lock()
+            .map(|path| path.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            .filter(|path| path.exists());
+        let recoverable_record = if !final_output_emitted.load(Ordering::Relaxed) {
+            recovery_path.and_then(|path| {
+                record_recoverable_dictation_audio(
+                    path,
+                    &config,
+                    dictation_target_context_for_thread.as_ref(),
+                    match &result {
+                        Ok(()) => "Captured audio is safe. Reprocess it without re-speaking."
+                            .to_string(),
+                        Err(error) => format!(
+                            "Captured audio is safe after a dictation failure. Reprocess it without re-speaking. ({error})"
+                        ),
+                    },
+                )
+            })
+        } else {
+            None
+        };
 
         // dictation_active is flipped to false (and the tray re-syncs)
         // when `_tray_guard` drops on closure exit. See `DictationActiveGuard`.
         match result {
             Ok(()) => {
+                if let Some(record) = recoverable_record {
+                    app_clone
+                        .emit("dictation:recovery", serde_json::json!({ "id": record.id }))
+                        .ok();
+                    publish_dictation_overlay_state(&app_clone, "recoverable");
+                    return;
+                }
                 // Session ended normally (silence timeout or yield).
                 // Dismiss overlay if it wasn't already dismissed by a terminal event.
                 if !final_output_emitted.load(Ordering::Relaxed)
@@ -20558,7 +20849,14 @@ fn start_dictation_session(
             }
             Err(e) => {
                 eprintln!("[dictation] error: {}", e);
-                publish_dictation_overlay_state(&app_clone, "error");
+                if let Some(record) = recoverable_record {
+                    app_clone
+                        .emit("dictation:recovery", serde_json::json!({ "id": record.id }))
+                        .ok();
+                    publish_dictation_overlay_state(&app_clone, "recoverable");
+                } else {
+                    publish_dictation_overlay_state(&app_clone, "error");
+                }
             }
         }
     });

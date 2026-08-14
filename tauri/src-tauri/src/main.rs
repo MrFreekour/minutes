@@ -564,6 +564,9 @@ pub struct TrayMenuHandles {
     pub sensitive: tauri::menu::MenuItem<tauri::Wry>,
     pub mic_mute: tauri::menu::MenuItem<tauri::Wry>,
     pub note: tauri::menu::MenuItem<tauri::Wry>,
+    pub copy_last_dictation: tauri::menu::MenuItem<tauri::Wry>,
+    pub paste_last_dictation: tauri::menu::MenuItem<tauri::Wry>,
+    pub reprocess_last_dictation: tauri::menu::MenuItem<tauri::Wry>,
     pub assistant: tauri::menu::MenuItem<tauri::Wry>,
     pub list: tauri::menu::MenuItem<tauri::Wry>,
     pub paste_summary: tauri::menu::MenuItem<tauri::Wry>,
@@ -815,6 +818,14 @@ fn apply_tray_activity(
                 .quick_thought
                 .set_enabled(!activity.blocks_capture_controls())
                 .ok();
+            handles
+                .paste_last_dictation
+                .set_enabled(!activity.is_active())
+                .ok();
+            handles
+                .reprocess_last_dictation
+                .set_enabled(!activity.is_active())
+                .ok();
             handles.stop.set_enabled(activity.is_active()).ok();
             handles
                 .stop
@@ -888,6 +899,15 @@ pub fn rebuild_localized_shell(app: &tauri::AppHandle) {
             }))
             .ok();
         h.note.set_text(tr("Add Note...")).ok();
+        h.copy_last_dictation
+            .set_text(tr("Copy Last Dictation"))
+            .ok();
+        h.paste_last_dictation
+            .set_text(tr("Paste Last Dictation"))
+            .ok();
+        h.reprocess_last_dictation
+            .set_text(tr("Reprocess Last Dictation"))
+            .ok();
         h.assistant.set_text(tr("Recall")).ok();
         h.list.set_text(tr("Open Meetings Folder")).ok();
         h.paste_summary.set_text(tr("Copy Latest Summary")).ok();
@@ -2023,6 +2043,13 @@ fn main() {
             let initial_recording = minutes_core::pid::status().recording;
             let startup_config = minutes_core::config::Config::load();
 
+            let recovered_dictations = commands::adopt_orphaned_dictation_audio();
+            if recovered_dictations > 0 {
+                eprintln!(
+                    "[dictation] adopted {recovered_dictations} interrupted capture(s) for recovery"
+                );
+            }
+
             #[cfg(target_os = "macos")]
             install_macos_terminate_hook(app.handle());
 
@@ -2283,6 +2310,27 @@ fn main() {
             let mic_mute_item_ref = mic_mute_item.clone();
             let sep = MenuItem::with_id(app, "sep1", "──────────", false, None::<&str>)?;
             let note_item = MenuItem::with_id(app, "note", tr("Add Note..."), true, None::<&str>)?;
+            let copy_last_dictation_item = MenuItem::with_id(
+                app,
+                "copy-last-dictation",
+                tr("Copy Last Dictation"),
+                true,
+                None::<&str>,
+            )?;
+            let paste_last_dictation_item = MenuItem::with_id(
+                app,
+                "paste-last-dictation",
+                tr("Paste Last Dictation"),
+                true,
+                None::<&str>,
+            )?;
+            let reprocess_last_dictation_item = MenuItem::with_id(
+                app,
+                "reprocess-last-dictation",
+                tr("Reprocess Last Dictation"),
+                true,
+                None::<&str>,
+            )?;
             let list_item =
                 MenuItem::with_id(app, "list", tr("Open Meetings Folder"), true, None::<&str>)?;
             let paste_summary_item = MenuItem::with_id(
@@ -2335,6 +2383,9 @@ fn main() {
                 &mic_mute_item,
                 &sep,
                 &note_item,
+                &copy_last_dictation_item,
+                &paste_last_dictation_item,
+                &reprocess_last_dictation_item,
                 &assistant_item,
                 &list_item,
             ])?;
@@ -2561,6 +2612,43 @@ fn main() {
                         "note" => {
                             show_note_window(app);
                         }
+                        "copy-last-dictation" => match commands::cmd_copy_last_dictation() {
+                            Ok(result) => commands::show_user_notification(
+                                app,
+                                "Last dictation",
+                                &result.message,
+                            ),
+                            Err(error) => {
+                                commands::show_user_notification(app, "Last dictation", &error)
+                            }
+                        },
+                        "paste-last-dictation" => match commands::cmd_paste_last_dictation() {
+                            Ok(result) => commands::show_user_notification(
+                                app,
+                                "Last dictation",
+                                &result.message,
+                            ),
+                            Err(error) => {
+                                commands::show_user_notification(app, "Last dictation", &error)
+                            }
+                        },
+                        "reprocess-last-dictation" => {
+                            let app_handle = app.clone();
+                            std::thread::spawn(
+                                move || match commands::cmd_reprocess_last_dictation() {
+                                    Ok(result) => commands::show_user_notification(
+                                        &app_handle,
+                                        "Recovered dictation",
+                                        &result.message,
+                                    ),
+                                    Err(error) => commands::show_user_notification(
+                                        &app_handle,
+                                        "Dictation recovery",
+                                        &error,
+                                    ),
+                                },
+                            );
+                        }
                         "assistant" => {
                             let pty_mgr = app.state::<commands::AppState>().pty_manager.clone();
                             let app_handle = app.clone();
@@ -2684,6 +2772,9 @@ fn main() {
                 sensitive: sensitive_item.clone(),
                 mic_mute: mic_mute_item.clone(),
                 note: note_item.clone(),
+                copy_last_dictation: copy_last_dictation_item.clone(),
+                paste_last_dictation: paste_last_dictation_item.clone(),
+                reprocess_last_dictation: reprocess_last_dictation_item.clone(),
                 assistant: assistant_item.clone(),
                 list: list_item.clone(),
                 paste_summary: paste_summary_item.clone(),
@@ -2953,7 +3044,14 @@ fn main() {
             commands::cmd_dictation_overlay_ready,
             commands::cmd_recent_dictations,
             commands::cmd_copy_dictation,
+            commands::cmd_copy_raw_dictation,
             commands::cmd_repaste_dictation,
+            commands::cmd_copy_last_dictation,
+            commands::cmd_restore_raw_last_dictation,
+            commands::cmd_paste_last_dictation,
+            commands::cmd_reprocess_dictation,
+            commands::cmd_reprocess_last_dictation,
+            commands::cmd_delete_dictation_audio,
             commands::cmd_set_shortcut,
             commands::cmd_shortcut_status,
             commands::cmd_suspend_shortcut,
@@ -3464,6 +3562,30 @@ mod tray_activity_tests {
                 && overlay.contains("cmd_download_model")
                 && overlay.contains("listen('download-model'"),
             "the recovery UI should expose one-click download and progress handling"
+        );
+    }
+
+    #[test]
+    fn dictation_overlay_interrupted_audio_recovery_is_reachable() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        assert!(
+            commands_rs.contains("publish_dictation_overlay_state(&app_clone, \"recoverable\")")
+                && commands_rs.contains("emit(\"dictation:recovery\"")
+                && commands_rs.contains("adopt_orphaned_dictation_audio"),
+            "interrupted and crash-left audio should become a visible recovery record"
+        );
+        assert!(
+            overlay.contains("case 'recoverable':")
+                && overlay.contains("Your words are safe")
+                && overlay.contains("cmd_reprocess_dictation")
+                && overlay.contains("Audio is still safe"),
+            "the overlay should offer a calm retry without implying the saved audio was lost"
         );
     }
 

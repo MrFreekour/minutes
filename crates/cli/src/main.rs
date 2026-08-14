@@ -16726,6 +16726,7 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
                     target_context: None,
                     file_path: result.file_path.clone(),
                     daily_note_appended: result.daily_note_appended,
+                    recovery_audio_path: None,
                 },
             );
             if let Err(error) = minutes_core::dictation_memory::append_record(record) {

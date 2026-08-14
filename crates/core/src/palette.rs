@@ -94,6 +94,10 @@ pub enum ActionId {
     // Dictation
     StartDictation,
     StopDictation,
+    CopyLastDictation,
+    PasteLastDictation,
+    RestoreRawLastDictation,
+    ReprocessLastDictation,
 
     // Navigation
     OpenLatestMeeting,
@@ -149,6 +153,10 @@ impl ActionId {
             ActionId::StopSensitiveMeeting => "stop-sensitive-meeting",
             ActionId::StartDictation => "start-dictation",
             ActionId::StopDictation => "stop-dictation",
+            ActionId::CopyLastDictation => "copy-last-dictation",
+            ActionId::PasteLastDictation => "paste-last-dictation",
+            ActionId::RestoreRawLastDictation => "restore-raw-last-dictation",
+            ActionId::ReprocessLastDictation => "reprocess-last-dictation",
             ActionId::OpenLatestMeeting => "open-latest-meeting",
             ActionId::OpenLatestMeetingFromToday => "open-latest-meeting-from-today",
             ActionId::OpenMeetingsFolder => "open-meetings-folder",
@@ -454,6 +462,42 @@ pub fn commands() -> Vec<Command> {
             keywords: &["stop", "end", "dictate"],
             section: Section::Dictation,
             visibility: Visibility::when_dictation(),
+            input: InputKind::None,
+        },
+        Command {
+            id: ActionId::CopyLastDictation,
+            title: "Copy last dictation",
+            description: "Copy the cleaned text from local history",
+            keywords: &["dictate", "recent", "clipboard", "recover"],
+            section: Section::Dictation,
+            visibility: Visibility::always(),
+            input: InputKind::None,
+        },
+        Command {
+            id: ActionId::PasteLastDictation,
+            title: "Paste last dictation",
+            description: "Insert the cleaned text at the current cursor",
+            keywords: &["dictate", "recent", "insert", "recover"],
+            section: Section::Dictation,
+            visibility: Visibility::when_idle(),
+            input: InputKind::None,
+        },
+        Command {
+            id: ActionId::RestoreRawLastDictation,
+            title: "Copy raw last dictation",
+            description: "Restore the original local transcript before cleanup",
+            keywords: &["dictate", "raw", "undo", "restore"],
+            section: Section::Dictation,
+            visibility: Visibility::always(),
+            input: InputKind::None,
+        },
+        Command {
+            id: ActionId::ReprocessLastDictation,
+            title: "Reprocess last dictation",
+            description: "Retry saved audio without speaking again",
+            keywords: &["dictate", "audio", "retry", "recover"],
+            section: Section::Dictation,
+            visibility: Visibility::when_idle(),
             input: InputKind::None,
         },
         // ── Navigation ───────────────────────────────────────────────
@@ -1207,13 +1251,12 @@ mod tests {
     #[test]
     fn registry_has_seed_commands() {
         let all = commands();
-        // The launch-cohesion slice adds two meeting-context commands
-        // on top of slice 2, and consent wave 1 adds the sensitive
-        // start/stop pair.
+        // The registry includes the original 24 backed commands plus four
+        // local dictation recovery actions.
         assert_eq!(
             all.len(),
-            24,
-            "registry should have exactly 24 commands with backing dispatchers"
+            28,
+            "registry should have exactly 28 commands with backing dispatchers"
         );
     }
 

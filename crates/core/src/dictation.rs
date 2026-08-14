@@ -335,6 +335,9 @@ pub struct DictationRunOptions {
     /// When set at the same time as `stop_flag`, discard the entire session:
     /// do not finalize audio, write history/files, or deliver text.
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Shared slot populated with the private incremental recovery WAV used by
+    /// the desktop. Callers retire it only after text delivery succeeds.
+    pub recovery_audio_path: Option<Arc<std::sync::Mutex<Option<PathBuf>>>>,
 }
 
 impl Default for DictationRunOptions {
@@ -342,6 +345,7 @@ impl Default for DictationRunOptions {
         Self {
             auto_stop_on_silence: true,
             cancel_flag: None,
+            recovery_audio_path: None,
         }
     }
 }
@@ -512,6 +516,16 @@ where
             Some(&stream.device_name),
         );
         tracing::info!(device = %stream.device_name, "dictation audio stream started");
+        let mut recovery_capture = if let Some(path_slot) = &options.recovery_audio_path {
+            let capture = crate::dictation_memory::DictationRecoveryCapture::create()?;
+            match path_slot.lock() {
+                Ok(mut slot) => *slot = Some(capture.path().to_path_buf()),
+                Err(poisoned) => *poisoned.into_inner() = Some(capture.path().to_path_buf()),
+            }
+            Some(capture)
+        } else {
+            None
+        };
         crate::events::append_event(crate::events::recording_started_event(
             None,
             "dictation",
@@ -560,6 +574,11 @@ where
                     // dictation file and daily note before delivering text.
                     final_utterance_samples.clear();
                     discard_accumulated_results(&mut accumulated_results);
+                    settle_recovery_capture(
+                        &mut recovery_capture,
+                        options.recovery_audio_path.as_ref(),
+                        false,
+                    )?;
                     on_event(DictationEvent::Cancelled);
                     break;
                 }
@@ -586,6 +605,11 @@ where
                     }
                     final_utterance_samples.clear();
                 }
+                settle_recovery_capture(
+                    &mut recovery_capture,
+                    options.recovery_audio_path.as_ref(),
+                    has_spoken,
+                )?;
                 flush_accumulated_results(config, &mut accumulated_results, on_event, on_result);
                 break;
             }
@@ -615,6 +639,11 @@ where
                     }
                     final_utterance_samples.clear();
                 }
+                settle_recovery_capture(
+                    &mut recovery_capture,
+                    options.recovery_audio_path.as_ref(),
+                    has_spoken,
+                )?;
                 flush_accumulated_results(config, &mut accumulated_results, on_event, on_result);
                 on_event(DictationEvent::Yielded);
                 break;
@@ -667,6 +696,10 @@ where
                     }
                 }
             };
+
+            if let Some(capture) = recovery_capture.as_mut() {
+                capture.append_samples(&chunk.samples)?;
+            }
 
             let vad_result = vad.process(chunk.rms);
             on_event(DictationEvent::AudioLevel(
@@ -776,6 +809,11 @@ where
                         silence_ms = total_silence_ms,
                         "silence timeout — ending dictation"
                     );
+                    settle_recovery_capture(
+                        &mut recovery_capture,
+                        options.recovery_audio_path.as_ref(),
+                        has_spoken,
+                    )?;
                     flush_accumulated_results(
                         config,
                         &mut accumulated_results,
@@ -787,6 +825,14 @@ where
             }
         }
 
+        // Stream/device failure paths break the loop without normal delivery.
+        // Keep speech-bearing audio recoverable; retire pure silence.
+        settle_recovery_capture(
+            &mut recovery_capture,
+            options.recovery_audio_path.as_ref(),
+            has_spoken,
+        )?;
+
         // Return model to cache for next session
         if let Some(context) = whisper_ctx {
             return_model_to_cache(context, model_name);
@@ -794,6 +840,29 @@ where
 
         Ok(())
     }
+}
+
+#[cfg(feature = "whisper")]
+fn settle_recovery_capture(
+    capture: &mut Option<crate::dictation_memory::DictationRecoveryCapture>,
+    path_slot: Option<&Arc<std::sync::Mutex<Option<PathBuf>>>>,
+    keep: bool,
+) -> Result<(), MinutesError> {
+    let Some(capture) = capture.take() else {
+        return Ok(());
+    };
+    if keep {
+        capture.finish()?;
+    } else {
+        capture.discard()?;
+        if let Some(path_slot) = path_slot {
+            match path_slot.lock() {
+                Ok(mut slot) => *slot = None,
+                Err(poisoned) => *poisoned.into_inner() = None,
+            }
+        }
+    }
+    Ok(())
 }
 
 fn should_end_after_silence(
@@ -996,7 +1065,6 @@ fn transcribe_utterance_with_parakeet(
     }
 }
 
-#[cfg(any(test, feature = "parakeet", target_os = "macos"))]
 fn normalize_final_dictation_text(text: &str) -> Option<String> {
     let text = text
         .lines()
@@ -1009,11 +1077,54 @@ fn normalize_final_dictation_text(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.trim().to_string())
 }
 
-#[cfg(any(test, feature = "parakeet", target_os = "macos"))]
 fn dictation_text_part(line: &str) -> &str {
     line.find("] ")
         .map(|index| &line[index + 2..])
         .unwrap_or(line)
+}
+
+/// Re-run the configured local dictation engine against a private recovery
+/// WAV. The path must belong to Minutes' owner-only recovery namespace.
+pub fn reprocess_recovery_audio(
+    audio_path: &std::path::Path,
+    config: &Config,
+) -> Result<DictationResult, MinutesError> {
+    let audio_path = crate::dictation_memory::validate_recovery_audio_path(audio_path)?;
+    let probe = crate::stem_probe::probe_and_repair(&audio_path).map_err(|error| {
+        MinutesError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    if !probe.is_usable() {
+        return Err(MinutesError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Recovery audio is {}.", probe.description()),
+        )));
+    }
+
+    let backend = dictation_final_backend(config);
+    let mut transcription_config = config.clone();
+    match backend {
+        DictationFinalBackend::Parakeet => {
+            transcription_config.transcription.engine = "parakeet".into();
+        }
+        DictationFinalBackend::Whisper | DictationFinalBackend::AppleSpeech => {
+            // Apple Speech's private-audio transport remains gated; its
+            // retained preference already resolves through sealed Whisper.
+            transcription_config.transcription.engine = "whisper".into();
+            transcription_config.transcription.model = config.dictation.model.clone();
+        }
+    }
+    let transcript = crate::transcribe::transcribe(&audio_path, &transcription_config)?;
+    let text = normalize_final_dictation_text(&transcript.text).ok_or_else(|| {
+        MinutesError::from(TranscribeError::EmptyTranscript(
+            transcription_config.transcription.min_words,
+        ))
+    })?;
+    let duration_secs = crate::dictation_memory::recovery_audio_duration_secs(&audio_path)?;
+    prepare_result(&text, duration_secs, backend, config).ok_or_else(|| {
+        MinutesError::from(TranscribeError::EmptyTranscript(
+            transcription_config.transcription.min_words,
+        ))
+    })
 }
 
 fn handle_utterance<G>(
@@ -1581,6 +1692,7 @@ mod tests {
         let shortcut_options = DictationRunOptions {
             auto_stop_on_silence: false,
             cancel_flag: None,
+            recovery_audio_path: None,
         };
         assert!(!should_end_after_silence(
             &shortcut_options,
