@@ -327,11 +327,13 @@ fn dictation_focus_debug(
         "target": target_context.map(|context| serde_json::json!({
             "appName": context.app_name.as_deref(),
             "bundleId": context.bundle_id.as_deref(),
+            "processId": context.process_id,
             "platform": context.platform.as_str(),
         })),
         "currentFrontmost": current_frontmost.map(|context| serde_json::json!({
             "appName": context.app_name.as_deref(),
             "bundleId": context.bundle_id.as_deref(),
+            "processId": context.process_id,
             "platform": context.platform,
         })),
         "mainWindowHidden": main_window_hidden,
@@ -12435,6 +12437,7 @@ mod tests {
             platform: "macos".into(),
             app_name: Some("private app name".into()),
             bundle_id: Some(bundle_id.into()),
+            process_id: Some(42),
         };
         assert_eq!(
             dictation_target_class(Some(&target("com.mitchellh.ghostty")), "minutes.dev"),

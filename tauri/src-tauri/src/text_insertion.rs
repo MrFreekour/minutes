@@ -90,6 +90,7 @@ pub struct ActiveTargetContext {
     pub platform: String,
     pub app_name: Option<String>,
     pub bundle_id: Option<String>,
+    pub process_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -650,6 +651,15 @@ fn verify_paste_target(
     expected: Option<&ActiveTargetContext>,
     actual: Option<&ActiveTargetContext>,
 ) -> Result<(), String> {
+    if let Some(expected_process_id) = expected.and_then(|context| context.process_id) {
+        let actual_process_id = actual
+            .and_then(|context| context.process_id)
+            .ok_or_else(|| "app changed, text is on the clipboard".to_string())?;
+        if actual_process_id != expected_process_id {
+            return Err("app changed, text is on the clipboard".into());
+        }
+    }
+
     let Some(expected_bundle_id) = expected
         .and_then(|context| context.bundle_id.as_deref())
         .filter(|value| !value.is_empty())
@@ -932,15 +942,18 @@ fn capture_target_context() -> Option<ActiveTargetContext> {
                 platform: "macos".into(),
                 app_name: identity.app_name,
                 bundle_id: identity.bundle_id,
+                process_id: (identity.process_id > 0).then_some(identity.process_id),
             });
         }
 
         let app_name = frontmost_app_name().ok();
         let bundle_id = frontmost_app_bundle_id().ok();
+        let process_id = frontmost_app_process_id().ok();
         Some(ActiveTargetContext {
             platform: "macos".into(),
             app_name,
             bundle_id,
+            process_id,
         })
     }
 
@@ -950,6 +963,7 @@ fn capture_target_context() -> Option<ActiveTargetContext> {
             platform: std::env::consts::OS.into(),
             app_name: None,
             bundle_id: None,
+            process_id: None,
         })
     }
 }
@@ -995,7 +1009,31 @@ fn frontmost_app_bundle_id() -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
+fn frontmost_app_process_id() -> Result<i32, String> {
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(
+            r#"tell application "System Events" to get unix id of first application process whose frontmost is true"#,
+        )
+        .output()
+        .map_err(|error| format!("Could not query frontmost app process id: {error}"))?;
+    if !output.status.success() {
+        return Err("Could not query frontmost app process id.".into());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "Frontmost app query returned no process id.".into())
+}
+
+#[cfg(target_os = "macos")]
 fn restore_macos_target_focus(context: &ActiveTargetContext) -> Result<(), String> {
+    if let Some(process_id) = context.process_id.filter(|pid| *pid > 0) {
+        return macos_ax::focus_process(process_id);
+    }
+
     if let Some(bundle_id) = context
         .bundle_id
         .as_deref()
@@ -1264,6 +1302,7 @@ mod macos_ax {
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
+        fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
         fn AXUIElementCreateSystemWide() -> AXUIElementRef;
         fn AXUIElementCopyAttributeValue(
             element: AXUIElementRef,
@@ -1279,6 +1318,8 @@ mod macos_ax {
 
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        #[link_name = "kCFBooleanTrue"]
+        static K_CF_BOOLEAN_TRUE: CFTypeRef;
         fn CFStringCreateWithCString(
             alloc: CFAllocatorRef,
             c_str: *const c_char,
@@ -1298,6 +1339,33 @@ mod macos_ax {
         let value = copy_string_attribute(focused.cast(), "AXValue");
         unsafe { CFRelease(focused) };
         value
+    }
+
+    pub fn focus_process(process_id: i32) -> Result<(), String> {
+        let application = unsafe { AXUIElementCreateApplication(process_id) };
+        if application.is_null() {
+            return Err("Could not create target app accessibility element.".into());
+        }
+        let frontmost_attr = match cfstring("AXFrontmost") {
+            Ok(attribute) => attribute,
+            Err(error) => {
+                unsafe { CFRelease(application) };
+                return Err(error);
+            }
+        };
+        let set_err =
+            unsafe { AXUIElementSetAttributeValue(application, frontmost_attr, K_CF_BOOLEAN_TRUE) };
+        unsafe {
+            CFRelease(frontmost_attr);
+            CFRelease(application);
+        }
+        if set_err == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not focus the captured app process (AX error {set_err})."
+            ))
+        }
     }
 
     pub fn insert_selected_text(text: &str) -> Result<(), String> {
@@ -1585,11 +1653,13 @@ mod tests {
             platform: "macos".into(),
             app_name: Some("Notes".into()),
             bundle_id: Some("com.apple.Notes".into()),
+            process_id: None,
         };
         let actual = ActiveTargetContext {
             platform: "macos".into(),
             app_name: Some("Slack".into()),
             bundle_id: Some("com.tinyspeck.slackmacgap".into()),
+            process_id: None,
         };
 
         let error = verify_paste_target(Some(&expected), Some(&actual)).unwrap_err();
@@ -1604,14 +1674,37 @@ mod tests {
             platform: "macos".into(),
             app_name: Some("Notes".into()),
             bundle_id: Some("com.apple.Notes".into()),
+            process_id: Some(42),
         };
         let actual = ActiveTargetContext {
             platform: "macos".into(),
             app_name: Some("Notes".into()),
             bundle_id: Some("com.apple.Notes".into()),
+            process_id: Some(42),
         };
 
         verify_paste_target(Some(&expected), Some(&actual)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paste_target_verification_blocks_matching_bundle_with_different_process() {
+        let expected = ActiveTargetContext {
+            platform: "macos".into(),
+            app_name: Some("TextEdit".into()),
+            bundle_id: Some("com.apple.TextEdit".into()),
+            process_id: Some(42),
+        };
+        let actual = ActiveTargetContext {
+            platform: "macos".into(),
+            app_name: Some("TextEdit".into()),
+            bundle_id: Some("com.apple.TextEdit".into()),
+            process_id: Some(43),
+        };
+
+        let error = verify_paste_target(Some(&expected), Some(&actual)).unwrap_err();
+
+        assert_eq!(error, "app changed, text is on the clipboard");
     }
 
     #[cfg(target_os = "macos")]

@@ -42,6 +42,7 @@ struct PlatformSnapshot {
 pub struct FrontmostAppIdentity {
     pub app_name: Option<String>,
     pub bundle_id: Option<String>,
+    pub process_id: i32,
 }
 
 pub fn capture_supported() -> bool {
@@ -419,6 +420,7 @@ mod platform {
             Ok(Some(FrontmostAppIdentity {
                 app_name,
                 bundle_id,
+                process_id: frontmost.processIdentifier(),
             }))
         })
     }
