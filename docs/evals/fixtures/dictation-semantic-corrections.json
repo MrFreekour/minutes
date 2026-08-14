@@ -1,0 +1,39 @@
+[
+  {"id":"genuine-time","category":"genuine_correction","text":"Meet at two — actually, three.","should_rewrite":true},
+  {"id":"genuine-day","category":"genuine_correction","text":"Send it Tuesday — actually, Wednesday.","should_rewrite":true},
+  {"id":"genuine-count","category":"genuine_correction","text":"Order four — actually, five.","should_rewrite":true},
+  {"id":"genuine-name","category":"genuine_correction","text":"Call Alex — actually, Sam.","should_rewrite":true},
+  {"id":"genuine-place","category":"genuine_correction","text":"Meet in Oakland — actually, Berkeley.","should_rewrite":true},
+  {"id":"genuine-color","category":"genuine_correction","text":"Use the blue version — actually, green.","should_rewrite":true},
+  {"id":"genuine-price","category":"genuine_correction","text":"The price is sixty — actually, seventy.","should_rewrite":true},
+  {"id":"genuine-date","category":"genuine_correction","text":"Book August tenth — actually, August twelfth.","should_rewrite":true},
+  {"id":"genuine-channel","category":"genuine_correction","text":"Send it by email — actually, Slack.","should_rewrite":true},
+  {"id":"genuine-version","category":"genuine_correction","text":"Deploy version four — actually, version five.","should_rewrite":true},
+  {"id":"genuine-duration","category":"genuine_correction","text":"Wait ten minutes — actually, fifteen minutes.","should_rewrite":true},
+  {"id":"genuine-owner","category":"genuine_correction","text":"Assign it to Priya — actually, Jordan.","should_rewrite":true},
+
+  {"id":"bare-ordinary-1","category":"intentional_actually","text":"I actually prefer the first option.","should_rewrite":false},
+  {"id":"bare-ordinary-2","category":"intentional_actually","text":"This is actually working now.","should_rewrite":false},
+  {"id":"bare-ordinary-3","category":"intentional_actually","text":"We actually have two separate problems.","should_rewrite":false},
+  {"id":"bare-ordinary-4","category":"intentional_actually","text":"The user may intentionally say actually.","should_rewrite":false},
+  {"id":"bare-ordinary-5","category":"intentional_actually","text":"Keep the word actually in the transcript.","should_rewrite":false},
+
+  {"id":"discourse-1","category":"discourse_marker","text":"Actually, I already sent it.","should_rewrite":false},
+  {"id":"discourse-2","category":"discourse_marker","text":"The room was quiet — actually, surprisingly quiet.","should_rewrite":false},
+  {"id":"discourse-3","category":"discourse_marker","text":"I thought it was done — actually, let me explain what happened.","should_rewrite":false},
+  {"id":"discourse-4","category":"discourse_marker","text":"That is useful — actually, it is the key insight.","should_rewrite":false},
+
+  {"id":"quoted-1","category":"quoted_speech","text":"She said, \"actually, three is enough.\"","should_rewrite":false},
+  {"id":"quoted-2","category":"quoted_speech","text":"Write the phrase — actually, three — exactly as spoken.","should_rewrite":false},
+  {"id":"quoted-3","category":"quoted_speech","text":"The title is \"Actually, Maybe\".","should_rewrite":false},
+
+  {"id":"technical-1","category":"technical_prose","text":"The value is actually three after normalization.","should_rewrite":false},
+  {"id":"technical-2","category":"technical_prose","text":"The branch is not deleted — actually, it remains reachable from the tag.","should_rewrite":false},
+  {"id":"technical-3","category":"technical_prose","text":"Latency is lower — actually, measurably lower at p95.","should_rewrite":false},
+  {"id":"technical-4","category":"technical_prose","text":"The flag is actually, in this implementation, optional.","should_rewrite":false},
+
+  {"id":"ambiguous-1","category":"multiple_antecedents","text":"Meet Alex at two — actually, three.","should_rewrite":false},
+  {"id":"ambiguous-2","category":"multiple_antecedents","text":"Move the red card above the blue one — actually, the green one.","should_rewrite":false},
+  {"id":"ambiguous-3","category":"multiple_antecedents","text":"Email Jordan the draft on Friday — actually, Monday.","should_rewrite":false},
+  {"id":"ambiguous-4","category":"multiple_antecedents","text":"Set retries to three and timeout to five — actually, seven.","should_rewrite":false}
+]

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_PATH="${1:-/Applications/Minutes Dev.app}"
-KEYCODE="${2:-57}"
+KEYCODE="${2:-}"
 OUTPUT_PATH="${3:-/tmp/minutes-hotkey-diagnostic.json}"
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -13,15 +13,31 @@ fi
 
 rm -f "$OUTPUT_PATH"
 
-open -n -a "$APP_PATH" --args \
-  --diagnose-hotkey \
-  --diagnose-hotkey-keycode "$KEYCODE" \
-  --diagnose-hotkey-output "$OUTPUT_PATH"
+APP_EXECUTABLE="$APP_PATH/Contents/MacOS/minutes-app"
+if [[ ! -x "$APP_EXECUTABLE" ]]; then
+  echo "Installed app executable not found: $APP_EXECUTABLE" >&2
+  exit 1
+fi
 
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if [[ -f "$OUTPUT_PATH" ]]; then
-    cat "$OUTPUT_PATH"
-    STATUS="$(python3 - <<'PY' "$OUTPUT_PATH"
+DIAGNOSTIC_ARGS=(
+  --diagnose-hotkey
+  --diagnose-hotkey-output "$OUTPUT_PATH"
+)
+if [[ -n "$KEYCODE" ]]; then
+  DIAGNOSTIC_ARGS+=(--diagnose-hotkey-keycode "$KEYCODE")
+fi
+
+set +e
+"$APP_EXECUTABLE" "${DIAGNOSTIC_ARGS[@]}"
+DIAGNOSTIC_EXIT=$?
+set -e
+
+if [[ ! -f "$OUTPUT_PATH" ]]; then
+  echo "Installed diagnostic exited without writing $OUTPUT_PATH" >&2
+  exit 1
+fi
+
+STATUS="$(python3 - <<'PY' "$OUTPUT_PATH"
 import json, sys
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -29,13 +45,8 @@ payload = json.loads(path.read_text())
 print(payload.get("probe", {}).get("status", "unknown"))
 PY
 )"
-    if [[ "$STATUS" == "active" ]]; then
-      exit 0
-    fi
-    exit 2
-  fi
-  sleep 1
-done
 
-echo "Timed out waiting for LaunchServices diagnostic output: $OUTPUT_PATH" >&2
-exit 1
+if [[ "$STATUS" == "active" && "$DIAGNOSTIC_EXIT" == "0" ]]; then
+  exit 0
+fi
+exit 2

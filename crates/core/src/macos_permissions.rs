@@ -289,10 +289,12 @@ pub fn accessibility_row() -> MacPermissionRow {
         required_for: &["desktop window titles", "browser/app context"],
         detail: match status {
             MacPermissionStatus::Granted => {
-                "Minutes can read focused app and window context when enabled.".into()
+                "Minutes can use focused app and window context when those features are enabled."
+                    .into()
             }
             MacPermissionStatus::Denied | MacPermissionStatus::NotDetermined => {
-                "Accessibility is not currently available to Minutes.".into()
+                "Focused app and window context is limited without Accessibility; meeting recording and dictation still work."
+                    .into()
             }
             MacPermissionStatus::NotNeeded => {
                 "This platform does not require a separate Accessibility permission.".into()
@@ -310,6 +312,10 @@ pub fn accessibility_row() -> MacPermissionRow {
         settings_url: platform::ACCESSIBILITY_SETTINGS_URL,
         can_request: true,
     })
+}
+
+pub fn accessibility_settings_url() -> Option<&'static str> {
+    platform::ACCESSIBILITY_SETTINGS_URL
 }
 
 pub fn automation_row() -> MacPermissionRow {
@@ -614,6 +620,23 @@ mod tests {
         assert!(kinds.contains(&MacPermissionKind::InputMonitoring));
         assert!(kinds.contains(&MacPermissionKind::Accessibility));
         assert!(kinds.contains(&MacPermissionKind::Automation));
+    }
+
+    #[test]
+    fn accessibility_truth_does_not_claim_system_events_paste_capability() {
+        let row = accessibility_row();
+        assert!(
+            row.optional,
+            "Accessibility is not required for meeting recording"
+        );
+        assert!(!row
+            .required_for
+            .iter()
+            .any(|feature| feature == "typing dictation at the cursor"));
+        assert_eq!(
+            accessibility_settings_url(),
+            platform::ACCESSIBILITY_SETTINGS_URL
+        );
     }
 
     #[test]

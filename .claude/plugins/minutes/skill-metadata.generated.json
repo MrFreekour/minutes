@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-21T09:27:30.416Z",
+  "generated_at": "2026-08-14T16:01:52.068Z",
   "source": {
     "plugin_json": ".claude/plugins/minutes/plugin.json",
     "packs_dir": ".claude/plugins/minutes/packs"
@@ -55,7 +55,7 @@
     {
       "skill_name": "minutes-recap",
       "title": "recap",
-      "description": "Generate a daily digest of today's meetings and voice memos — key decisions, action items, and themes across all recordings. Use when the user asks \"recap my day\", \"what happened in my meetings today\", \"daily summary\", \"what did I discuss today\", \"any action items from today\", or wants a consolidated view of the day's conversations.",
+      "description": "Generate a daily digest of today's policy-authorized meetings and voice memos — key decisions, action items, and themes across available recordings. Use when the user asks \"recap my day\", \"what happened in my meetings today\", \"daily summary\", \"what did I discuss today\", \"any action items from today\", or wants a consolidated view of the day's conversations.",
       "category": "capture",
       "surface_support": [
         "claude-code-plugin"
@@ -271,7 +271,7 @@
     {
       "skill_name": "minutes-graph",
       "title": "graph",
-      "description": "Policy-safe relationship intelligence across normal meeting history. Use for top contacts, relationship summaries, commitments, losing-touch signals, person profiles, topic research, or questions about people across meetings. Always use Minutes' native CLI projections; never build or read a durable graph cache.",
+      "description": "Policy-safe relationship rankings, commitments, aliases, person profiles, and topic research. Always use Minutes' bounded native CLI surfaces; never build or read a durable graph cache.",
       "category": "intelligence",
       "surface_support": [
         "claude-code-plugin"
@@ -336,19 +336,6 @@
       "pack_ids": [],
       "role_fit": [],
       "source_path": "skills/minutes-release-notes/SKILL.md"
-    },
-    {
-      "skill_name": "minutes-seo-wave",
-      "title": "seo wave",
-      "description": "Plan, build, and review one evidence-backed SEO content wave for the Minutes site, including SERP research, page inventory, design-system compliance, internal linking, generated LLM text, and a shipped-wave retro. Use when the user asks for an SEO wave, a group of comparison or use-case pages, a docs or resource hub expansion, or a coordinated batch of search landing pages.",
-      "category": "other",
-      "surface_support": [
-        "claude-code-plugin"
-      ],
-      "installable_via": "claude-code-plugin",
-      "pack_ids": [],
-      "role_fit": [],
-      "source_path": "skills/minutes-seo-wave/SKILL.md"
     }
   ]
 }

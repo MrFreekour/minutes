@@ -54,9 +54,12 @@ pub struct AppState {
     pub pty_manager: Arc<Mutex<crate::pty::PtyManager>>,
     pub dictation_active: Arc<AtomicBool>,
     pub dictation_stop_flag: Arc<AtomicBool>,
+    pub dictation_cancel_flag: Arc<AtomicBool>,
+    pub dictation_capture_style: Arc<Mutex<Option<HotkeyCaptureStyle>>>,
     pub dictation_focus_guard: Arc<Mutex<Option<DictationFocusGuard>>>,
     pub pending_dictation_target: Arc<Mutex<Option<PendingDictationTarget>>>,
     pub dictation_release_started_at: Arc<Mutex<Option<Instant>>>,
+    pub dictation_overlay: Arc<Mutex<DictationOverlaySnapshot>>,
     pub dictation_shortcut_enabled: Arc<AtomicBool>,
     pub dictation_shortcut: Arc<Mutex<String>>,
     pub live_transcript_active: Arc<AtomicBool>,
@@ -237,6 +240,39 @@ pub struct DictationFocusGuard {
     main_window_hidden: bool,
 }
 
+/// Backend-owned presentation state for the short-lived dictation overlay.
+///
+/// The overlay WebView is rebuilt for each session, so an event can arrive
+/// before its JavaScript listener is attached. The revision lets the frontend
+/// combine live events with a ready-time snapshot without an older invoke
+/// response overwriting newer state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationOverlaySnapshot {
+    pub state: String,
+    pub revision: u64,
+    pub capture_style: Option<HotkeyCaptureStyle>,
+}
+
+impl Default for DictationOverlaySnapshot {
+    fn default() -> Self {
+        Self {
+            state: "idle".into(),
+            revision: 0,
+            capture_style: None,
+        }
+    }
+}
+
+impl DictationOverlaySnapshot {
+    fn advance(&mut self, state: &str, capture_style: Option<HotkeyCaptureStyle>) -> Self {
+        self.state = state.into();
+        self.capture_style = capture_style;
+        self.revision = self.revision.saturating_add(1);
+        self.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingDictationTarget {
     captured_at: Instant,
@@ -291,11 +327,13 @@ fn dictation_focus_debug(
         "target": target_context.map(|context| serde_json::json!({
             "appName": context.app_name.as_deref(),
             "bundleId": context.bundle_id.as_deref(),
+            "processId": context.process_id,
             "platform": context.platform.as_str(),
         })),
         "currentFrontmost": current_frontmost.map(|context| serde_json::json!({
             "appName": context.app_name.as_deref(),
             "bundleId": context.bundle_id.as_deref(),
+            "processId": context.process_id,
             "platform": context.platform,
         })),
         "mainWindowHidden": main_window_hidden,
@@ -2589,7 +2627,8 @@ pub struct TerminalInfo {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HotkeyCaptureStyle {
     Hold,
     Locked,
@@ -11850,6 +11889,11 @@ pub fn cmd_get_settings() -> serde_json::Value {
             "accumulate": config.dictation.accumulate,
             "daily_note_log": config.dictation.daily_note_log,
             "cleanup_engine": config.dictation.cleanup_engine,
+            "voice_commands_enabled": config.dictation.voice_commands_enabled,
+            "voice_snippets": config.dictation.voice_snippets,
+            "history_policy": config.dictation.history_policy,
+            "insert_capability": crate::text_insertion::current_insertion_capability().as_str(),
+            "active_app_insertion_supported": crate::text_insertion::can_insert_into_apps(),
             "auto_paste": config.dictation.auto_paste,
             "silence_timeout_ms": config.dictation.silence_timeout_ms,
             "max_utterance_secs": config.dictation.max_utterance_secs,
@@ -11888,6 +11932,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
         },
         "ui": {
             "language": config.ui.language,
+            "dictation_hud_anchor": config.ui.dictation_hud_anchor,
         },
     })
 }
@@ -12214,6 +12259,15 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
             config.dictation.auto_paste = value == "true";
         }
         ("dictation", "cleanup_engine") => config.dictation.cleanup_engine = value.clone(),
+        ("dictation", "voice_commands_enabled") => {
+            config.dictation.voice_commands_enabled = value == "true";
+        }
+        ("dictation", "history_policy") => {
+            if !["recent", "off"].contains(&value.as_str()) {
+                return Err("history_policy must be recent or off".into());
+            }
+            config.dictation.history_policy = value.clone();
+        }
         ("dictation", "shortcut_enabled") => {
             config.dictation.shortcut_enabled = value == "true";
         }
@@ -12376,6 +12430,38 @@ mod tests {
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
+
+    #[test]
+    fn dictation_latency_target_classes_are_coarse() {
+        let target = |bundle_id: &str| crate::text_insertion::ActiveTargetContext {
+            platform: "macos".into(),
+            app_name: Some("private app name".into()),
+            bundle_id: Some(bundle_id.into()),
+            process_id: Some(42),
+        };
+        assert_eq!(
+            dictation_target_class(Some(&target("com.mitchellh.ghostty")), "minutes.dev"),
+            "terminal"
+        );
+        assert_eq!(
+            dictation_target_class(Some(&target("com.apple.TextEdit")), "minutes.dev"),
+            "document"
+        );
+        assert_eq!(
+            dictation_target_class(Some(&target("private.unknown.bundle")), "minutes.dev"),
+            "other_app"
+        );
+        assert_eq!(dictation_target_class(None, "minutes.dev"), "unknown");
+    }
+
+    #[test]
+    fn dictation_latency_rejects_reversed_phase_order() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(25);
+        assert_eq!(duration_between_ms(Some(now), Some(later)), Some(25));
+        assert_eq!(duration_between_ms(Some(later), Some(now)), None);
+        assert_eq!(duration_between_ms(None, Some(later)), None);
+    }
 
     /// Loopback enforcement must judge the destination, not the spelling.
     ///
@@ -12864,9 +12950,12 @@ mod tests {
             pty_manager: Arc::new(Mutex::new(crate::pty::PtyManager::default())),
             dictation_active: Arc::new(AtomicBool::new(false)),
             dictation_stop_flag: Arc::new(AtomicBool::new(false)),
+            dictation_cancel_flag: Arc::new(AtomicBool::new(false)),
+            dictation_capture_style: Arc::new(Mutex::new(None)),
             dictation_focus_guard: Arc::new(Mutex::new(None)),
             pending_dictation_target: Arc::new(Mutex::new(None)),
             dictation_release_started_at: Arc::new(Mutex::new(None)),
+            dictation_overlay: Arc::new(Mutex::new(DictationOverlaySnapshot::default())),
             dictation_shortcut_enabled: Arc::new(AtomicBool::new(false)),
             dictation_shortcut: Arc::new(Mutex::new("CmdOrCtrl+Shift+Space".into())),
             live_transcript_active: Arc::new(AtomicBool::new(false)),
@@ -12895,6 +12984,21 @@ mod tests {
             recall_chat_turn: Arc::new(Mutex::new(None)),
             recall_chat_next_turn_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[test]
+    fn dictation_overlay_snapshot_advances_for_replay_ordering() {
+        let mut snapshot = DictationOverlaySnapshot::default();
+
+        let starting = snapshot.advance("starting", Some(HotkeyCaptureStyle::Hold));
+        let listening = snapshot.advance("listening", Some(HotkeyCaptureStyle::Locked));
+
+        assert_eq!(starting.state, "starting");
+        assert_eq!(starting.revision, 1);
+        assert_eq!(starting.capture_style, Some(HotkeyCaptureStyle::Hold));
+        assert_eq!(listening.state, "listening");
+        assert_eq!(listening.revision, 2);
+        assert_eq!(listening.capture_style, Some(HotkeyCaptureStyle::Locked));
     }
 
     #[test]
@@ -13993,7 +14097,6 @@ mod tests {
         // future UI row.
         ("dictation", "accumulate"),
         ("dictation", "auto_paste"),
-        ("dictation", "cleanup_engine"),
         // NOTE: ("dictation", "shortcut_enabled") used to live here as a
         // vestigial arm (cmd_set_shortcut writes the field directly). It now
         // has a real caller via the central path — the round-trip persistence
@@ -18042,6 +18145,19 @@ pub fn cmd_start_dictation(
 }
 
 #[tauri::command]
+pub fn cmd_show_dictation_permission_help(app: tauri::AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Minutes could not open its dictation setup view.".to_string())?;
+    main.show()
+        .map_err(|error| format!("Minutes could not show its main window: {error}"))?;
+    main.set_focus()
+        .map_err(|error| format!("Minutes could not focus its main window: {error}"))?;
+    main.emit("minutes://show-dictation-permissions", ())
+        .map_err(|error| format!("Minutes could not open dictation setup: {error}"))
+}
+
+#[tauri::command]
 pub fn cmd_recent_dictations(
     limit: Option<usize>,
 ) -> Result<Vec<minutes_core::dictation_memory::DictationMemoryRecord>, String> {
@@ -18059,6 +18175,49 @@ pub fn cmd_copy_dictation(
     Ok(crate::text_insertion::insert_text(
         crate::text_insertion::TextInsertionRequest {
             text: record.cleaned_text,
+            mode: crate::text_insertion::TextInsertionMode::CopyOnly,
+            restore_clipboard: false,
+            clipboard_snapshot: None,
+            expected_target: None,
+        },
+    ))
+}
+
+#[tauri::command]
+pub fn cmd_copy_raw_dictation(
+    id: String,
+) -> Result<crate::text_insertion::TextInsertionResult, String> {
+    let record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    if record.raw_text.trim().is_empty() {
+        return Err("Raw text is not available yet. Reprocess the saved audio first.".into());
+    }
+    Ok(crate::text_insertion::insert_text(
+        crate::text_insertion::TextInsertionRequest {
+            text: record.raw_text,
+            mode: crate::text_insertion::TextInsertionMode::CopyOnly,
+            restore_clipboard: false,
+            clipboard_snapshot: None,
+            expected_target: None,
+        },
+    ))
+}
+
+#[tauri::command]
+pub fn cmd_copy_pre_command_dictation(
+    id: String,
+) -> Result<crate::text_insertion::TextInsertionResult, String> {
+    let record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    let text = record
+        .pre_command_text
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| "This dictation has no voice edit to undo.".to_string())?;
+    Ok(crate::text_insertion::insert_text(
+        crate::text_insertion::TextInsertionRequest {
+            text,
             mode: crate::text_insertion::TextInsertionMode::CopyOnly,
             restore_clipboard: false,
             clipboard_snapshot: None,
@@ -18091,6 +18250,124 @@ pub fn cmd_repaste_dictation(
     ))
 }
 
+fn latest_dictation_record() -> Result<minutes_core::dictation_memory::DictationMemoryRecord, String>
+{
+    minutes_core::dictation_memory::load_recent(1)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "There is no recent dictation yet.".to_string())
+}
+
+#[tauri::command]
+pub fn cmd_copy_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String> {
+    cmd_copy_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_restore_raw_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String>
+{
+    cmd_copy_raw_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_paste_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String> {
+    cmd_repaste_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_reprocess_dictation(
+    id: String,
+) -> Result<crate::text_insertion::TextInsertionResult, String> {
+    let mut record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    let recovery_path = record
+        .recovery_audio_path
+        .clone()
+        .ok_or_else(|| "This dictation has no saved recovery audio.".to_string())?;
+    let config = Config::load();
+    let expected_target = crate::text_insertion::capture_active_target_context();
+    let text_mode = minutes_core::dictation_context::infer_target_text_mode(
+        record
+            .target_context
+            .as_ref()
+            .and_then(|target| target.app_name.as_deref()),
+        None,
+        None,
+    );
+    let result = minutes_core::dictation::reprocess_recovery_audio_with_mode(
+        &recovery_path,
+        &config,
+        text_mode,
+    )
+    .map_err(|error| format!("Could not reprocess saved dictation audio: {error}"))?;
+    let insert_requested = dictation_should_insert(&config);
+    let clipboard_snapshot = if insert_requested && config.dictation.auto_paste_restore {
+        crate::text_insertion::read_clipboard().ok()
+    } else {
+        None
+    };
+    let insertion =
+        crate::text_insertion::insert_text(crate::text_insertion::TextInsertionRequest {
+            text: result.text.clone(),
+            mode: if insert_requested {
+                crate::text_insertion::TextInsertionMode::BestEffortVerified
+            } else {
+                crate::text_insertion::TextInsertionMode::CopyOnly
+            },
+            restore_clipboard: insert_requested && config.dictation.auto_paste_restore,
+            clipboard_snapshot,
+            expected_target: if insert_requested {
+                expected_target
+            } else {
+                None
+            },
+        });
+    let retained =
+        (!dictation_delivery_succeeded(&insertion, insert_requested)).then_some(recovery_path);
+    record.raw_text = result.raw_text;
+    record.cleaned_text = result.text;
+    record.pre_command_text = result.pre_command_text;
+    record.commands_applied = result.commands_applied;
+    record.duration_secs = result.duration_secs;
+    record.engine_id = result.engine_id;
+    record.engine_descriptor_version = result.engine_descriptor_version;
+    record.destination = result.destination;
+    record.insertion = dictation_insertion_memory(&insertion);
+    record.target_context = dictation_target_context(&insertion);
+    record.recovery_audio_path = retained;
+    minutes_core::dictation_memory::append_record(record)
+        .map_err(|error| format!("Could not update dictation history: {error}"))?;
+    Ok(insertion)
+}
+
+#[tauri::command]
+pub fn cmd_reprocess_last_dictation() -> Result<crate::text_insertion::TextInsertionResult, String>
+{
+    cmd_reprocess_dictation(latest_dictation_record()?.id)
+}
+
+#[tauri::command]
+pub fn cmd_delete_dictation_audio(id: String) -> Result<String, String> {
+    let mut record = minutes_core::dictation_memory::find_record(&id)
+        .map_err(|error| format!("Could not load dictation history: {error}"))?
+        .ok_or_else(|| "Dictation was not found in local history.".to_string())?;
+    let path = record
+        .recovery_audio_path
+        .take()
+        .ok_or_else(|| "This dictation has no saved recovery audio.".to_string())?;
+    minutes_core::dictation_memory::append_record(record)
+        .map_err(|error| format!("Could not update dictation history: {error}"))?;
+    if path.exists() {
+        return Err(
+            "The history was updated, but Minutes could not delete the saved audio. It will be offered for recovery again on the next launch."
+                .into(),
+        );
+    }
+    Ok("Deleted the saved recovery audio. Text history was kept.".into())
+}
+
 #[tauri::command]
 pub fn cmd_stop_dictation(state: tauri::State<AppState>) -> Result<String, String> {
     if state.dictation_active.load(Ordering::Relaxed) {
@@ -18099,6 +18376,19 @@ pub fn cmd_stop_dictation(state: tauri::State<AppState>) -> Result<String, Strin
         }
         state.dictation_stop_flag.store(true, Ordering::Relaxed);
         return Ok("Dictation stop requested".into());
+    }
+    if dictation_pid_active() {
+        return Err("Dictation is running in another Minutes process.".into());
+    }
+    Err("Dictation is not active".into())
+}
+
+#[tauri::command]
+pub fn cmd_cancel_dictation(state: tauri::State<AppState>) -> Result<String, String> {
+    if state.dictation_active.load(Ordering::Relaxed) {
+        state.dictation_cancel_flag.store(true, Ordering::Relaxed);
+        state.dictation_stop_flag.store(true, Ordering::Relaxed);
+        return Ok("Dictation cancellation requested".into());
     }
     if dictation_pid_active() {
         return Err("Dictation is running in another Minutes process.".into());
@@ -18116,10 +18406,11 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         win.destroy().ok();
     }
 
-    // Position: bottom-center HUD, anchored to the current monitor work area.
+    // Position from a remembered edge anchor. Top-center is the default so
+    // the HUD avoids the Dock, terminal prompt, and common send controls.
     let width = 320.0;
     let height = 88.0;
-    let inset_y = 16.0;
+    let anchor = Config::load().ui.dictation_hud_anchor;
 
     let monitor = app
         .get_webview_window("main")
@@ -18136,12 +18427,17 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         let work_y = work_area.position.y as f64 / scale;
         let work_width = work_area.size.width as f64 / scale;
         let work_height = work_area.size.height as f64 / scale;
-        (
-            work_x + (work_width - width) / 2.0,
-            work_y + work_height - height - inset_y,
+        dictation_hud_anchor_position(
+            &anchor,
+            work_x,
+            work_y,
+            work_width,
+            work_height,
+            width,
+            height,
         )
     } else {
-        ((1440.0 - width) / 2.0, 900.0 - height - inset_y)
+        dictation_hud_anchor_position(&anchor, 0.0, 0.0, 1440.0, 900.0, width, height)
     };
 
     match tauri::WebviewWindowBuilder::new(
@@ -18159,12 +18455,87 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
     .content_protected(Config::load().privacy.hide_from_screen_share)
     .always_on_top(true)
     .focused(false)
+    .focusable(false)
     .skip_taskbar(true)
     .build()
     {
         Ok(_) => eprintln!("[dictation] overlay shown"),
         Err(e) => eprintln!("[dictation] overlay failed: {}", e),
     }
+}
+
+fn dictation_hud_anchor_position(
+    anchor: &str,
+    work_x: f64,
+    work_y: f64,
+    work_width: f64,
+    work_height: f64,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let inset = 16.0;
+    let x = match anchor {
+        "top_left" | "bottom_left" => work_x + inset,
+        "top_right" | "bottom_right" => work_x + work_width - width - inset,
+        _ => work_x + (work_width - width) / 2.0,
+    };
+    let y = if anchor.starts_with("bottom_") {
+        work_y + work_height - height - inset
+    } else {
+        work_y + inset
+    };
+    (
+        x.clamp(work_x, work_x + (work_width - width).max(0.0)),
+        y.clamp(work_y, work_y + (work_height - height).max(0.0)),
+    )
+}
+
+fn nearest_dictation_hud_anchor(
+    center_x: f64,
+    center_y: f64,
+    work_x: f64,
+    work_y: f64,
+    work_width: f64,
+    work_height: f64,
+) -> &'static str {
+    let horizontal = ((center_x - work_x) / work_width.max(1.0)).clamp(0.0, 1.0);
+    let vertical = ((center_y - work_y) / work_height.max(1.0)).clamp(0.0, 1.0);
+    match (vertical >= 0.5, horizontal) {
+        (false, x) if x < 1.0 / 3.0 => "top_left",
+        (false, x) if x > 2.0 / 3.0 => "top_right",
+        (false, _) => "top_center",
+        (true, x) if x < 1.0 / 3.0 => "bottom_left",
+        (true, x) if x > 2.0 / 3.0 => "bottom_right",
+        (true, _) => "bottom_center",
+    }
+}
+
+#[tauri::command]
+pub fn cmd_remember_dictation_hud_position(app: tauri::AppHandle) -> Result<String, String> {
+    let window = app
+        .get_webview_window("dictation-overlay")
+        .ok_or_else(|| "Dictation HUD is not open".to_string())?;
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or_else(|| "Could not identify the Dictation HUD monitor".to_string())?;
+    let scale = monitor.scale_factor();
+    let work_area = monitor.work_area();
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let work_x = work_area.position.x as f64 / scale;
+    let work_y = work_area.position.y as f64 / scale;
+    let work_width = work_area.size.width as f64 / scale;
+    let work_height = work_area.size.height as f64 / scale;
+    let center_x = position.x as f64 / scale + size.width as f64 / scale / 2.0;
+    let center_y = position.y as f64 / scale + size.height as f64 / scale / 2.0;
+    let anchor =
+        nearest_dictation_hud_anchor(center_x, center_y, work_x, work_y, work_width, work_height);
+    let mut config = Config::load();
+    config.ui.dictation_hud_anchor = anchor.into();
+    config.save().map_err(|error| error.to_string())?;
+    Ok(anchor.into())
 }
 
 // ── Copilot Coach HUD commands ──────────────────────────────
@@ -19020,6 +19391,13 @@ struct DictationActiveGuard {
 impl Drop for DictationActiveGuard {
     fn drop(&mut self) {
         self.active.store(false, Ordering::SeqCst);
+        if let Some(state) = self.app.try_state::<AppState>() {
+            state.dictation_cancel_flag.store(false, Ordering::Relaxed);
+            match state.dictation_capture_style.lock() {
+                Ok(mut style) => *style = None,
+                Err(poisoned) => *poisoned.into_inner() = None,
+            }
+        }
         crate::sync_tray_state(&self.app);
     }
 }
@@ -19673,11 +20051,19 @@ fn dictation_target_context(
 fn record_dictation_memory(
     result: &minutes_core::dictation::DictationResult,
     insertion: &crate::text_insertion::TextInsertionResult,
+    recovery_audio_path: Option<PathBuf>,
 ) {
+    // Disabling routine history must never hide a failed capture. Recoverable
+    // audio remains listed until the user resolves or deletes it explicitly.
+    if Config::load().dictation.history_policy == "off" && recovery_audio_path.is_none() {
+        return;
+    }
     let record = minutes_core::dictation_memory::DictationMemoryRecord::new(
         minutes_core::dictation_memory::DictationMemoryInput {
             raw_text: result.raw_text.clone(),
             cleaned_text: result.text.clone(),
+            pre_command_text: result.pre_command_text.clone(),
+            commands_applied: result.commands_applied.clone(),
             duration_secs: result.duration_secs,
             engine_id: result.engine_id.clone(),
             engine_descriptor_version: result.engine_descriptor_version.clone(),
@@ -19688,11 +20074,131 @@ fn record_dictation_memory(
             target_context: dictation_target_context(insertion),
             file_path: result.file_path.clone(),
             daily_note_appended: result.daily_note_appended,
+            recovery_audio_path,
         },
     );
     if let Err(error) = minutes_core::dictation_memory::append_record(record) {
         tracing::warn!(error = %error, "failed to persist dictation memory record");
     }
+}
+
+fn retained_recovery_audio_after_delivery(
+    path: Option<PathBuf>,
+    insertion: &crate::text_insertion::TextInsertionResult,
+    insert_requested: bool,
+) -> Option<PathBuf> {
+    let delivered = dictation_delivery_succeeded(insertion, insert_requested);
+    let path = path?;
+    if !delivered {
+        return Some(path);
+    }
+    match minutes_core::dictation_memory::retire_recovery_audio(&path) {
+        Ok(()) => None,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not retire delivered dictation recovery audio");
+            Some(path)
+        }
+    }
+}
+
+fn dictation_delivery_succeeded(
+    insertion: &crate::text_insertion::TextInsertionResult,
+    insert_requested: bool,
+) -> bool {
+    if insert_requested {
+        matches!(
+            insertion.outcome,
+            crate::text_insertion::InsertOutcome::Typed
+                | crate::text_insertion::InsertOutcome::Pasted
+        )
+    } else {
+        insertion.outcome == crate::text_insertion::InsertOutcome::Copied
+    }
+}
+
+fn record_recoverable_dictation_audio(
+    path: PathBuf,
+    config: &Config,
+    target: Option<&crate::text_insertion::ActiveTargetContext>,
+    message: String,
+) -> Option<minutes_core::dictation_memory::DictationMemoryRecord> {
+    let duration_secs = minutes_core::dictation_memory::recovery_audio_duration_secs(&path).ok()?;
+    if duration_secs < 0.1 {
+        if let Err(error) = minutes_core::dictation_memory::retire_recovery_audio(&path) {
+            tracing::warn!(error = %error, "could not retire empty dictation recovery audio");
+        }
+        return None;
+    }
+    let record = minutes_core::dictation_memory::DictationMemoryRecord::new(
+        minutes_core::dictation_memory::DictationMemoryInput {
+            raw_text: String::new(),
+            cleaned_text: String::new(),
+            pre_command_text: None,
+            commands_applied: Vec::new(),
+            duration_secs,
+            engine_id: format!("{}:{}", config.dictation.backend, config.dictation.model),
+            engine_descriptor_version: Some(config.dictation.model.clone()),
+            vocabulary_mode: None,
+            vocabulary_used: Vec::new(),
+            destination: config.dictation.destination.clone(),
+            insertion: minutes_core::dictation_memory::DictationInsertionMemory {
+                outcome: "recoverable".into(),
+                method: "recovery_audio".into(),
+                verified: false,
+                clipboard_restored: false,
+                message,
+            },
+            target_context: target.map(|context| {
+                minutes_core::dictation_memory::DictationTargetContext {
+                    platform: context.platform.clone(),
+                    app_name: context.app_name.clone(),
+                }
+            }),
+            file_path: None,
+            daily_note_appended: false,
+            recovery_audio_path: Some(path),
+        },
+    );
+    if let Err(error) = minutes_core::dictation_memory::append_record(record.clone()) {
+        tracing::warn!(error = %error, "failed to persist recoverable dictation record");
+        return None;
+    }
+    Some(record)
+}
+
+/// Adopt crash-left recovery WAVs into the visible dictation history. This is
+/// deliberately run at desktop startup, before a new dictation can create an
+/// active file, so an in-progress capture is never mistaken for an orphan.
+pub fn adopt_orphaned_dictation_audio() -> usize {
+    if dictation_pid_active() {
+        // Another Minutes process owns the capture lease; its recovery WAV is
+        // live, not orphaned. The next clean launch will adopt it if needed.
+        return 0;
+    }
+    let paths = match minutes_core::dictation_memory::orphaned_recovery_audio() {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not scan for orphaned dictation recovery audio");
+            return 0;
+        }
+    };
+    if paths.is_empty() {
+        return 0;
+    }
+    let config = Config::load();
+    paths
+        .into_iter()
+        .filter(|path| {
+            record_recoverable_dictation_audio(
+                path.clone(),
+                &config,
+                None,
+                "Minutes closed before this dictation finished. Its private audio is ready to reprocess."
+                    .into(),
+            )
+            .is_some()
+        })
+        .count()
 }
 
 fn dictation_should_insert(config: &Config) -> bool {
@@ -19705,7 +20211,7 @@ fn dictation_should_insert(config: &Config) -> bool {
 
 fn dictation_insert_fallback_message(config: &Config) -> Option<&'static str> {
     if dictation_should_insert(config) && !crate::text_insertion::can_insert_into_apps() {
-        Some(crate::text_insertion::insertion_permission_fallback_message())
+        Some(crate::text_insertion::insertion_unavailable_message())
     } else {
         None
     }
@@ -19719,6 +20225,174 @@ fn take_dictation_release_started_at(state: &AppState) -> Option<Instant> {
         .and_then(|mut released_at| released_at.take())
 }
 
+#[derive(Debug)]
+struct DictationLatencyTrace {
+    started_at: Instant,
+    target_class: &'static str,
+    overlay_at: Option<Instant>,
+    engine_warm: Option<bool>,
+    engine_ready_at: Option<Instant>,
+    listening_at: Option<Instant>,
+    speech_started_at: Option<Instant>,
+    speech_ended_at: Option<Instant>,
+    first_partial_at: Option<Instant>,
+    final_ready_at: Option<Instant>,
+}
+
+impl DictationLatencyTrace {
+    fn new(started_at: Instant, target_class: &'static str) -> Self {
+        Self {
+            started_at,
+            target_class,
+            overlay_at: None,
+            engine_warm: None,
+            engine_ready_at: None,
+            listening_at: None,
+            speech_started_at: None,
+            speech_ended_at: None,
+            first_partial_at: None,
+            final_ready_at: None,
+        }
+    }
+
+    fn elapsed_ms(&self, at: Option<Instant>) -> Option<u64> {
+        at.and_then(|at| at.checked_duration_since(self.started_at))
+            .map(|duration| duration.as_millis() as u64)
+    }
+}
+
+fn dictation_target_class(
+    target: Option<&crate::text_insertion::ActiveTargetContext>,
+    minutes_bundle_id: &str,
+) -> &'static str {
+    let bundle_id = target.and_then(|target| target.bundle_id.as_deref());
+    if bundle_id == Some(minutes_bundle_id) {
+        "minutes"
+    } else if bundle_id.is_some_and(|bundle| {
+        bundle.contains("ghostty")
+            || bundle.contains("Terminal")
+            || bundle.contains("terminal")
+            || bundle.contains("iterm")
+    }) {
+        "terminal"
+    } else if bundle_id.is_some_and(|bundle| {
+        bundle.contains("TextEdit")
+            || bundle.contains("Pages")
+            || bundle.contains("word")
+            || bundle.contains("notion")
+    }) {
+        "document"
+    } else if bundle_id.is_some_and(|bundle| {
+        bundle.contains("Chrome")
+            || bundle.contains("Safari")
+            || bundle.contains("firefox")
+            || bundle.contains("arc")
+    }) {
+        "browser"
+    } else if bundle_id.is_some() {
+        "other_app"
+    } else {
+        "unknown"
+    }
+}
+
+fn duration_between_ms(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    let (Some(start), Some(end)) = (start, end) else {
+        return None;
+    };
+    end.checked_duration_since(start)
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn mark_dictation_latency_event(
+    trace: &Arc<Mutex<DictationLatencyTrace>>,
+    event: &minutes_core::dictation::DictationEvent,
+) {
+    let Ok(mut trace) = trace.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    use minutes_core::dictation::DictationEvent;
+    match event {
+        DictationEvent::EngineReady { warm } => {
+            trace.engine_warm = Some(*warm);
+            trace.engine_ready_at.get_or_insert(now);
+        }
+        DictationEvent::Listening => {
+            trace.listening_at.get_or_insert(now);
+        }
+        DictationEvent::Accumulating => {
+            trace.speech_started_at.get_or_insert(now);
+        }
+        DictationEvent::Processing => {
+            trace.speech_ended_at.get_or_insert(now);
+        }
+        DictationEvent::PartialText(_) => {
+            trace.first_partial_at.get_or_insert(now);
+        }
+        DictationEvent::Success => {
+            trace.final_ready_at.get_or_insert(now);
+        }
+        DictationEvent::AudioLevel(_)
+        | DictationEvent::SilenceCountdown { .. }
+        | DictationEvent::Error
+        | DictationEvent::ModelMissing { .. }
+        | DictationEvent::Cancelled
+        | DictationEvent::Yielded => {}
+    }
+}
+
+fn log_dictation_latency(
+    trace: &Arc<Mutex<DictationLatencyTrace>>,
+    insertion: &crate::text_insertion::TextInsertionResult,
+    release_started_at: Option<Instant>,
+    insert_started_at: Instant,
+) {
+    let Ok(trace) = trace.lock() else {
+        return;
+    };
+    let visible_at = insertion
+        .timing
+        .visible_ms
+        .map(|visible_ms| insert_started_at + Duration::from_millis(visible_ms));
+    let verification_at =
+        Some(insert_started_at + Duration::from_millis(insertion.timing.total_ms));
+    let total_ms = verification_at
+        .and_then(|at| at.checked_duration_since(trace.started_at))
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+
+    minutes_core::logging::log_step(
+        "dictation_latency",
+        "dictation",
+        total_ms,
+        serde_json::json!({
+            "press_to_hud_ms": trace.elapsed_ms(trace.overlay_at),
+            "press_to_engine_ready_ms": trace.elapsed_ms(trace.engine_ready_at),
+            "press_to_listening_ms": trace.elapsed_ms(trace.listening_at),
+            "speech_to_first_partial_ms": duration_between_ms(trace.speech_started_at, trace.first_partial_at),
+            "speech_end_to_final_ms": duration_between_ms(trace.speech_ended_at, trace.final_ready_at),
+            "speech_end_to_visible_ms": duration_between_ms(trace.speech_ended_at, visible_at),
+            "release_to_final_ms": duration_between_ms(release_started_at, trace.final_ready_at),
+            "release_to_visible_ms": duration_between_ms(release_started_at, visible_at),
+            "final_to_visible_ms": duration_between_ms(trace.final_ready_at, visible_at),
+            "final_to_verification_complete_ms": duration_between_ms(trace.final_ready_at, verification_at),
+            "visible_insert_operation_ms": insertion.timing.visible_ms,
+            "clipboard_restore_ms": insertion.timing.clipboard_restore_ms,
+            "verification_ms": insertion.timing.verification_ms,
+            "insertion_total_ms": insertion.timing.total_ms,
+            "insertion_diagnostic": insertion.timing.diagnostic,
+            "session_total_ms": total_ms,
+            "engine_warm": trace.engine_warm,
+            "target_class": trace.target_class,
+            "outcome": insertion.outcome.as_str(),
+            "method": insertion.method.as_str(),
+            "verified": insertion.verified,
+            "clipboard_restored": insertion.clipboard_restored,
+        }),
+    );
+}
+
 fn log_dictation_insert(
     result: &minutes_core::dictation::DictationResult,
     insertion: &crate::text_insertion::TextInsertionResult,
@@ -19728,14 +20402,9 @@ fn log_dictation_insert(
     let release_to_inserted_ms = release_started_at.map(|started| started.elapsed().as_millis());
     let duration_ms =
         release_to_inserted_ms.unwrap_or_else(|| insert_started_at.elapsed().as_millis());
-    let file_label = result
-        .file_path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
     minutes_core::logging::log_step(
         "dictation_insert",
-        &file_label,
+        "dictation",
         duration_ms as u64,
         serde_json::json!({
             "release_to_inserted_ms": release_to_inserted_ms,
@@ -19749,7 +20418,27 @@ fn log_dictation_insert(
     );
 }
 
+fn remember_dictation_target_focus(
+    app: &tauri::AppHandle,
+    target_context: &Option<crate::text_insertion::ActiveTargetContext>,
+) {
+    let is_minutes = target_context
+        .as_ref()
+        .and_then(|context| context.bundle_id.as_deref())
+        == Some(app.config().identifier.as_str());
+    if !is_minutes {
+        return;
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        // Creating the non-focused overlay can still make WebKit blur the active
+        // DOM control. Retain the exact in-app target before the overlay exists.
+        let _ = window.eval("window.__minutesDictationFocusTarget = document.activeElement;");
+    }
+}
+
 fn restore_dictation_target_focus(
+    app: &tauri::AppHandle,
     target_context: &Option<crate::text_insertion::ActiveTargetContext>,
 ) {
     let Some(context) = target_context else {
@@ -19770,6 +20459,15 @@ fn restore_dictation_target_focus(
             Some(error.as_str()),
         );
         return;
+    }
+
+    let is_minutes = context.bundle_id.as_deref() == Some(app.config().identifier.as_str());
+    if is_minutes {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.eval(
+                "(() => { const target = window.__minutesDictationFocusTarget; if (target?.isConnected && typeof target.focus === 'function') target.focus({ preventScroll: true }); })();",
+            );
+        }
     }
 
     // Give the window server a beat before clipboard paste automation or overlay
@@ -19860,13 +20558,59 @@ fn finish_dictation_overlay_lifecycle(app: &tauri::AppHandle, guard: Option<Dict
         );
     }
 
-    restore_dictation_target_focus(&guard.target_context);
+    restore_dictation_target_focus(app, &guard.target_context);
     dictation_focus_debug(
         "finish_overlay_lifecycle_done",
         guard.target_context.as_ref(),
         Some(guard.main_window_hidden),
         None,
     );
+}
+
+fn publish_dictation_overlay_state(app: &tauri::AppHandle, state: &str) {
+    let snapshot = {
+        let app_state = app.state::<AppState>();
+        let capture_style = *app_state
+            .dictation_capture_style
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut snapshot = app_state
+            .dictation_overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshot.advance(state, capture_style)
+    };
+
+    // Keep the existing lightweight event for command-palette refreshes while
+    // the overlay consumes the revisioned, replayable contract.
+    app.emit("dictation:state", state).ok();
+    app.emit("dictation:overlay", snapshot).ok();
+}
+
+/// Latch an already-running hold gesture into tap-to-lock mode and publish a
+/// fresh snapshot even though the underlying capture state did not change.
+pub fn lock_active_dictation_capture(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    match state.dictation_capture_style.lock() {
+        Ok(mut style) => *style = Some(HotkeyCaptureStyle::Locked),
+        Err(poisoned) => *poisoned.into_inner() = Some(HotkeyCaptureStyle::Locked),
+    }
+    let current = state
+        .dictation_overlay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .state
+        .clone();
+    publish_dictation_overlay_state(app, &current);
+}
+
+#[tauri::command]
+pub fn cmd_dictation_overlay_ready(state: tauri::State<AppState>) -> DictationOverlaySnapshot {
+    state
+        .dictation_overlay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 #[tauri::command]
@@ -19894,6 +20638,7 @@ fn start_dictation_session(
     app: &tauri::AppHandle,
     capture_style: Option<HotkeyCaptureStyle>,
 ) -> Result<String, String> {
+    let dictation_pressed_at = Instant::now();
     let state = app.state::<AppState>();
 
     // Acquire BEFORE any side effects (overlay, focus capture, emits). The
@@ -19921,6 +20666,22 @@ fn start_dictation_session(
 
     let dictation_target_context = take_pending_dictation_target(&state)
         .or_else(crate::text_insertion::capture_active_target_context);
+    let dictation_text_mode = minutes_core::dictation_context::infer_target_text_mode(
+        dictation_target_context
+            .as_ref()
+            .and_then(|target| target.app_name.as_deref()),
+        dictation_target_context
+            .as_ref()
+            .and_then(|target| target.bundle_id.as_deref()),
+        Some(app.config().identifier.as_str()),
+    );
+    let latency_trace = Arc::new(Mutex::new(DictationLatencyTrace::new(
+        dictation_pressed_at,
+        dictation_target_class(
+            dictation_target_context.as_ref(),
+            app.config().identifier.as_str(),
+        ),
+    )));
     dictation_focus_debug(
         "session_start_target_captured",
         dictation_target_context.as_ref(),
@@ -19937,17 +20698,14 @@ fn start_dictation_session(
         Ok(mut guard) => *guard = Some(focus_guard.clone()),
         Err(poisoned) => *poisoned.into_inner() = Some(focus_guard.clone()),
     }
-    show_dictation_overlay(app);
-    dictation_focus_debug(
-        "overlay_shown",
-        dictation_target_context.as_ref(),
-        Some(main_window_hidden),
-        None,
-    );
-    restore_dictation_target_focus(&dictation_target_context);
-    app.emit("dictation:state", "loading").ok();
-
+    remember_dictation_target_focus(app, &dictation_target_context);
+    match state.dictation_capture_style.lock() {
+        Ok(mut style) => *style = capture_style,
+        Err(poisoned) => *poisoned.into_inner() = capture_style,
+    }
+    publish_dictation_overlay_state(app, "starting");
     state.dictation_stop_flag.store(false, Ordering::Relaxed);
+    state.dictation_cancel_flag.store(false, Ordering::Relaxed);
     if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
         *released_at = None;
     }
@@ -19955,19 +20713,24 @@ fn start_dictation_session(
     // tray so the menu reflects the just-started session.
     crate::sync_tray_state(app);
 
-    let _ = capture_style;
-
     let app_clone = app.clone();
     let stop_flag = Arc::clone(&state.dictation_stop_flag);
+    let cancel_flag = Arc::clone(&state.dictation_cancel_flag);
     let final_output_emitted = Arc::new(AtomicBool::new(false));
     let model_missing_emitted = Arc::new(AtomicBool::new(false));
+    let recovery_audio_path = Arc::new(Mutex::new(None::<PathBuf>));
     let dictation_target_context_for_thread = dictation_target_context.clone();
+    let latency_trace_for_thread = Arc::clone(&latency_trace);
     std::thread::spawn(move || {
         // Move the tray guard into the thread. When this closure exits
         // (normal return, error, or panic) the guard drops, which stores
         // `dictation_active = false` and re-syncs the tray (idle).
         let _tray_guard = tray_guard;
         let mut config = Config::load();
+        // Desktop dictation is delivered atomically at the user's finishing
+        // gesture. Buffer utterances so Escape can still discard the whole
+        // session even after an ordinary thinking pause finalized one segment.
+        config.dictation.accumulate = true;
         // Re-validate the pinned input device for mid-session
         // disconnects (#189). In-memory only; startup-side persistence
         // is in main.rs.
@@ -19982,17 +20745,33 @@ fn start_dictation_session(
         let final_output_for_results = Arc::clone(&final_output_emitted);
         let model_missing_for_events = Arc::clone(&model_missing_emitted);
         let dictation_target_context_for_results = dictation_target_context_for_thread.clone();
+        let latency_trace_for_events = Arc::clone(&latency_trace_for_thread);
+        let latency_trace_for_results = Arc::clone(&latency_trace_for_thread);
+        let recovery_audio_for_run = Arc::clone(&recovery_audio_path);
+        let recovery_audio_for_results = Arc::clone(&recovery_audio_path);
 
-        let result = minutes_core::dictation::run(
+        let result = minutes_core::dictation::run_with_options(
             stop_flag,
             &config,
+            minutes_core::dictation::DictationRunOptions {
+                auto_stop_on_silence: capture_style.is_none(),
+                cancel_flag: Some(cancel_flag),
+                recovery_audio_path: Some(recovery_audio_for_run),
+                text_mode: dictation_text_mode,
+            },
             move |event| {
                 use minutes_core::dictation::DictationEvent;
+                mark_dictation_latency_event(&latency_trace_for_events, &event);
                 let state_str = match &event {
+                    DictationEvent::EngineReady { .. } => "",
                     DictationEvent::Listening => "listening",
                     DictationEvent::Accumulating => "accumulating",
                     DictationEvent::Processing => "processing",
-                    DictationEvent::PartialText(_) => "partial",
+                    // Partial text supplements the active capture state; it is
+                    // not independently renderable if a new overlay missed
+                    // the preceding listening/accumulating event. Keep the
+                    // replay snapshot on that durable state instead.
+                    DictationEvent::PartialText(_) => "",
                     DictationEvent::AudioLevel(_) => "",
                     DictationEvent::SilenceCountdown { .. } => "",
                     DictationEvent::Success => "success",
@@ -20021,22 +20800,27 @@ fn start_dictation_session(
                         .ok();
                 }
                 if !state_str.is_empty() {
-                    if matches!(&event, DictationEvent::Listening) {
-                        if let Some(message) = insert_fallback_message_for_events.as_ref() {
-                            if !insert_fallback_emitted.swap(true, Ordering::Relaxed) {
-                                app_for_events
-                                    .emit(
-                                        "dictation:insertion",
-                                        serde_json::json!({
-                                            "message": message,
-                                            "earlyFallback": true,
-                                        }),
-                                    )
-                                    .ok();
-                            }
-                        }
+                    if matches!(&event, DictationEvent::Listening)
+                        && insert_fallback_message_for_events.is_some()
+                        && !insert_fallback_emitted.swap(true, Ordering::Relaxed)
+                    {
+                        app_for_events
+                            .emit(
+                                "dictation:insertion",
+                                serde_json::json!({
+                                    "message": insert_fallback_message_for_events.as_deref().unwrap_or("Type at cursor is unavailable; dictation will be copied."),
+                                    "activeLabel": "copy only",
+                                    "earlyFallback": true,
+                                    "settingsUrl": if cfg!(target_os = "macos") {
+                                        minutes_core::macos_permissions::accessibility_settings_url()
+                                    } else {
+                                        None::<&str>
+                                    },
+                                }),
+                            )
+                            .ok();
                     }
-                    app_for_events.emit("dictation:state", state_str).ok();
+                    publish_dictation_overlay_state(&app_for_events, state_str);
                 }
 
                 if let DictationEvent::PartialText(text) = &event {
@@ -20071,14 +20855,17 @@ fn start_dictation_session(
                     .try_state::<AppState>()
                     .and_then(|state| take_dictation_release_started_at(&state));
                 if dictation_should_insert(&config_for_results) && insert_available_at_start {
-                    app_for_results.emit("dictation:state", "inserting").ok();
+                    publish_dictation_overlay_state(&app_for_results, "inserting");
                     dictation_focus_debug(
                         "before_insert_restore",
                         dictation_target_context_for_results.as_ref(),
                         None,
                         None,
                     );
-                    restore_dictation_target_focus(&dictation_target_context_for_results);
+                    restore_dictation_target_focus(
+                        &app_for_results,
+                        &dictation_target_context_for_results,
+                    );
                     let insertion = crate::text_insertion::insert_text(
                         crate::text_insertion::TextInsertionRequest {
                             text: result.text.clone(),
@@ -20089,16 +20876,26 @@ fn start_dictation_session(
                         },
                     );
                     app_for_results.emit("dictation:insertion", &insertion).ok();
-                    app_for_results
-                        .emit("dictation:state", insertion.overlay_state())
-                        .ok();
+                    publish_dictation_overlay_state(&app_for_results, insertion.overlay_state());
                     log_dictation_insert(
                         &result,
                         &insertion,
                         release_started_at,
                         insert_started_at,
                     );
-                    record_dictation_memory(&result, &insertion);
+                    log_dictation_latency(
+                        &latency_trace_for_results,
+                        &insertion,
+                        release_started_at,
+                        insert_started_at,
+                    );
+                    let recovery_path = recovery_audio_for_results
+                        .lock()
+                        .map(|path| path.clone())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                    let retained =
+                        retained_recovery_audio_after_delivery(recovery_path, &insertion, true);
+                    record_dictation_memory(&result, &insertion, retained);
                 } else {
                     dictation_focus_debug(
                         "before_copy_restore",
@@ -20106,7 +20903,10 @@ fn start_dictation_session(
                         None,
                         None,
                     );
-                    restore_dictation_target_focus(&dictation_target_context_for_results);
+                    restore_dictation_target_focus(
+                        &app_for_results,
+                        &dictation_target_context_for_results,
+                    );
                     let insertion = crate::text_insertion::insert_text(
                         crate::text_insertion::TextInsertionRequest {
                             text: result.text.clone(),
@@ -20117,30 +20917,71 @@ fn start_dictation_session(
                         },
                     );
                     app_for_results.emit("dictation:insertion", &insertion).ok();
-                    app_for_results
-                        .emit("dictation:state", insertion.overlay_state())
-                        .ok();
+                    publish_dictation_overlay_state(&app_for_results, insertion.overlay_state());
                     log_dictation_insert(
                         &result,
                         &insertion,
                         release_started_at,
                         insert_started_at,
                     );
-                    record_dictation_memory(&result, &insertion);
+                    log_dictation_latency(
+                        &latency_trace_for_results,
+                        &insertion,
+                        release_started_at,
+                        insert_started_at,
+                    );
+                    let recovery_path = recovery_audio_for_results
+                        .lock()
+                        .map(|path| path.clone())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                    let retained =
+                        retained_recovery_audio_after_delivery(recovery_path, &insertion, false);
+                    record_dictation_memory(&result, &insertion, retained);
                 }
             },
         );
+
+        let recovery_path = recovery_audio_path
+            .lock()
+            .map(|path| path.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            .filter(|path| path.exists());
+        let recoverable_record = if !final_output_emitted.load(Ordering::Relaxed) {
+            recovery_path.and_then(|path| {
+                record_recoverable_dictation_audio(
+                    path,
+                    &config,
+                    dictation_target_context_for_thread.as_ref(),
+                    match &result {
+                        Ok(()) => "Captured audio is safe. Reprocess it without re-speaking."
+                            .to_string(),
+                        Err(error) => format!(
+                            "Captured audio is safe after a dictation failure. Reprocess it without re-speaking. ({error})"
+                        ),
+                    },
+                )
+            })
+        } else {
+            None
+        };
 
         // dictation_active is flipped to false (and the tray re-syncs)
         // when `_tray_guard` drops on closure exit. See `DictationActiveGuard`.
         match result {
             Ok(()) => {
+                if let Some(record) = recoverable_record {
+                    app_clone
+                        .emit("dictation:recovery", serde_json::json!({ "id": record.id }))
+                        .ok();
+                    publish_dictation_overlay_state(&app_clone, "recoverable");
+                    return;
+                }
                 // Session ended normally (silence timeout or yield).
                 // Dismiss overlay if it wasn't already dismissed by a terminal event.
                 if !final_output_emitted.load(Ordering::Relaxed)
                     && !model_missing_emitted.load(Ordering::Relaxed)
                 {
-                    app_clone.emit("dictation:state", "cancelled").ok();
+                    publish_dictation_overlay_state(&app_clone, "cancelled");
                     let guard = app_clone
                         .state::<AppState>()
                         .dictation_focus_guard
@@ -20161,10 +21002,33 @@ fn start_dictation_session(
             }
             Err(e) => {
                 eprintln!("[dictation] error: {}", e);
-                app_clone.emit("dictation:state", "error").ok();
+                if let Some(record) = recoverable_record {
+                    app_clone
+                        .emit("dictation:recovery", serde_json::json!({ "id": record.id }))
+                        .ok();
+                    publish_dictation_overlay_state(&app_clone, "recoverable");
+                } else {
+                    publish_dictation_overlay_state(&app_clone, "error");
+                }
             }
         }
     });
+
+    // Start microphone initialization before constructing the overlay and
+    // restoring app focus. The replayable snapshot makes this ordering safe:
+    // if capture becomes ready first, the new WebView paints Listening on its
+    // first reconciled frame instead of exposing internal setup phases.
+    show_dictation_overlay(app);
+    if let Ok(mut trace) = latency_trace.lock() {
+        trace.overlay_at = Some(Instant::now());
+    }
+    dictation_focus_debug(
+        "overlay_shown",
+        dictation_target_context.as_ref(),
+        Some(main_window_hidden),
+        None,
+    );
+    restore_dictation_target_focus(app, &dictation_target_context);
 
     Ok("Dictation started".into())
 }
@@ -21224,5 +22088,46 @@ mod update_ui_tests {
         assert_eq!(failed.error_message.as_deref(), Some("network stalled"));
         assert!(failed.recoverable);
         assert!(!failed.can_cancel);
+    }
+}
+
+#[cfg(test)]
+mod dictation_hud_position_tests {
+    use super::*;
+
+    #[test]
+    fn default_top_center_avoids_bottom_edge_controls() {
+        assert_eq!(
+            dictation_hud_anchor_position("top_center", 0.0, 24.0, 1440.0, 876.0, 320.0, 88.0,),
+            (560.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn edge_positions_are_inset_and_clamped() {
+        assert_eq!(
+            dictation_hud_anchor_position("bottom_right", 100.0, 50.0, 800.0, 600.0, 320.0, 88.0,),
+            (564.0, 546.0)
+        );
+        assert_eq!(
+            dictation_hud_anchor_position("top_left", 0.0, 0.0, 200.0, 60.0, 320.0, 88.0,),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn drag_location_snaps_to_nearest_edge_region() {
+        assert_eq!(
+            nearest_dictation_hud_anchor(100.0, 100.0, 0.0, 0.0, 1200.0, 800.0),
+            "top_left"
+        );
+        assert_eq!(
+            nearest_dictation_hud_anchor(600.0, 700.0, 0.0, 0.0, 1200.0, 800.0),
+            "bottom_center"
+        );
+        assert_eq!(
+            nearest_dictation_hud_anchor(1100.0, 100.0, 0.0, 0.0, 1200.0, 800.0),
+            "top_right"
+        );
     }
 }

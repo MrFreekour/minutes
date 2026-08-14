@@ -50,11 +50,12 @@ use minutes_core::palette::{visible_commands, ActionId, Command, Context, InputK
 use minutes_core::Config;
 
 use crate::commands::{
-    cmd_add_note, cmd_create_artifact_from_meeting, cmd_open_meeting_url, cmd_search,
-    cmd_sensitive_start, cmd_sensitive_stop, cmd_start_dictation, cmd_start_live_transcript,
-    cmd_start_recording, cmd_stop_dictation, cmd_stop_live_transcript, cmd_stop_recording,
-    cmd_upcoming_meetings, copy_to_clipboard, dictation_pid_active, open_target, recording_active,
-    AppState,
+    cmd_add_note, cmd_copy_last_dictation, cmd_create_artifact_from_meeting, cmd_open_meeting_url,
+    cmd_paste_last_dictation, cmd_reprocess_last_dictation, cmd_restore_raw_last_dictation,
+    cmd_search, cmd_sensitive_start, cmd_sensitive_stop, cmd_start_dictation,
+    cmd_start_live_transcript, cmd_start_recording, cmd_stop_dictation, cmd_stop_live_transcript,
+    cmd_stop_recording, cmd_upcoming_meetings, copy_to_clipboard, dictation_pid_active,
+    open_target, recording_active, AppState,
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -128,6 +129,8 @@ pub enum ActionResponse {
     NoteAdded { line: String },
     /// StopDictation — confirmation message from the dictation pipeline.
     DictationStopped { detail: String },
+    /// Recovery actions — honest delivery or retry outcome.
+    DictationRecovery { detail: String },
     /// ReadLiveTranscript — passthrough JSON array of TranscriptLine.
     LiveLines { lines: serde_json::Value },
     /// SearchTranscripts — passthrough cmd_search shape.
@@ -510,6 +513,22 @@ fn dispatch_action(
         ActionId::StopDictation => {
             let detail = cmd_stop_dictation(state)?;
             Ok(ActionResponse::DictationStopped { detail })
+        }
+        ActionId::CopyLastDictation => {
+            let detail = cmd_copy_last_dictation()?.message;
+            Ok(ActionResponse::DictationRecovery { detail })
+        }
+        ActionId::PasteLastDictation => {
+            let detail = cmd_paste_last_dictation()?.message;
+            Ok(ActionResponse::DictationRecovery { detail })
+        }
+        ActionId::RestoreRawLastDictation => {
+            let detail = cmd_restore_raw_last_dictation()?.message;
+            Ok(ActionResponse::DictationRecovery { detail })
+        }
+        ActionId::ReprocessLastDictation => {
+            let detail = cmd_reprocess_last_dictation()?.message;
+            Ok(ActionResponse::DictationRecovery { detail })
         }
 
         // ── Navigation ───────────────────────────────────────────

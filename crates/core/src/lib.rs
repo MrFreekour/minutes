@@ -34,6 +34,8 @@ pub mod desktop_control;
 pub mod device_monitor;
 pub mod diarize;
 pub mod dictation_cleanup;
+pub mod dictation_commands;
+pub mod dictation_context;
 pub mod dictation_memory;
 pub(crate) mod engine_process;
 /// Person entity-resolution clustering (issue #385, class 3): suggestion-only
@@ -72,6 +74,7 @@ pub mod overlays;
 pub mod palette;
 pub mod parakeet;
 pub mod parakeet_sidecar;
+pub mod partial_quality;
 pub(crate) mod person_identity;
 pub mod pid;
 pub mod pipeline;

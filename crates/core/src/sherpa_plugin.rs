@@ -23,7 +23,7 @@ use crate::config::Config;
 /// The plugin ships separately from the binaries, so a mismatched pair is a
 /// real possibility. Refusing to load is far better than calling through a
 /// changed signature.
-const EXPECTED_ABI_VERSION: u32 = 1;
+const EXPECTED_ABI_VERSION: u32 = 2;
 
 /// Bytes reserved for a failure message from the plugin.
 const ERROR_BUFFER_BYTES: usize = 512;
@@ -33,6 +33,11 @@ type CreateFn = unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> *mut 
 type TranscribeFn = unsafe extern "C" fn(*mut c_void, u32, *const f32, usize) -> *mut c_char;
 type FreeStringFn = unsafe extern "C" fn(*mut c_char);
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
+type StreamCreateFn = unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> *mut c_void;
+type StreamFeedFn = unsafe extern "C" fn(*mut c_void, u32, *const f32, usize) -> *mut c_char;
+type StreamFinishFn = unsafe extern "C" fn(*mut c_void) -> *mut c_char;
+type StreamResetFn = unsafe extern "C" fn(*mut c_void) -> bool;
+type StreamDestroyFn = unsafe extern "C" fn(*mut c_void);
 
 struct PluginApi {
     // Held so the library outlives every symbol taken from it. Never unloaded:
@@ -44,6 +49,11 @@ struct PluginApi {
     transcribe: TranscribeFn,
     free_string: FreeStringFn,
     destroy: DestroyFn,
+    stream_create: StreamCreateFn,
+    stream_feed: StreamFeedFn,
+    stream_finish: StreamFinishFn,
+    stream_reset: StreamResetFn,
+    stream_destroy: StreamDestroyFn,
 }
 
 // The plugin's entry points are called from whichever thread runs a
@@ -152,14 +162,74 @@ fn load_from(path: &Path) -> Result<PluginApi, String> {
             .get(b"minutes_sherpa_destroy")
             .map_err(|e| format!("{} is missing minutes_sherpa_destroy: {e}", path.display()))?;
 
-        let (create, transcribe, free_string, destroy) =
-            (*create, *transcribe, *free_string, *destroy);
+        let stream_create: libloading::Symbol<StreamCreateFn> =
+            library.get(b"minutes_sherpa_stream_create").map_err(|e| {
+                format!(
+                    "{} is missing minutes_sherpa_stream_create: {e}",
+                    path.display()
+                )
+            })?;
+        let stream_feed: libloading::Symbol<StreamFeedFn> =
+            library.get(b"minutes_sherpa_stream_feed").map_err(|e| {
+                format!(
+                    "{} is missing minutes_sherpa_stream_feed: {e}",
+                    path.display()
+                )
+            })?;
+        let stream_finish: libloading::Symbol<StreamFinishFn> =
+            library.get(b"minutes_sherpa_stream_finish").map_err(|e| {
+                format!(
+                    "{} is missing minutes_sherpa_stream_finish: {e}",
+                    path.display()
+                )
+            })?;
+        let stream_reset: libloading::Symbol<StreamResetFn> =
+            library.get(b"minutes_sherpa_stream_reset").map_err(|e| {
+                format!(
+                    "{} is missing minutes_sherpa_stream_reset: {e}",
+                    path.display()
+                )
+            })?;
+        let stream_destroy: libloading::Symbol<StreamDestroyFn> =
+            library.get(b"minutes_sherpa_stream_destroy").map_err(|e| {
+                format!(
+                    "{} is missing minutes_sherpa_stream_destroy: {e}",
+                    path.display()
+                )
+            })?;
+
+        let (
+            create,
+            transcribe,
+            free_string,
+            destroy,
+            stream_create,
+            stream_feed,
+            stream_finish,
+            stream_reset,
+            stream_destroy,
+        ) = (
+            *create,
+            *transcribe,
+            *free_string,
+            *destroy,
+            *stream_create,
+            *stream_feed,
+            *stream_finish,
+            *stream_reset,
+            *stream_destroy,
+        );
         Ok(PluginApi {
             _library: library,
             create,
             transcribe,
             free_string,
             destroy,
+            stream_create,
+            stream_feed,
+            stream_finish,
+            stream_reset,
+            stream_destroy,
         })
     }
 }
@@ -278,6 +348,79 @@ impl Drop for PluginRecognizer {
         }
         // SAFETY: destroyed exactly once, and the handle is not used again.
         unsafe { (self.api.destroy)(self.handle) };
+        self.handle = std::ptr::null_mut();
+    }
+}
+
+/// Retained true-streaming recognizer. The model stays resident while
+/// `reset()` swaps only the cheap online stream between utterances/sessions.
+pub struct PluginStreamingRecognizer {
+    api: &'static PluginApi,
+    handle: *mut c_void,
+}
+
+unsafe impl Send for PluginStreamingRecognizer {}
+
+impl PluginStreamingRecognizer {
+    pub fn new(model_dir: &Path, config: &Config) -> Result<Self, String> {
+        let api = plugin(config)?;
+        let dir = CString::new(model_dir.to_string_lossy().as_ref())
+            .map_err(|_| "sherpa model path contained an interior null".to_string())?;
+        let mut error = vec![0i8 as c_char; ERROR_BUFFER_BYTES];
+        let handle = unsafe { (api.stream_create)(dir.as_ptr(), error.as_mut_ptr(), error.len()) };
+        if handle.is_null() {
+            let message = unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(if message.is_empty() {
+                "the sherpa plugin failed to load the streaming model".to_string()
+            } else {
+                message
+            });
+        }
+        Ok(Self { api, handle })
+    }
+
+    fn take_plugin_text(&self, raw: *mut c_char, operation: &str) -> Result<String, String> {
+        if raw.is_null() {
+            return Err(format!("the sherpa plugin failed to {operation}"));
+        }
+        let text = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { (self.api.free_string)(raw) };
+        Ok(text)
+    }
+
+    /// Feed one 16 kHz mono chunk. This advances the model state instead of
+    /// re-transcribing the accumulated utterance.
+    pub fn feed(&mut self, sample_rate: u32, samples: &[f32]) -> Result<String, String> {
+        let raw = unsafe {
+            (self.api.stream_feed)(self.handle, sample_rate, samples.as_ptr(), samples.len())
+        };
+        self.take_plugin_text(raw, "decode a streaming chunk")
+    }
+
+    pub fn finish(&mut self) -> Result<String, String> {
+        let raw = unsafe { (self.api.stream_finish)(self.handle) };
+        self.take_plugin_text(raw, "finish the streaming utterance")
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        if unsafe { (self.api.stream_reset)(self.handle) } {
+            Ok(())
+        } else {
+            Err("the sherpa plugin failed to reset its streaming session".to_string())
+        }
+    }
+}
+
+impl Drop for PluginStreamingRecognizer {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        unsafe { (self.api.stream_destroy)(self.handle) };
         self.handle = std::ptr::null_mut();
     }
 }

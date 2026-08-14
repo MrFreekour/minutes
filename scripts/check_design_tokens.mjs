@@ -25,6 +25,7 @@ const SCAN_ROOTS = ["site", "tauri/src"];
 const TOKEN_DEFINITION_FILES = new Set([
   "site/app/globals.css",
   "tauri/src/index.html",
+  "tauri/src/dictation-overlay.html",
   "tauri/src/styles/theme-tokens.css",
 ]);
 const SOURCE_EXTENSIONS = new Set([".css", ".html", ".js", ".jsx", ".ts", ".tsx"]);

@@ -1,6 +1,10 @@
 use crate::apple_speech_session::AppleSpeechSession;
 use crate::config::Config;
 use crate::dictation_cleanup::{clean_dictation_text, CleanupEngine, CleanupOptions};
+use crate::dictation_commands::{
+    apply_explicit_voice_commands, DictationCommandProvenance, DictationCommandUtterance,
+};
+use crate::dictation_context::DictationTextMode;
 use crate::error::{DictationError, MinutesError, TranscribeError};
 use crate::markdown::{ContentType, Frontmatter, OutputStatus};
 use crate::pid;
@@ -175,6 +179,12 @@ fn return_model_to_cache(ctx: whisper_rs::WhisperContext, model_name: String) {
 pub struct DictationResult {
     pub raw_text: String,
     pub text: String,
+    /// Cleaned text before any explicit voice editing commands were applied.
+    /// Present only when at least one command changed the output.
+    pub pre_command_text: Option<String>,
+    /// Local provenance for reversible, deterministic voice edits.
+    pub commands_applied: Vec<DictationCommandProvenance>,
+    pub text_mode: DictationTextMode,
     pub duration_secs: f64,
     pub destination: String,
     pub file_path: Option<PathBuf>,
@@ -187,6 +197,12 @@ pub struct DictationResult {
 /// Callback for dictation events (used by Tauri UI).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DictationEvent {
+    /// The local transcription engine is available. `warm` means the model
+    /// came from the in-process preload cache rather than being loaded on the
+    /// dictation critical path.
+    EngineReady {
+        warm: bool,
+    },
     Listening,
     Accumulating,
     Processing,
@@ -302,6 +318,56 @@ pub fn preflight_model(config: &Config) -> Result<(), DictationEvent> {
 pub fn run<F, G>(
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    on_event: F,
+    on_result: G,
+) -> Result<(), MinutesError>
+where
+    F: FnMut(DictationEvent),
+    G: FnMut(DictationResult),
+{
+    run_with_options(
+        stop_flag,
+        config,
+        DictationRunOptions::default(),
+        on_event,
+        on_result,
+    )
+}
+
+/// Session behavior that differs between autonomous CLI capture and an
+/// explicitly controlled desktop shortcut gesture.
+#[derive(Debug, Clone)]
+pub struct DictationRunOptions {
+    /// End the session after the configured post-speech silence interval.
+    /// Desktop hold/locked gestures disable this because the gesture owns the
+    /// end of the session; command-line capture retains the legacy timeout.
+    pub auto_stop_on_silence: bool,
+    /// When set at the same time as `stop_flag`, discard the entire session:
+    /// do not finalize audio, write history/files, or deliver text.
+    pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Shared slot populated with the private incremental recovery WAV used by
+    /// the desktop. Callers retire it only after text delivery succeeds.
+    pub recovery_audio_path: Option<Arc<std::sync::Mutex<Option<PathBuf>>>>,
+    /// Sparse local target hint for deterministic formatting. It contains no
+    /// surrounding text and defaults to conservative prose when unknown.
+    pub text_mode: DictationTextMode,
+}
+
+impl Default for DictationRunOptions {
+    fn default() -> Self {
+        Self {
+            auto_stop_on_silence: true,
+            cancel_flag: None,
+            recovery_audio_path: None,
+            text_mode: DictationTextMode::Unknown,
+        }
+    }
+}
+
+pub fn run_with_options<F, G>(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    options: DictationRunOptions,
     mut on_event: F,
     mut on_result: G,
 ) -> Result<(), MinutesError>
@@ -336,7 +402,7 @@ where
     pid::create_pid_file(&dict_pid)?;
 
     // Ensure cleanup on all exit paths
-    let result = run_inner(stop_flag, config, &mut on_event, &mut on_result);
+    let result = run_inner(stop_flag, config, &options, &mut on_event, &mut on_result);
 
     // Release PID
     pid::remove_pid_file(&dict_pid).ok();
@@ -347,6 +413,7 @@ where
 fn run_inner<F, G>(
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    options: &DictationRunOptions,
     on_event: &mut F,
     on_result: &mut G,
 ) -> Result<(), MinutesError>
@@ -369,7 +436,7 @@ where
     #[cfg(feature = "whisper")]
     let model_name = config.dictation.model.clone();
     #[cfg(feature = "whisper")]
-    let whisper_ctx = if let Some(ctx) = take_cached_model(&model_name) {
+    let (whisper_ctx, engine_warm) = if let Some(ctx) = take_cached_model(&model_name) {
         tracing::info!(model = %model_name, "using preloaded whisper model");
         startup_debug(
             "model_cache_hit",
@@ -377,7 +444,7 @@ where
             Some(run_start.elapsed().as_millis()),
             None,
         );
-        Some(ctx)
+        (Some(ctx), true)
     } else {
         let load_start = Instant::now();
         startup_debug(
@@ -404,14 +471,14 @@ where
                             Some(load_start.elapsed().as_millis()),
                             None,
                         );
-                        Some(context)
+                        (Some(context), false)
                     }
                     Err(error) if final_backend == DictationFinalBackend::Parakeet => {
                         tracing::warn!(
                             error = %error,
                             "whisper partial model could not load; continuing with configured Parakeet dictation"
                         );
-                        None
+                        (None, false)
                     }
                     Err(error) => {
                         return Err(TranscribeError::ModelLoadError(error.to_string()).into())
@@ -423,7 +490,7 @@ where
                     error = %error,
                     "whisper partials unavailable; continuing with configured Parakeet dictation"
                 );
-                None
+                (None, false)
             }
             Err(error) => return Err(error.into()),
         }
@@ -433,6 +500,8 @@ where
     return Err(
         TranscribeError::ModelLoadError("dictation requires the whisper feature".into()).into(),
     );
+
+    on_event(DictationEvent::EngineReady { warm: engine_warm });
 
     // Start audio stream
     #[cfg(feature = "whisper")]
@@ -461,6 +530,16 @@ where
             Some(&stream.device_name),
         );
         tracing::info!(device = %stream.device_name, "dictation audio stream started");
+        let mut recovery_capture = if let Some(path_slot) = &options.recovery_audio_path {
+            let capture = crate::dictation_memory::DictationRecoveryCapture::create()?;
+            match path_slot.lock() {
+                Ok(mut slot) => *slot = Some(capture.path().to_path_buf()),
+                Err(poisoned) => *poisoned.into_inner() = Some(capture.path().to_path_buf()),
+            }
+            Some(capture)
+        } else {
+            None
+        };
         crate::events::append_event(crate::events::recording_started_event(
             None,
             "dictation",
@@ -499,6 +578,24 @@ where
         loop {
             // Check stop flag (Esc / Ctrl-C / MCP stop)
             if stop_flag.load(Ordering::Relaxed) {
+                if options
+                    .cancel_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    // Cancellation is a true discard boundary. In particular,
+                    // do not flush accumulated results: that path writes the
+                    // dictation file and daily note before delivering text.
+                    final_utterance_samples.clear();
+                    discard_accumulated_results(&mut accumulated_results);
+                    settle_recovery_capture(
+                        &mut recovery_capture,
+                        options.recovery_audio_path.as_ref(),
+                        false,
+                    )?;
+                    on_event(DictationEvent::Cancelled);
+                    break;
+                }
                 // Finalize any in-progress transcription before exiting
                 if utterance_samples > 0 {
                     on_event(DictationEvent::Processing);
@@ -515,6 +612,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -522,8 +620,12 @@ where
                     }
                     final_utterance_samples.clear();
                 }
+                settle_recovery_capture(
+                    &mut recovery_capture,
+                    options.recovery_audio_path.as_ref(),
+                    has_spoken,
+                )?;
                 flush_accumulated_results(config, &mut accumulated_results, on_event, on_result);
-                on_event(DictationEvent::Cancelled);
                 break;
             }
 
@@ -545,6 +647,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -552,6 +655,11 @@ where
                     }
                     final_utterance_samples.clear();
                 }
+                settle_recovery_capture(
+                    &mut recovery_capture,
+                    options.recovery_audio_path.as_ref(),
+                    has_spoken,
+                )?;
                 flush_accumulated_results(config, &mut accumulated_results, on_event, on_result);
                 on_event(DictationEvent::Yielded);
                 break;
@@ -605,6 +713,10 @@ where
                 }
             };
 
+            if let Some(capture) = recovery_capture.as_mut() {
+                capture.append_samples(&chunk.samples)?;
+            }
+
             let vad_result = vad.process(chunk.rms);
             on_event(DictationEvent::AudioLevel(
                 crate::streaming::stream_audio_level(),
@@ -646,6 +758,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -675,6 +788,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -688,8 +802,11 @@ where
                     on_event(DictationEvent::Listening);
                 }
 
-                total_silence_ms += 100;
-                if has_spoken
+                if options.auto_stop_on_silence {
+                    total_silence_ms += 100;
+                }
+                if options.auto_stop_on_silence
+                    && has_spoken
                     && !was_speaking
                     && total_silence_ms < config.dictation.silence_timeout_ms
                 {
@@ -699,14 +816,22 @@ where
                         remaining_ms: remaining,
                     });
                 }
-                if has_spoken
-                    && !was_speaking
-                    && total_silence_ms >= config.dictation.silence_timeout_ms
-                {
+                if should_end_after_silence(
+                    options,
+                    has_spoken,
+                    was_speaking,
+                    total_silence_ms,
+                    config.dictation.silence_timeout_ms,
+                ) {
                     tracing::info!(
                         silence_ms = total_silence_ms,
                         "silence timeout — ending dictation"
                     );
+                    settle_recovery_capture(
+                        &mut recovery_capture,
+                        options.recovery_audio_path.as_ref(),
+                        has_spoken,
+                    )?;
                     flush_accumulated_results(
                         config,
                         &mut accumulated_results,
@@ -718,6 +843,14 @@ where
             }
         }
 
+        // Stream/device failure paths break the loop without normal delivery.
+        // Keep speech-bearing audio recoverable; retire pure silence.
+        settle_recovery_capture(
+            &mut recovery_capture,
+            options.recovery_audio_path.as_ref(),
+            has_spoken,
+        )?;
+
         // Return model to cache for next session
         if let Some(context) = whisper_ctx {
             return_model_to_cache(context, model_name);
@@ -725,6 +858,43 @@ where
 
         Ok(())
     }
+}
+
+#[cfg(feature = "whisper")]
+fn settle_recovery_capture(
+    capture: &mut Option<crate::dictation_memory::DictationRecoveryCapture>,
+    path_slot: Option<&Arc<std::sync::Mutex<Option<PathBuf>>>>,
+    keep: bool,
+) -> Result<(), MinutesError> {
+    let Some(capture) = capture.take() else {
+        return Ok(());
+    };
+    if keep {
+        capture.finish()?;
+    } else {
+        capture.discard()?;
+        if let Some(path_slot) = path_slot {
+            match path_slot.lock() {
+                Ok(mut slot) => *slot = None,
+                Err(poisoned) => *poisoned.into_inner() = None,
+            }
+        }
+    }
+    Ok(())
+}
+
+fn should_end_after_silence(
+    options: &DictationRunOptions,
+    has_spoken: bool,
+    is_speaking: bool,
+    silence_ms: u64,
+    timeout_ms: u64,
+) -> bool {
+    options.auto_stop_on_silence && has_spoken && !is_speaking && silence_ms >= timeout_ms
+}
+
+fn discard_accumulated_results(accumulated_results: &mut Vec<DictationResult>) {
+    accumulated_results.clear();
 }
 
 fn dictation_final_backend(config: &Config) -> DictationFinalBackend {
@@ -913,7 +1083,6 @@ fn transcribe_utterance_with_parakeet(
     }
 }
 
-#[cfg(any(test, feature = "parakeet", target_os = "macos"))]
 fn normalize_final_dictation_text(text: &str) -> Option<String> {
     let text = text
         .lines()
@@ -926,11 +1095,65 @@ fn normalize_final_dictation_text(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.trim().to_string())
 }
 
-#[cfg(any(test, feature = "parakeet", target_os = "macos"))]
 fn dictation_text_part(line: &str) -> &str {
     line.find("] ")
         .map(|index| &line[index + 2..])
         .unwrap_or(line)
+}
+
+/// Re-run the configured local dictation engine against a private recovery
+/// WAV. The path must belong to Minutes' owner-only recovery namespace.
+pub fn reprocess_recovery_audio(
+    audio_path: &std::path::Path,
+    config: &Config,
+) -> Result<DictationResult, MinutesError> {
+    reprocess_recovery_audio_with_mode(audio_path, config, DictationTextMode::Unknown)
+}
+
+/// Re-run retained recovery audio using the formatting contract captured for
+/// its original destination. Callers without a trustworthy destination hint
+/// should use [`reprocess_recovery_audio`], which fails closed to `Unknown`.
+pub fn reprocess_recovery_audio_with_mode(
+    audio_path: &std::path::Path,
+    config: &Config,
+    text_mode: DictationTextMode,
+) -> Result<DictationResult, MinutesError> {
+    let audio_path = crate::dictation_memory::validate_recovery_audio_path(audio_path)?;
+    let probe = crate::stem_probe::probe_and_repair(&audio_path).map_err(|error| {
+        MinutesError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    if !probe.is_usable() {
+        return Err(MinutesError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Recovery audio is {}.", probe.description()),
+        )));
+    }
+
+    let backend = dictation_final_backend(config);
+    let mut transcription_config = config.clone();
+    match backend {
+        DictationFinalBackend::Parakeet => {
+            transcription_config.transcription.engine = "parakeet".into();
+        }
+        DictationFinalBackend::Whisper | DictationFinalBackend::AppleSpeech => {
+            // Apple Speech's private-audio transport remains gated; its
+            // retained preference already resolves through sealed Whisper.
+            transcription_config.transcription.engine = "whisper".into();
+            transcription_config.transcription.model = config.dictation.model.clone();
+        }
+    }
+    let transcript = crate::transcribe::transcribe(&audio_path, &transcription_config)?;
+    let text = normalize_final_dictation_text(&transcript.text).ok_or_else(|| {
+        MinutesError::from(TranscribeError::EmptyTranscript(
+            transcription_config.transcription.min_words,
+        ))
+    })?;
+    let duration_secs = crate::dictation_memory::recovery_audio_duration_secs(&audio_path)?;
+    prepare_result(&text, duration_secs, backend, config, text_mode).ok_or_else(|| {
+        MinutesError::from(TranscribeError::EmptyTranscript(
+            transcription_config.transcription.min_words,
+        ))
+    })
 }
 
 fn handle_utterance<G>(
@@ -938,12 +1161,13 @@ fn handle_utterance<G>(
     duration_secs: f64,
     backend: DictationFinalBackend,
     config: &Config,
+    text_mode: DictationTextMode,
     accumulated_results: &mut Vec<DictationResult>,
     on_result: &mut G,
 ) where
     G: FnMut(DictationResult),
 {
-    let Some(result) = prepare_result(text, duration_secs, backend, config) else {
+    let Some(result) = prepare_result(text, duration_secs, backend, config, text_mode) else {
         return;
     };
 
@@ -992,7 +1216,13 @@ fn flush_accumulated_results<F, G>(
 /// Finish a transcribed utterance: write to clipboard, file, daily note.
 /// Called after StreamingWhisper produces a final result.
 fn finish_utterance(text: &str, duration_secs: f64, config: &Config) -> Option<DictationResult> {
-    let result = prepare_result(text, duration_secs, DictationFinalBackend::Whisper, config)?;
+    let result = prepare_result(
+        text,
+        duration_secs,
+        DictationFinalBackend::Whisper,
+        config,
+        DictationTextMode::Unknown,
+    )?;
     write_result_outputs(result, config)
 }
 
@@ -1001,6 +1231,7 @@ fn prepare_result(
     duration_secs: f64,
     backend: DictationFinalBackend,
     config: &Config,
+    text_mode: DictationTextMode,
 ) -> Option<DictationResult> {
     let raw_text = text.trim().to_string();
     if raw_text.is_empty() {
@@ -1011,7 +1242,7 @@ fn prepare_result(
     // before it reaches the clipboard/file/daily-note. `raw_text` keeps the original.
     // If cleanup empties the text (e.g. an all-filler utterance), fall back to the raw
     // text rather than silently dropping content the user actually spoke.
-    let cleaned = clean_dictation_text(&raw_text, &build_cleanup_options(config));
+    let cleaned = clean_dictation_text(&raw_text, &build_cleanup_options(config, text_mode));
     let text = if cleaned.is_empty() {
         raw_text.clone()
     } else {
@@ -1028,6 +1259,9 @@ fn prepare_result(
     Some(DictationResult {
         raw_text,
         text,
+        pre_command_text: None,
+        commands_applied: Vec::new(),
+        text_mode,
         duration_secs,
         destination: config.dictation.destination.clone(),
         file_path: None,
@@ -1038,7 +1272,7 @@ fn prepare_result(
 }
 
 /// Build cleanup options from config, loading vocabulary replacements when enabled.
-fn build_cleanup_options(config: &Config) -> CleanupOptions {
+fn build_cleanup_options(config: &Config, text_mode: DictationTextMode) -> CleanupOptions {
     let d = &config.dictation;
     let engine = CleanupEngine::parse(&d.cleanup_engine);
     let replacements = if d.cleanup_apply_vocabulary && engine != CleanupEngine::None {
@@ -1050,6 +1284,7 @@ fn build_cleanup_options(config: &Config) -> CleanupOptions {
         engine,
         remove_fillers: d.cleanup_remove_fillers,
         spoken_punctuation: d.cleanup_spoken_punctuation,
+        text_mode,
         replacements,
     }
     .with_sorted_replacements()
@@ -1089,6 +1324,7 @@ fn load_vocab_replacements() -> Vec<(String, String)> {
 }
 
 fn write_result_outputs(mut result: DictationResult, config: &Config) -> Option<DictationResult> {
+    apply_voice_commands_to_result(&mut result, config);
     let destination = result.destination.as_str();
     if destination == "clipboard" || destination.is_empty() {
         if let Err(e) = write_to_clipboard(&result.text) {
@@ -1153,9 +1389,28 @@ fn combine_results(results: &[DictationResult], config: &Config) -> Option<Dicta
         .iter()
         .all(|result| result.engine_descriptor_version == first_descriptor);
 
+    let mode = results
+        .first()
+        .map_or(DictationTextMode::Unknown, |result| result.text_mode);
+    let command_output = apply_explicit_voice_commands(
+        &results
+            .iter()
+            .map(|result| DictationCommandUtterance {
+                raw: result.raw_text.as_str(),
+                cleaned: result.text.as_str(),
+            })
+            .collect::<Vec<_>>(),
+        mode,
+        voice_commands_enabled(config),
+        &config.dictation.voice_snippets,
+    );
+
     Some(DictationResult {
         raw_text: raw_parts.join(" "),
-        text: parts.join(" "),
+        text: command_output.text,
+        pre_command_text: command_output.pre_command_text,
+        commands_applied: command_output.commands_applied,
+        text_mode: mode,
         duration_secs: results.iter().map(|result| result.duration_secs).sum(),
         destination: config.dictation.destination.clone(),
         file_path: None,
@@ -1171,6 +1426,25 @@ fn combine_results(results: &[DictationResult], config: &Config) -> Option<Dicta
             None
         },
     })
+}
+
+fn apply_voice_commands_to_result(result: &mut DictationResult, config: &Config) {
+    let output = apply_explicit_voice_commands(
+        &[DictationCommandUtterance {
+            raw: result.raw_text.as_str(),
+            cleaned: result.text.as_str(),
+        }],
+        result.text_mode,
+        voice_commands_enabled(config),
+        &config.dictation.voice_snippets,
+    );
+    result.text = output.text;
+    result.pre_command_text = output.pre_command_text;
+    result.commands_applied = output.commands_applied;
+}
+
+fn voice_commands_enabled(config: &Config) -> bool {
+    config.dictation.voice_commands_enabled && config.dictation.destination != "stdout"
 }
 
 /// Legacy batch process: transcribe → output. Kept for fallback/testing.
@@ -1494,6 +1768,56 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_owned_sessions_ignore_silence_timeout() {
+        let shortcut_options = DictationRunOptions {
+            auto_stop_on_silence: false,
+            cancel_flag: None,
+            recovery_audio_path: None,
+            text_mode: DictationTextMode::Unknown,
+        };
+        assert!(!should_end_after_silence(
+            &shortcut_options,
+            true,
+            false,
+            10_000,
+            2_000,
+        ));
+
+        assert!(should_end_after_silence(
+            &DictationRunOptions::default(),
+            true,
+            false,
+            2_000,
+            2_000,
+        ));
+    }
+
+    #[test]
+    fn cancellation_discards_accumulated_text_without_writing_history() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let mut accumulated = vec![DictationResult {
+            raw_text: "this must disappear".into(),
+            text: "This must disappear.".into(),
+            pre_command_text: None,
+            commands_applied: Vec::new(),
+            text_mode: DictationTextMode::Unknown,
+            duration_secs: 1.0,
+            destination: "daily_note".into(),
+            file_path: None,
+            daily_note_appended: false,
+            engine_id: "whisper:small".into(),
+            engine_descriptor_version: Some("small".into()),
+        }];
+
+        discard_accumulated_results(&mut accumulated);
+
+        assert!(accumulated.is_empty());
+        assert!(!config.daily_notes.path.exists());
+        assert!(!config.output_dir.exists());
+    }
+
+    #[test]
     fn dictation_latches_off_apple_speech_after_a_failure() {
         let session = AppleSpeechSession::new();
         // Fresh session with the apple-speech backend selected: attempt it.
@@ -1638,7 +1962,8 @@ mod tests {
 
         let backend = dictation_final_backend(&config);
         assert_eq!(backend, DictationFinalBackend::Whisper);
-        let result = prepare_result("hello", 1.0, backend, &config).unwrap();
+        let result =
+            prepare_result("hello", 1.0, backend, &config, DictationTextMode::Unknown).unwrap();
         assert!(result.engine_id.starts_with("whisper:"));
         assert_eq!(
             result.engine_descriptor_version.as_deref(),
@@ -1656,6 +1981,9 @@ mod tests {
             DictationResult {
                 raw_text: "first sentence.".into(),
                 text: "first sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 1.25,
                 destination: "clipboard".into(),
                 file_path: None,
@@ -1666,6 +1994,9 @@ mod tests {
             DictationResult {
                 raw_text: "second sentence.".into(),
                 text: "second sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 2.75,
                 destination: "clipboard".into(),
                 file_path: None,
@@ -1680,6 +2011,81 @@ mod tests {
         assert!((combined.duration_secs - 4.0).abs() < f64::EPSILON);
         assert_eq!(combined.destination, "clipboard");
         assert!(combined.file_path.is_none());
+    }
+
+    #[test]
+    fn combine_results_applies_and_records_explicit_voice_edits() {
+        let mut config = Config::default();
+        config.dictation.destination = "clipboard".into();
+        let result = |raw: &str, text: &str| DictationResult {
+            raw_text: raw.into(),
+            text: text.into(),
+            pre_command_text: None,
+            commands_applied: Vec::new(),
+            text_mode: DictationTextMode::Chat,
+            duration_secs: 1.0,
+            destination: "clipboard".into(),
+            file_path: None,
+            daily_note_appended: false,
+            engine_id: "whisper:small".into(),
+            engine_descriptor_version: Some("small".into()),
+        };
+        let combined = combine_results(
+            &[
+                result("keep", "Keep"),
+                result("remove", "Remove"),
+                result("scratch that", "Scratch that"),
+                result("new line", "New line"),
+                result("continue", "Continue"),
+            ],
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(combined.text, "Keep\nContinue");
+        assert_eq!(combined.commands_applied.len(), 2);
+        assert_eq!(
+            combined.pre_command_text.as_deref(),
+            Some("Keep Remove Scratch that New line Continue")
+        );
+    }
+
+    #[test]
+    fn irreversible_stdout_stream_keeps_voice_commands_literal() {
+        let mut config = Config::default();
+        config.dictation.destination = "stdout".into();
+        let results = vec![
+            DictationResult {
+                raw_text: "keep".into(),
+                text: "Keep".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Chat,
+                duration_secs: 1.0,
+                destination: "stdout".into(),
+                file_path: None,
+                daily_note_appended: false,
+                engine_id: "whisper:small".into(),
+                engine_descriptor_version: Some("small".into()),
+            },
+            DictationResult {
+                raw_text: "scratch that".into(),
+                text: "Scratch that".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Chat,
+                duration_secs: 1.0,
+                destination: "stdout".into(),
+                file_path: None,
+                daily_note_appended: false,
+                engine_id: "whisper:small".into(),
+                engine_descriptor_version: Some("small".into()),
+            },
+        ];
+
+        let combined = combine_results(&results, &config).unwrap();
+        assert_eq!(combined.text, "Keep Scratch that");
+        assert!(combined.commands_applied.is_empty());
     }
 
     #[test]
@@ -1701,6 +2107,9 @@ mod tests {
             DictationResult {
                 raw_text: "first sentence.".into(),
                 text: "first sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 1.0,
                 destination: "daily_note".into(),
                 file_path: None,
@@ -1711,6 +2120,9 @@ mod tests {
             DictationResult {
                 raw_text: "second sentence.".into(),
                 text: "second sentence.".into(),
+                pre_command_text: None,
+                commands_applied: Vec::new(),
+                text_mode: DictationTextMode::Unknown,
                 duration_secs: 2.0,
                 destination: "daily_note".into(),
                 file_path: None,
@@ -1752,6 +2164,7 @@ mod tests {
                 1.0,
                 DictationFinalBackend::Whisper,
                 &config,
+                DictationTextMode::Unknown,
                 &mut accumulated,
                 &mut on_result,
             );
@@ -1777,6 +2190,7 @@ mod tests {
                 1.0,
                 DictationFinalBackend::Whisper,
                 &config,
+                DictationTextMode::Unknown,
                 &mut accumulated_stdout,
                 &mut on_result,
             );

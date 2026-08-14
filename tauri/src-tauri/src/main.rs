@@ -195,7 +195,12 @@ fn maybe_run_hotkey_diagnostic() -> Option<i32> {
         return None;
     }
 
-    let mut keycode = minutes_core::hotkey_macos::KEYCODE_CAPS_LOCK;
+    let config = minutes_core::Config::load();
+    let mut keycode = if config.dictation.hotkey_enabled {
+        config.dictation.hotkey_keycode
+    } else {
+        minutes_core::hotkey_macos::KEYCODE_FN
+    };
     let mut output_path: Option<std::path::PathBuf> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -559,6 +564,9 @@ pub struct TrayMenuHandles {
     pub sensitive: tauri::menu::MenuItem<tauri::Wry>,
     pub mic_mute: tauri::menu::MenuItem<tauri::Wry>,
     pub note: tauri::menu::MenuItem<tauri::Wry>,
+    pub copy_last_dictation: tauri::menu::MenuItem<tauri::Wry>,
+    pub paste_last_dictation: tauri::menu::MenuItem<tauri::Wry>,
+    pub reprocess_last_dictation: tauri::menu::MenuItem<tauri::Wry>,
     pub assistant: tauri::menu::MenuItem<tauri::Wry>,
     pub list: tauri::menu::MenuItem<tauri::Wry>,
     pub paste_summary: tauri::menu::MenuItem<tauri::Wry>,
@@ -810,6 +818,14 @@ fn apply_tray_activity(
                 .quick_thought
                 .set_enabled(!activity.blocks_capture_controls())
                 .ok();
+            handles
+                .paste_last_dictation
+                .set_enabled(!activity.is_active())
+                .ok();
+            handles
+                .reprocess_last_dictation
+                .set_enabled(!activity.is_active())
+                .ok();
             handles.stop.set_enabled(activity.is_active()).ok();
             handles
                 .stop
@@ -883,6 +899,15 @@ pub fn rebuild_localized_shell(app: &tauri::AppHandle) {
             }))
             .ok();
         h.note.set_text(tr("Add Note...")).ok();
+        h.copy_last_dictation
+            .set_text(tr("Copy Last Dictation"))
+            .ok();
+        h.paste_last_dictation
+            .set_text(tr("Paste Last Dictation"))
+            .ok();
+        h.reprocess_last_dictation
+            .set_text(tr("Reprocess Last Dictation"))
+            .ok();
         h.assistant.set_text(tr("Recall")).ok();
         h.list.set_text(tr("Open Meetings Folder")).ok();
         h.paste_summary.set_text(tr("Copy Latest Summary")).ok();
@@ -1704,6 +1729,8 @@ fn main() {
     let discard_short_hotkey_capture = Arc::new(AtomicBool::new(false));
     let dictation_active = Arc::new(AtomicBool::new(false));
     let dictation_stop_flag = Arc::new(AtomicBool::new(false));
+    let dictation_cancel_flag = Arc::new(AtomicBool::new(false));
+    let dictation_capture_style = Arc::new(Mutex::new(None));
     let dictation_release_started_at = Arc::new(Mutex::new(None));
     let live_transcript_active = Arc::new(AtomicBool::new(false));
     let live_transcript_stop_flag = Arc::new(AtomicBool::new(false));
@@ -1966,9 +1993,12 @@ fn main() {
             pty_manager: Arc::new(Mutex::new(pty::PtyManager::default())),
             dictation_active: dictation_active.clone(),
             dictation_stop_flag: dictation_stop_flag.clone(),
+            dictation_cancel_flag: dictation_cancel_flag.clone(),
+            dictation_capture_style: dictation_capture_style.clone(),
             dictation_focus_guard: Arc::new(Mutex::new(None)),
             pending_dictation_target: Arc::new(Mutex::new(None)),
             dictation_release_started_at: dictation_release_started_at.clone(),
+            dictation_overlay: Arc::new(Mutex::new(commands::DictationOverlaySnapshot::default())),
             live_transcript_active: live_transcript_active.clone(),
             live_transcript_stop_flag: live_transcript_stop_flag.clone(),
             copilot_active: copilot_active.clone(),
@@ -2012,6 +2042,13 @@ fn main() {
         .setup(move |app| {
             let initial_recording = minutes_core::pid::status().recording;
             let startup_config = minutes_core::config::Config::load();
+
+            let recovered_dictations = commands::adopt_orphaned_dictation_audio();
+            if recovered_dictations > 0 {
+                eprintln!(
+                    "[dictation] adopted {recovered_dictations} interrupted capture(s) for recovery"
+                );
+            }
 
             #[cfg(target_os = "macos")]
             install_macos_terminate_hook(app.handle());
@@ -2273,6 +2310,27 @@ fn main() {
             let mic_mute_item_ref = mic_mute_item.clone();
             let sep = MenuItem::with_id(app, "sep1", "──────────", false, None::<&str>)?;
             let note_item = MenuItem::with_id(app, "note", tr("Add Note..."), true, None::<&str>)?;
+            let copy_last_dictation_item = MenuItem::with_id(
+                app,
+                "copy-last-dictation",
+                tr("Copy Last Dictation"),
+                true,
+                None::<&str>,
+            )?;
+            let paste_last_dictation_item = MenuItem::with_id(
+                app,
+                "paste-last-dictation",
+                tr("Paste Last Dictation"),
+                true,
+                None::<&str>,
+            )?;
+            let reprocess_last_dictation_item = MenuItem::with_id(
+                app,
+                "reprocess-last-dictation",
+                tr("Reprocess Last Dictation"),
+                true,
+                None::<&str>,
+            )?;
             let list_item =
                 MenuItem::with_id(app, "list", tr("Open Meetings Folder"), true, None::<&str>)?;
             let paste_summary_item = MenuItem::with_id(
@@ -2325,6 +2383,9 @@ fn main() {
                 &mic_mute_item,
                 &sep,
                 &note_item,
+                &copy_last_dictation_item,
+                &paste_last_dictation_item,
+                &reprocess_last_dictation_item,
                 &assistant_item,
                 &list_item,
             ])?;
@@ -2551,6 +2612,43 @@ fn main() {
                         "note" => {
                             show_note_window(app);
                         }
+                        "copy-last-dictation" => match commands::cmd_copy_last_dictation() {
+                            Ok(result) => commands::show_user_notification(
+                                app,
+                                "Last dictation",
+                                &result.message,
+                            ),
+                            Err(error) => {
+                                commands::show_user_notification(app, "Last dictation", &error)
+                            }
+                        },
+                        "paste-last-dictation" => match commands::cmd_paste_last_dictation() {
+                            Ok(result) => commands::show_user_notification(
+                                app,
+                                "Last dictation",
+                                &result.message,
+                            ),
+                            Err(error) => {
+                                commands::show_user_notification(app, "Last dictation", &error)
+                            }
+                        },
+                        "reprocess-last-dictation" => {
+                            let app_handle = app.clone();
+                            std::thread::spawn(
+                                move || match commands::cmd_reprocess_last_dictation() {
+                                    Ok(result) => commands::show_user_notification(
+                                        &app_handle,
+                                        "Recovered dictation",
+                                        &result.message,
+                                    ),
+                                    Err(error) => commands::show_user_notification(
+                                        &app_handle,
+                                        "Dictation recovery",
+                                        &error,
+                                    ),
+                                },
+                            );
+                        }
                         "assistant" => {
                             let pty_mgr = app.state::<commands::AppState>().pty_manager.clone();
                             let app_handle = app.clone();
@@ -2674,6 +2772,9 @@ fn main() {
                 sensitive: sensitive_item.clone(),
                 mic_mute: mic_mute_item.clone(),
                 note: note_item.clone(),
+                copy_last_dictation: copy_last_dictation_item.clone(),
+                paste_last_dictation: paste_last_dictation_item.clone(),
+                reprocess_last_dictation: reprocess_last_dictation_item.clone(),
                 assistant: assistant_item.clone(),
                 list: list_item.clone(),
                 paste_summary: paste_summary_item.clone(),
@@ -2890,6 +2991,7 @@ fn main() {
             commands::cmd_weekly_summary,
             commands::cmd_proactive_context_bundle,
             commands::cmd_list_devices,
+            commands::cmd_remember_dictation_hud_position,
             commands::cmd_delete_meeting,
             commands::cmd_get_meeting_detail,
             commands::cmd_resummarize_meeting,
@@ -2936,11 +3038,22 @@ fn main() {
             commands::cmd_get_meeting_prompt,
             commands::cmd_close_meeting_prompt,
             commands::cmd_start_dictation,
+            commands::cmd_show_dictation_permission_help,
             commands::cmd_stop_dictation,
+            commands::cmd_cancel_dictation,
             commands::cmd_dismiss_dictation_overlay,
+            commands::cmd_dictation_overlay_ready,
             commands::cmd_recent_dictations,
             commands::cmd_copy_dictation,
+            commands::cmd_copy_pre_command_dictation,
+            commands::cmd_copy_raw_dictation,
             commands::cmd_repaste_dictation,
+            commands::cmd_copy_last_dictation,
+            commands::cmd_restore_raw_last_dictation,
+            commands::cmd_paste_last_dictation,
+            commands::cmd_reprocess_dictation,
+            commands::cmd_reprocess_last_dictation,
+            commands::cmd_delete_dictation_audio,
             commands::cmd_set_shortcut,
             commands::cmd_shortcut_status,
             commands::cmd_suspend_shortcut,
@@ -3067,6 +3180,28 @@ mod tray_activity_tests {
     }
 
     #[test]
+    fn collapsed_sidebar_always_leaves_a_reachable_expand_control() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let index_html = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read index.html");
+
+        assert!(
+            index_html
+                .contains("body.sidebar-collapsed .sidebar-expand-rail {\n      position: fixed;"),
+            "the expand control must live outside and remain visible beside the zero-width pane"
+        );
+        assert!(
+            index_html.contains("id=\"btn-sidebar-expand\"")
+                && index_html.contains("sidebarExpandRail.addEventListener('click'"),
+            "the out-of-pane expand control must be wired to restore the sidebar"
+        );
+        assert!(
+            !index_html.contains("body:not(.sidebar-expanded-session) .app-left"),
+            "responsive CSS must not blank the initial frame before JS installs a reachable collapsed state"
+        );
+    }
+
+    #[test]
     fn meeting_prompt_dismiss_uses_native_destroy_path() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let main_rs = std::fs::read_to_string(format!("{}/src/main.rs", manifest))
@@ -3161,6 +3296,250 @@ mod tray_activity_tests {
     }
 
     #[test]
+    fn dictation_overlay_first_frame_is_truthful_and_state_is_replayable() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        assert!(
+            !overlay.contains("Loading model"),
+            "routine startup must not imply a warm model is loading"
+        );
+        assert!(
+            overlay.contains(">Starting…</span>")
+                && !overlay.contains("Preparing dictation")
+                && !overlay.contains("preparationTimer"),
+            "the first frame may be neutral, but routine startup must not expose internal preparation phases"
+        );
+        assert!(
+            overlay.contains("listen('dictation:overlay'")
+                && overlay.contains("cmd_dictation_overlay_ready")
+                && overlay.contains("snapshot.revision <= overlayRevision"),
+            "the overlay should reconcile live events with a revisioned ready-time snapshot"
+        );
+        assert!(
+            commands_rs.contains("publish_dictation_overlay_state(app, \"starting\")")
+                && commands_rs.contains("snapshot.advance(state, capture_style)")
+                && commands_rs.contains("app.emit(\"dictation:overlay\", snapshot)")
+                && commands_rs.contains("DictationEvent::PartialText(_) => \"\"")
+                && commands_rs.contains(
+                    "Start microphone initialization before constructing the overlay"
+                ),
+            "the backend should start capture early and own replayable overlay state before creating the WebView"
+        );
+    }
+
+    #[test]
+    fn dictation_gestures_silence_and_cancel_have_distinct_contracts() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let shortcuts_rs = std::fs::read_to_string(format!("{}/src/shortcut_manager.rs", manifest))
+            .expect("failed to read shortcut_manager.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        assert!(
+            shortcuts_rs.contains("StateMachineAction::Lock")
+                && commands_rs.contains("lock_active_dictation_capture")
+                && overlay.contains("Release to finish")
+                && overlay.contains("Tap again to finish"),
+            "a quick release must visibly latch the running hold capture into locked mode"
+        );
+        assert!(
+            commands_rs.contains("auto_stop_on_silence: capture_style.is_none()"),
+            "shortcut-owned hold and locked sessions must end by gesture, not ordinary silence"
+        );
+        assert!(
+            commands_rs.contains("config.dictation.accumulate = true")
+                && overlay.contains("cmd_cancel_dictation")
+                && !overlay.contains("mic silent, check input device"),
+            "desktop results must remain buffered for Escape discard, while low audio stays neutral"
+        );
+        assert!(
+            shortcuts_rs.contains("HotkeyEvent::Cancel")
+                && shortcuts_rs.contains("dictation_cancel_flag.store(true"),
+            "the native macOS event tap should route cross-app Escape into true cancellation"
+        );
+    }
+
+    #[test]
+    fn routine_audio_capture_is_calm_and_error_red_stays_exceptional() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let index_html = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read desktop frontend");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+        let design = std::fs::read_to_string(format!("{}/../../DESIGN.md", manifest))
+            .expect("failed to read design system");
+        let recording_css = index_html
+            .split("/* ── Recording bar ── */")
+            .nth(1)
+            .and_then(|tail| tail.split("/* ── Processing bar ── */").next())
+            .expect("recording CSS should be extractable");
+        let overlay_dot_css = overlay
+            .split("/* Status dot */")
+            .nth(1)
+            .and_then(|tail| tail.split("/* Spinner */").next())
+            .expect("dictation status-dot CSS should be extractable");
+
+        assert!(
+            recording_css.contains("var(--capture)")
+                && recording_css.contains("var(--capture-tint-soft)")
+                && recording_css.contains("var(--capture-border)"),
+            "routine meeting capture should use the dedicated calm capture tokens"
+        );
+        assert!(
+            !recording_css.contains("var(--red)") && !recording_css.contains("recording-breathe"),
+            "routine meeting capture should not borrow error red or redundant breathing motion"
+        );
+        assert!(
+            index_html.contains(
+                ".recall-phase-dot.listening {\n      background: var(--capture);",
+            ) && index_html.contains(
+                ".recall-phase-label.listening {\n      color: var(--capture);",
+            ) && index_html.contains(
+                "background: var(--capture-tint);\n      color: var(--capture);",
+            ) && index_html.contains(
+                "html[data-platform=\"macos\"] .header .status-pill.recording {\n      background: var(--capture);",
+            ),
+            "compact recorder states should share the same capture semantics"
+        );
+        assert!(
+            overlay_dot_css.contains(".dot.capture")
+                && overlay_dot_css.contains("var(--capture)")
+                && !overlay_dot_css.contains("var(--red)"),
+            "routine dictation activity should use capture blue, not error red"
+        );
+        assert!(
+            overlay.contains("setIndicator('dot-neutral')")
+                && overlay.contains("indicator.className = 'dot capture blink'")
+                && overlay.contains("indicator.className = 'dot capture'"),
+            "dictation startup should remain neutral until active capture is confirmed"
+        );
+        assert!(
+            design.contains("Capture blue and error red are separate")
+                && design.contains("routine recording and dictation never borrow its urgency"),
+            "the design system should preserve the capture-versus-error semantic split"
+        );
+    }
+
+    #[test]
+    fn dictation_insertion_fallback_is_calm_truthful_and_actionable() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read desktop commands");
+        let insertion_rs = std::fs::read_to_string(format!("{}/src/text_insertion.rs", manifest))
+            .expect("failed to read text insertion");
+        let permissions_rs = std::fs::read_to_string(format!(
+            "{}/../../crates/core/src/macos_permissions.rs",
+            manifest
+        ))
+        .expect("failed to read macOS permission contract");
+
+        assert!(commands_rs.contains("\"activeLabel\": \"copy only\""));
+        assert!(
+            overlay.contains("const destinationHint = earlyInsertionFallback")
+                && overlay.contains("insertionActiveLabel || 'copy only'")
+                && overlay.contains("'Copied · typing needs setup'")
+                && overlay.contains("permissionButton.classList.remove('hidden')")
+                && overlay.contains("cmd_show_dictation_permission_help"),
+            "the overlay should present a calm preserved-copy outcome and return to scoped recovery"
+        );
+        assert!(
+            overlay.contains("if (earlyInsertionFallback && insertionSettingsUrl)")
+                && overlay.contains("pill.classList.add('error');"),
+            "only the known safe-copy fallback should avoid true error styling"
+        );
+        assert!(
+            insertion_rs.contains("The attempted operation is the")
+                && !insertion_rs.contains(
+                    "if !minutes_core::hotkey_macos::is_accessibility_trusted()"
+                )
+                && insertion_rs.contains("Type at cursor is not supported on Windows yet")
+                && !permissions_rs.contains("Typing dictation at the cursor requires Accessibility")
+                && permissions_rs.contains("meeting recording and dictation still work"),
+            "insertion should attempt macOS automation without a mismatched AX preflight and keep platform claims honest"
+        );
+        assert!(
+            commands_rs.contains("window.__minutesDictationFocusTarget = document.activeElement")
+                && commands_rs.contains("target.focus({ preventScroll: true })"),
+            "self-app dictation must restore the exact focused DOM control, not only the Minutes process"
+        );
+        assert!(
+            insertion_rs.contains("dictation pasted but clipboard restore failed")
+                && insertion_rs.contains("log_error(\"dictation_paste\""),
+            "clipboard cleanup must be secondary to delivered paste and real paste failures must be durable"
+        );
+
+        let index_html = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read desktop UI");
+        assert!(
+            index_html.contains("Set up Type at cursor")
+                && index_html.contains("Only needed for fn or Caps Lock")
+                && index_html.contains("Optional for dictation")
+                && index_html.contains("macOS asks when Minutes first sends the paste shortcut")
+                && index_html.contains("recheckButton.textContent = 'Recheck'")
+                && index_html.contains("minutes.dictationPermissionNudgeVersion"),
+            "dictation permission setup must remain contextual, capability-specific, recheckable, and deduplicated"
+        );
+    }
+
+    #[test]
+    fn dev_installer_cannot_validate_a_stale_running_app() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let installer =
+            std::fs::read_to_string(format!("{}/../../scripts/install-dev-app.sh", manifest))
+                .expect("failed to read dev installer");
+        let diagnostic = std::fs::read_to_string(format!(
+            "{}/../../scripts/diagnose-desktop-hotkey.sh",
+            manifest
+        ))
+        .expect("failed to read desktop hotkey diagnostic");
+        let main_rs = std::fs::read_to_string(format!("{}/src/main.rs", manifest))
+            .expect("failed to read desktop main source");
+
+        assert!(
+            installer.contains("stop_idle_installed_dev_app\n  rm -rf \"$INSTALL_APP\""),
+            "the old process must stop immediately before replacement"
+        );
+        assert!(
+            installer.contains("open -a \"$INSTALL_APP\"\n  verify_fresh_installed_dev_process"),
+            "fresh-process verification must immediately follow launch"
+        );
+        assert!(
+            installer.contains("installed_dev_work_is_active")
+                && installer.contains("\"$installed_cli\" status 2>/dev/null")
+                && installer.contains("recording or processing"),
+            "installer must refuse to interrupt active work"
+        );
+        assert!(
+            !installer.contains("\"$installed_cli\" status --json"),
+            "the bundled CLI status command emits JSON without a trailing --json flag"
+        );
+        assert!(
+            diagnostic.contains("APP_EXECUTABLE=\"$APP_PATH/Contents/MacOS/minutes-app\"")
+                && diagnostic.contains("\"$APP_EXECUTABLE\" \"${DIAGNOSTIC_ARGS[@]}\"")
+                && !diagnostic.contains("open -n"),
+            "the diagnostic must execute the installed signed binary directly instead of creating a misleading LaunchServices process"
+        );
+        assert!(
+            diagnostic.contains("KEYCODE=\"${2:-}\"")
+                && diagnostic.contains("if [[ -n \"$KEYCODE\" ]]")
+                && main_rs.contains("config.dictation.hotkey_keycode"),
+            "the installed diagnostic must probe the configured native shortcut instead of silently defaulting to Caps Lock"
+        );
+    }
+
+    #[test]
     fn dictation_overlay_success_is_not_terminal_dismiss() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let overlay =
@@ -3211,6 +3590,30 @@ mod tray_activity_tests {
     }
 
     #[test]
+    fn dictation_overlay_interrupted_audio_recovery_is_reachable() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        assert!(
+            commands_rs.contains("publish_dictation_overlay_state(&app_clone, \"recoverable\")")
+                && commands_rs.contains("emit(\"dictation:recovery\"")
+                && commands_rs.contains("adopt_orphaned_dictation_audio"),
+            "interrupted and crash-left audio should become a visible recovery record"
+        );
+        assert!(
+            overlay.contains("case 'recoverable':")
+                && overlay.contains("Your words are safe")
+                && overlay.contains("cmd_reprocess_dictation")
+                && overlay.contains("Audio is still safe"),
+            "the overlay should offer a calm retry without implying the saved audio was lost"
+        );
+    }
+
+    #[test]
     fn dictation_overlay_reduced_motion_disables_animations() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let overlay =
@@ -3239,6 +3642,75 @@ mod tray_activity_tests {
                 && overlay.contains("transition: none !important"),
             "reduced-motion block should effectively disable animation and transition effects"
         );
+    }
+
+    #[test]
+    fn dictation_hud_is_movable_quiet_and_respects_sound_preference() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+        let overlay =
+            std::fs::read_to_string(format!("{}/../src/dictation-overlay.html", manifest))
+                .expect("failed to read dictation overlay");
+
+        for contract in [
+            ".focusable(false)",
+            "dictation_hud_anchor_position",
+            "cmd_remember_dictation_hud_position",
+            "startDragging()",
+        ] {
+            assert!(
+                commands_rs.contains(contract) || overlay.contains(contract),
+                "dictation HUD must preserve movable non-activating contract: {contract}"
+            );
+        }
+        assert!(overlay.contains("role=\"group\"") && overlay.contains("id=\"announcement\""));
+        assert!(overlay.contains("function announceState(state)"));
+        assert!(
+            !overlay.contains("id=\"pill\" role=\"status\""),
+            "rapid visual updates must not all be exposed as live announcements"
+        );
+        assert!(
+            overlay.contains("minutes.playCaptureCues")
+                && overlay.contains("if (!cuesEnabled) return"),
+            "the overlay must honor the shared sound-cue preference"
+        );
+    }
+
+    #[test]
+    fn dictation_settings_keep_routine_choices_out_of_advanced() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let index = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read index.html");
+        let dictation = index
+            .split("<!-- Dictation -->")
+            .nth(1)
+            .and_then(|tail| tail.split("<!-- Live Transcript -->").next())
+            .expect("dictation settings section should be extractable");
+        let (routine, advanced) = dictation
+            .split_once("<details class=\"settings-advanced\">")
+            .expect("dictation settings should have an Advanced disclosure");
+
+        for id in [
+            "settings-dictation-destination",
+            "settings-dictation-writing-style",
+            "settings-dictation-microphone",
+            "settings-dictation-history-policy",
+            "settings-dictation-recents",
+        ] {
+            assert!(routine.contains(id), "routine settings should contain {id}");
+        }
+        for id in [
+            "settings-dictation-model",
+            "settings-dictation-voice-commands",
+            "settings-dictation-daily-note",
+            "settings-dictation-silence",
+        ] {
+            assert!(
+                advanced.contains(id),
+                "Advanced settings should contain {id}"
+            );
+        }
     }
 
     #[test]

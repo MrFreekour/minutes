@@ -115,6 +115,8 @@ pub enum StateMachineAction {
     StartHold,
     /// Start a new session in locked mode (user tapped quickly).
     StartLocked,
+    /// The immediate hold capture was released quickly and is now latched.
+    Lock,
     /// Stop the active session (release after hold, or second tap after lock).
     Stop { discard: bool },
     /// No action (key event consumed but nothing to do).
@@ -172,7 +174,7 @@ impl ShortcutStateMachine {
         if matches!(self.active_capture, Some(CaptureStyle::Hold)) {
             if was_short_tap {
                 self.active_capture = Some(CaptureStyle::Locked);
-                return StateMachineAction::None;
+                return StateMachineAction::Lock;
             }
             let discard = self.should_discard_capture();
             self.active_capture = None;
@@ -692,6 +694,15 @@ pub fn execute_action(app: &tauri::AppHandle, slot: ShortcutSlot, action: StateM
                 crate::commands::show_user_notification(app, slot.label(), &e);
             }
         }
+        StateMachineAction::Lock => {
+            if slot == ShortcutSlot::Dictation {
+                crate::commands::lock_active_dictation_capture(app);
+            } else if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                if let Ok(mut runtime) = state.hotkey_runtime.lock() {
+                    runtime.active_capture = Some(crate::commands::HotkeyCaptureStyle::Locked);
+                }
+            }
+        }
         StateMachineAction::Stop { discard } => {
             stop_slot_session(app, slot, discard);
         }
@@ -774,6 +785,9 @@ fn stop_slot_session(app: &tauri::AppHandle, slot: ShortcutSlot, discard: bool) 
             }
         }
         ShortcutSlot::Dictation => {
+            if discard {
+                state.dictation_cancel_flag.store(true, Ordering::Relaxed);
+            }
             if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
                 *released_at = Some(Instant::now());
             }
@@ -806,6 +820,22 @@ fn handle_native_event_callback(
     };
 
     match event {
+        minutes_core::hotkey_macos::HotkeyEvent::Cancel => {
+            if slot == ShortcutSlot::Dictation {
+                if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                    if state.dictation_active.load(Ordering::Relaxed) {
+                        minutes_core::logging::log_step(
+                            "dictation_cancel_request",
+                            "",
+                            0,
+                            serde_json::json!({ "source": "escape" }),
+                        );
+                        state.dictation_cancel_flag.store(true, Ordering::Relaxed);
+                        state.dictation_stop_flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         minutes_core::hotkey_macos::HotkeyEvent::Press => {
             if slot == ShortcutSlot::Dictation {
                 crate::commands::capture_pending_dictation_target(app);
@@ -962,7 +992,7 @@ mod tests {
         // Quick release (before threshold) with no active session
         sm.key_down_started_at = Some(Instant::now()); // ensure it's "just now"
         let action = sm.handle_release(false);
-        assert!(matches!(action, StateMachineAction::None));
+        assert!(matches!(action, StateMachineAction::Lock));
         assert!(matches!(sm.active_capture, Some(CaptureStyle::Locked)));
     }
 
@@ -975,7 +1005,7 @@ mod tests {
 
         let action = sm.handle_release(false);
 
-        assert!(matches!(action, StateMachineAction::None));
+        assert!(matches!(action, StateMachineAction::Lock));
         assert!(matches!(sm.active_capture, Some(CaptureStyle::Locked)));
     }
 
@@ -999,7 +1029,7 @@ mod tests {
         sm.handle_press(false);
         sm.key_down_started_at = Some(Instant::now());
         let action = sm.handle_release(false);
-        assert!(matches!(action, StateMachineAction::None));
+        assert!(matches!(action, StateMachineAction::Lock));
         assert!(matches!(sm.active_capture, Some(CaptureStyle::Locked)));
 
         // Session is now active. Second tap to stop.

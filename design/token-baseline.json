@@ -356,16 +356,6 @@
   },
   {
     "file": "tauri/src/dictation-overlay.html",
-    "property": "--accent",
-    "value": "#30D158"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--accent",
-    "value": "#C96B4E"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
     "property": "--accent-glow",
     "value": "rgba(201, 107, 78, 0.20)"
   },
@@ -383,46 +373,6 @@
     "file": "tauri/src/dictation-overlay.html",
     "property": "--accent-ring",
     "value": "rgba(48, 209, 88, 0.18)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--bg-hover",
-    "value": "#1C1C1A"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--bg-hover",
-    "value": "#E8E2D8"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--border",
-    "value": "rgba(0, 0, 0, 0.07)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--border",
-    "value": "rgba(255, 255, 255, 0.06)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--border-mid",
-    "value": "#2A2924"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--border-mid",
-    "value": "rgba(0, 0, 0, 0.13)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--green",
-    "value": "#2E7D46"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--green",
-    "value": "#30D158"
   },
   {
     "file": "tauri/src/dictation-overlay.html",
@@ -446,16 +396,6 @@
   },
   {
     "file": "tauri/src/dictation-overlay.html",
-    "property": "--red",
-    "value": "#C0392B"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red",
-    "value": "#FF453A"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
     "property": "--red-border-strong",
     "value": "rgba(192, 57, 43, 0.32)"
   },
@@ -463,46 +403,6 @@
     "file": "tauri/src/dictation-overlay.html",
     "property": "--red-border-strong",
     "value": "rgba(255, 69, 58, 0.45)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-glow",
-    "value": "rgba(192, 57, 43, 0.18)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-glow",
-    "value": "rgba(255, 69, 58, 0.28)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-halo",
-    "value": "rgba(192, 57, 43, 0.06)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-halo",
-    "value": "rgba(255, 69, 58, 0.08)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-outline",
-    "value": "rgba(192, 57, 43, 0.12)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-outline",
-    "value": "rgba(255, 69, 58, 0.14)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-ring",
-    "value": "rgba(192, 57, 43, 0.12)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--red-ring",
-    "value": "rgba(255, 69, 58, 0.16)"
   },
   {
     "file": "tauri/src/dictation-overlay.html",
@@ -531,11 +431,6 @@
   },
   {
     "file": "tauri/src/dictation-overlay.html",
-    "property": "--shadow",
-    "value": "rgba(255,255,255,0.06)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
     "property": "--spinner-track",
     "value": "rgba(201, 107, 78, 0.14)"
   },
@@ -543,36 +438,6 @@
     "file": "tauri/src/dictation-overlay.html",
     "property": "--spinner-track",
     "value": "rgba(48, 209, 88, 0.18)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--text",
-    "value": "#1A1916"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--text",
-    "value": "#E8E4DA"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--text-secondary",
-    "value": "#6B6760"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--text-secondary",
-    "value": "#8C8880"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--text-tertiary",
-    "value": "#3D3B38"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "--text-tertiary",
-    "value": "#BDB9B0"
   },
   {
     "file": "tauri/src/dictation-overlay.html",
@@ -603,16 +468,6 @@
     "file": "tauri/src/dictation-overlay.html",
     "property": "box-shadow",
     "value": "rgba(0, 0, 0, 0.18)"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "font-family",
-    "value": "'Geist Mono'"
-  },
-  {
-    "file": "tauri/src/dictation-overlay.html",
-    "property": "font-family",
-    "value": "'Geist'"
   },
   {
     "file": "tauri/src/dictation-overlay.html",

@@ -476,13 +476,18 @@ fn stage_assistant_skill_bundle() {
         .join("assistant-skill-bundle");
 
     let sources = [
-        ("agents-skills", repo_root.join(".agents").join("skills")),
         (
-            "opencode-skills",
+            // Stage only first-party skills. `.agents/skills/` also holds local
+            // dev tooling (impeccable) that must not ship to users.
+            PathBuf::from("agents-skills").join("minutes"),
+            repo_root.join(".agents").join("skills").join("minutes"),
+        ),
+        (
+            PathBuf::from("opencode-skills"),
             repo_root.join(".opencode").join("skills"),
         ),
         (
-            "opencode-commands",
+            PathBuf::from("opencode-commands"),
             repo_root.join(".opencode").join("commands"),
         ),
     ];

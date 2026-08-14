@@ -17,13 +17,13 @@ crate-type = ["cdylib"]
 [target.'cfg(target_os = "macos")'.dependencies]
 # Static on macOS: sherpa-onnx AND its own ONNX Runtime live inside this
 # dylib, which is what keeps them away from the host's ort (issue #683).
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "static"] }
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "static", "sys"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "sys"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "sys"] }
 
 [profile.release]
 opt-level = 2

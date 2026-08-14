@@ -16660,6 +16660,7 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
         |event| {
             use minutes_core::dictation::DictationEvent;
             match event {
+                DictationEvent::EngineReady { .. } => {}
                 DictationEvent::Listening => eprintln!("[minutes] Listening..."),
                 DictationEvent::Accumulating => eprintln!("[minutes] Speaking detected..."),
                 DictationEvent::Processing => eprintln!("[minutes] Transcribing..."),
@@ -16709,6 +16710,8 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
                 minutes_core::dictation_memory::DictationMemoryInput {
                     raw_text: result.raw_text.clone(),
                     cleaned_text: result.text.clone(),
+                    pre_command_text: result.pre_command_text.clone(),
+                    commands_applied: result.commands_applied.clone(),
                     duration_secs: result.duration_secs,
                     engine_id: result.engine_id.clone(),
                     engine_descriptor_version: result.engine_descriptor_version.clone(),
@@ -16725,10 +16728,13 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
                     target_context: None,
                     file_path: result.file_path.clone(),
                     daily_note_appended: result.daily_note_appended,
+                    recovery_audio_path: None,
                 },
             );
-            if let Err(error) = minutes_core::dictation_memory::append_record(record) {
-                eprintln!("[minutes] Could not update dictation history: {error}");
+            if config.dictation.history_policy != "off" {
+                if let Err(error) = minutes_core::dictation_memory::append_record(record) {
+                    eprintln!("[minutes] Could not update dictation history: {error}");
+                }
             }
         },
     )?;

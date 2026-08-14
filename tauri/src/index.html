@@ -83,6 +83,10 @@
       --accent: #30D158;
       --accent-hover: #4ADE70;
       --accent-soft: rgba(48, 209, 88, 0.10);
+      --capture: #62BCE9;
+      --capture-tint: rgba(98, 188, 233, 0.10);
+      --capture-tint-soft: rgba(98, 188, 233, 0.055);
+      --capture-border: rgba(98, 188, 233, 0.16);
       --red: #FF453A;
       --red-bg: rgba(255, 69, 58, 0.12);
       --green: #30D158;
@@ -157,6 +161,10 @@
         --accent: #C96B4E;
         --accent-hover: #B85A3E;
         --accent-soft: rgba(201, 107, 78, 0.10);
+        --capture: #2F6F8F;
+        --capture-tint: rgba(47, 111, 143, 0.10);
+        --capture-tint-soft: rgba(47, 111, 143, 0.05);
+        --capture-border: rgba(47, 111, 143, 0.14);
         --red: #C0392B;
         --red-bg: rgba(192, 57, 43, 0.12);
         --green: #2E7D46;
@@ -265,6 +273,41 @@
       flex: 0 0 0;
       width: 0;
       min-width: 0;
+      /* The expand control is fixed to the window edge. Keep it reachable even
+         though the pane itself has no width; otherwise a persisted collapse
+         can strand the app on an empty canvas when Recall is closed. */
+      overflow: visible;
+    }
+
+    body.sidebar-collapsed .app-left > * {
+      visibility: hidden;
+    }
+
+    body.sidebar-collapsed .app-left .sidebar-collapse-btn {
+      visibility: visible;
+    }
+
+    .sidebar-expand-rail {
+      display: none;
+    }
+
+    body.sidebar-collapsed .sidebar-expand-rail {
+      position: fixed;
+      left: 16px;
+      top: 88px;
+      z-index: 41;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg);
+      color: var(--text-muted);
+      font: inherit;
+      cursor: pointer;
+      display: inline-flex;
     }
 
     body.sidebar-collapsed .split-handle {
@@ -277,23 +320,6 @@
     body.sidebar-collapsed .recall-panel.expanded {
       width: auto;
       flex: 1 1 auto;
-    }
-
-    @media (max-width: 720px) {
-      body:not(.sidebar-expanded-session) .app-left {
-        flex: 0 0 0;
-        width: 0;
-        min-width: 0;
-      }
-
-      body:not(.sidebar-expanded-session) .split-handle {
-        display: none;
-      }
-
-      body:not(.sidebar-expanded-session) .recall-panel.expanded {
-        width: auto;
-        flex: 1 1 auto;
-      }
     }
 
     .window-drag-strip {
@@ -402,7 +428,7 @@
     }
 
     .recall-phase-dot.listening {
-      background: var(--red);
+      background: var(--capture);
       animation: recording-glow 1.8s ease-in-out infinite;
     }
 
@@ -426,7 +452,7 @@
     }
 
     .recall-phase-label.listening {
-      color: var(--red);
+      color: var(--capture);
     }
 
     .recall-phase-label.debrief {
@@ -1072,8 +1098,8 @@
       height: auto;
       border-radius: 12px;
       opacity: 1;
-      background: var(--red-tint);
-      color: var(--red);
+      background: var(--capture-tint);
+      color: var(--capture);
       font-weight: 600;
       letter-spacing: 0.3px;
     }
@@ -1155,7 +1181,8 @@
     }
 
     @media (prefers-reduced-motion: reduce) {
-      .live-dot {
+      .live-dot,
+      .recall-phase-dot.listening {
         animation: none;
       }
     }
@@ -1255,38 +1282,24 @@
     .recording-bar {
       display: none;
       padding: 16px;
-      background: var(--red-tint-soft);
-      border-bottom: 1px solid var(--red-border);
-      animation: recording-breathe 3s ease-in-out infinite;
-      box-shadow: inset 0 0 24px var(--red-glow-soft);
+      background: var(--capture-tint-soft);
+      border-bottom: 1px solid var(--capture-border);
     }
 
     .recording-bar.active {
       display: block;
-      animation: recording-enter 0.3s ease-out, recording-breathe 3s ease-in-out 0.3s infinite;
+      animation: recording-enter 160ms ease-out;
     }
 
     @keyframes recording-enter {
       from {
         opacity: 0;
-        transform: translateY(-4px);
+        transform: translateY(-2px);
       }
 
       to {
         opacity: 1;
         transform: translateY(0);
-      }
-    }
-
-    @keyframes recording-breathe {
-
-      0%,
-      100% {
-        background: var(--red-tint-soft);
-      }
-
-      50% {
-        background: var(--red-tint);
       }
     }
 
@@ -1303,17 +1316,15 @@
       gap: 8px;
       font-size: var(--text-meta);
       font-weight: 600;
-      color: var(--red);
-      letter-spacing: 0.3px;
-      text-transform: uppercase;
+      color: var(--capture);
+      letter-spacing: 0.1px;
     }
 
     .recording-dot {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: var(--red);
-      animation: recording-glow 2s ease-in-out infinite;
+      background: var(--capture);
     }
 
     @keyframes blink {
@@ -1358,7 +1369,7 @@
     .audio-viz .bar {
       width: 2px;
       border-radius: 999px;
-      background: var(--red);
+      background: var(--capture);
       opacity: 0.72;
       min-height: 2px;
       transition: height 0.1s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.18s ease;
@@ -1591,6 +1602,10 @@
       font-size: var(--text-body);
       font-weight: 600;
       color: var(--text);
+    }
+
+    html[data-platform="macos"] .header .status-pill.recording {
+      background: var(--capture);
     }
 
     .output-notice-detail {
@@ -5218,6 +5233,27 @@
       overflow-wrap: anywhere;
     }
 
+    .settings-advanced {
+      margin-top: 10px;
+      border-top: 1px solid var(--neutral-border);
+      color: var(--text-secondary);
+    }
+
+    .settings-advanced > summary {
+      width: fit-content;
+      padding: 14px 0 6px;
+      cursor: pointer;
+      font-size: var(--text-xs);
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .settings-advanced > summary:focus-visible {
+      outline: 2px solid var(--info-ring);
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
     #coach-onboarding-overlay {
       z-index: 155;
     }
@@ -5615,6 +5651,11 @@
     </div>
   </div><!-- end .app-left -->
 
+  <!-- Kept outside the zero-width pane so a persisted collapse can always be
+       reversed, including at the default narrow startup size. -->
+  <button class="sidebar-expand-rail" id="btn-sidebar-expand" type="button"
+    aria-label="Expand list pane" title="Expand list pane">›</button>
+
   <!-- ── Draggable split handle ── -->
   <div class="split-handle" id="split-handle"></div>
 
@@ -5739,7 +5780,7 @@
       <div class="readiness-header">
         <div>
           <div class="readiness-title" id="readiness-title">Readiness Center</div>
-          <div class="readiness-sub">This view only reports what Minutes can verify right now. Optional items stay
+          <div class="readiness-sub" id="readiness-sub">This view only reports what Minutes can verify right now. Optional items stay
             optional, and unknown states are never hidden behind fake confidence.</div>
         </div>
         <button class="btn btn-secondary btn-sm" id="btn-readiness-close">Close</button>
@@ -5990,37 +6031,39 @@
           <div class="about-controls-group">
             <div class="about-controls-copy">Where dictated text goes</div>
             <select id="settings-dictation-destination" class="settings-field">
-              <option value="insert">Type at cursor — inserts into the app you're in (needs Accessibility)</option>
+              <option id="settings-dictation-destination-insert" value="insert">Type at cursor — inserts into the app you're in</option>
               <option value="clipboard">Copy to clipboard — paste it yourself</option>
             </select>
-            <div class="about-controls-meta">"Type at cursor" pastes the transcript straight into the focused app. macOS asks for Accessibility permission the first time; until granted it falls back to the clipboard.</div>
+            <div class="about-controls-meta" id="settings-dictation-destination-detail">Minutes verifies the target before inserting. If typing is unavailable or the app changes, your transcript stays on the clipboard.</div>
           </div>
         </div>
         <div class="about-controls">
           <div class="about-controls-group">
-            <div class="about-controls-copy">Dictation whisper model</div>
-            <select id="settings-dictation-model" class="settings-field">
-              <option value="tiny">tiny — fastest, lower quality</option>
-              <option value="base">base — fast, decent quality (default)</option>
-              <option value="small">small — good quality, slower</option>
+            <div class="about-controls-copy">Writing style</div>
+            <select id="settings-dictation-writing-style" class="settings-field">
+              <option value="natural">Natural — light formatting and filler cleanup</option>
+              <option value="literal">Literal — keep the transcript as spoken</option>
             </select>
-            <div class="about-controls-meta">Smaller models = faster dictation. "base" is recommended.</div>
+            <div class="about-controls-meta">Natural formatting is deterministic and stays on this device. It does not rewrite meaning.</div>
           </div>
         </div>
         <div class="about-controls">
-          <div class="about-controls-copy">Log dictations to daily note</div>
-          <button class="btn btn-secondary btn-sm toggle-btn" id="settings-dictation-daily-note">On</button>
+          <div class="about-controls-group">
+            <div class="about-controls-copy">Microphone</div>
+            <select id="settings-dictation-microphone" class="settings-field" title="Select dictation microphone">
+              <option value="">System Default</option>
+            </select>
+            <div class="about-controls-meta">Uses the same microphone as recordings. The list refreshes when opened.</div>
+          </div>
         </div>
         <div class="about-controls">
           <div class="about-controls-group">
-            <div class="about-controls-copy">Silence timeout</div>
-            <div class="about-controls-meta">End dictation session after this much silence (after first speech).</div>
-            <select id="settings-dictation-silence" class="settings-field">
-              <option value="1000">1 second</option>
-              <option value="2000">2 seconds (default)</option>
-              <option value="3000">3 seconds</option>
-              <option value="5000">5 seconds</option>
+            <div class="about-controls-copy">History</div>
+            <select id="settings-dictation-history-policy" class="settings-field">
+              <option value="recent">Keep recent transcripts</option>
+              <option value="off">Off — keep only recoverable failures</option>
             </select>
+            <div class="about-controls-meta">Turning history off never discards audio from a failed or interrupted capture.</div>
           </div>
         </div>
         <div class="about-controls">
@@ -6032,6 +6075,40 @@
             <div class="about-controls-meta" id="settings-dictation-recents-status"></div>
           </div>
         </div>
+        <details class="settings-advanced">
+          <summary>Advanced</summary>
+          <div class="about-controls">
+            <div class="about-controls-group">
+              <div class="about-controls-copy">Dictation whisper model</div>
+              <select id="settings-dictation-model" class="settings-field">
+                <option value="tiny">tiny — fastest, lower quality</option>
+                <option value="base">base — fast, decent quality (default)</option>
+                <option value="small">small — good quality, slower</option>
+              </select>
+              <div class="about-controls-meta">Smaller models are faster. Base is recommended.</div>
+            </div>
+          </div>
+          <div class="about-controls">
+            <div class="about-controls-copy">Exact voice-edit commands</div>
+            <button class="btn btn-secondary btn-sm toggle-btn" id="settings-dictation-voice-commands">On</button>
+          </div>
+          <div class="about-controls">
+            <div class="about-controls-copy">Log dictations to daily note</div>
+            <button class="btn btn-secondary btn-sm toggle-btn" id="settings-dictation-daily-note">On</button>
+          </div>
+          <div class="about-controls">
+            <div class="about-controls-group">
+              <div class="about-controls-copy">Silence timeout</div>
+              <div class="about-controls-meta">Used only for dictation started inside Minutes. Shortcut gestures finish shortcut dictation.</div>
+              <select id="settings-dictation-silence" class="settings-field">
+                <option value="1000">1 second</option>
+                <option value="2000">2 seconds (default)</option>
+                <option value="3000">3 seconds</option>
+                <option value="5000">5 seconds</option>
+              </select>
+            </div>
+          </div>
+        </details>
       </div>
 
       <!-- Live Transcript -->
@@ -6921,6 +6998,7 @@
     const meetingsScroll = document.getElementById('meetings-scroll');
     const documentsToggle = document.getElementById('btn-documents-toggle');
     const sidebarCollapseButton = document.getElementById('btn-sidebar-collapse');
+    const sidebarExpandRail = document.getElementById('btn-sidebar-expand');
     const searchInput = document.getElementById('search-input');
     const detailOverlay = document.getElementById('detail-overlay');
     const detailTitle = document.getElementById('detail-title');
@@ -6951,6 +7029,8 @@
     const readinessOverlay = document.getElementById('readiness-overlay');
     const readinessButton = document.getElementById('btn-readiness');
     const readinessScroll = document.getElementById('readiness-scroll');
+    const readinessTitle = document.getElementById('readiness-title');
+    const readinessSub = document.getElementById('readiness-sub');
     const recordingConsentOverlay = document.getElementById('recording-consent-overlay');
     const recordingConsentDisclosure = document.getElementById('recording-consent-disclosure');
     const recordingConsentConfirm = document.getElementById('recording-consent-confirm');
@@ -7034,6 +7114,9 @@
     const RESUMMARIZE_CONFIRM_MS = 6000;
     let processingJobs = [];
     let readinessItems = [];
+    let readinessScope = 'all';
+    let latestSettings = null;
+    let desktopAppVersion = '';
     let recoveryItems = [];
     let recoveryLoadGeneration = 0;
     let recoveryLoadPromise = null;
@@ -8461,16 +8544,46 @@
       }
     }
 
-    function permissionRowToReadinessItem(row, restartSafety) {
-      return {
+    function permissionRowToReadinessItem(row, restartSafety, shortcutSettings, scope) {
+      const item = {
+        kind: row.kind,
         label: `${row.label} permission`,
         state: permissionReadinessState(row),
         detail: permissionReadinessDetail(row),
         optional: !!row.optional,
         settingsUrl: row.settingsUrl || null,
         restartRecommended: !!row.restartRecommended,
-        restartSafety
+        restartSafety,
+        permission: true
       };
+
+      if (scope !== 'dictation') return item;
+
+      if (row.kind === 'microphone') {
+        item.optional = false;
+        item.detail = row.runtimeUsable
+          ? 'Ready to listen when you start dictation.'
+          : 'Needed only when you dictate. macOS asks at first use; no recording starts from this screen.';
+      } else if (row.kind === 'inputMonitoring') {
+        const usesNativeShortcut = shortcutSettings?.enabled && shortcutSettings?.backend === 'native';
+        item.optional = !usesNativeShortcut;
+        item.detail = usesNativeShortcut
+          ? (row.runtimeUsable
+            ? `${shortcutDisplayLabel(shortcutSettings.shortcut, shortcutSettings.keycode)} works while another app is active.`
+            : `${shortcutDisplayLabel(shortcutSettings.shortcut, shortcutSettings.keycode)} needs Input Monitoring to work outside Minutes.`)
+          : 'Only needed for fn or Caps Lock. Standard shortcuts do not use Input Monitoring.';
+      } else if (row.kind === 'accessibility') {
+        item.optional = true;
+        item.detail = row.runtimeUsable
+          ? 'Available for richer focused-app and window context.'
+          : 'Optional for dictation. It improves app and window context, but Minutes still attempts the real paste operation without treating this check as proof.';
+      } else if (row.kind === 'automation') {
+        item.label = 'Paste automation';
+        item.optional = false;
+        item.detail = 'macOS asks when Minutes first sends the paste shortcut to another app. If that operation is declined or blocked, your transcript stays safely on the clipboard.';
+      }
+
+      return item;
     }
 
     function withUiDeadline(promise, label, timeoutMs = 5000) {
@@ -8487,16 +8600,81 @@
       ]);
     }
 
+    function setReadinessScope(scope = 'all') {
+      readinessScope = scope === 'dictation' ? 'dictation' : 'all';
+      if (readinessScope === 'dictation') {
+        readinessTitle.textContent = 'Set up Type at cursor';
+        readinessSub.textContent = 'Four separate capabilities, checked only for dictation. Minutes never asks recording-only users to configure them.';
+      } else {
+        readinessTitle.textContent = 'Readiness Center';
+        readinessSub.textContent = 'This view only reports what Minutes can verify right now. Optional items stay optional, and unknown states are never hidden behind fake confidence.';
+      }
+    }
+
+    async function refreshDictationPermissionNudge({ allowShow = false, force = false } = {}) {
+      if (!latestSettings || !desktopAppVersion) return;
+      const destination = latestSettings?.dictation?.destination || 'insert';
+      if (destination !== 'insert') {
+        if (readinessButton.dataset.scope === 'dictation') {
+          readinessButton.classList.remove('active');
+          readinessButton.textContent = 'Readiness';
+          readinessButton.dataset.scope = 'all';
+        }
+        return;
+      }
+
+      try {
+        const [rows, shortcut] = await Promise.all([
+          invoke('cmd_macos_permission_rows'),
+          invoke('cmd_dictation_shortcut_settings'),
+        ]);
+        const microphone = rows.find(row => row.kind === 'microphone');
+        const inputMonitoring = rows.find(row => row.kind === 'inputMonitoring');
+        const needsInputMonitoring = shortcut?.enabled && shortcut?.backend === 'native';
+        const needsAttention = Boolean(
+          (microphone && !microphone.runtimeUsable)
+          || (needsInputMonitoring && inputMonitoring && !inputMonitoring.runtimeUsable)
+        );
+
+        if (!needsAttention) {
+          if (readinessButton.dataset.scope === 'dictation') {
+            readinessButton.classList.remove('active');
+            readinessButton.textContent = 'Readiness';
+            readinessButton.dataset.scope = 'all';
+          }
+          return;
+        }
+
+        const markerKey = 'minutes.dictationPermissionNudgeVersion';
+        if (!allowShow || (!force && localStorage.getItem(markerKey) === desktopAppVersion)) return;
+        localStorage.setItem(markerKey, desktopAppVersion);
+        readinessButton.textContent = force ? 'Dictation needs setup' : 'Dictation setup';
+        readinessButton.dataset.scope = 'dictation';
+        readinessButton.classList.add('active');
+      } catch (error) {
+        console.error('Dictation permission nudge:', error);
+      }
+    }
+
+    async function openReadiness(scope = 'all') {
+      setReadinessScope(scope);
+      readinessOverlay.classList.add('active');
+      await loadReadinessItems();
+    }
+
     async function loadReadinessItems() {
       readinessScroll.replaceChildren();
       const checking = document.createElement('div');
       checking.className = 'readiness-item-detail';
-      checking.textContent = 'Checking readiness in the background...';
+      checking.textContent = 'Checking now…';
       readinessScroll.appendChild(checking);
-      const [itemsResult, permissionRowsResult, restartSafetyResult] = await Promise.allSettled([
-        withUiDeadline(invoke('cmd_permission_center'), 'Readiness inventory'),
+      const [itemsResult, permissionRowsResult, restartSafetyResult, shortcutResult] = await Promise.allSettled([
+        readinessScope === 'all'
+          ? withUiDeadline(invoke('cmd_permission_center'), 'Readiness inventory')
+          : Promise.resolve([]),
         withUiDeadline(invoke('cmd_macos_permission_rows'), 'macOS permission checks'),
-        invoke('cmd_permission_restart_safety')
+        invoke('cmd_permission_restart_safety'),
+        invoke('cmd_dictation_shortcut_settings')
       ]);
 
       let items = [];
@@ -8521,7 +8699,11 @@
 
       let permissionItems = [];
       if (permissionRowsResult.status === 'fulfilled' && Array.isArray(permissionRowsResult.value)) {
-        permissionItems = permissionRowsResult.value.map(row => permissionRowToReadinessItem(row, restartSafety));
+        const shortcutSettings = shortcutResult.status === 'fulfilled' ? shortcutResult.value : null;
+        const rows = readinessScope === 'dictation'
+          ? permissionRowsResult.value.filter(row => ['microphone', 'inputMonitoring', 'accessibility', 'automation'].includes(row.kind))
+          : permissionRowsResult.value;
+        permissionItems = rows.map(row => permissionRowToReadinessItem(row, restartSafety, shortcutSettings, readinessScope));
       } else if (permissionRowsResult.status === 'rejected') {
         console.error('macOS permission rows:', permissionRowsResult.reason);
         permissionItems.push({
@@ -8570,9 +8752,22 @@
           card.appendChild(optional);
         }
 
-        if (item.settingsUrl || item.restartRecommended) {
+        if (item.permission || item.settingsUrl || item.restartRecommended) {
           const actions = document.createElement('div');
           actions.className = 'readiness-actions';
+          const statusLine = document.createElement('div');
+          statusLine.className = 'readiness-action-status';
+          const recheckButton = document.createElement('button');
+          recheckButton.type = 'button';
+          recheckButton.className = 'btn btn-secondary btn-sm';
+          recheckButton.textContent = 'Recheck';
+          recheckButton.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            recheckButton.disabled = true;
+            recheckButton.textContent = 'Checking…';
+            await loadReadinessItems();
+          });
+          actions.appendChild(recheckButton);
           if (item.settingsUrl) {
             const openSettings = document.createElement('button');
             openSettings.type = 'button';
@@ -8594,8 +8789,6 @@
             actions.appendChild(openSettings);
           }
           if (item.restartRecommended) {
-            const statusLine = document.createElement('div');
-            statusLine.className = 'readiness-action-status';
             const initialStatus = permissionRestartStatusText(item.restartSafety);
             if (initialStatus && item.restartSafety && item.restartSafety.status !== 'allowed') {
               statusLine.textContent = initialStatus;
@@ -8611,8 +8804,8 @@
               restartForPermission(statusLine, restartButton);
             });
             actions.appendChild(restartButton);
-            actions.appendChild(statusLine);
           }
+          actions.appendChild(statusLine);
           card.appendChild(actions);
         }
 
@@ -8788,40 +8981,43 @@
 
     // ── Device picker ──
     const devicePicker = document.getElementById('device-picker');
+    const dictationMicrophonePicker = document.getElementById('settings-dictation-microphone');
+    function populateDevicePicker(picker, result) {
+      if (!picker) return;
+      picker.replaceChildren();
+      const defaultOpt = document.createElement('option');
+      defaultOpt.value = '';
+      defaultOpt.textContent = 'System Default';
+      picker.appendChild(defaultOpt);
+      const configured = result.configured_device || '';
+      if (Array.isArray(result.entries) && result.entries.length > 0) {
+        for (const entry of result.entries) {
+          const opt = document.createElement('option');
+          opt.value = entry.name;
+          opt.textContent = entry.label;
+          if (configured && (entry.name === configured || entry.label === configured)) {
+            opt.selected = true;
+          }
+          picker.appendChild(opt);
+        }
+      } else {
+        for (const fullName of result.devices || []) {
+          const opt = document.createElement('option');
+          opt.value = fullName;
+          opt.textContent = fullName;
+          if (configured && fullName === configured) opt.selected = true;
+          picker.appendChild(opt);
+        }
+      }
+    }
+
     async function loadDevices() {
       try {
         const result = await invoke('cmd_list_devices');
-        devicePicker.replaceChildren();
-        const defaultOpt = document.createElement('option');
-        defaultOpt.value = '';
-        defaultOpt.textContent = 'System Default';
-        devicePicker.appendChild(defaultOpt);
-        // Prefer structured entries so we store the canonical CPAL name
-        // in config. Older hosts only return the decorated `devices` list,
-        // in which case we fall back and let the backend's suffix stripper
-        // resolve the selection at capture time.
-        const configured = result.configured_device || '';
-        if (Array.isArray(result.entries) && result.entries.length > 0) {
-          for (const entry of result.entries) {
-            const opt = document.createElement('option');
-            opt.value = entry.name;
-            opt.textContent = entry.label;
-            if (configured && (entry.name === configured || entry.label === configured)) {
-              opt.selected = true;
-            }
-            devicePicker.appendChild(opt);
-          }
-        } else {
-          for (const fullName of result.devices || []) {
-            const opt = document.createElement('option');
-            opt.value = fullName;
-            opt.textContent = fullName;
-            if (configured && fullName === configured) {
-              opt.selected = true;
-            }
-            devicePicker.appendChild(opt);
-          }
-        }
+        // Prefer structured entries so we persist canonical CPAL names. Both
+        // pickers share one setting and therefore always render the same value.
+        populateDevicePicker(devicePicker, result);
+        populateDevicePicker(dictationMicrophonePicker, result);
       } catch (e) {
         console.error('Load devices:', e);
       }
@@ -8829,6 +9025,7 @@
     loadDevices();
     // Re-scan devices when the picker is focused (handles hotplug)
     devicePicker.addEventListener('focus', loadDevices);
+    dictationMicrophonePicker?.addEventListener('focus', loadDevices);
 
     // Persist device choice to config — recording reads config.recording.device at capture time
     devicePicker.addEventListener('change', async () => {
@@ -8840,6 +9037,18 @@
         });
       } catch (e) {
         console.error('Set device:', e);
+      }
+    });
+    dictationMicrophonePicker?.addEventListener('change', async () => {
+      try {
+        await invoke('cmd_set_setting', {
+          section: 'recording',
+          key: 'device',
+          value: dictationMicrophonePicker.value || '',
+        });
+        devicePicker.value = dictationMicrophonePicker.value;
+      } catch (e) {
+        console.error('Set dictation device:', e);
       }
     });
 
@@ -9536,8 +9745,14 @@
     });
 
     readinessButton.addEventListener('click', () => {
-      loadReadinessItems();
-      readinessOverlay.classList.add('active');
+      const scope = readinessButton.dataset.scope || 'all';
+      if (scope === 'dictation' && desktopAppVersion) {
+        localStorage.setItem('minutes.dictationPermissionNudgeVersion', desktopAppVersion);
+        readinessButton.classList.remove('active');
+        readinessButton.textContent = 'Readiness';
+        readinessButton.dataset.scope = 'all';
+      }
+      openReadiness(scope);
     });
     document.getElementById('btn-readiness-close').addEventListener('click', closeReadiness);
     readinessOverlay.addEventListener('click', (e) => {
@@ -11354,6 +11569,7 @@
           invoke('cmd_get_settings'),
           invoke('cmd_get_coach_settings'),
         ]);
+        latestSettings = s;
         renderCoachSettings(coach);
         document.getElementById('settings-config-path').textContent = s.config_path;
         // Identity — populate name, emails, and aliases. The legacy
@@ -11573,7 +11789,28 @@
           // Empty/unset destination means the compiled default (insert).
           document.getElementById('settings-dictation-destination').value =
             (s.dictation.destination && s.dictation.destination !== '') ? s.dictation.destination : 'insert';
+          const insertOption = document.getElementById('settings-dictation-destination-insert');
+          const destinationDetail = document.getElementById('settings-dictation-destination-detail');
+          const insertionCapability = s.dictation.insert_capability || 'unavailable';
+          if (insertionCapability === 'macos_native_or_paste') {
+            insertOption.textContent = "Type at cursor — inserts into the app you're in";
+            destinationDetail.textContent = 'Minutes prefers native text insertion, with a verified paste fallback. If the target changes or macOS blocks insertion, your transcript stays on the clipboard.';
+          } else if (insertionCapability === 'linux_x11_paste') {
+            insertOption.textContent = "Type at cursor — inserts into the app you're in";
+            destinationDetail.textContent = 'On X11, Minutes uses the clipboard and xdotool after verifying the target. If insertion is unavailable, your transcript stays on the clipboard.';
+          } else if (insertionCapability === 'clipboard_only') {
+            insertOption.textContent = 'Type at cursor — unavailable here; copies instead';
+            destinationDetail.textContent = 'This platform supports clipboard delivery, not verified active-app insertion. Minutes will preserve the transcript on the clipboard.';
+          } else {
+            insertOption.textContent = 'Type at cursor — unavailable here';
+            destinationDetail.textContent = 'Active-app insertion is unavailable in this session. Choose clipboard delivery so your transcript remains accessible.';
+          }
           document.getElementById('settings-dictation-model').value = s.dictation.model || 'base';
+          document.getElementById('settings-dictation-writing-style').value =
+            ['none', 'off'].includes(s.dictation.cleanup_engine) ? 'literal' : 'natural';
+          document.getElementById('settings-dictation-history-policy').value =
+            s.dictation.history_policy === 'off' ? 'off' : 'recent';
+          setSettingsToggle('settings-dictation-voice-commands', s.dictation.voice_commands_enabled !== false);
           setSettingsToggle('settings-dictation-daily-note', s.dictation.daily_note_log !== false);
           document.getElementById('settings-dictation-silence').value = String(s.dictation.silence_timeout_ms || 2000);
         }
@@ -11586,7 +11823,10 @@
 
     function dictationRecentPreview(record) {
       const text = (record.cleanedText || record.rawText || '').trim();
-      return text || '(empty dictation)';
+      if (text) return text;
+      return record.recoveryAudioPath
+        ? 'Captured audio — ready to reprocess'
+        : '(empty dictation)';
     }
 
     function dictationRecentMeta(record) {
@@ -11600,6 +11840,12 @@
       if (record.engineId) parts.push(record.engineId);
       if (record.insertion?.outcome) parts.push(record.insertion.outcome.replaceAll('_', ' '));
       if (record.targetContext?.appName) parts.push(record.targetContext.appName);
+      if (record.commandsApplied?.length) {
+        const edits = record.commandsApplied
+          .map((command) => String(command.kind || 'edit').replaceAll('_', ' '))
+          .join(', ');
+        parts.push('voice edits: ' + edits);
+      }
       return parts.join(' · ');
     }
 
@@ -11608,7 +11854,11 @@
       const status = document.getElementById('settings-dictation-recents-status');
       if (!root) return;
       root.innerHTML = '<div class="about-controls-meta">Loading...</div>';
-      if (status) status.textContent = '';
+      if (status) {
+        status.textContent = latestSettings?.dictation?.history_policy === 'off'
+          ? 'Routine history is off. Recoverable captures will still appear here.'
+          : '';
+      }
       try {
         const records = await invoke('cmd_recent_dictations', { limit: 5 });
         renderRecentDictations(records || []);
@@ -11633,6 +11883,22 @@
         const openButton = record.filePath
           ? `<button class="btn btn-secondary btn-sm" data-dictation-action="open" data-dictation-id="${escapeHtml(record.id)}">Open</button>`
           : '';
+        const hasText = Boolean((record.cleanedText || '').trim());
+        const hasRaw = Boolean((record.rawText || '').trim());
+        const textButtons = hasText
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="copy" data-dictation-id="${escapeHtml(record.id)}">Copy</button>
+             <button class="btn btn-secondary btn-sm" data-dictation-action="paste" data-dictation-id="${escapeHtml(record.id)}">Paste</button>`
+          : '';
+        const rawButton = hasRaw
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="raw" data-dictation-id="${escapeHtml(record.id)}">Copy raw</button>`
+          : '';
+        const undoVoiceEditButton = record.preCommandText && record.commandsApplied?.length
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="before-edits" data-dictation-id="${escapeHtml(record.id)}">Copy before edits</button>`
+          : '';
+        const recoveryButtons = record.recoveryAudioPath
+          ? `<button class="btn btn-secondary btn-sm" data-dictation-action="reprocess" data-dictation-id="${escapeHtml(record.id)}">Reprocess</button>
+             <button class="btn btn-secondary btn-sm" data-dictation-action="delete-audio" data-dictation-id="${escapeHtml(record.id)}">Delete audio</button>`
+          : '';
         return `
           <div class="dictation-recent-item" data-dictation-id="${escapeHtml(record.id)}">
             <div>
@@ -11640,8 +11906,10 @@
               <div class="dictation-recent-meta">${meta}</div>
             </div>
             <div class="dictation-recent-actions">
-              <button class="btn btn-secondary btn-sm" data-dictation-action="copy" data-dictation-id="${escapeHtml(record.id)}">Copy</button>
-              <button class="btn btn-secondary btn-sm" data-dictation-action="paste" data-dictation-id="${escapeHtml(record.id)}">Paste</button>
+              ${textButtons}
+              ${rawButton}
+              ${undoVoiceEditButton}
+              ${recoveryButtons}
               ${openButton}
             </div>
           </div>
@@ -11669,6 +11937,20 @@
         } else if (action === 'paste') {
           const result = await invoke('cmd_repaste_dictation', { id });
           if (status) status.textContent = result?.message || 'Pasted.';
+        } else if (action === 'raw') {
+          const result = await invoke('cmd_copy_raw_dictation', { id });
+          if (status) status.textContent = result?.message || 'Copied raw dictation.';
+        } else if (action === 'before-edits') {
+          const result = await invoke('cmd_copy_pre_command_dictation', { id });
+          if (status) status.textContent = result?.message || 'Copied the text from before voice edits.';
+        } else if (action === 'reprocess') {
+          const result = await invoke('cmd_reprocess_dictation', { id });
+          await loadRecentDictations();
+          if (status) status.textContent = result?.message || 'Recovered dictation.';
+        } else if (action === 'delete-audio') {
+          const result = await invoke('cmd_delete_dictation_audio', { id });
+          await loadRecentDictations();
+          if (status) status.textContent = result || 'Deleted saved audio.';
         } else if (action === 'open' && record.filePath) {
           await invoke('cmd_open_file', { path: record.filePath });
           if (status) status.textContent = 'Opened dictation file.';
@@ -12497,7 +12779,17 @@
         document.getElementById('settings-dictation-shortcut-status').textContent = String(e2);
       }
     });
-    document.getElementById('settings-dictation-destination').addEventListener('change', (e) => invoke('cmd_set_setting', { section: 'dictation', key: 'destination', value: e.target.value }));
+    document.getElementById('settings-dictation-destination').addEventListener('change', async (e) => {
+      const destination = e.target.value;
+      await invoke('cmd_set_setting', { section: 'dictation', key: 'destination', value: destination });
+      if (latestSettings?.dictation) latestSettings.dictation.destination = destination;
+      if (destination === 'insert') {
+        closeSettings();
+        await openReadiness('dictation');
+      } else {
+        refreshDictationPermissionNudge();
+      }
+    });
     // UI language: persist via config + rebuild native shell, then apply to the
     // frontend in place (cmd returns the resolved locale, "en" | "zh-CN").
     document.getElementById('settings-ui-language').addEventListener('change', async (e) => {
@@ -12507,7 +12799,25 @@
       } catch (err) { console.error('set ui language:', err); }
     });
     document.getElementById('settings-dictation-model').addEventListener('change', (e) => invoke('cmd_set_setting', { section: 'dictation', key: 'model', value: e.target.value }));
+    document.getElementById('settings-dictation-writing-style').addEventListener('change', (e) => invoke('cmd_set_setting', {
+      section: 'dictation',
+      key: 'cleanup_engine',
+      value: e.target.value === 'literal' ? 'none' : 'rules',
+    }));
+    document.getElementById('settings-dictation-history-policy').addEventListener('change', async (e) => {
+      await invoke('cmd_set_setting', { section: 'dictation', key: 'history_policy', value: e.target.value });
+      if (latestSettings?.dictation) latestSettings.dictation.history_policy = e.target.value;
+      document.getElementById('settings-dictation-recents-status').textContent = e.target.value === 'off'
+        ? 'Routine history is off. Recoverable captures will still appear here.'
+        : '';
+    });
     document.getElementById('settings-dictation-silence').addEventListener('change', (e) => invoke('cmd_set_setting', { section: 'dictation', key: 'silence_timeout_ms', value: e.target.value }));
+    document.getElementById('settings-dictation-voice-commands').addEventListener('click', async () => {
+      const btn = document.getElementById('settings-dictation-voice-commands');
+      const next = btn.textContent !== 'On';
+      await invoke('cmd_set_setting', { section: 'dictation', key: 'voice_commands_enabled', value: String(next) });
+      setSettingsToggle('settings-dictation-voice-commands', next);
+    });
     document.getElementById('settings-dictation-daily-note').addEventListener('click', async () => {
       const btn = document.getElementById('settings-dictation-daily-note');
       const next = btn.textContent !== 'On';
@@ -13196,7 +13506,9 @@
     const currentWindow = getCurrentWindow();
 
     window.__TAURI__.app.getVersion?.().then((version) => {
+      desktopAppVersion = version;
       if (aboutVersion) aboutVersion.textContent = `Desktop app v${version}`;
+      refreshDictationPermissionNudge({ allowShow: true });
     }).catch(() => { });
 
     aboutWebsiteButton?.addEventListener('click', () => {
@@ -13233,8 +13545,18 @@
       openSettings();
     });
 
-    currentWindow.listen('permissions:changed', () => {
+    currentWindow.listen('minutes://show-dictation-permissions', () => {
+      closeAbout();
+      closeSettings();
+      openReadiness('dictation');
+    });
+
+    currentWindow.listen('permissions:changed', (event) => {
       loadReadinessItems();
+      refreshDictationPermissionNudge({
+        allowShow: event.payload?.reason === 'permission_loss',
+        force: event.payload?.reason === 'permission_loss',
+      });
     });
 
     const recallPanel = document.getElementById('recall-panel');
@@ -13396,6 +13718,9 @@
       sidebarCollapseButton.classList.add('is-collapsed');
     }
     sidebarCollapseButton.addEventListener('click', toggleSidebarCollapsed);
+    sidebarExpandRail.addEventListener('click', () => {
+      applySidebarCollapsed(false, { explicit: true });
+    });
     window.addEventListener('resize', () => {
       if (window.innerWidth < 720 && !userExpandedSidebarThisSession && localStorage.getItem('minutes.sidebarCollapsed') !== 'true') {
         sidebarAutoCollapsed = true;
@@ -16332,8 +16657,10 @@
       try {
         await legacyConfigMigrationReady;
         const s = await invoke('cmd_get_settings');
+        latestSettings = s;
         setNotificationToggle(s?.notifications?.completion_enabled !== false);
         copilotCriticalAlertsEnabled = s?.notifications?.copilot_critical_enabled === true;
+        refreshDictationPermissionNudge({ allowShow: true });
       } catch (e) {
         console.error('Init notifications from config:', e);
       }

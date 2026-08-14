@@ -159,6 +159,9 @@ pub fn prompt_accessibility_permission() {
 pub enum HotkeyEvent {
     Press,
     Release,
+    /// Escape key-down observed by the same global event tap. The caller
+    /// decides whether an active capture should treat it as cancellation.
+    Cancel,
 }
 
 /// Lifecycle updates emitted by the native hotkey monitor thread.
@@ -179,7 +182,7 @@ pub struct HotkeyMonitor {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HotkeyProbeResult {
     pub keycode: i64,
-    pub accessibility_trusted: bool,
+    pub input_monitoring_granted: bool,
     pub status: String,
     pub message: String,
     pub elapsed_ms: u128,
@@ -236,10 +239,21 @@ fn should_consume_matched_events(keycode: i64) -> bool {
     keycode != KEYCODE_FN
 }
 
+fn is_cancel_key_down(keycode: i64, event_type: ffi::CGEventType) -> bool {
+    const KEYCODE_ESCAPE: i64 = 53;
+    keycode == KEYCODE_ESCAPE && event_type == ffi::kCGEventKeyDown
+}
+
+fn input_monitoring_failure(granted: bool) -> Option<&'static str> {
+    (!granted).then_some(
+        "This copy of Minutes cannot detect Fn while another app is active because Input Monitoring is unavailable. Add the installed Minutes app in System Settings > Privacy & Security > Input Monitoring, turn it on, then fully quit and reopen Minutes.",
+    )
+}
+
 /// Attempt to start the native macOS hotkey monitor and report whether the
 /// current process identity can create the CGEventTap successfully.
 pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResult {
-    let accessibility_trusted = is_input_monitoring_granted();
+    let input_monitoring_granted = is_input_monitoring_granted();
     let started_at = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel::<HotkeyMonitorStatus>();
 
@@ -254,7 +268,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
         Err(error) => {
             return HotkeyProbeResult {
                 keycode,
-                accessibility_trusted,
+                input_monitoring_granted,
                 status: "spawn-failed".into(),
                 message: error,
                 elapsed_ms: started_at.elapsed().as_millis(),
@@ -265,7 +279,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
     let deadline = started_at + timeout;
     let mut result = HotkeyProbeResult {
         keycode,
-        accessibility_trusted,
+        input_monitoring_granted,
         status: "timeout".into(),
         message: format!(
             "Timed out after {}ms waiting for the native hotkey monitor to report status.",
@@ -284,7 +298,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Starting) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "starting".into(),
                     message: "Native hotkey monitor thread started and is waiting for CGEventTap activation.".into(),
                     elapsed_ms: started_at.elapsed().as_millis(),
@@ -293,7 +307,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Active) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "active".into(),
                     message: "CGEventTap started successfully for this process identity.".into(),
                     elapsed_ms: started_at.elapsed().as_millis(),
@@ -303,7 +317,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Failed(message)) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "failed".into(),
                     message,
                     elapsed_ms: started_at.elapsed().as_millis(),
@@ -313,7 +327,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Ok(HotkeyMonitorStatus::Stopped) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "stopped".into(),
                     message: "Native hotkey monitor stopped before it reported active status."
                         .into(),
@@ -327,7 +341,7 @@ pub fn probe_hotkey_monitor(keycode: i64, timeout: Duration) -> HotkeyProbeResul
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 result = HotkeyProbeResult {
                     keycode,
-                    accessibility_trusted,
+                    input_monitoring_granted,
                     status: "disconnected".into(),
                     message: "Native hotkey monitor status channel disconnected unexpectedly."
                         .into(),
@@ -358,6 +372,18 @@ fn run_event_tap(
     status_callback: Box<dyn Fn(HotkeyMonitorStatus) + Send>,
     stop: Arc<AtomicBool>,
 ) {
+    status_callback(HotkeyMonitorStatus::Starting);
+
+    // macOS may still create a process-local event tap when ListenEvent access
+    // is missing. That tap sees keys only while Minutes is frontmost, so
+    // treating creation as success produces a particularly misleading
+    // "active" state. Preflight is the authoritative global-capability gate.
+    if let Some(message) = input_monitoring_failure(is_input_monitoring_granted()) {
+        tracing::error!("{}", message);
+        status_callback(HotkeyMonitorStatus::Failed(message.to_string()));
+        return;
+    }
+
     // `fn`/Globe is safe to observe without suppressing the key itself. Using
     // listen-only keeps it on the Input Monitoring privilege path and avoids
     // the more fragile modifying-tap behavior needed for Caps Lock suppression.
@@ -375,8 +401,6 @@ fn run_event_tap(
         consume_matched_events,
     });
     let context_ptr = Box::into_raw(context) as *mut std::ffi::c_void;
-
-    status_callback(HotkeyMonitorStatus::Starting);
 
     unsafe {
         let tap = ffi::CGEventTapCreate(
@@ -467,15 +491,32 @@ unsafe extern "C" fn event_tap_callback(
     user_info: *mut std::ffi::c_void,
 ) -> ffi::CGEventRef {
     let context = &*(user_info as *const TapContext);
-
-    if context.stop.load(Ordering::Relaxed) {
-        return event;
-    }
-
     let keycode = ffi::CGEventGetIntegerValueField(event, ffi::kCGKeyboardEventKeycode);
 
+    if dispatch_hotkey_event(context, event_type, keycode) {
+        std::ptr::null_mut()
+    } else {
+        event
+    }
+}
+
+/// Dispatch one decoded event-tap input. Returns whether the matched event
+/// should be consumed rather than passed through to the foreground app.
+fn dispatch_hotkey_event(context: &TapContext, event_type: ffi::CGEventType, keycode: i64) -> bool {
+    if context.stop.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    // Modifier-less Escape is not a reliable Carbon/global-shortcut
+    // registration on macOS. Observe it through the already-authorized HID
+    // event tap instead and leave the event untouched for the foreground app.
+    if is_cancel_key_down(keycode, event_type) {
+        (context.callback)(HotkeyEvent::Cancel);
+        return false;
+    }
+
     if keycode != context.target_keycode {
-        return event; // Not our key — pass through
+        return false; // Not our key — pass through
     }
 
     match event_type {
@@ -483,20 +524,12 @@ unsafe extern "C" fn event_tap_callback(
             if !context.key_is_down.swap(true, Ordering::Relaxed) {
                 (context.callback)(HotkeyEvent::Press);
             }
-            if context.consume_matched_events {
-                std::ptr::null_mut()
-            } else {
-                event
-            }
+            context.consume_matched_events
         }
         ffi::kCGEventKeyUp => {
             context.key_is_down.store(false, Ordering::Relaxed);
             (context.callback)(HotkeyEvent::Release);
-            if context.consume_matched_events {
-                std::ptr::null_mut()
-            } else {
-                event
-            }
+            context.consume_matched_events
         }
         ffi::kCGEventFlagsChanged => {
             // Modifier keys (Caps Lock, fn) use FlagsChanged instead of keyDown/keyUp.
@@ -509,13 +542,9 @@ unsafe extern "C" fn event_tap_callback(
                 context.key_is_down.store(true, Ordering::Relaxed);
                 (context.callback)(HotkeyEvent::Press);
             }
-            if context.consume_matched_events {
-                std::ptr::null_mut() // Consume — prevent Caps Lock toggle.
-            } else {
-                event
-            }
+            context.consume_matched_events // Consume Caps Lock; observe Fn.
         }
-        _ => event, // Unknown — pass through
+        _ => false, // Unknown — pass through
     }
 }
 
@@ -534,6 +563,20 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_probe_json_names_input_monitoring_not_accessibility() {
+        let probe = HotkeyProbeResult {
+            keycode: KEYCODE_FN,
+            input_monitoring_granted: true,
+            status: "active".into(),
+            message: "test".into(),
+            elapsed_ms: 1,
+        };
+        let json = serde_json::to_value(probe).expect("probe should serialize");
+        assert_eq!(json["input_monitoring_granted"], true);
+        assert!(json.get("accessibility_trusted").is_none());
+    }
+
+    #[test]
     fn constants_are_correct() {
         assert_eq!(KEYCODE_CAPS_LOCK, 57);
         assert_eq!(KEYCODE_FN, 63);
@@ -543,5 +586,42 @@ mod tests {
     fn fn_uses_listen_only_event_tap() {
         assert!(!should_consume_matched_events(KEYCODE_FN));
         assert!(should_consume_matched_events(KEYCODE_CAPS_LOCK));
+    }
+
+    #[test]
+    fn escape_key_down_is_the_only_native_cancel_event() {
+        assert!(is_cancel_key_down(53, ffi::kCGEventKeyDown));
+        assert!(!is_cancel_key_down(53, ffi::kCGEventKeyUp));
+        assert!(!is_cancel_key_down(KEYCODE_FN, ffi::kCGEventKeyDown));
+    }
+
+    #[test]
+    fn native_escape_dispatches_cancel_without_consuming_the_foreground_event() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        let context = TapContext {
+            target_keycode: KEYCODE_FN,
+            callback: Box::new(move |event| {
+                callback_observed.lock().expect("event lock").push(event);
+            }),
+            stop: Arc::new(AtomicBool::new(false)),
+            key_is_down: AtomicBool::new(false),
+            consume_matched_events: false,
+        };
+
+        assert!(!dispatch_hotkey_event(&context, ffi::kCGEventKeyDown, 53));
+        assert_eq!(
+            *observed.lock().expect("event lock"),
+            vec![HotkeyEvent::Cancel]
+        );
+    }
+
+    #[test]
+    fn missing_input_monitoring_never_reports_a_self_only_tap_as_usable() {
+        assert!(input_monitoring_failure(true).is_none());
+
+        let message = input_monitoring_failure(false).expect("permission should be required");
+        assert!(message.contains("while another app is active"));
+        assert!(message.contains("fully quit and reopen Minutes"));
     }
 }
