@@ -88,6 +88,7 @@ jobs:
           set -euo pipefail
           npm ci
           npm run build
+          node ../../scripts/normalize_npm_pack_permissions.mjs .
 
           pack_json="$(mktemp)"
           npm pack --json > "$pack_json"
@@ -100,12 +101,13 @@ jobs:
           )
           package_name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
-          rm -f "${pack[0]}" "$pack_json"
+          rm -f "$pack_json"
 
           {
             echo "package_name=${package_name}"
             echo "version=${version}"
             echo "integrity=${pack[1]}"
+            echo "tarball=${pack[0]}"
           } >> "$GITHUB_OUTPUT"
           node ../../scripts/registry_poll.mjs npm-check "$package_name" "$version" "${pack[1]}" >> "$GITHUB_OUTPUT"
 
@@ -116,12 +118,13 @@ jobs:
           PACKAGE_NAME: ${{ steps.sdk.outputs.package_name }}
           PACKAGE_VERSION: ${{ steps.sdk.outputs.version }}
           PACKAGE_INTEGRITY: ${{ steps.sdk.outputs.integrity }}
+          PACKAGE_TARBALL: ${{ steps.sdk.outputs.tarball }}
         shell: bash
         run: |
           set -euo pipefail
           publish_log="$(mktemp)"
           set +e
-          npm publish --access public 2>&1 | tee "$publish_log"
+          npm publish "$PACKAGE_TARBALL" --access public 2>&1 | tee "$publish_log"
           publish_status="${PIPESTATUS[0]}"
           set -e
           rm -f "$publish_log"
@@ -153,6 +156,7 @@ jobs:
           set -euo pipefail
           npm ci
           npm run build
+          node ../../scripts/normalize_npm_pack_permissions.mjs .
 
           pack_json="$(mktemp)"
           npm pack --json > "$pack_json"
@@ -165,12 +169,13 @@ jobs:
           )
           package_name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
-          rm -f "${pack[0]}" "$pack_json"
+          rm -f "$pack_json"
 
           {
             echo "package_name=${package_name}"
             echo "version=${version}"
             echo "integrity=${pack[1]}"
+            echo "tarball=${pack[0]}"
           } >> "$GITHUB_OUTPUT"
           node ../../scripts/registry_poll.mjs npm-check "$package_name" "$version" "${pack[1]}" >> "$GITHUB_OUTPUT"
 
@@ -181,12 +186,13 @@ jobs:
           PACKAGE_NAME: ${{ steps.mcp.outputs.package_name }}
           PACKAGE_VERSION: ${{ steps.mcp.outputs.version }}
           PACKAGE_INTEGRITY: ${{ steps.mcp.outputs.integrity }}
+          PACKAGE_TARBALL: ${{ steps.mcp.outputs.tarball }}
         shell: bash
         run: |
           set -euo pipefail
           publish_log="$(mktemp)"
           set +e
-          npm publish --access public 2>&1 | tee "$publish_log"
+          npm publish "$PACKAGE_TARBALL" --access public 2>&1 | tee "$publish_log"
           publish_status="${PIPESTATUS[0]}"
           set -e
           rm -f "$publish_log"

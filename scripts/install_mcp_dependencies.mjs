@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { normalizeNpmPackPermissions } from "./normalize_npm_pack_permissions.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sdkDirectory = path.join(root, "crates", "sdk");
@@ -64,6 +65,7 @@ try {
     runNpm(["ci"], sdkDirectory);
     runNpm(["run", "build"], sdkDirectory);
   }
+  await normalizeNpmPackPermissions(sdkDirectory);
 
   const packOutput = runNpm(
     ["pack", "--json", "--pack-destination", temporaryDirectory],
