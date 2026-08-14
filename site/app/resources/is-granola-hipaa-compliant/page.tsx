@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Is Granola HIPAA compliant?",
@@ -205,6 +206,8 @@ export default function IsGranolaHipaaCompliantPage() {
           patient conversation.
         </p>
       </section>
+
+      <RelatedResources slug="is-granola-hipaa-compliant" />
 
       <PublicFooter />
     </div>

@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Meeting minutes templates (markdown, copy-paste ready)",
@@ -229,6 +230,8 @@ export default function MeetingMinutesTemplatePage() {
           </a>
         </div>
       </section>
+
+      <RelatedResources slug="meeting-minutes-template" />
 
       <PublicFooter />
     </div>

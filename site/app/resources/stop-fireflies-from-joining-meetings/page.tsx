@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "How to stop Fireflies from joining your meetings",
@@ -353,6 +354,8 @@ export default function StopFirefliesJoiningPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="stop-fireflies-from-joining-meetings" />
 
       <PublicFooter />
     </div>

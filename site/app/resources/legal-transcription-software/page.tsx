@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Legal transcription software: what confidentiality actually requires",
@@ -210,6 +211,8 @@ export default function LegalTranscriptionSoftwarePage() {
           jurisdiction — confirm with your ethics counsel.
         </p>
       </section>
+
+      <RelatedResources slug="legal-transcription-software" />
 
       <PublicFooter />
     </div>

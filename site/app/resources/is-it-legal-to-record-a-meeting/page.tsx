@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Is it legal to record a meeting? Consent law, explained",
@@ -236,6 +237,8 @@ export default function IsItLegalToRecordAMeetingPage() {
           the RCFP guide is the reference to check, and counsel is the answer when it matters.
         </p>
       </section>
+
+      <RelatedResources slug="is-it-legal-to-record-a-meeting" />
 
       <PublicFooter />
     </div>

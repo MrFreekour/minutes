@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "Open-source alternatives to Granola AI",
@@ -222,6 +223,8 @@ export default function OpenSourceAlternativesToGranolaPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="open-source-alternatives-to-granola-ai" />
 
       <PublicFooter />
     </div>

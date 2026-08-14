@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "How to turn off built-in AI notetakers in Zoom and Teams",
@@ -396,6 +397,8 @@ export default function BuiltInAiNotetakersPage() {
           than assuming a saved setting took effect.
         </p>
       </section>
+
+      <RelatedResources slug="turn-off-built-in-ai-notetakers" />
 
       <PublicFooter />
     </div>

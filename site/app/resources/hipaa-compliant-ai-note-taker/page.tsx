@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "HIPAA-compliant AI note takers: the actual state of play",
@@ -284,6 +285,8 @@ export default function HipaaCompliantAiNoteTakerPage() {
           recording PHI with any tool.
         </p>
       </section>
+
+      <RelatedResources slug="hipaa-compliant-ai-note-taker" />
 
       <PublicFooter />
     </div>

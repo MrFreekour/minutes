@@ -3,6 +3,7 @@ import { FaqSection } from "@/components/faq-section";
 import { PublicFooter } from "@/components/public-footer";
 import { SectionLabel } from "@/components/section-label";
 import { faqPageSchema, resourceArticleSchema } from "@/lib/schema";
+import { RelatedResources } from "@/components/related-resources";
 
 export const metadata: Metadata = {
   title: "How to remove Otter AI from Zoom",
@@ -339,6 +340,8 @@ export default function RemoveOtterFromZoomPage() {
           ))}
         </ul>
       </section>
+
+      <RelatedResources slug="remove-otter-ai-from-zoom" />
 
       <PublicFooter />
     </div>
