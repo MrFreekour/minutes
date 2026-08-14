@@ -18249,8 +18249,20 @@ pub fn cmd_reprocess_dictation(
         .ok_or_else(|| "This dictation has no saved recovery audio.".to_string())?;
     let config = Config::load();
     let expected_target = crate::text_insertion::capture_active_target_context();
-    let result = minutes_core::dictation::reprocess_recovery_audio(&recovery_path, &config)
-        .map_err(|error| format!("Could not reprocess saved dictation audio: {error}"))?;
+    let text_mode = minutes_core::dictation_context::infer_target_text_mode(
+        record
+            .target_context
+            .as_ref()
+            .and_then(|target| target.app_name.as_deref()),
+        None,
+        None,
+    );
+    let result = minutes_core::dictation::reprocess_recovery_audio_with_mode(
+        &recovery_path,
+        &config,
+        text_mode,
+    )
+    .map_err(|error| format!("Could not reprocess saved dictation audio: {error}"))?;
     let insert_requested = dictation_should_insert(&config);
     let clipboard_snapshot = if insert_requested && config.dictation.auto_paste_restore {
         crate::text_insertion::read_clipboard().ok()
@@ -20523,6 +20535,15 @@ fn start_dictation_session(
 
     let dictation_target_context = take_pending_dictation_target(&state)
         .or_else(crate::text_insertion::capture_active_target_context);
+    let dictation_text_mode = minutes_core::dictation_context::infer_target_text_mode(
+        dictation_target_context
+            .as_ref()
+            .and_then(|target| target.app_name.as_deref()),
+        dictation_target_context
+            .as_ref()
+            .and_then(|target| target.bundle_id.as_deref()),
+        Some(app.config().identifier.as_str()),
+    );
     let latency_trace = Arc::new(Mutex::new(DictationLatencyTrace::new(
         dictation_pressed_at,
         dictation_target_class(
@@ -20605,6 +20626,7 @@ fn start_dictation_session(
                 auto_stop_on_silence: capture_style.is_none(),
                 cancel_flag: Some(cancel_flag),
                 recovery_audio_path: Some(recovery_audio_for_run),
+                text_mode: dictation_text_mode,
             },
             move |event| {
                 use minutes_core::dictation::DictationEvent;

@@ -1,6 +1,7 @@
 use crate::apple_speech_session::AppleSpeechSession;
 use crate::config::Config;
 use crate::dictation_cleanup::{clean_dictation_text, CleanupEngine, CleanupOptions};
+use crate::dictation_context::DictationTextMode;
 use crate::error::{DictationError, MinutesError, TranscribeError};
 use crate::markdown::{ContentType, Frontmatter, OutputStatus};
 use crate::pid;
@@ -338,6 +339,9 @@ pub struct DictationRunOptions {
     /// Shared slot populated with the private incremental recovery WAV used by
     /// the desktop. Callers retire it only after text delivery succeeds.
     pub recovery_audio_path: Option<Arc<std::sync::Mutex<Option<PathBuf>>>>,
+    /// Sparse local target hint for deterministic formatting. It contains no
+    /// surrounding text and defaults to conservative prose when unknown.
+    pub text_mode: DictationTextMode,
 }
 
 impl Default for DictationRunOptions {
@@ -346,6 +350,7 @@ impl Default for DictationRunOptions {
             auto_stop_on_silence: true,
             cancel_flag: None,
             recovery_audio_path: None,
+            text_mode: DictationTextMode::Unknown,
         }
     }
 }
@@ -598,6 +603,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -632,6 +638,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -742,6 +749,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -771,6 +779,7 @@ where
                             finalized.transcript.duration_secs,
                             finalized.backend,
                             config,
+                            options.text_mode,
                             &mut accumulated_results,
                             on_result,
                         );
@@ -1089,6 +1098,17 @@ pub fn reprocess_recovery_audio(
     audio_path: &std::path::Path,
     config: &Config,
 ) -> Result<DictationResult, MinutesError> {
+    reprocess_recovery_audio_with_mode(audio_path, config, DictationTextMode::Unknown)
+}
+
+/// Re-run retained recovery audio using the formatting contract captured for
+/// its original destination. Callers without a trustworthy destination hint
+/// should use [`reprocess_recovery_audio`], which fails closed to `Unknown`.
+pub fn reprocess_recovery_audio_with_mode(
+    audio_path: &std::path::Path,
+    config: &Config,
+    text_mode: DictationTextMode,
+) -> Result<DictationResult, MinutesError> {
     let audio_path = crate::dictation_memory::validate_recovery_audio_path(audio_path)?;
     let probe = crate::stem_probe::probe_and_repair(&audio_path).map_err(|error| {
         MinutesError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
@@ -1120,7 +1140,7 @@ pub fn reprocess_recovery_audio(
         ))
     })?;
     let duration_secs = crate::dictation_memory::recovery_audio_duration_secs(&audio_path)?;
-    prepare_result(&text, duration_secs, backend, config).ok_or_else(|| {
+    prepare_result(&text, duration_secs, backend, config, text_mode).ok_or_else(|| {
         MinutesError::from(TranscribeError::EmptyTranscript(
             transcription_config.transcription.min_words,
         ))
@@ -1132,12 +1152,13 @@ fn handle_utterance<G>(
     duration_secs: f64,
     backend: DictationFinalBackend,
     config: &Config,
+    text_mode: DictationTextMode,
     accumulated_results: &mut Vec<DictationResult>,
     on_result: &mut G,
 ) where
     G: FnMut(DictationResult),
 {
-    let Some(result) = prepare_result(text, duration_secs, backend, config) else {
+    let Some(result) = prepare_result(text, duration_secs, backend, config, text_mode) else {
         return;
     };
 
@@ -1186,7 +1207,13 @@ fn flush_accumulated_results<F, G>(
 /// Finish a transcribed utterance: write to clipboard, file, daily note.
 /// Called after StreamingWhisper produces a final result.
 fn finish_utterance(text: &str, duration_secs: f64, config: &Config) -> Option<DictationResult> {
-    let result = prepare_result(text, duration_secs, DictationFinalBackend::Whisper, config)?;
+    let result = prepare_result(
+        text,
+        duration_secs,
+        DictationFinalBackend::Whisper,
+        config,
+        DictationTextMode::Unknown,
+    )?;
     write_result_outputs(result, config)
 }
 
@@ -1195,6 +1222,7 @@ fn prepare_result(
     duration_secs: f64,
     backend: DictationFinalBackend,
     config: &Config,
+    text_mode: DictationTextMode,
 ) -> Option<DictationResult> {
     let raw_text = text.trim().to_string();
     if raw_text.is_empty() {
@@ -1205,7 +1233,7 @@ fn prepare_result(
     // before it reaches the clipboard/file/daily-note. `raw_text` keeps the original.
     // If cleanup empties the text (e.g. an all-filler utterance), fall back to the raw
     // text rather than silently dropping content the user actually spoke.
-    let cleaned = clean_dictation_text(&raw_text, &build_cleanup_options(config));
+    let cleaned = clean_dictation_text(&raw_text, &build_cleanup_options(config, text_mode));
     let text = if cleaned.is_empty() {
         raw_text.clone()
     } else {
@@ -1232,7 +1260,7 @@ fn prepare_result(
 }
 
 /// Build cleanup options from config, loading vocabulary replacements when enabled.
-fn build_cleanup_options(config: &Config) -> CleanupOptions {
+fn build_cleanup_options(config: &Config, text_mode: DictationTextMode) -> CleanupOptions {
     let d = &config.dictation;
     let engine = CleanupEngine::parse(&d.cleanup_engine);
     let replacements = if d.cleanup_apply_vocabulary && engine != CleanupEngine::None {
@@ -1244,6 +1272,7 @@ fn build_cleanup_options(config: &Config) -> CleanupOptions {
         engine,
         remove_fillers: d.cleanup_remove_fillers,
         spoken_punctuation: d.cleanup_spoken_punctuation,
+        text_mode,
         replacements,
     }
     .with_sorted_replacements()
@@ -1693,6 +1722,7 @@ mod tests {
             auto_stop_on_silence: false,
             cancel_flag: None,
             recovery_audio_path: None,
+            text_mode: DictationTextMode::Unknown,
         };
         assert!(!should_end_after_silence(
             &shortcut_options,
@@ -1878,7 +1908,8 @@ mod tests {
 
         let backend = dictation_final_backend(&config);
         assert_eq!(backend, DictationFinalBackend::Whisper);
-        let result = prepare_result("hello", 1.0, backend, &config).unwrap();
+        let result =
+            prepare_result("hello", 1.0, backend, &config, DictationTextMode::Unknown).unwrap();
         assert!(result.engine_id.starts_with("whisper:"));
         assert_eq!(
             result.engine_descriptor_version.as_deref(),
@@ -1992,6 +2023,7 @@ mod tests {
                 1.0,
                 DictationFinalBackend::Whisper,
                 &config,
+                DictationTextMode::Unknown,
                 &mut accumulated,
                 &mut on_result,
             );
@@ -2017,6 +2049,7 @@ mod tests {
                 1.0,
                 DictationFinalBackend::Whisper,
                 &config,
+                DictationTextMode::Unknown,
                 &mut accumulated_stdout,
                 &mut on_result,
             );

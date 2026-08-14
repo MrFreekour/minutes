@@ -23,6 +23,8 @@
 //! - Spoken-punctuation mode (opt-in) consumes the literal words "period",
 //!   "comma", etc. as commands, so those words cannot appear as content there.
 
+use crate::dictation_context::DictationTextMode;
+
 /// Conservative filler tokens removed by default.
 ///
 /// Deliberately tight: only unambiguous vocalized pauses. Words that double as real
@@ -89,6 +91,9 @@ pub struct CleanupOptions {
     /// Convert spoken punctuation commands ("period", "new line"). Opt-in: collides
     /// with ordinary words, so off by default.
     pub spoken_punctuation: bool,
+    /// Sparse local target hint. Terminal/code is literal; agent prompts keep
+    /// command-like lines literal; prose modes use conservative polish.
+    pub text_mode: DictationTextMode,
     /// `(surface, canonical)` replacements applied case-insensitively at word
     /// boundaries, e.g. `("gpt", "GPT")`. Sorted longest-surface-first by the
     /// constructor so multi-word phrases win over their sub-words.
@@ -106,6 +111,7 @@ impl Default for CleanupOptions {
             engine: CleanupEngine::Rules,
             remove_fillers: true,
             spoken_punctuation: false,
+            text_mode: DictationTextMode::Unknown,
             replacements: Vec::new(),
         }
     }
@@ -140,6 +146,10 @@ pub fn clean_dictation_text(raw: &str, opts: &CleanupOptions) -> String {
         return raw.trim().to_string();
     }
 
+    if opts.text_mode == DictationTextMode::TerminalCode {
+        return raw.trim().to_string();
+    }
+
     let mut text = collapse_whitespace(raw.trim());
 
     if !opts.replacements.is_empty() {
@@ -160,10 +170,65 @@ pub fn clean_dictation_text(raw: &str, opts: &CleanupOptions) -> String {
     // Cap blank lines again: spoken-punctuation newlines are injected after the
     // initial collapse_whitespace, so adjacent "new paragraph" can stack.
     text = cap_blank_lines(&text);
-    text = capitalize_sentences(&text);
+    text = if opts.text_mode == DictationTextMode::AgentPrompt {
+        capitalize_agent_prompt(&text)
+    } else {
+        capitalize_sentences(&text)
+    };
     text = capitalize_standalone_i(&text);
 
     text.trim().to_string()
+}
+
+fn capitalize_agent_prompt(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            if line_looks_literal(line) {
+                line.to_string()
+            } else {
+                capitalize_sentences(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn line_looks_literal(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let first = trimmed.split_whitespace().next().unwrap_or_default();
+    let command = first.trim_start_matches(['$', '>', '#']);
+    let known_command = matches!(
+        command,
+        "cd" | "git"
+            | "rg"
+            | "ls"
+            | "pwd"
+            | "cp"
+            | "mv"
+            | "ssh"
+            | "scp"
+            | "curl"
+            | "cargo"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "python"
+            | "python3"
+            | "node"
+            | "export"
+            | "set"
+    );
+    known_command
+        || first.contains("--")
+        || first.contains("://")
+        || first.contains('/')
+        || first.contains('\\')
+        || first.contains('_')
+        || first.contains('.')
+        || first
+            .chars()
+            .skip(1)
+            .any(|character| character.is_uppercase())
 }
 
 /// Collapse runs of spaces/tabs to a single space, drop line-leading whitespace, and
@@ -757,6 +822,65 @@ mod tests {
     fn clean_input_is_left_alone() {
         let already = "I shipped the GPT integration. It works well.";
         assert_eq!(clean_dictation_text(already, &rules()), already);
+    }
+
+    #[test]
+    fn terminal_code_is_literal_except_for_outer_trim() {
+        let opts = CleanupOptions {
+            text_mode: DictationTextMode::TerminalCode,
+            spoken_punctuation: true,
+            replacements: vec![("rg".into(), "ripgrep".into())],
+            ..rules()
+        };
+        let command = "  rg --files /private/tmp/my_app | head -20\nmyVariable_name  ";
+        assert_eq!(
+            clean_dictation_text(command, &opts),
+            "rg --files /private/tmp/my_app | head -20\nmyVariable_name"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_preserves_literal_lines_and_polishes_prose() {
+        let opts = CleanupOptions {
+            text_mode: DictationTextMode::AgentPrompt,
+            ..rules()
+        };
+        assert_eq!(
+            clean_dictation_text(
+                "please inspect this command\ncd /private/tmp/my_app && cargo test --all\nthen explain the failure",
+                &opts
+            ),
+            "Please inspect this command\ncd /private/tmp/my_app && cargo test --all\nThen explain the failure"
+        );
+        assert_eq!(
+            clean_dictation_text("myVariable should stay camelCase", &opts),
+            "myVariable should stay camelCase"
+        );
+        assert_eq!(
+            clean_dictation_text(
+                "please inspect /private/tmp/my_app and --keep this flag",
+                &opts
+            ),
+            "Please inspect /private/tmp/my_app and --keep this flag"
+        );
+    }
+
+    #[test]
+    fn chat_document_and_unknown_use_conservative_prose_rules() {
+        for text_mode in [
+            DictationTextMode::Chat,
+            DictationTextMode::EmailDocument,
+            DictationTextMode::Unknown,
+        ] {
+            let opts = CleanupOptions {
+                text_mode,
+                ..rules()
+            };
+            assert_eq!(
+                clean_dictation_text("um i sent it. can you review?", &opts),
+                "I sent it. Can you review?"
+            );
+        }
     }
 
     #[test]
