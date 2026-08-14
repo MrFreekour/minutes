@@ -318,6 +318,8 @@ struct VoiceMatchDiagnostic {
     segment_matching_count: usize,
     segment_rejected_count: usize,
     segment_conflicting_identity_count: usize,
+    segment_uncovered_count: usize,
+    segment_embedding_seconds: f64,
     segment_speech_seconds: f64,
 }
 
@@ -532,6 +534,10 @@ fn evaluate_speaker_voice_matches(
             .iter()
             .map(|segment| segment.speech_seconds)
             .sum();
+        let segment_embedding_seconds = segment_evidence
+            .iter()
+            .map(|segment| segment.embedding_seconds)
+            .sum();
         let mut diagnostic = VoiceMatchDiagnostic {
             speaker_label: label.clone(),
             model_id: model_id.to_string(),
@@ -546,6 +552,8 @@ fn evaluate_speaker_voice_matches(
             segment_matching_count: 0,
             segment_rejected_count: 0,
             segment_conflicting_identity_count: 0,
+            segment_uncovered_count: 0,
+            segment_embedding_seconds,
             segment_speech_seconds,
         };
 
@@ -589,6 +597,16 @@ fn evaluate_speaker_voice_matches(
         }
 
         for segment in segment_evidence {
+            if !segment.embedding_seconds.is_finite()
+                || !segment.speech_seconds.is_finite()
+                || segment.embedding_seconds <= 0.0
+                || segment.speech_seconds <= 0.0
+                || segment.embedding_seconds < segment.speech_seconds
+            {
+                diagnostic.segment_rejected_count += 1;
+                diagnostic.segment_uncovered_count += 1;
+                continue;
+            }
             if segment.embedding.iter().any(|value| !value.is_finite()) {
                 diagnostic.segment_rejected_count += 1;
                 continue;
@@ -611,9 +629,12 @@ fn evaluate_speaker_voice_matches(
         }
 
         if diagnostic.segment_matching_count != diagnostic.segment_evidence_count {
-            diagnostic.reason =
+            diagnostic.reason = if diagnostic.segment_uncovered_count > 0 {
+                "intra-cluster embedding evidence did not cover all represented speech".to_string()
+            } else {
                 "intra-cluster segment evidence did not consistently support the centroid winner"
-                    .to_string();
+                    .to_string()
+            };
             diagnostics.push(diagnostic);
             continue;
         }
@@ -9364,8 +9385,46 @@ mod tests {
     fn segment_evidence(embedding: &[f32]) -> diarize::SpeakerEmbeddingSegment {
         diarize::SpeakerEmbeddingSegment {
             embedding: embedding.to_vec(),
+            embedding_seconds: 3.0,
             speech_seconds: 3.0,
         }
+    }
+
+    #[test]
+    fn long_segment_abstains_when_embedding_did_not_cover_all_speech() {
+        let profiles = vec![active_voice_profile("mat", "Mat", "model-a", &[1.0, 0.0])];
+        let centroids =
+            std::collections::HashMap::from([("SPEAKER_1".to_string(), vec![1.0, 0.0])]);
+        let segments = std::collections::HashMap::from([(
+            "SPEAKER_1".to_string(),
+            vec![diarize::SpeakerEmbeddingSegment {
+                embedding: vec![1.0, 0.0],
+                embedding_seconds: 60.0,
+                speech_seconds: 120.0,
+            }],
+        )]);
+
+        let result = evaluate_speaker_voice_matches(
+            "model-a",
+            &profiles,
+            Some("mat"),
+            0.65,
+            &centroids,
+            &segments,
+        );
+
+        assert!(result.attributions.is_empty());
+        let diagnostic = &result.diagnostics[0];
+        assert!(!diagnostic.accepted);
+        assert_eq!(diagnostic.segment_matching_count, 0);
+        assert_eq!(diagnostic.segment_rejected_count, 1);
+        assert_eq!(diagnostic.segment_uncovered_count, 1);
+        assert_eq!(diagnostic.segment_embedding_seconds, 60.0);
+        assert_eq!(diagnostic.segment_speech_seconds, 120.0);
+        assert_eq!(
+            diagnostic.reason,
+            "intra-cluster embedding evidence did not cover all represented speech"
+        );
     }
 
     #[test]

@@ -180,6 +180,9 @@ pub struct SpeakerSegment {
 #[derive(Debug, Clone)]
 pub struct SpeakerEmbeddingSegment {
     pub embedding: Vec<f32>,
+    /// Amount of audio the embedding model actually evaluated.
+    pub embedding_seconds: f64,
+    /// Amount of diarized speech this evidence is being asked to represent.
     pub speech_seconds: f64,
 }
 
@@ -3263,7 +3266,7 @@ fn diarize_with_pyannote_rs(
     let mut seg_speaker_ids: Vec<usize> = Vec::new();
     // Reliable embeddings parallel to `speech_segments`. Short segments stay
     // `None` and are never allowed to vote on an identity decision.
-    let mut seg_embeddings: Vec<Option<Vec<f32>>> = Vec::new();
+    let mut seg_embeddings: Vec<Option<(Vec<f32>, f64)>> = Vec::new();
 
     // Minimum samples for reliable embedding extraction (~1.5s at 16kHz).
     // Shorter segments produce unstable embeddings that corrupt clustering.
@@ -3295,7 +3298,8 @@ fn diarize_with_pyannote_rs(
         // L2-normalize so every segment contributes equally to the
         // average direction, regardless of the model's output magnitude.
         let embedding = l2_normalize(&raw_embedding);
-        seg_embeddings.push(Some(embedding.clone()));
+        let embedding_seconds = (embed_end - seg.start_sample) as f64 / sample_rate as f64;
+        seg_embeddings.push(Some((embedding.clone(), embedding_seconds)));
 
         // Find best matching speaker by cosine similarity
         let mut best_id = None;
@@ -3442,8 +3446,8 @@ fn diarize_with_pyannote_rs(
         String,
         Vec<SpeakerEmbeddingSegment>,
     > = std::collections::HashMap::new();
-    for (idx, embedding) in seg_embeddings.into_iter().enumerate() {
-        let Some(embedding) = embedding else {
+    for (idx, evidence) in seg_embeddings.into_iter().enumerate() {
+        let Some((embedding, embedding_seconds)) = evidence else {
             continue;
         };
         speaker_embedding_segments
@@ -3451,7 +3455,12 @@ fn diarize_with_pyannote_rs(
             .or_default()
             .push(SpeakerEmbeddingSegment {
                 embedding,
-                speech_seconds: (speech_segments[idx].end - speech_segments[idx].start).max(0.0),
+                embedding_seconds,
+                speech_seconds: speech_segments[idx]
+                    .end_sample
+                    .saturating_sub(speech_segments[idx].start_sample)
+                    as f64
+                    / sample_rate as f64,
             });
     }
 
@@ -5138,6 +5147,7 @@ mod tests {
                     "remote-alex".to_string(),
                     vec![SpeakerEmbeddingSegment {
                         embedding: vec![0.1, 0.2],
+                        embedding_seconds: 3.0,
                         speech_seconds: 3.0,
                     }],
                 ),
@@ -5145,6 +5155,7 @@ mod tests {
                     "remote-sam".to_string(),
                     vec![SpeakerEmbeddingSegment {
                         embedding: vec![0.3, 0.4],
+                        embedding_seconds: 3.0,
                         speech_seconds: 3.0,
                     }],
                 ),
@@ -5238,6 +5249,7 @@ mod tests {
                     "SPEAKER_2".to_string(),
                     vec![SpeakerEmbeddingSegment {
                         embedding: vec![0.1],
+                        embedding_seconds: 3.0,
                         speech_seconds: 3.0,
                     }],
                 ),
@@ -5245,6 +5257,7 @@ mod tests {
                     "SPEAKER_3".to_string(),
                     vec![SpeakerEmbeddingSegment {
                         embedding: vec![0.2],
+                        embedding_seconds: 3.0,
                         speech_seconds: 3.0,
                     }],
                 ),
@@ -5401,6 +5414,7 @@ mod tests {
                 "SPEAKER_2".to_string(),
                 vec![SpeakerEmbeddingSegment {
                     embedding: vec![0.2],
+                    embedding_seconds: 3.0,
                     speech_seconds: 3.0,
                 }],
             )]),
