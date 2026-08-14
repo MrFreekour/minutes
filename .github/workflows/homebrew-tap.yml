@@ -135,14 +135,11 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          # Re-running the bump in dry-run mode is the strongest postcondition
-          # available: it re-reads the published tap and re-derives the
-          # expected hash from the release, so it catches a wrong sha256 as
-          # well as a wrong version. Comparing version strings alone would
-          # call a cask with a corrupt hash correct.
-          output=$(python3 scripts/bump_homebrew_tap.py --version "$VERSION" --dry-run)
-          echo "$output"
-          case "$output" in
-            *"nothing to do"*) echo "tap verified at $VERSION" ;;
-            *) echo "::error::the tap does not match release $VERSION after the write"; exit 1 ;;
-          esac
+          # Re-read both published tap files and re-derive the release hash.
+          # GitHub's branch Contents API can briefly expose different files
+          # from different cache generations after the atomic ref update, so
+          # this verifier retries that read boundedly. A persistent wrong
+          # version or hash still fails the release lane.
+          python3 scripts/bump_homebrew_tap.py \
+            --version "$VERSION" \
+            --wait-current
