@@ -1544,5 +1544,5 @@ describe("stable corpus lease", () => {
         withStableCorpusLease(root, () => "must not reuse")
       ).rejects.toThrow("killed without confirming it died");
     });
-  }, 10_000);
+  });
 });
