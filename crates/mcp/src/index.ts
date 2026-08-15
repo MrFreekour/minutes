@@ -2144,7 +2144,8 @@ if (isExtensionRuntime) {
 // ── Find the minutes binary ─────────────────────────────────
 
 function findMinutesBinary(): string {
-  const isWindows = process.platform === "win32";
+  const platform = process.platform;
+  const isWindows = platform === "win32";
   const ext = isWindows ? ".exe" : "";
   const candidates = [
     join(__dirname, "..", "..", "..", "target", "release", `minutes${ext}`),
@@ -2162,6 +2163,19 @@ function findMinutesBinary(): string {
           "/opt/homebrew/bin/minutes",
           "/usr/local/bin/minutes",
         ]),
+    // Inside the desktop app, which ships the CLI as a sidecar and updates it
+    // with the app. Without this, someone who installed the app and never
+    // opened it has the engine on disk while the extension reports it missing,
+    // and the remedy we print is something they have already done. The app's
+    // own "Set up CLI" symlinks ~/.local/bin above, so this is the path for
+    // people who never clicked it.
+    ...(platform === "darwin"
+      ? [
+          "/Applications/Minutes.app/Contents/MacOS/minutes",
+          join(homedir(), "Applications", "Minutes.app", "Contents", "MacOS", "minutes"),
+          join(homedir(), "Applications", "Minutes Dev.app", "Contents", "MacOS", "minutes"),
+        ]
+      : []),
   ];
 
   for (const candidate of candidates) {
@@ -3244,6 +3258,34 @@ export function selectCopilotNudges(
  */
 const MCP_CLI_MAX_STDOUT_BYTES = 64 * 1024 * 1024;
 
+/**
+ * What a person should actually do when the CLI is absent, phrased for the
+ * surface they installed.
+ *
+ * The server downloads a prebuilt CLI on first run, so this text is only ever
+ * reached when that could not complete: no network, a proxy, or a platform
+ * with no published binary. Naming the likely cause matters more than naming
+ * the component, because the reader is usually a Claude Desktop user who never
+ * chose to have a CLI at all (#774).
+ */
+export function cliMissingGuidance(
+  platform: NodeJS.Platform = process.platform
+): string {
+  // Only macOS and Windows have a desktop app. Linux ships the CLI alone, so
+  // pointing a Linux user at "the app" sends them to a download that does not
+  // exist.
+  const manual =
+    platform === "darwin" || platform === "win32"
+      ? "Install the free Minutes desktop app from https://useminutes.app, which includes the engine and keeps it updated."
+      : "Install the Minutes CLI from https://useminutes.app, or run `cargo install minutes-cli`.";
+  return (
+    "The Minutes engine is not installed yet. Minutes normally installs it " +
+    "automatically on first run, so this usually means it could not be " +
+    "downloaded: no internet access, a proxy, or an unsupported platform. " +
+    `${manual} Then restart this app.`
+  );
+}
+
 async function runMinutes(
   args: string[],
   timeoutMs: number = 30000,
@@ -3261,6 +3303,16 @@ async function runMinutes(
   } catch (error: any) {
     if (error.killed) {
       throw new Error(`Command timed out after ${timeoutMs}ms`);
+    }
+    // Every tool reaches the CLI through here, including the readiness probe
+    // behind the content-bearing tools, so this one branch is what turns a
+    // missing engine into advice instead of ENOENT.
+    if (error?.code === "ENOENT") {
+      const missing = new Error(cliMissingGuidance());
+      // Tagged rather than string-matched, so callers that deliberately keep
+      // their own failures opaque can still let this one through.
+      (missing as any).cliMissing = true;
+      throw missing;
     }
     const stderr = error.stderr?.trim() || "";
     const stdout = error.stdout?.trim() || "";
@@ -3342,7 +3394,13 @@ export async function readAgentTrustReadiness(
   let stdout: string;
   try {
     ({ stdout } = await runner(["agent-readiness", "--json"]));
-  } catch {
+  } catch (error: any) {
+    // A malformed or unverifiable readiness answer stays opaque on purpose:
+    // the caller must not learn why the boundary refused. A missing engine is
+    // not that. It is the reader's own machine state, it is already printed by
+    // the capture tools, and withholding it leaves a Claude Desktop user with
+    // "could not be verified safely" and nothing to do about it (#774).
+    if (error?.cliMissing) throw error;
     throw new Error("Minutes agent readiness could not be verified safely.");
   }
   let result: any;
@@ -9204,6 +9262,26 @@ function printUsage(): void {
 
 // ── Start server ────────────────────────────────────────────
 
+/**
+ * Probe for the engine at startup, install it if possible, and say what
+ * happened. Never throws: startup does not depend on the outcome.
+ */
+async function announceCliAvailability(): Promise<void> {
+  let available = false;
+  try {
+    available = await isCliAvailable();
+  } catch {
+    // A probe that fails is the same as one that says no.
+  }
+  crashTrace(available ? "required-cli-ready" : "required-cli-absent");
+  if (!available) {
+    console.error(`[Minutes] ${cliMissingGuidance()}`);
+    console.error(
+      "[Minutes] Starting anyway so tools can report this. Tools that need the engine will explain it."
+    );
+  }
+}
+
 async function main() {
   crashTrace("main-start");
   const config = parseTransportConfig(process.argv.slice(2));
@@ -9215,8 +9293,8 @@ async function main() {
 
   if (config.transport === "http") {
     crashTrace("main-transport-http", { port: config.port });
-    await afterRequiredCli(async () => {
-      crashTrace("required-cli-ready");
+    await announceCliAvailability();
+    {
       const httpServer = await startMinutesHttpServer({
         port: config.port,
         maxSessions: config.maxSessions,
@@ -9232,17 +9310,22 @@ async function main() {
       };
       process.once("SIGINT", shutdown);
       process.once("SIGTERM", shutdown);
-    });
+    }
     return;
   }
 
-  await afterRequiredCli(async () => {
-    crashTrace("required-cli-ready");
-    const transport = new StdioServerTransport();
-    crashTrace("transport-created");
-    await server.connect(transport);
-    crashTrace("transport-connected");
-  });
+  // The handshake is never gated on the engine. Refusing to start buys no
+  // safety over refusing each operation, because completing a handshake and
+  // listing tools exposes nothing, and every tool that touches content still
+  // checks readiness on each call. What it did cost was the entire diagnosis:
+  // a user whose auto-install could not reach the network got a server that
+  // exited before saying anything, which reads as a broken extension rather
+  // than a missing dependency (#774, reported against v0.25.0).
+  await announceCliAvailability();
+  const transport = new StdioServerTransport();
+  crashTrace("transport-created");
+  await server.connect(transport);
+  crashTrace("transport-connected");
   console.error("Minutes MCP server running on stdio");
 }
 
