@@ -120,6 +120,7 @@ import {
   registerLiveEventsSubscriptionHandlers,
   registerToolWithRestrictedPolicy,
   registerUnavailableCompatibilityTools,
+  cliMissingGuidance,
   readAgentTrustReadiness,
   readCopilotStatusFromCli,
   readKnowledgeStatusSnapshot,
@@ -6401,3 +6402,40 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
   throw new Error("timed out waiting for condition");
 }
+
+describe("missing engine guidance (#774)", () => {
+  it("points macOS and Windows at the app, and Linux at the CLI", () => {
+    const mac = cliMissingGuidance("darwin");
+    const win = cliMissingGuidance("win32");
+    const linux = cliMissingGuidance("linux");
+    // The desktop app ships for macOS and Windows only. Telling a Linux user
+    // to install it sends them to a download that does not exist.
+    expect(mac).toContain("desktop app");
+    expect(win).toContain("desktop app");
+    expect(linux).not.toContain("desktop app");
+    expect(linux).toContain("cargo install minutes-cli");
+    for (const text of [mac, win, linux]) {
+      expect(text).toContain("https://useminutes.app");
+      // The likely cause, because auto-install normally handles this and the
+      // reader is usually someone who never chose to have a CLI.
+      expect(text).toMatch(/internet|proxy|unsupported platform/);
+    }
+  });
+
+  it("lets a missing engine through the readiness gate, but nothing else", async () => {
+    const missing = Object.assign(new Error("engine gone"), { cliMissing: true });
+    await expect(
+      readAgentTrustReadiness(async () => {
+        throw missing;
+      })
+    ).rejects.toBe(missing);
+
+    // An unverifiable answer must stay opaque: the caller does not learn why
+    // the boundary refused.
+    await expect(
+      readAgentTrustReadiness(async () => {
+        throw new Error("something the caller must not see");
+      })
+    ).rejects.toThrow("could not be verified safely");
+  });
+});
