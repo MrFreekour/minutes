@@ -2,7 +2,7 @@
 
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts + site/lib/skills-catalog.json
-> Last generated: 2026-08-14
+> Last generated: 2026-08-15
 
 ## Product
 
@@ -18,6 +18,8 @@ What you get:
 • Live sessions that promote into diarized, summarized meetings when you stop.
 • Consent provenance in every file, and sensitivity gating agents must respect.
 • Diarized speaker labels, structured action items and decisions, and policy-safe search over owned markdown. Cross-meeting relationship answers are rebuilt from bounded live policy-authorized snapshots; compatibility-only derived insight and annotation reads still fail explicitly until their source provenance can be revalidated.
+
+**Before you start.** Minutes runs entirely on your own machine, so it needs the Minutes engine installed locally. The extension normally downloads it for you the first time it runs. If your machine cannot reach the internet, or you are on a platform we do not publish a binary for, install it yourself: on macOS and Windows get the free desktop app from https://useminutes.app, which includes the engine and keeps it updated; on Linux install the CLI from the same page. Until the engine is present the extension still starts and lists its tools, and each tool will tell you what is missing.
 
 ## Choose your surface
 
