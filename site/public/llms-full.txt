@@ -19,7 +19,11 @@ What you get:
 • Consent provenance in every file, and sensitivity gating agents must respect.
 • Diarized speaker labels, structured action items and decisions, and policy-safe search over owned markdown. Cross-meeting relationship answers are rebuilt from bounded live policy-authorized snapshots; compatibility-only derived insight and annotation reads still fail explicitly until their source provenance can be revalidated.
 
-**Before you start.** Minutes runs entirely on your own machine, so it needs the Minutes engine installed locally. The extension normally downloads it for you the first time it runs. If your machine cannot reach the internet, or you are on a platform we do not publish a binary for, install it yourself: on macOS and Windows get the free desktop app from https://useminutes.app, which includes the engine and keeps it updated; on Linux install the CLI from the same page. Until the engine is present the extension still starts and lists its tools, and each tool will tell you what is missing.
+**Getting set up.** Minutes keeps everything on your own machine, so it needs the Minutes engine installed locally. The extension downloads it for you the first time it runs, and most people never have to think about it.
+
+If it cannot reach the internet, or you are on an unusual platform, install it yourself. On macOS and Windows the easiest way is the free, open-source Minutes desktop app at https://useminutes.app, which includes the engine and keeps it updated. On Linux, install the command line tool from the same page.
+
+Either way the extension always starts and lists its tools, so if something is missing it will tell you exactly what to do.
 
 ## Choose your surface
 
