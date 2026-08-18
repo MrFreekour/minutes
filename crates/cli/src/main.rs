@@ -8145,14 +8145,21 @@ fn qmd_cleanup_status_report(collection: &str, config: &Config) -> Result<QmdSta
         std::fs::symlink_metadata(&report.policy_mirror),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
-    // `qmd_available` is deliberately NOT required here. When qmd is not
-    // installed there is no registry to inspect and nothing that could serve a
-    // stale registration, so demanding an inspection that cannot happen left
-    // users who never opted into QMD permanently blocked, with the remediation
-    // we printed failing for the same reason (#788). The retraction itself
-    // still has to succeed, and every other condition below still applies.
+    // `qmd_available` is deliberately NOT required here. When the registry
+    // never answered there is nothing that could serve a stale registration,
+    // so demanding an inspection that cannot happen left users who never opted
+    // into QMD permanently blocked, with the remediation we printed failing for
+    // the same reason (#788).
+    //
+    // `registration_evidence` is required to be false alongside it, and comes
+    // from the same snapshot agent readiness uses. Without that this reports a
+    // confirmed cleanup on a machine whose ownership marker readiness is still
+    // blocking on, which tells the user their remediation worked while they
+    // stay blocked. The retraction itself still has to succeed, and every other
+    // condition below still applies.
     report.cleanup_confirmed = (persistent_cleanup.confirmed
-        || persistent_cleanup.registry_never_answered)
+        || (persistent_cleanup.registry_never_answered
+            && !persistent_cleanup.registration_evidence))
         && !report.registered
         && !report.physically_registered
         && report.matching_collections.is_empty()
@@ -9345,6 +9352,43 @@ life (qmd://life/)
             assert!(error.contains("Persistent QMD collections are disabled"));
             assert!(!error.contains("engine ="));
             assert!(!error.contains("qmd_collection"));
+
+            if let Some(path) = original_path {
+                std::env::set_var("PATH", path);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn qmd_cleanup_is_not_confirmed_while_an_ownership_marker_survives() {
+        // Counterpart to the no-qmd case above. With no qmd on PATH but an
+        // ownership marker still on disk, agent readiness blocks, so cleanup
+        // must not tell the user it succeeded. Reporting confirmed here sends
+        // someone away believing they are unblocked when they are not.
+        with_temp_home(|dir| {
+            let empty_bin = dir.join("empty-bin");
+            std::fs::create_dir_all(&empty_bin).unwrap();
+            let original_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", &empty_bin);
+
+            let config = Config::default();
+            config.ensure_dirs().unwrap();
+            std::fs::write(
+                minutes_core::knowledge::qmd_owned_target_path_for_tests(),
+                br#"{"schema":1,"target":"minutes"}"#,
+            )
+            .unwrap();
+
+            let report = qmd_cleanup_status_report("minutes", &config).unwrap();
+            assert!(!report.qmd_available);
+            assert!(
+                !report.cleanup_confirmed,
+                "a surviving ownership marker must not report a confirmed cleanup"
+            );
+            assert!(cmd_qmd("cleanup", "minutes").is_err());
 
             if let Some(path) = original_path {
                 std::env::set_var("PATH", path);
