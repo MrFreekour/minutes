@@ -3455,6 +3455,12 @@ struct QmdOperationRunner<'a, R: QmdRunner> {
     runner: &'a R,
     deadline: Instant,
     commands_started: std::cell::Cell<usize>,
+    /// Set when a command failed because the `qmd` binary is not installed, as
+    /// opposed to installed and unhappy. `run` flattens errors to strings for
+    /// callers, so without this the difference is lost, and it is the whole
+    /// difference between "we cannot inspect a registry that exists" and
+    /// "there is nothing here to inspect" (#788).
+    qmd_absent: std::cell::Cell<bool>,
 }
 
 impl<'a, R: QmdRunner> QmdOperationRunner<'a, R> {
@@ -3467,6 +3473,7 @@ impl<'a, R: QmdRunner> QmdOperationRunner<'a, R> {
             runner,
             deadline: Instant::now() + timeout,
             commands_started: std::cell::Cell::new(0),
+            qmd_absent: std::cell::Cell::new(false),
         }
     }
 
@@ -3479,9 +3486,23 @@ impl<'a, R: QmdRunner> QmdOperationRunner<'a, R> {
             return Err("QMD registry command budget exceeded".into());
         }
         self.commands_started.set(started + 1);
-        self.runner
-            .run_until(args, self.deadline)
-            .map_err(|error| error.to_string())
+        self.runner.run_until(args, self.deadline).map_err(|error| {
+            if matches!(
+                error,
+                QmdRunError::Io {
+                    kind: std::io::ErrorKind::NotFound,
+                    ..
+                }
+            ) {
+                self.qmd_absent.set(true);
+            }
+            error.to_string()
+        })
+    }
+
+    /// Whether a command failed specifically because `qmd` is not installed.
+    fn qmd_absent(&self) -> bool {
+        self.qmd_absent.get()
     }
 }
 
@@ -4970,6 +4991,40 @@ fn purge_qmd_policy_plaintext_at_with_hooks_and_claims(
     qmd_sync_directory(parent).map_err(|_| "QMD mirror cleanup could not be synced".to_string())
 }
 
+/// Outcome of a retraction attempt, keeping the reason it failed.
+struct QmdRetractionOutcome {
+    result: Result<(), String>,
+    /// The failure was only that `qmd` is not installed. Nothing was
+    /// inspectable because there is nothing on this machine to inspect.
+    qmd_absent: bool,
+}
+
+fn disable_qmd_persistence_reporting_at<R: QmdRunner>(
+    config: &Config,
+    runner: &R,
+    mirror_path: &Path,
+    lock_directory: &Path,
+    configured_target: Option<&str>,
+) -> QmdRetractionOutcome {
+    let operation = QmdOperationRunner::new(runner);
+    let lock = acquire_policy_lock_at_until(lock_directory, QMD_POLICY_LOCK, operation.deadline);
+    let Ok(_lock) = lock else {
+        return QmdRetractionOutcome {
+            result: Err("QMD policy lock failed".to_string()),
+            qmd_absent: false,
+        };
+    };
+    let result = disable_qmd_persistence_locked(
+        config,
+        &operation,
+        mirror_path,
+        lock_directory,
+        configured_target,
+    );
+    let qmd_absent = operation.qmd_absent();
+    QmdRetractionOutcome { result, qmd_absent }
+}
+
 fn disable_qmd_persistence_with_at<R: QmdRunner>(
     config: &Config,
     runner: &R,
@@ -5068,18 +5123,38 @@ fn evaluate_agent_trust_readiness_with_at<R: QmdRunner>(
     mirror_path: &Path,
     lock_directory: &Path,
 ) -> AgentTrustReadiness {
-    match disable_qmd_persistence_with_at(
+    let outcome = disable_qmd_persistence_reporting_at(
         config,
         runner,
         mirror_path,
         lock_directory,
         config.search.qmd_collection.as_deref(),
-    ) {
+    );
+    match outcome.result {
         Ok(()) => match clear_qmd_retirement_pending(lock_directory) {
             Ok(()) => AgentTrustReadiness::ready(QmdRetirementReadiness::ReadyClean),
             Err(_) => AgentTrustReadiness::blocked(),
         },
+        Err(_) if outcome.qmd_absent => {
+            // The retraction could not attest anything because `qmd` is not
+            // installed. That is not a live exposure: a stale registration
+            // needs qmd to serve it, and there is no qmd here to do so.
+            //
+            // Blocking on it anyway trapped users who never opted into QMD
+            // with no way out, because the remediation we printed
+            // (`minutes qmd cleanup`) fails for the same reason and there is
+            // no override (#788). A control with no remediation path is not
+            // failing closed, it is just failing.
+            //
+            // The pending marker stays set deliberately, so the audit runs
+            // again and can still block the moment qmd appears. Readiness is
+            // re-evaluated on every agent call, so that moment is caught.
+            let _ = mark_qmd_retirement_pending(lock_directory);
+            AgentTrustReadiness::ready(QmdRetirementReadiness::ReadyClean)
+        }
         Err(_) => {
+            // qmd is installed and the cleanup could not be confirmed. That is
+            // a live exposure and still blocks.
             let _ = mark_qmd_retirement_pending(lock_directory);
             AgentTrustReadiness::blocked()
         }
