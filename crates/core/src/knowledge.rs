@@ -5017,10 +5017,6 @@ fn disable_qmd_persistence_reporting_at<R: QmdRunner>(
     lock_directory: &Path,
     configured_target: Option<&str>,
 ) -> QmdRetractionOutcome {
-    // Read the evidence before anything else runs. The retraction deletes the
-    // mirror directories on its way through, so asking afterwards would be
-    // asking about a machine we have already cleaned.
-    let registration_evidence = qmd_registration_evidence_at(config, mirror_path, lock_directory);
     let operation = QmdOperationRunner::new(runner);
     let lock = acquire_policy_lock_at_until(lock_directory, QMD_POLICY_LOCK, operation.deadline);
     let Ok(_lock) = lock else {
@@ -5030,6 +5026,11 @@ fn disable_qmd_persistence_reporting_at<R: QmdRunner>(
             registration_evidence: true,
         };
     };
+    // Read the evidence under the policy lock, before the retraction below
+    // starts deleting the mirror directories that constitute it. Reading it
+    // outside the lock would be reading it against a machine another retraction
+    // may be halfway through changing.
+    let registration_evidence = qmd_registration_evidence_at(config, mirror_path, lock_directory);
     let result = disable_qmd_persistence_locked(
         config,
         &operation,
