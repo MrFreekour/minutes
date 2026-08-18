@@ -8152,7 +8152,7 @@ fn qmd_cleanup_status_report(collection: &str, config: &Config) -> Result<QmdSta
     // we printed failing for the same reason (#788). The retraction itself
     // still has to succeed, and every other condition below still applies.
     report.cleanup_confirmed = (persistent_cleanup.confirmed
-        || persistent_cleanup.registry_unreachable)
+        || persistent_cleanup.registry_never_answered)
         && !report.registered
         && !report.physically_registered
         && report.matching_collections.is_empty()

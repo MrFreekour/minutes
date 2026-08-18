@@ -3455,19 +3455,20 @@ struct QmdOperationRunner<'a, R: QmdRunner> {
     runner: &'a R,
     deadline: Instant,
     commands_started: std::cell::Cell<usize>,
-    /// Set when Minutes could not get any statement out of the QMD registry:
-    /// the binary would not spawn, or `collection list` refused to answer.
+    /// Set the first time a `qmd` command comes back successful, meaning the
+    /// registry answered us at least once.
     ///
     /// `run` flattens errors to strings for callers, so without this the
-    /// distinction is lost, and it is the whole difference between "we could
-    /// not inspect a registry that answered us" and "there is no registry
-    /// here to inspect" (#788).
+    /// difference between "we could not inspect a registry that answered us"
+    /// and "there is no registry here to inspect" is lost, and that difference
+    /// is the whole of #788.
     ///
-    /// Deliberately *not* set when the registry answers and something later
-    /// fails. A parseable-but-surprising listing, or a collection whose
-    /// details will not load, means qmd is holding state we could not rule
-    /// out, and that must keep failing closed.
-    registry_unreachable: std::cell::Cell<bool>,
+    /// This tracks the positive fact rather than the negative one on purpose.
+    /// The retraction runs a second audit after its removals and can fail with
+    /// an I/O error at any point, so "the last command failed to spawn" does
+    /// not mean qmd was never there. Once it has answered, every later failure
+    /// keeps failing closed.
+    registry_answered: std::cell::Cell<bool>,
 }
 
 impl<'a, R: QmdRunner> QmdOperationRunner<'a, R> {
@@ -3480,7 +3481,7 @@ impl<'a, R: QmdRunner> QmdOperationRunner<'a, R> {
             runner,
             deadline: Instant::now() + timeout,
             commands_started: std::cell::Cell::new(0),
-            registry_unreachable: std::cell::Cell::new(false),
+            registry_answered: std::cell::Cell::new(false),
         }
     }
 
@@ -3493,21 +3494,16 @@ impl<'a, R: QmdRunner> QmdOperationRunner<'a, R> {
             return Err("QMD registry command budget exceeded".into());
         }
         self.commands_started.set(started + 1);
-        self.runner.run_until(args, self.deadline).map_err(|error| {
-            // Any spawn-level I/O failure means no command ran, so the
-            // registry told us nothing. NotFound is the common case (#788),
-            // but a permission or resource failure to launch is no more
-            // informative.
-            if matches!(error, QmdRunError::Io { .. }) {
-                self.registry_unreachable.set(true);
-            }
-            error.to_string()
-        })
+        let result = self.runner.run_until(args, self.deadline);
+        if result.as_ref().is_ok_and(|command| command.success) {
+            self.registry_answered.set(true);
+        }
+        result.map_err(|error| error.to_string())
     }
 
     /// Whether a command failed specifically because `qmd` is not installed.
-    fn registry_unreachable(&self) -> bool {
-        self.registry_unreachable.get()
+    fn registry_never_answered(&self) -> bool {
+        !self.registry_answered.get()
     }
 }
 
@@ -3733,10 +3729,10 @@ fn qmd_registry_audit<R: QmdRunner>(
 ) -> Result<QmdRegistryAudit, String> {
     let list = runner.run(&["collection", "list"])?;
     if !list.success {
-        // qmd ran but declined to enumerate: a broken install fails this way
-        // (a native-binding load failure exits non-zero), and it leaves us as
-        // uninformed as no qmd at all.
-        runner.registry_unreachable.set(true);
+        // qmd ran but declined to enumerate. A broken install fails this way,
+        // a native-binding load failure exits non-zero, and it leaves us as
+        // uninformed as no qmd at all. Nothing to set here: an unsuccessful
+        // command never marks the registry as having answered.
         return Err("QMD registry could not be listed".into());
     }
     let all = parse_qmd_collection_names(&list.stdout)?;
@@ -5003,9 +4999,11 @@ fn purge_qmd_policy_plaintext_at_with_hooks_and_claims(
 /// Outcome of a retraction attempt, keeping the reason it failed.
 struct QmdRetractionOutcome {
     result: Result<(), String>,
-    /// The failure was only that `qmd` is not installed. Nothing was
-    /// inspectable because there is nothing on this machine to inspect.
-    registry_unreachable: bool,
+    /// No `qmd` command ever came back successful, so the registry told us
+    /// nothing at all: either it is not installed, or it is installed and will
+    /// not answer. Nothing was inspectable, as opposed to inspected and found
+    /// wanting.
+    registry_never_answered: bool,
 }
 
 fn disable_qmd_persistence_reporting_at<R: QmdRunner>(
@@ -5020,7 +5018,7 @@ fn disable_qmd_persistence_reporting_at<R: QmdRunner>(
     let Ok(_lock) = lock else {
         return QmdRetractionOutcome {
             result: Err("QMD policy lock failed".to_string()),
-            registry_unreachable: false,
+            registry_never_answered: false,
         };
     };
     let result = disable_qmd_persistence_locked(
@@ -5030,10 +5028,10 @@ fn disable_qmd_persistence_reporting_at<R: QmdRunner>(
         lock_directory,
         configured_target,
     );
-    let registry_unreachable = operation.registry_unreachable();
+    let registry_never_answered = operation.registry_never_answered();
     QmdRetractionOutcome {
         result,
-        registry_unreachable,
+        registry_never_answered,
     }
 }
 
@@ -5125,7 +5123,7 @@ pub struct QmdRetractionStatus {
     pub confirmed: bool,
     /// Nothing could be inspected because there is no `qmd` on this machine.
     /// Distinct from an inspection that ran and could not confirm.
-    pub registry_unreachable: bool,
+    pub registry_never_answered: bool,
     pub error: Option<String>,
 }
 
@@ -5142,12 +5140,12 @@ pub fn ensure_qmd_persistence_disabled_status(config: &Config) -> QmdRetractionS
     match outcome.result {
         Ok(()) => QmdRetractionStatus {
             confirmed: true,
-            registry_unreachable: outcome.registry_unreachable,
+            registry_never_answered: outcome.registry_never_answered,
             error: None,
         },
         Err(error) => QmdRetractionStatus {
             confirmed: false,
-            registry_unreachable: outcome.registry_unreachable,
+            registry_never_answered: outcome.registry_never_answered,
             error: Some(error),
         },
     }
@@ -5233,7 +5231,7 @@ fn evaluate_agent_trust_readiness_with_at<R: QmdRunner>(
             Ok(()) => AgentTrustReadiness::ready(QmdRetirementReadiness::ReadyClean),
             Err(_) => AgentTrustReadiness::blocked(),
         },
-        Err(_) if outcome.registry_unreachable && !evidence => {
+        Err(_) if outcome.registry_never_answered && !evidence => {
             // Two things are true at once here: the registry told us nothing
             // (no qmd, or a qmd that will not answer), and nothing on this
             // machine says Minutes ever registered a collection. There is no
@@ -13068,6 +13066,57 @@ mod tests {
             assert_eq!(readiness.qmd_retirement, QmdRetirementReadiness::Blocked);
             assert!(readiness.remediation.is_some());
         }
+    }
+
+    /// Answers one `collection list` and then behaves as though the binary is
+    /// gone, the way a qmd removed or replaced mid-run would.
+    struct VanishingQmdRunner {
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl QmdRunner for VanishingQmdRunner {
+        fn run_until(
+            &self,
+            args: &[&str],
+            _deadline: Instant,
+        ) -> Result<QmdCommandResult, QmdRunError> {
+            if args == ["collection", "list"]
+                && self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                return Ok(QmdCommandResult {
+                    success: true,
+                    stdout: "Collections (0):\n".into(),
+                });
+            }
+            Err(QmdRunError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                message: "qmd vanished mid-run".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_registry_that_answered_once_never_counts_as_unreachable() {
+        // The #788 pass requires that qmd told us nothing at all. Deciding that
+        // from the *last* failure instead of the whole run is wrong: the
+        // retraction re-audits after its removals, so a registry that listed
+        // fine and then failed would look identical to one that was never
+        // there. On a machine whose local marker had been deleted, that would
+        // report ready while a real Minutes-owned collection still held the
+        // meeting text.
+        let (_meetings, state, _mirror_parent, config, mirror) = qmd_fixture();
+        let runner = VanishingQmdRunner {
+            lists: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let readiness =
+            evaluate_agent_trust_readiness_with_at(&config, &runner, &mirror, state.path());
+
+        assert!(
+            !readiness.ready,
+            "a registry that answered once must keep failing closed"
+        );
+        assert_eq!(readiness.qmd_retirement, QmdRetirementReadiness::Blocked);
     }
 
     #[test]
