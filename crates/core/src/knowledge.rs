@@ -5206,6 +5206,12 @@ const MAX_QMD_EVIDENCE_ENTRIES: usize = 8192;
 /// residue, because this feeds a gate that lets agent tools run and the only
 /// safe direction to be wrong in is towards blocking.
 fn qmd_mirror_residue_evidence(mirror_path: &Path) -> bool {
+    qmd_mirror_residue_evidence_within(mirror_path, MAX_QMD_EVIDENCE_ENTRIES)
+}
+
+/// [`qmd_mirror_residue_evidence`] with the walk bound supplied, so the
+/// give-up rule can be tested without materializing the real bound.
+fn qmd_mirror_residue_evidence_within(mirror_path: &Path, limit: usize) -> bool {
     let Some(parent) = mirror_path.parent() else {
         return true;
     };
@@ -5220,7 +5226,7 @@ fn qmd_mirror_residue_evidence(mirror_path: &Path) -> bool {
         format!(".{QMD_MIRROR_DIR}.retired-"),
     ];
     for (inspected, entry) in entries.enumerate() {
-        if inspected >= MAX_QMD_EVIDENCE_ENTRIES {
+        if inspected >= limit {
             return true;
         }
         let Ok(entry) = entry else {
@@ -13172,16 +13178,24 @@ mod tests {
         // More entries than the scan is willing to walk, and none of them
         // residue. Answering "no" here would be answering a question we
         // stopped reading before the end of, so it has to answer "yes".
-        // Asserted on the real bound rather than a sampled prefix, because a
-        // prefix test passes or fails on readdir order.
+        //
+        // Asserted through the injected bound rather than by materializing the
+        // real one. A test that writes 8193 files to prove this puts that load
+        // on every other test running beside it, and asserting it on a sampled
+        // prefix instead would make the result depend on readdir order, which
+        // is the defect being tested for.
         let crowded = TempDir::new().unwrap();
         let crowded_mirror = crowded.path().join("mirror");
-        for index in 0..=MAX_QMD_EVIDENCE_ENTRIES {
+        for index in 0..4 {
             fs::write(crowded.path().join(format!("unrelated-{index}")), b"").unwrap();
         }
         assert!(
-            qmd_mirror_residue_evidence(&crowded_mirror),
+            qmd_mirror_residue_evidence_within(&crowded_mirror, 3),
             "a scan that gave up early must not report clean"
+        );
+        assert!(
+            !qmd_mirror_residue_evidence_within(&crowded_mirror, 4),
+            "a scan that read every entry and found nothing reports clean"
         );
 
         // A missing parent is the one honest "no": there is nowhere for a
