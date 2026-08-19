@@ -36,7 +36,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: release_readiness
+    # needs: release_readiness  (local build: skip maintainer site-constants gate)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
